@@ -1,0 +1,28 @@
+{
+  "$schema": "https://opencode.ai/config.schema.json",
+  "instructions": ["./AGENTS.md"],
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "git *": "ask",
+      "npm *": "allow",
+      "rm *": "ask",
+      "grep *": "ask",
+      "glob *": "ask",
+      "openspec *": "allow"
+    },
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow"
+    },
+    "edit": {
+      "*": "deny",
+      "**/*.html": "allow",
+      "**/*.ts": "allow",
+      "**/*.json": "ask",
+      "**/*.md": "ask"
+    }
+  }
+}
