@@ -531,9 +531,7 @@ namespace ps2recomp
             inst.modificationInfo.modifiesControl = true;
             break;
         case MMI_PMTHL:
-        case MMI3_PMTHI:
-        case MMI3_PMTLO:
-            inst.modificationInfo.modifiesGPR = false; // Writes to HI/LO or HI1/LO1
+            inst.modificationInfo.modifiesGPR = false; // Writes to HI/LO
             inst.modificationInfo.modifiesControl = true;
             break;
         case MMI_PMFHL:
@@ -608,6 +606,10 @@ namespace ps2recomp
         case MMI1_PABSW:
         case MMI1_PABSH:
             // Absolute value operations
+            break;
+
+        case MMI1_PADSBH:
+            // Parallel add/subtract halfwords
             break;
 
         case MMI1_PCEQW:
