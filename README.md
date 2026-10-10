@@ -1,49 +1,31 @@
-# tales-of-legendia-ps2recomp
+# Tales of Legendia PS2recomp
 
 A recompilation of the Tales of Legendia game on the PS2
 
+### What is this project?
 
 
 
-
-\### What is this project?
-
-
-
-\### Requirements
+### Requirements
 
 
 
-\### How to use it
-
+### How to use it
 
 
 
 
 Do not publish `data`, `out` or `tools\\.build`. They may contain user inputs,
-
 extracted game files or generated derivatives.
 
 
+| Step                                                                | Status      | Note                     |
+|---------------------------------------------------------------------|-------------|--------------------------|
+| Base game compiles, but is missing MMI functions and has CP0 errors | In Progress | Screen is currently pink |
 
-
-
-| Step | Status | Note |
-
-| --- | --- | --- |
-
-| Base game compiles, but is missing MMI functions and has CP0 errors | In Progress | Screen is currently pink
-
-
-
-
-
-\### Legal notice
-
-
+### Legal notice
 
 This project is an interoperability-oriented source project and is not legal
-
 advice. It is not affiliated with or endorsed by Namco, Sony, or any other rightsholder. 
 
 All trademarks and copyrighted game material belong to their respective owners.
@@ -80,5 +62,5 @@ separate rights review. See `LEGAL.md` for the canonical scope.
 
 
 
-\---
+---
 
