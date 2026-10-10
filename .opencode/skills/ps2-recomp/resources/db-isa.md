@@ -331,8 +331,12 @@ J-Type:  [opcode:6][target:26]
 ### Format Field — bits [25:21]
 | Hex | Name | Next decode |
 |-----|------|-------------|
-| 0x00 | MFC0 | Move From COP0: `rd` = COP0 register |
-| 0x04 | MTC0 | Move To COP0: `rd` = COP0 register |
+| 0x00 | MFC0 | Move From COP0 (32-bit): `rd` = COP0 register |
+| 0x01 | DMFC0 | Doubleword Move From COP0 (64-bit): `rd` = COP0 register |
+| 0x02 | CFC0 | Move Control From COP0 (32-bit): `rd` = COP0 register |
+| 0x04 | MTC0 | Move To COP0 (32-bit): `rd` = COP0 register |
+| 0x05 | DMTC0 | Doubleword Move To COP0 (64-bit): `rd` = COP0 register |
+| 0x06 | CTC0 | Move Control To COP0 (32-bit): `rd` = COP0 register |
 | 0x08 | BC0 | → BC condition (bits [20:16]) |
 | 0x10 | CO | → CO function (bits [5:0]) |
 

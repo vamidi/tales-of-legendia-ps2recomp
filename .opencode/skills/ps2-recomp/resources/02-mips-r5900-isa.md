@@ -40,6 +40,21 @@ Instructions like `MFC0` (Move From Coprocessor 0) and `MTC0` (Move To Coprocess
 - **Status Register**: Often handles interrupts. In C++, might translate to checking a flag.
 - **Cause Register**: Used to determine exception type.
 
+*COP0 Formats & Operations (`OPCODE_COP0 = 0x10`, format bits [25:21] in `rs`):*
+- `COP0_MF = 0x00` (`MFC0`): 32-bit move from COP0 register `rd` into GPR `rt` (sign-extended to 64-bit via `SET_GPR_S32`).
+- `COP0_DMF = 0x01` (`DMFC0`): 64-bit doubleword move from COP0 register `rd` into GPR `rt` (via `SET_GPR_S64`).
+- `COP0_CF = 0x02` (`CFC0`): Move control word from COP0 register `rd` into GPR `rt` (via `SET_GPR_S32`). Example: `0x404E0000` is `CFC0 $t6, $0` (`format=0x2`, `rt=14 ($t6)`, `rd=0 ($index)`).
+- `COP0_MT = 0x04` (`MTC0`): 32-bit move from GPR `rt` into COP0 register `rd`.
+- `COP0_DMT = 0x05` (`DMTC0`): 64-bit doubleword move from GPR `rt` into COP0 register `rd`.
+- `COP0_CT = 0x06` (`CTC0`): Move control word from GPR `rt` into COP0 register `rd`.
+- `COP0_BC = 0x08` (`BC0`): Coprocessor 0 conditional branches (`BC0F`, `BC0T`, `BC0FL`, `BC0TL`).
+- `COP0_CO = 0x10` (`C0`): Coprocessor 0 functions (`TLBR`, `TLBWI`, `TLBWR`, `TLBP`, `ERET`, `EI`, `DI`).
+
+*Code Generator & Decoder Mapping in PS2Recomp:*
+- `instructions.h`: `COP0Format` enum defines all formats (`COP0_MF`, `COP0_DMF`, `COP0_CF`, `COP0_MT`, `COP0_DMT`, `COP0_CT`, `COP0_BC`, `COP0_CO`).
+- `r5900_decoder.cpp`: `decodeCOP0` flags `modifiesGPR = true` for read formats (`COP0_MF`, `COP0_DMF`, `COP0_CF`) when `rt != 0`.
+- `cop0_translator.cpp`: `Cop0Translator::translate` maps register reads and writes to `R5900Context` fields (`ctx->cop0_index`, `ctx->cop0_status`, `ctx->cop0_cause`, `ctx->cop0_epc`, etc.).
+
 ### COP1 (FPU - Floating Point)
 Standard MIPS floating point. FPU registers are `f0 - f31`.
 PS2 FPU operates in Single Precision (`.S`) exclusively.
