@@ -992,6 +992,34 @@ void register_code_generator_tests()
             t.IsTrue(mtc0Code.find("Unhandled COP0") == std::string::npos, "MTC0 should not hit unhandled COP0 path");
         });
 
+        tc.Run("COP0 CFC0/CTC0 translate to COP0 register access", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction cfc0{};
+            cfc0.opcode = OPCODE_COP0;
+            cfc0.rs = COP0_CF;
+            cfc0.rt = 14;
+            cfc0.rd = COP0_REG_INDEX;
+
+            std::string cfc0Code = gen.translateInstruction(cfc0);
+            printGeneratedCode("COP0 CFC0/CTC0 translate to COP0 register access (CFC0)", cfc0Code);
+            t.IsTrue(cfc0Code.find("SET_GPR_S32(ctx, 14") != std::string::npos, "CFC0 should write to rt");
+            t.IsTrue(cfc0Code.find("ctx->cop0_index") != std::string::npos, "CFC0 INDEX should read cop0_index");
+            t.IsTrue(cfc0Code.find("Unhandled COP0") == std::string::npos, "CFC0 should not hit unhandled COP0 path");
+
+            Instruction ctc0{};
+            ctc0.opcode = OPCODE_COP0;
+            ctc0.rs = COP0_CT;
+            ctc0.rt = 7;
+            ctc0.rd = COP0_REG_STATUS;
+
+            std::string ctc0Code = gen.translateInstruction(ctc0);
+            printGeneratedCode("COP0 CFC0/CTC0 translate to COP0 register access (CTC0)", ctc0Code);
+            t.IsTrue(ctc0Code.find("ctx->cop0_status") != std::string::npos, "CTC0 STATUS should write cop0_status");
+            t.IsTrue(ctc0Code.find("GPR_U32(ctx, 7)") != std::string::npos, "CTC0 should read from rt");
+            t.IsTrue(ctc0Code.find("Unhandled COP0") == std::string::npos, "CTC0 should not hit unhandled COP0 path");
+        });
+
         tc.Run("FCR access uses CFC1/CTC1", [](TestCase &t) {
             CodeGenerator gen({}, {});
 

@@ -375,10 +375,14 @@ namespace ps2recomp
     // COP0 Format Field ('fmt' or 'rs' field, bits 25-21) for OPCODE_COP0
     enum COP0Format
     {
-        COP0_MF = 0x00, // Move From COP0 - MFC0 (fmt=00000)
-        COP0_MT = 0x04, // Move To COP0 - MTC0 (fmt=00100)
-        COP0_BC = 0x08, // BC0 group (fmt=01000) (see Cop0BranchCondition)
-        COP0_CO = 0x10  // COP0 Operation group (fmt=10000) (see Cop0CoFunctions)
+        COP0_MF = 0x00,  // Move From COP0 - MFC0 (fmt=00000)
+        COP0_DMF = 0x01, // Doubleword Move From COP0 - DMFC0 (fmt=00001)
+        COP0_CF = 0x02,  // Move Control From COP0 - CFC0 (fmt=00010)
+        COP0_MT = 0x04,  // Move To COP0 - MTC0 (fmt=00100)
+        COP0_DMT = 0x05, // Doubleword Move To COP0 - DMTC0 (fmt=00101)
+        COP0_CT = 0x06,  // Move Control To COP0 - CTC0 (fmt=00110)
+        COP0_BC = 0x08,  // BC0 group (fmt=01000) (see Cop0BranchCondition)
+        COP0_CO = 0x10   // COP0 Operation group (fmt=10000) (see Cop0CoFunctions)
     };
 
     // COP0 CO Function Field (bits 5-0) for COP0_CO Format

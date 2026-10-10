@@ -25,6 +25,7 @@ namespace ps2recomp
         switch (format)
         {
         case COP0_MF:
+        case COP0_CF:
             switch (rd)
             {
             case COP0_REG_INDEX:
@@ -74,7 +75,59 @@ namespace ps2recomp
             default:
                 return fmt::format("SET_GPR_S32(ctx, {}, 0);  // Unimplemented COP0 register {}", rt, rd);
             }
+        case COP0_DMF:
+            switch (rd)
+            {
+            case COP0_REG_INDEX:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_index);", rt);
+            case COP0_REG_RANDOM:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_random);", rt);
+            case COP0_REG_ENTRYLO0:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_entrylo0);", rt);
+            case COP0_REG_ENTRYLO1:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_entrylo1);", rt);
+            case COP0_REG_CONTEXT:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_context);", rt);
+            case COP0_REG_PAGEMASK:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_pagemask);", rt);
+            case COP0_REG_WIRED:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_wired);", rt);
+            case COP0_REG_BADVADDR:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_badvaddr);", rt);
+            case COP0_REG_COUNT:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_count);", rt);
+            case COP0_REG_ENTRYHI:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_entryhi);", rt);
+            case COP0_REG_COMPARE:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_compare);", rt);
+            case COP0_REG_STATUS:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_status);", rt);
+            case COP0_REG_CAUSE:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_cause);", rt);
+            case COP0_REG_EPC:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_epc);", rt);
+            case COP0_REG_PRID:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_prid);", rt);
+            case COP0_REG_CONFIG:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_config);", rt);
+            case COP0_REG_BADPADDR:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_badpaddr);", rt);
+            case COP0_REG_DEBUG:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_debug);", rt);
+            case COP0_REG_PERF:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_perf);", rt);
+            case COP0_REG_TAGLO:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_taglo);", rt);
+            case COP0_REG_TAGHI:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_taghi);", rt);
+            case COP0_REG_ERROREPC:
+                return fmt::format("SET_GPR_S64(ctx, {}, (int64_t)(int32_t)ctx->cop0_errorepc);", rt);
+            default:
+                return fmt::format("SET_GPR_S64(ctx, {}, 0);  // Unimplemented COP0 register {}", rt, rd);
+            }
         case COP0_MT:
+        case COP0_CT:
+        case COP0_DMT:
             switch (rd)
             {
             case COP0_REG_INDEX:

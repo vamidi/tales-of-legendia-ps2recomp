@@ -216,5 +216,19 @@ void register_r5900_decoder_tests()
         t.IsTrue(inst.isReturn, "eret should be marked as return");
         t.IsFalse(inst.hasDelaySlot, "eret should not have a delay slot");
         t.IsTrue(inst.modificationInfo.modifiesControl, "eret changes control state");
+    });
+
+    tc.Run("COP0 CFC0 decodes format and marks GPR modification", [](TestCase &t) {
+        uint32_t address = 0x3C74A4;
+        uint32_t raw = 0x404E0000; // cfc0 $t6, $0
+
+        R5900Decoder decoder;
+        Instruction inst = decoder.decodeInstruction(address, raw);
+
+        t.Equals(inst.opcode, static_cast<uint8_t>(OPCODE_COP0), "opcode should be COP0");
+        t.Equals(inst.rs, static_cast<uint8_t>(COP0_CF), "format should be COP0_CF (0x2)");
+        t.Equals(inst.rt, static_cast<uint8_t>(14), "rt should be 14 ($t6)");
+        t.Equals(inst.rd, static_cast<uint8_t>(0), "rd should be 0");
+        t.IsTrue(inst.modificationInfo.modifiesGPR, "cfc0 with rt!=0 should mark GPR modification");
     }); });
 }

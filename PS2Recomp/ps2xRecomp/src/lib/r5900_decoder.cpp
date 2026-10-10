@@ -783,7 +783,7 @@ namespace ps2recomp
         // COP0 (System Control) instructions
         uint8_t format = inst.rs;
         inst.modificationInfo.modifiesControl = true; // Assume COP0 always modifies some control state
-        if (format == COP0_MF && inst.rt != 0)
+        if ((format == COP0_MF || format == COP0_DMF || format == COP0_CF) && inst.rt != 0)
         {
             inst.modificationInfo.modifiesGPR = true;
         }
