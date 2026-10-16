@@ -501,25 +501,23 @@ namespace ps2_syscalls
                                        : 0u;
         if (stack == 0xFFFFFFFFu)
         {
-            if (stackSizeSigned > 0)
-            {
-                const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
-                if (requestedSize < PS2_RAM_SIZE)
-                {
-                    sp = PS2_RAM_SIZE - requestedSize;
-                }
-                else
-                {
-                    sp = PS2_RAM_SIZE;
-                }
-            }
-            else
-            {
-                sp = PS2_RAM_SIZE;
-            }
+            // Kernel-allocated stack. Reserve `stackSize` bytes just below the
+            // top of RAM, then hand back the TOP of that region: the guest stack
+            // grows downward, so $sp must start at the high end. Returning the
+            // low end drops the very first frame into the game heap, which games
+            // commonly clear with one large memset; that destroys the saved
+            // return addresses and sends the thread to PC 0 (a silent hang).
+            const uint32_t requestedSize = stackSizeSigned > 0
+                                               ? static_cast<uint32_t>(stackSizeSigned)
+                                               : 0u;
+            initialStack = (requestedSize > 0u && requestedSize < PS2_RAM_SIZE)
+                               ? PS2_RAM_SIZE - requestedSize
+                               : 0u;
+            sp = PS2_RAM_SIZE;
         }
         else if (stack != 0u)
         {
+            initialStack = stack;
             if (stackSizeSigned > 0)
             {
                 sp = stack + static_cast<uint32_t>(stackSizeSigned);
@@ -531,14 +529,6 @@ namespace ps2_syscalls
         }
 
         sp &= ~0xFu;
-        if (stack == 0xFFFFFFFFu)
-        {
-            initialStack = sp;
-        }
-        else if (stack != 0u)
-        {
-            initialStack = stack;
-        }
 
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
         setReturnU32(ctx, sp);

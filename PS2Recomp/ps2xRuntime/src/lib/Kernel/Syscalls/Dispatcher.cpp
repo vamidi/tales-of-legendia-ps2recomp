@@ -6,6 +6,23 @@ namespace ps2_syscalls
 {
     bool dispatchNumericSyscall(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // TEMP DIAGNOSTIC (black-content triage): first 60 syscalls, then a
+        // every-64th heartbeat so a long boot or a stalled executor is visible.
+        static int s_syscallTraceFirst = 60;
+        static uint64_t s_syscallTraceCount = 0u;
+        ++s_syscallTraceCount;
+        if (s_syscallTraceFirst > 0 || (s_syscallTraceCount & 63u) == 0u)
+        {
+            if (s_syscallTraceFirst > 0)
+            {
+                --s_syscallTraceFirst;
+            }
+            std::cerr << "[EE-syscall] n=" << s_syscallTraceCount
+                      << " id=0x" << std::hex << syscallNumber
+                      << " pc=0x" << ctx->pc
+                      << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+        }
+
         if (dispatchSyscallOverride(syscallNumber, rdram, ctx, runtime))
         {
             return true;

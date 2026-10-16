@@ -4,10 +4,14 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
+#include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 
 namespace
 {
@@ -35,6 +39,68 @@ namespace
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+
+    // TEMP DIAGNOSTIC (black-content triage): recent guest dispatch PCs, mirroring
+    // PS2Runtime's dispatch history which is file-local to ps2_runtime.cpp. Dumped
+    // when a thread goes dormant so the execution tail that led to PC=0 is visible.
+    constexpr uint32_t kDispatchTraceSize = 24u;
+    std::array<uint32_t, kDispatchTraceSize> g_dispatchTrace{};
+    uint32_t g_dispatchTraceNext = 0u;
+    bool g_dispatchTraceWrapped = false;
+    int g_dormantTraceBudget = 3;
+    int g_exitTraceBudget = 3;
+    int g_startThreadTraceBudget = 20;
+
+    void pushDispatchTrace(uint32_t pc)
+    {
+        g_dispatchTrace[g_dispatchTraceNext] = pc;
+        g_dispatchTraceNext = (g_dispatchTraceNext + 1u) % kDispatchTraceSize;
+        if (g_dispatchTraceNext == 0u)
+        {
+            g_dispatchTraceWrapped = true;
+        }
+    }
+
+    std::string formatDispatchTrace()
+    {
+        const uint32_t count = g_dispatchTraceWrapped ? kDispatchTraceSize : g_dispatchTraceNext;
+        if (count == 0u)
+        {
+            return "(empty)";
+        }
+        std::ostringstream oss;
+        for (uint32_t i = 0u; i < count; ++i)
+        {
+            const uint32_t idx = (g_dispatchTraceNext + kDispatchTraceSize - count + i) % kDispatchTraceSize;
+            if (i != 0u)
+            {
+                oss << " -> ";
+            }
+            oss << "0x" << std::hex << g_dispatchTrace[idx];
+        }
+        return oss.str();
+    }
+
+    // TEMP DIAGNOSTIC: dump a small region of guest RAM as hex words.
+    std::string formatHexWords(uint8_t *rdram, uint32_t base, uint32_t words)
+    {
+        if (!rdram)
+        {
+            return "(no-ram)";
+        }
+        std::ostringstream oss;
+        for (uint32_t i = 0u; i < words; ++i)
+        {
+            uint32_t value = 0u;
+            std::memcpy(&value, rdram + (base + i * 4u), sizeof(value));
+            if (i != 0u)
+            {
+                oss << " ";
+            }
+            oss << std::hex << value;
+        }
+        return oss.str();
+    }
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
@@ -150,6 +216,17 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
                   std::chrono::steady_clock::now() + kVBlankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
+    g_dispatchTrace = {};
+    g_dispatchTraceNext = 0u;
+    g_dispatchTraceWrapped = false;
+    g_dormantTraceBudget = 3;
+    g_exitTraceBudget = 3;
+    g_startThreadTraceBudget = 20;
+    std::cerr << "[EE-boot] main thread entry=0x" << std::hex << mainContext.pc
+              << " ra=0x" << getRegU32(&mainContext, 31)
+              << " sp=0x" << getRegU32(&mainContext, 29)
+              << " gp=0x" << getRegU32(&mainContext, 28)
+              << " t9=0x" << getRegU32(&mainContext, 25) << std::dec << std::endl;
     publishSnapshot();
 }
 
@@ -175,6 +252,16 @@ void EeScheduler::run()
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
                 publishSnapshot();
+                {
+                    static auto s_idleLast = std::chrono::steady_clock::now();
+                    const auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::seconds>(now - s_idleLast).count() >= 3)
+                    {
+                        s_idleLast = now;
+                        std::cerr << "[EE-hb] IDLE pending=" << m_pendingInvocations.size()
+                                  << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+                    }
+                }
                 waitForEvent();
                 continue;
             }
@@ -211,6 +298,29 @@ void EeScheduler::run()
             }
         }
         R5900Context &context = running->activeContext();
+        {
+            static auto s_hbLast = std::chrono::steady_clock::now();
+            static uint64_t s_hbIters = 0;
+            ++s_hbIters;
+            const auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - s_hbLast).count() >= 3)
+            {
+                s_hbLast = now;
+                std::cerr << "[EE-hb] run iters=" << s_hbIters << " id=" << running->id
+                          << " pc=0x" << std::hex << context.pc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " sp=0x" << getRegU32(&context, 29)
+                          << " gp=0x" << getRegU32(&context, 28)
+                          << " t9=0x" << getRegU32(&context, 25)
+                          << " inv=" << running->invocations.size()
+                          << " s387658=" << formatHexWords(m_rdram, 0x387658u, 1u)
+                          << " s387660=" << formatHexWords(m_rdram, 0x387660u, 1u)
+                          << " cmd=" << formatHexWords(m_rdram, 0x3DED98u, 8u)
+                          << " h=" << formatHexWords(m_rdram, 0x3DEF40u, 32u)
+                          << " pkt=" << formatHexWords(m_rdram, 0x3E0000u, 4u)
+                          << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+            }
+        }
         if (m_debugPublishCountdown == 0u)
         {
             copyMainContextToRuntime();
@@ -235,6 +345,18 @@ void EeScheduler::run()
                     completed.onComplete(completed.context, running->activeContext());
                 }
                 continue;
+            }
+            if (g_dormantTraceBudget > 0)
+            {
+                --g_dormantTraceBudget;
+                std::cerr << "[EE-dormant] thread=" << running->id
+                          << " pc=0x" << std::hex << context.pc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " sp=0x" << getRegU32(&context, 29)
+                          << " gp=0x" << getRegU32(&context, 28)
+                          << " v0=0x" << getRegU32(&context, 2)
+                          << " t9=0x" << getRegU32(&context, 25)
+                          << " trace=" << formatDispatchTrace() << std::dec << std::endl;
             }
             makeDormant(*running);
             m_currentThreadId = 0;
@@ -270,12 +392,21 @@ void EeScheduler::run()
                                                 context.pc,
                                                 PS2Runtime::GuestBranchKind::DirectJump,
                                                 "EE scheduler");
+                if (g_dormantTraceBudget > 0)
+                {
+                    --g_dormantTraceBudget;
+                    std::cerr << "[EE-dormant-missing] thread=" << running->id
+                              << " pc=0x" << std::hex << context.pc
+                              << " ra=0x" << getRegU32(&context, 31)
+                              << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+                }
                 makeDormant(*running);
                 m_currentThreadId = 0;
             }
             continue;
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
+        pushDispatchTrace(context.pc);
 
         if (checkpointDue(kGuestDispatchCycles))
         {
@@ -478,6 +609,14 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
         return KE_NOT_DORMANT;
     }
 
+    if (g_startThreadTraceBudget > 0)
+    {
+        --g_startThreadTraceBudget;
+        std::cerr << "[EE-startThread] id=" << id
+                  << " entry=0x" << std::hex << target->entry
+                  << " arg=0x" << arg << std::dec << std::endl;
+    }
+
     target->context = R5900Context{};
     target->context.pc = target->entry;
     target->arg = arg;
@@ -503,6 +642,17 @@ void EeScheduler::exitCurrent(bool deleteThreadRecord)
     GuestThread *exiting = currentThread();
     assert(exiting != nullptr);
     const int id = exiting->id;
+    if (g_exitTraceBudget > 0)
+    {
+        --g_exitTraceBudget;
+        R5900Context &exitingContext = exiting->activeContext();
+        std::cerr << "[EE-exit] thread=" << id
+                  << " delete=" << (deleteThreadRecord ? 1 : 0)
+                  << " pc=0x" << std::hex << exitingContext.pc
+                  << " ra=0x" << getRegU32(&exitingContext, 31)
+                  << " v0=0x" << getRegU32(&exitingContext, 2)
+                  << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+    }
     const uint32_t ownedStack = deleteThreadRecord && exiting->ownsStack ? exiting->stack : 0u;
     makeDormant(*exiting);
     m_currentThreadId = 0;
@@ -1258,6 +1408,17 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
             m_runtime.hasFunction(handler.handler))
         {
             matching.push_back(handler);
+        }
+    }
+    // TEMP DIAGNOSTIC
+    if (dmac)
+    {
+        std::cerr << "[IRQ-dmac] cause=" << cause << " handlers=" << handlers.size()
+                  << " matching=" << matching.size() << std::dec << std::endl;
+        for (const EeIrqHandler &h : matching)
+        {
+            std::cerr << "[IRQ-dmac]   -> handler=0x" << std::hex << h.handler
+                      << " arg=0x" << h.argument << " gp=0x" << h.gp << std::dec << std::endl;
         }
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)

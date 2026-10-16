@@ -118,6 +118,87 @@ namespace ps2_stubs
             }
         }
 
+        // ---- Emulated IOP side of the SIFCMD / SIFRPC initialization -------
+        // This game links its own libkernel SIF implementation, so its SIFCMD
+        // traffic never reaches the sceSif* stubs (or their RPC bridge): it is
+        // posted to the IOP with raw sceSifSetDma descriptors.  The runtime has
+        // to play the IOP's documented part of the handshake instead.
+        //
+        // "SIFCMD Init" (80000002h) is sent twice by the EE during SIFRPC
+        // initialization - first with opt=0, then with opt=1 - and the IOP
+        // answers with "Set SREG" (80000001h), which updates the EE's
+        // _sif_cmd_data.sregs[] software register mirror.  sceSifInitRpc spins
+        // on sregs[SIF_SREG_RPCINIT] until the opt=1 answer arrives.
+        //
+        // Only opt != 0 finishes SIFRPC init; opt == 0 publishes the EE's SIF0
+        // receive buffer and is already covered by the SIF_SMFLG seed.
+        constexpr uint32_t kSifCmdSifcmdInit = 0x80000002u;
+        constexpr uint32_t kSifSregRpcInit = 0u;
+        constexpr uint32_t kSifSysregCmdData = 0x80000001u; // holds &_sif_cmd_data
+        constexpr uint32_t kSifCmdDataSregsOffset = 0x1Cu;
+        constexpr uint32_t kSifCmdHeaderCidOffset = 0x8u;
+        constexpr uint32_t kSifCmdHeaderOptOffset = 0xCu;
+        constexpr uint32_t kSifCmdHeaderSize = 16u;
+
+        void emulateIopSifCmdInitHandshake(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                                           const Ps2SifDmaTransfer &xfer)
+        {
+            if (!runtime || xfer.src == 0u || xfer.size < static_cast<int32_t>(kSifCmdHeaderSize))
+            {
+                return;
+            }
+
+            const uint32_t src = xfer.src;
+            if (runtime->Load32(rdram, ctx, src + kSifCmdHeaderCidOffset) != kSifCmdSifcmdInit)
+            {
+                return;
+            }
+
+            const uint32_t opt = runtime->Load32(rdram, ctx, src + kSifCmdHeaderOptOffset);
+            if (opt == 0u)
+            {
+                return;
+            }
+
+            uint32_t cmdData = 0u;
+            {
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                auto it = g_sifRegs.find(kSifSysregCmdData);
+                if (it != g_sifRegs.end())
+                {
+                    cmdData = it->second;
+                }
+            }
+
+            // SIF_SYSREG_MAINADDR is published by the EE's sceSifInitCmd; it is
+            // the only way to find the guest's sregs[] mirror from here.
+            static bool loggedFailure = false;
+            const uint32_t sregs = cmdData != 0u ? runtime->Load32(rdram, ctx, cmdData + kSifCmdDataSregsOffset) : 0u;
+            if (sregs == 0u)
+            {
+                if (!loggedFailure)
+                {
+                    loggedFailure = true;
+                    std::cerr << "[SIF-iop] SIFCMD init: _sif_cmd_data/sregs unavailable "
+                                 "(SIF reg 0x80000001 = 0x"
+                              << std::hex << cmdData << "); cannot answer Set SREG" << std::dec << std::endl;
+                }
+                return;
+            }
+
+            const uint32_t slot = sregs + (kSifSregRpcInit * 4u);
+            runtime->Store32(rdram, ctx, slot, 1u);
+
+            static bool loggedSuccess = false;
+            if (!loggedSuccess)
+            {
+                loggedSuccess = true;
+                std::cerr << "[SIF-iop] SIFCMD init opt=" << opt << ": answered Set SREG RPCINIT=1 at 0x"
+                          << std::hex << slot << " (_sif_cmd_data=0x" << cmdData
+                          << " sregs=0x" << sregs << ")" << std::dec << std::endl;
+            }
+        }
+
         struct SifStateInitializer
         {
             SifStateInitializer()
@@ -631,6 +712,41 @@ namespace ps2_stubs
         const uint32_t dmatAddr = getRegU32(ctx, 4);
         const uint32_t count = getRegU32(ctx, 5);
 
+        // TEMP DIAGNOSTIC (black-content triage)
+        std::cerr << "[SIF-SetDma] pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                  << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                  << " dmat=0x" << dmatAddr
+                  << " count=" << std::dec << count << std::endl;
+        for (uint32_t _di = 0u; _di < count && _di < 8u; ++_di)
+        {
+            const uint32_t _entAddr = dmatAddr + _di * static_cast<uint32_t>(sizeof(Ps2SifDmaTransfer));
+            const uint8_t *_ent = getConstMemPtr(rdram, _entAddr);
+            if (_ent)
+            {
+                uint32_t _w[4] = {0u, 0u, 0u, 0u};
+                std::memcpy(_w, _ent, sizeof(_w));
+                std::cerr << "[SIF-SetDma]   ent" << _di << " w0=0x" << std::hex << _w[0]
+                          << " w1=0x" << _w[1] << " w2=0x" << _w[2] << " w3=0x" << _w[3]
+                          << std::dec << std::endl;
+                const uint8_t *_pkt = getConstMemPtr(rdram, _w[0]);
+                if (_pkt && _w[2] >= 16u)
+                {
+                    const uint32_t _n = _w[2] >= 40u ? 40u : (_w[2] & ~3u);
+                    uint32_t _h[10] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+                    if (_n > 0u)
+                    {
+                        std::memcpy(_h, _pkt, _n);
+                    }
+                    std::cerr << "[SIF-SetDma]   pkt n=" << _n << std::hex;
+                    for (uint32_t _i = 0u; _i < (_n / 4u); ++_i)
+                    {
+                        std::cerr << " +" << (_i * 4u) << "=0x" << _h[_i];
+                    }
+                    std::cerr << std::dec << std::endl;
+                }
+            }
+        }
+
         const uint32_t listAddr = getRegU32(ctx, 4);
         PS2_IF_AGRESSIVE_LOGS({
             std::cerr << "[sceSifSetDma:CALL] pc=0x" << std::hex << ctx->pc
@@ -731,6 +847,9 @@ namespace ps2_stubs
                                                                         static_cast<uint32_t>(xfer.size),
                                                                     });
                 }
+                // The emulated IOP answers the SIFCMD initialization commands
+                // it just received (see emulateIopSifCmdInitHandshake).
+                emulateIopSifCmdInitHandshake(rdram, ctx, runtime, xfer);
             }
         }
 
@@ -750,6 +869,7 @@ namespace ps2_stubs
             return;
         }
 
+        std::cerr << "[SIF-SetDma] ok=1 pending=" << pendingCount << std::dec << std::endl;
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
 
         setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));

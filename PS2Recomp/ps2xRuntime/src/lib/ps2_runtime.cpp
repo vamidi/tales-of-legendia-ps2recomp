@@ -1994,27 +1994,28 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     }
 
     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-    uint32_t top = m_asyncCallbackStackTop;
-    if (top > PS2_RAM_SIZE)
-    {
-        top = PS2_RAM_SIZE;
-    }
-    top &= ~(kGuestHeapDefaultAlignment - 1u);
-
-    if (top <= allocSize)
+    // Async callback stacks share the high region reserved for a
+    // kernel-allocated guest stack: m_asyncCallbackStackFloor is the region
+    // base and m_asyncCallbackStackTop is the region end. They grow UP from the
+    // base while a guest stack grows DOWN from the top, so the two only meet if
+    // their combined depth approaches the whole region. Allocating from the top
+    // instead (as this once did) placed every callback frame directly on top of
+    // the live guest frames and clobbered saved return addresses, which sent
+    // the interrupted guest thread to PC 0.
+    //
+    // m_asyncCallbackStackFloor doubles as the pool cursor: it advances upward
+    // as stacks are handed out and is reset to the region base whenever the
+    // guest heap is (re)configured.
+    const uint32_t limit = std::min(m_asyncCallbackStackTop, PS2_RAM_SIZE);
+    const uint32_t base = alignGuestHeapValue(m_asyncCallbackStackFloor, normalizedAlignment);
+    if (base > limit || allocSize > limit - base)
     {
         return 0u;
     }
 
-    uint32_t base = top - allocSize;
-    base &= ~(normalizedAlignment - 1u);
-    if (base < m_asyncCallbackStackFloor || base >= top)
-    {
-        return 0u;
-    }
-
-    m_asyncCallbackStackTop = base;
-    return top - 0x10u;
+    const uint32_t end = base + allocSize;
+    m_asyncCallbackStackFloor = end;
+    return end - 0x10u;
 }
 
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
