@@ -4,6 +4,7 @@
 #include <algorithm>
 
 // For Unit tests link ps2_runtime without the generated runner source.
+// g_ps2RecompiledEeAbiVersion is now provided by ps2_runtime.cpp itself.
 extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x00000000u;
 extern const uint32_t g_ps2RecompiledFunctionTableEnd = PS2_RAM_SIZE;
 extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = (g_ps2RecompiledFunctionTableEnd - g_ps2RecompiledFunctionTableBase) >> 2;

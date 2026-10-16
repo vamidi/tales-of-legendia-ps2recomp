@@ -531,7 +531,9 @@ namespace ps2recomp
             inst.modificationInfo.modifiesControl = true;
             break;
         case MMI_PMTHL:
-            inst.modificationInfo.modifiesGPR = false; // Writes to HI/LO
+        case MMI3_PMTHI:
+        case MMI3_PMTLO:
+            inst.modificationInfo.modifiesGPR = false; // Writes to HI/LO or HI1/LO1
             inst.modificationInfo.modifiesControl = true;
             break;
         case MMI_PMFHL:
@@ -606,10 +608,6 @@ namespace ps2recomp
         case MMI1_PABSW:
         case MMI1_PABSH:
             // Absolute value operations
-            break;
-
-        case MMI1_PADSBH:
-            // Parallel add/subtract halfwords
             break;
 
         case MMI1_PCEQW:
@@ -785,7 +783,7 @@ namespace ps2recomp
         // COP0 (System Control) instructions
         uint8_t format = inst.rs;
         inst.modificationInfo.modifiesControl = true; // Assume COP0 always modifies some control state
-        if ((format == COP0_MF || format == COP0_DMF || format == COP0_CF) && inst.rt != 0)
+        if (format == COP0_MF && inst.rt != 0)
         {
             inst.modificationInfo.modifiesGPR = true;
         }

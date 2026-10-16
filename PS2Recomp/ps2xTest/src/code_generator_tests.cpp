@@ -224,6 +224,8 @@ void register_code_generator_tests()
         const std::string generated = gen.generateFunction(func, {syscall, after}, false);
         const size_t continuation = generated.find("ctx->pc = 0x9004u;");
         const size_t dispatch = generated.find("runtime->handleSyscall(rdram, ctx, 0x44u);");
+        const size_t transfer = generated.find("if (runtime->eeTransferPending()) { return; }", dispatch);
+        t.IsTrue(transfer != std::string::npos, "syscalls must return before executing the continuation when suspended");
 
         t.IsTrue(continuation != std::string::npos,
                  "generated syscall must publish the next guest PC");
@@ -992,34 +994,6 @@ void register_code_generator_tests()
             t.IsTrue(mtc0Code.find("Unhandled COP0") == std::string::npos, "MTC0 should not hit unhandled COP0 path");
         });
 
-        tc.Run("COP0 CFC0/CTC0 translate to COP0 register access", [](TestCase &t) {
-            CodeGenerator gen({}, {});
-
-            Instruction cfc0{};
-            cfc0.opcode = OPCODE_COP0;
-            cfc0.rs = COP0_CF;
-            cfc0.rt = 14;
-            cfc0.rd = COP0_REG_INDEX;
-
-            std::string cfc0Code = gen.translateInstruction(cfc0);
-            printGeneratedCode("COP0 CFC0/CTC0 translate to COP0 register access (CFC0)", cfc0Code);
-            t.IsTrue(cfc0Code.find("SET_GPR_S32(ctx, 14") != std::string::npos, "CFC0 should write to rt");
-            t.IsTrue(cfc0Code.find("ctx->cop0_index") != std::string::npos, "CFC0 INDEX should read cop0_index");
-            t.IsTrue(cfc0Code.find("Unhandled COP0") == std::string::npos, "CFC0 should not hit unhandled COP0 path");
-
-            Instruction ctc0{};
-            ctc0.opcode = OPCODE_COP0;
-            ctc0.rs = COP0_CT;
-            ctc0.rt = 7;
-            ctc0.rd = COP0_REG_STATUS;
-
-            std::string ctc0Code = gen.translateInstruction(ctc0);
-            printGeneratedCode("COP0 CFC0/CTC0 translate to COP0 register access (CTC0)", ctc0Code);
-            t.IsTrue(ctc0Code.find("ctx->cop0_status") != std::string::npos, "CTC0 STATUS should write cop0_status");
-            t.IsTrue(ctc0Code.find("GPR_U32(ctx, 7)") != std::string::npos, "CTC0 should read from rt");
-            t.IsTrue(ctc0Code.find("Unhandled COP0") == std::string::npos, "CTC0 should not hit unhandled COP0 path");
-        });
-
         tc.Run("FCR access uses CFC1/CTC1", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
@@ -1046,6 +1020,25 @@ void register_code_generator_tests()
             t.IsTrue(ctc1Code.find("ctx->fcr31 = GPR_U32(ctx, 4) & 0x0183FFFF") != std::string::npos,
                      "CTC1 FCR31 should mask and write fcr31");
             t.IsTrue(ctc1Code.find("ignored") == std::string::npos, "CTC1 FCR31 should not be ignored");
+        });
+
+        tc.Run("VU memory transfers synchronize the shared micro register state", [](TestCase &t)
+        {
+            CodeGenerator gen({}, {});
+            for (const auto opcode : {OPCODE_LDC2, OPCODE_SDC2})
+            {
+                Instruction instruction{};
+                instruction.opcode = opcode;
+                instruction.rs = 18;
+                instruction.rt = 4;
+                instruction.raw = (uint32_t(opcode) << 26) | (18u << 21) | (4u << 16);
+                const auto code = gen.translateInstruction(instruction);
+                const auto before = code.find("runtime->beforeVu0Access(ctx,");
+                const auto transfer = code.find("ctx->vu0_vf[4]");
+                const auto after = code.find("runtime->afterVu0Access(ctx,");
+                t.IsTrue(before != std::string::npos && before < transfer && transfer < after && after != std::string::npos,
+                         "LQC2 and SQC2 must bracket the memory transfer with VU synchronization");
+            }
         });
 
         tc.Run("VU CFC2/CTC2 access VI registers directly", [](TestCase& t)
@@ -1547,6 +1540,8 @@ void register_code_generator_tests()
                 func, {makeJal(0xA040, 0xB040), makeNop(0xA044)}, false);
             const size_t continuation = generated.find("ctx->pc = 0xA048u;");
             const size_t handler = generated.find("ps2_syscalls::GetThreadId(rdram, ctx, runtime);");
+            t.IsTrue(generated.find("if (runtime->eeTransferPending() || ctx->pc != 0xA048u)", handler) != std::string::npos,
+                     "HLE calls must test transfer before accessing a potentially deleted context");
 
             t.IsTrue(continuation != std::string::npos,
                      "a resolved HLE JAL should publish its fallthrough PC");

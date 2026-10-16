@@ -3,27 +3,50 @@
 
 namespace ps2_syscalls
 {
+    void configureGsCrt(GSRegisters &gs, uint32_t interlaced, uint32_t videoMode, uint32_t frameMode)
+    {
+        gs.smode2 = (static_cast<uint64_t>(interlaced) & 0x1ull) | ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
+ 
+        const uint64_t cmod = videoMode == 3 ? 3u : videoMode == 2 ? 2u : 0u;
+        const uint64_t lc = (videoMode == 0x51 || videoMode == 0x52) ? 22u :
+                            (videoMode >= 0x1a && videoMode <= 0x4a) ? 15u : 32u;
+        // SMODE1.INT (bit 0) selects interlace field ordering. The progressive
+        // (CMOD=0) + INT=1 combination has no decoder branch downstream, so keep
+        // INT consistent with CMOD: clear it for progressive, follow the caller
+        // otherwise.
+        const uint64_t intf = (cmod == 0ull) ? 0ull : (static_cast<uint64_t>(interlaced) & 0x1ull);
+        gs.smode1 = (gs.smode1 & ~((127ull << 3) | (3ull << 13) | 1ull)) | (lc << 3) | (cmod << 13) | intf;
+ 
+        if ((gs.pmode & 0x3ull) == 0ull)
+        {
+            gs.pmode |= 0x1ull;
+        }
+    }
+
     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
-        int videoMode = getRegU32(ctx, 5);  // $a1 - 0=NTSC, 1=PAL, 2=VESA, 3=HiVision
+        int videoMode = getRegU32(ctx, 5);  // $a1 - GS CRT mode (2=NTSC, 3=PAL, 0x50=480p)
         int frameMode = getRegU32(ctx, 6);  // $a2 - 0=field, 1=frame
 
         if (runtime)
         {
-            auto &gs = runtime->memory().gs();
-            const uint64_t smode2 =
-                (static_cast<uint64_t>(interlaced) & 0x1ull) |
-                ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
-
-            gs.smode2 = smode2;
-
-            // Keep CRT1 enabled after the BIOS syscall selects a display mode.
-            if ((gs.pmode & 0x3ull) == 0ull)
-            {
-                gs.pmode |= 0x1ull;
-            }
+            configureGsCrt(runtime->memory().gs(), interlaced, videoMode, frameMode);
         }
+
+        // Always-on diagnostic (RUNTIME_LOG is compiled out): capture the exact
+        // SetGsCrt arguments and the resulting SMODE1/SMODE2 so the parallel-gs
+        // "Unknown video format." fallthrough can be traced to a specific combo.
+        std::cerr << "[GS] SetGsCrt: interlaced=" << interlaced
+                  << " videoMode=0x" << std::hex << videoMode << std::dec
+                  << " frameMode=" << frameMode;
+        if (runtime)
+        {
+            const GSRegisters &gs = runtime->memory().gs();
+            std::cerr << " smode1=0x" << std::hex << gs.smode1
+                      << " smode2=0x" << gs.smode2 << std::dec;
+        }
+        std::cerr << std::endl;
 
         RUNTIME_LOG("PS2 GsSetCrt: interlaced=" << interlaced
                                                 << ", videoMode=" << videoMode
@@ -421,6 +444,7 @@ namespace ps2_syscalls
             parent.r[2] = completed.r[2];
         };
         scheduler.invokeCurrent(std::move(invocation));
+        return true;
     }
 
     static bool tryResolveGuestSyscallMirrorAddr(uint32_t syscallIndex, uint32_t &guestAddr)

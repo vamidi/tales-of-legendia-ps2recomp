@@ -20,3 +20,7 @@
 
 # Opencode
 opencode.json
+
+# Local runtime/agent artifacts
+imgui.ini
+logs/

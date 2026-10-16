@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -97,7 +98,61 @@ namespace
         }
     }
 
+    inline void writeGsRegister(GSRegisters &gs, uint64_t *reg, uint64_t value)
+    {
+        if (reg == &gs.dispfb1)
+            gs.writeDisplayFramebuffer(0, value);
+        else if (reg == &gs.dispfb2)
+            gs.writeDisplayFramebuffer(1, value);
+        else
+            *reg = value;
+    }
+
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+
+    // DIAGNOSTIC(temporary): report guest stores that land on a GS privileged MMIO
+    // register (which offset, which access width, what value), so we can tell
+    // whether the guest programs PMODE/SMODE1/SMODE2/SYNCV/DISPFB/DISPLAY at all.
+    void diagGsMmioWrite(uint32_t regOff, uint32_t bytes, uint64_t value)
+    {
+        struct Slot
+        {
+            uint32_t off;
+            uint32_t size;
+            unsigned hits;
+        };
+        static Slot slots[24] = {};
+        static unsigned used = 0;
+        for (unsigned i = 0; i < used; ++i)
+        {
+            if (slots[i].off != regOff || slots[i].size != bytes)
+                continue;
+            if (slots[i].hits >= 4u)
+                return;
+            ++slots[i].hits;
+            fprintf(stderr, "[MMIO] gs priv off=0x%04x size=%u value=0x%016llx (hit %u)\n", regOff, bytes,
+                    (unsigned long long)value, slots[i].hits);
+            return;
+        }
+        if (used >= 24u)
+            return;
+        slots[used++] = Slot{regOff, bytes, 1u};
+        fprintf(stderr, "[MMIO] gs priv off=0x%04x size=%u value=0x%016llx (hit 1)\n", regOff, bytes,
+                (unsigned long long)value);
+    }
+
+    // DIAGNOSTIC(temporary): a store whose PHYSICAL address sits in the GS register
+    // window but whose virtual address missed isGsPrivReg(), i.e. a TLB-alias write
+    // that would otherwise be silently dropped.
+    void diagGsMmioMissed(uint32_t vaddr, uint32_t physAddr, uint32_t bytes)
+    {
+        static unsigned logged = 0;
+        if (logged >= 12u)
+            return;
+        ++logged;
+        fprintf(stderr, "[MMIO] gs priv write NOT routed: vaddr=0x%08x phys=0x%08x size=%u\n", vaddr, physAddr,
+                bytes);
+    }
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
@@ -863,10 +918,35 @@ __m128i PS2Memory::read128(uint32_t address)
     return _mm_setzero_si128();
 }
 
+bool PS2Memory::writeVuCode(bool vu1, uint32_t offset, std::span<const uint8_t> bytes)
+{
+    auto *code = vu1 ? m_vu1Code : m_vu0Code;
+    if (!code)
+        throw std::logic_error("VU code memory is not initialized");
+
+    const auto size = vu1 ? PS2_VU1_CODE_SIZE : PS2_VU0_CODE_SIZE;
+    inRange(offset, bytes.size(), size, "VU code write", offset);
+    const bool changed = !bytes.empty() && std::memcmp(code + offset, bytes.data(), bytes.size()) != 0;
+    if (changed)
+    {
+        std::memmove(code + offset, bytes.data(), bytes.size());
+        if (vu1)
+            markVU1CodeModified();
+        else
+            markVU0CodeModified();
+    }
+    return changed;
+}
+
 void PS2Memory::write8(uint32_t address, uint8_t value)
 {
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+
+    // DIAGNOSTIC(temporary): byte stores into the GS-priv MMIO window are not
+    // modeled by write8; report them so dropped PMODE/SMODE1 byte writes are visible.
+    if (isGsPrivReg(address) || Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
+        diagGsMmioMissed(address, physAddr, 1u);
 
     if (scratch)
     {
@@ -883,11 +963,10 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint8_t), vuOffset, vuLimit))
         {
             (void)vuLimit;
-            vuMem[vuOffset] = value;
-            if (vuMem == m_vu0Code)
-                markVU0CodeModified();
-            else if (vuMem == m_vu1Code)
-                markVU1CodeModified();
+            if (vuMem == m_vu0Code || vuMem == m_vu1Code)
+                writeVuCode(vuMem == m_vu1Code, vuOffset, {&value, 1});
+            else
+                vuMem[vuOffset] = value;
             return;
         }
     }
@@ -912,6 +991,11 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
 
+    // DIAGNOSTIC(temporary): halfword stores into the GS-priv MMIO window are not
+    // modeled by write16; report them so dropped PMODE/SMODE1 halfword writes are visible.
+    if (isGsPrivReg(address) || Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
+        diagGsMmioMissed(address, physAddr, 2u);
+
     if (scratch)
     {
         storeScalar<uint16_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, value, "write16 scratchpad", address);
@@ -926,11 +1010,10 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
         {
-            storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
-            if (vuMem == m_vu0Code)
-                markVU0CodeModified();
-            else if (vuMem == m_vu1Code)
-                markVU1CodeModified();
+            if (vuMem == m_vu0Code || vuMem == m_vu1Code)
+                writeVuCode(vuMem == m_vu1Code, vuOffset, {reinterpret_cast<const uint8_t *>(&value), sizeof(value)});
+            else
+                storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
             return;
         }
     }
@@ -965,13 +1048,21 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         {
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
-            *reg = newVal;
+            writeGsRegister(gs_regs, reg, newVal);
+            diagGsMmioWrite(regOff, 4u, value);
+        }
+        else
+        {
+            diagGsMmioMissed(address, address, 4u);
         }
         return;
     }
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+
+    if (Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
+        diagGsMmioMissed(address, physAddr, 4u);
 
     if (scratch)
     {
@@ -990,11 +1081,10 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
         {
-            storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
-            if (vuMem == m_vu0Code)
-                markVU0CodeModified();
-            else if (vuMem == m_vu1Code)
-                markVU1CodeModified();
+            if (vuMem == m_vu0Code || vuMem == m_vu1Code)
+                writeVuCode(vuMem == m_vu1Code, vuOffset, {reinterpret_cast<const uint8_t *>(&value), sizeof(value)});
+            else
+                storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
             return;
         }
     }
@@ -1022,13 +1112,21 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
-            *reg = value;
+            writeGsRegister(gs_regs, reg, value);
+            diagGsMmioWrite(regOff, 8u, value);
+        }
+        else
+        {
+            diagGsMmioMissed(address, address, 8u);
         }
         return;
     }
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+
+    if (Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
+        diagGsMmioMissed(address, physAddr, 8u);
 
     if (scratch)
     {
@@ -1045,11 +1143,10 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
         {
-            storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
-            if (vuMem == m_vu0Code)
-                markVU0CodeModified();
-            else if (vuMem == m_vu1Code)
-                markVU1CodeModified();
+            if (vuMem == m_vu0Code || vuMem == m_vu1Code)
+                writeVuCode(vuMem == m_vu1Code, vuOffset, {reinterpret_cast<const uint8_t *>(&value), sizeof(value)});
+            else
+                storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
             return;
         }
     }
@@ -1085,6 +1182,21 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         return;
     }
 
+    // GS-priv MMIO: model 128-bit stores as two 64-bit register stores so QWC
+    // stores to PMODE/SMODE1/... reach GSRegisters (write64 applies CSR handling
+    // and the one-time [MMIO] diagnostic). Previously these stores were dropped.
+    if (isGsPrivReg(address))
+    {
+        const uint64_t lo = _mm_extract_epi64(value, 0);
+        const uint64_t hi = _mm_extract_epi64(value, 1);
+        diagGsMmioWrite((address - PS2_GS_PRIV_REG_BASE) & ~0x7u, 16u, lo);
+        write64(address, lo);
+        write64(address + 8, hi);
+        return;
+    }
+    if (Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
+        diagGsMmioMissed(address, physAddr, 16u);
+
     if (scratch)
     {
         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "write128 scratchpad", address);
@@ -1103,11 +1215,10 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(__m128i), vuOffset, vuLimit))
         {
             inRange(vuOffset, sizeof(__m128i), vuLimit, "write128 vu", address);
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
-            if (vuMem == m_vu0Code)
-                markVU0CodeModified();
-            else if (vuMem == m_vu1Code)
-                markVU1CodeModified();
+            if (vuMem == m_vu0Code || vuMem == m_vu1Code)
+                writeVuCode(vuMem == m_vu1Code, vuOffset, {reinterpret_cast<const uint8_t *>(&value), sizeof(value)});
+            else
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
             return;
         }
     }
@@ -1173,7 +1284,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
-            *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            writeGsRegister(gs_regs, reg, (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u)));
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
