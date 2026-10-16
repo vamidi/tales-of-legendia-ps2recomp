@@ -77,6 +77,7 @@ namespace ps2_stubs
         uint32_t g_sifCmdBuffer = 0u;
         uint32_t g_sifSysCmdBuffer = 0u;
         bool g_sifCmdInitialized = false;
+        bool g_sifIopBooted = false;
         uint32_t g_sifGetRegLogCount = 0u;
         uint32_t g_sifSetRegLogCount = 0u;
 
@@ -94,6 +95,7 @@ namespace ps2_stubs
             g_sifCmdBuffer = 0u;
             g_sifSysCmdBuffer = 0u;
             g_sifCmdInitialized = false;
+            g_sifIopBooted = false;
             g_sifGetRegLogCount = 0u;
             g_sifSetRegLogCount = 0u;
 
@@ -197,6 +199,336 @@ namespace ps2_stubs
                           << std::hex << slot << " (_sif_cmd_data=0x" << cmdData
                           << " sregs=0x" << sregs << ")" << std::dec << std::endl;
             }
+        }
+
+        // ---- Raw SIFRPC command stream -------------------------------------
+        // The RPC commands share the 16-byte SifCmdHeader above and add an
+        // SifRpcPktHeader tail (rec_id, pkt_addr, rpc_id); the command specific
+        // payload always starts with the client data pointer the EE passed to
+        // its in-ELF sceSifBindRpc/sceSifCallRpc.
+        constexpr uint32_t kSifCmdRpcEnd = 0x80000008u;
+        constexpr uint32_t kSifCmdRpcBind = 0x80000009u;
+        constexpr uint32_t kSifCmdRpcCall = 0x8000000Au;
+        constexpr uint32_t kSifCmdRpcData = 0x8000000Bu;
+        constexpr uint32_t kSifCmdRpcOtherData = 0x8000000Cu;
+        constexpr uint32_t kSifCmdRebootIop = 0x80000003u;
+
+        // Module-version handshake reply.
+        //
+        // A service is asked for its version with rpc 0xff (no send payload,
+        // 4-byte reply) and the guest memcmps that answer against the version
+        // literal it was built for: FUN_0011cfe0 compares the reply against the
+        // ASCII "3000" at 0x38763c (and against the wildcard-ish "...." string
+        // that 0x387714 points at).  On real hardware the IOP module reports its
+        // own build version here; the emulated IOP has to report the version the
+        // guest requires, otherwise FUN_0011d6b8 returns 0xFFFEFFFC and its
+        // caller's retry loop (entry_00166360) never terminates.
+        constexpr uint32_t kSifIopModuleVersion = 0x30303033u; // "3000"
+        constexpr uint32_t kSifRpcGetVersion = 0xFFu;
+
+        // SIF_SMFLG (register 4) carries the boot progress handshake flags:
+        //   0x10000 - SIF DMA/hardware initialized
+        //   0x20000 - SIFCMD initialized
+        //   0x40000 - the IOP has finished booting (announced with EESYNC)
+        // The game polls 0x40000 in a spin loop until the IOP reports ready.
+        constexpr uint32_t kSifRegSmflg = 0x4u;
+        constexpr uint32_t kSifSmflgBootedMask = 0x00070000u;
+
+        // _sif_cmd_data layout used by the guest's own libkernel sifcmd/sifrpc
+        // (confirmed against FUN_00117aa8 = _SifCmdIntHandler).
+        constexpr uint32_t kSifCmdDataPktBufOffset = 0x00u;
+        constexpr uint32_t kSifCmdDataSysHandlersOffset = 0x0Cu;
+        constexpr uint32_t kSifCmdDataNrSysOffset = 0x10u;
+        constexpr uint32_t kSifCmdHandlerStride = 12u;
+
+        // TEMP DIAGNOSTIC (raw-SIFRPC bridge): the game registers its RPC
+        // command handlers through its in-ELF libkernel, so the runtime can
+        // only learn which cids matter - and which guest routines implement
+        // them - by reading _sif_cmd_data.sys_cmd_handlers[] straight out of
+        // guest RAM once the RPC layer is up.
+        void dumpSifCmdHandlersOnce(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                                    const Ps2SifDmaTransfer &xfer)
+        {
+            static bool dumped = false;
+            if (dumped || !runtime || xfer.src == 0u || xfer.size < static_cast<int32_t>(kSifCmdHeaderSize))
+            {
+                return;
+            }
+            if (runtime->Load32(rdram, ctx, xfer.src + kSifCmdHeaderCidOffset) != kSifCmdRpcBind)
+            {
+                return;
+            }
+
+            uint32_t cmdData = 0u;
+            {
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                auto it = g_sifRegs.find(kSifSysregCmdData);
+                if (it != g_sifRegs.end())
+                {
+                    cmdData = it->second;
+                }
+            }
+            if (cmdData == 0u)
+            {
+                return;
+            }
+
+            dumped = true;
+            const uint32_t table = runtime->Load32(rdram, ctx, cmdData + kSifCmdDataSysHandlersOffset);
+            const uint32_t count = runtime->Load32(rdram, ctx, cmdData + kSifCmdDataNrSysOffset);
+            const uint32_t pktbuf = runtime->Load32(rdram, ctx, cmdData + kSifCmdDataPktBufOffset);
+            std::cerr << "[SIF-iop] sys_cmd_handlers table=0x" << std::hex << table
+                      << " nr=0x" << count << " pktbuf=0x" << pktbuf << std::dec << std::endl;
+            for (uint32_t i = 0u; i < count && i < 64u; ++i)
+            {
+                const uint32_t entry = table + i * kSifCmdHandlerStride;
+                const uint32_t func = runtime->Load32(rdram, ctx, entry);
+                if (func == 0u)
+                {
+                    continue;
+                }
+                const uint32_t arg = runtime->Load32(rdram, ctx, entry + 4u);
+                std::cerr << "[SIF-iop]   cid=0x" << std::hex << (0x80000000u | i)
+                          << " func=0x" << func << " arg=0x" << arg << std::dec << std::endl;
+            }
+        }
+
+        // ---- Emulated IOP side of the raw SIFRPC stream ---------------------
+        // The game drives SIFRPC through its own in-ELF libkernel, so the
+        // runtime's sceSif* stubs (and the RPC bridge behind them) are never
+        // reached: every request is a plain SIF command posted with
+        // sceSifSetDma.  The IOP answers with a SIF_CMD_RPC_END (80000008h)
+        // packet whose +0x20 field carries the cid of the request that just
+        // finished - exactly what the guest's own _SifRpcEndHandler
+        // (FUN_00117fa0) dispatches on before it signals client->hdr.sema_id.
+
+        uint32_t sifCmdDataAddr()
+        {
+            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+            const auto it = g_sifRegs.find(kSifSysregCmdData);
+            return it != g_sifRegs.end() ? it->second : 0u;
+        }
+
+        // Defined further down with the other EE memory helpers.
+        bool writeEeRange(uint8_t *rdram, uint32_t address, const void *source, uint32_t sizeBytes);
+
+        // Posts one emulated IOP -> EE command into the receive buffer the EE
+        // published with SifInitPkt (opt=0), i.e. _sif_cmd_data.pktbuf.  The
+        // caller raises SIF0/DMAC-5 afterwards (sceSifSetDma already does that
+        // once it has finished the outgoing transfers).
+        bool postIopSifCommand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                               const uint32_t *words, uint32_t wordCount)
+        {
+            if (!runtime || !words || wordCount == 0u)
+            {
+                return false;
+            }
+            const uint32_t cmdData = sifCmdDataAddr();
+            if (cmdData == 0u)
+            {
+                return false;
+            }
+            const uint32_t pktbuf = runtime->Load32(rdram, ctx, cmdData + kSifCmdDataPktBufOffset);
+            if (pktbuf == 0u)
+            {
+                return false;
+            }
+            return writeEeRange(rdram, pktbuf, words, wordCount * 4u);
+        }
+
+        // Guest-RAM server descriptor published as client->server.  The SDK
+        // treats server == NULL as "bind failed, retry", so the bind answer has
+        // to carry a readable non-zero pointer - the same contract the runtime
+        // implements on its sceSifBindRpc stub path.
+        struct SifRpcServerSlot
+        {
+            uint32_t sid;
+            uint32_t addr;
+        };
+        constexpr uint32_t kSifRpcServerSlotCount = 32u;
+        constexpr uint32_t kSifRpcServerSlotBytes = 0x30u;
+        SifRpcServerSlot g_sifRpcServerSlots[kSifRpcServerSlotCount]{};
+
+        uint32_t sifRpcServerAddr(PS2Runtime *runtime, uint32_t sid)
+        {
+            for (uint32_t i = 0u; i < kSifRpcServerSlotCount; ++i)
+            {
+                if (g_sifRpcServerSlots[i].addr != 0u && g_sifRpcServerSlots[i].sid == sid)
+                {
+                    return g_sifRpcServerSlots[i].addr;
+                }
+            }
+            for (uint32_t i = 0u; i < kSifRpcServerSlotCount; ++i)
+            {
+                if (g_sifRpcServerSlots[i].addr == 0u)
+                {
+                    const uint32_t addr = runtime->guestCalloc(1u, kSifRpcServerSlotBytes);
+                    if (addr != 0u)
+                    {
+                        g_sifRpcServerSlots[i] = {sid, addr};
+                    }
+                    return addr;
+                }
+            }
+            return 0u;
+        }
+
+        // TEMP DIAGNOSTIC (raw-SIFRPC bridge): remembered between the reply
+        // post and the DMAC-5 dispatch so the guest's own handlers can be
+        // observed doing their work.
+        uint32_t g_lastRpcClientPtr = 0u;
+        uint32_t g_lastRpcServerWanted = 0u;
+
+        void emulateIopSifRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                              const Ps2SifDmaTransfer &xfer)
+        {
+            if (!runtime || xfer.src == 0u || xfer.size < 0x24)
+            {
+                return;
+            }
+
+            const uint32_t packet = xfer.src;
+            const uint32_t cid = runtime->Load32(rdram, ctx, packet + kSifCmdHeaderCidOffset);
+
+            if (cid == kSifCmdRebootIop)
+            {
+                // Reboot IOP (SifIopResetPkt): the EE hands the IOP a module list
+                // to boot.  On real hardware the IOP loads them and then announces
+                // completion with EESYNC, which sets SMFLG bit 0x40000 ("IOP has
+                // finished booting").  The emulated IOP always succeeds, so the
+                // completion is latched here and reported through sceSifGetReg.
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                g_sifIopBooted = true;
+                g_sifRegs[kSifRegSmflg] |= kSifSmflgBootedMask;
+                std::cerr << "[SIF-iop] Reboot IOP: module list accepted, IOP boot complete (SMFLG=0x"
+                          << std::hex << g_sifRegs[kSifRegSmflg] << std::dec << ")" << std::endl;
+                return;
+            }
+
+            if (cid != kSifCmdRpcBind && cid != kSifCmdRpcCall)
+            {
+                return;
+            }
+
+            const uint32_t recId = runtime->Load32(rdram, ctx, packet + 0x10u);
+            const uint32_t clientPktAddr = runtime->Load32(rdram, ctx, packet + 0x14u);
+            const uint32_t rpcId = runtime->Load32(rdram, ctx, packet + 0x18u);
+            const uint32_t clientPtr = runtime->Load32(rdram, ctx, packet + 0x1Cu);
+
+            if (cid == kSifCmdRpcCall)
+            {
+                // SifRpcCallPkt: {SifCmdHeader sifcmd; rec_id; pkt_addr; rpc_id;
+                //                 SifRpcClientData *client; u32 rpc_number;
+                //                 u32 send_size; void *receive; u32 recv_size;
+                //                 u32 rmode; SifRpcServerData *server;}
+                const uint32_t rpcNumber = runtime->Load32(rdram, ctx, packet + 0x20u);
+                const uint32_t sendSize = runtime->Load32(rdram, ctx, packet + 0x24u);
+                const uint32_t receiveAddr = runtime->Load32(rdram, ctx, packet + 0x28u);
+                const uint32_t recvSize = runtime->Load32(rdram, ctx, packet + 0x2Cu);
+                const uint32_t rmode = runtime->Load32(rdram, ctx, packet + 0x30u);
+                const uint32_t server = runtime->Load32(rdram, ctx, packet + 0x34u);
+
+                uint32_t recvBefore[4] = {0u, 0u, 0u, 0u};
+                for (uint32_t i = 0u; i < 4u; ++i)
+                {
+                    recvBefore[i] = runtime->Load32(rdram, ctx, receiveAddr + i * 4u);
+                }
+
+                // TEMP DIAGNOSTIC: the per-service responses still have to be
+                // derived from each call site; echo the request shape so the next
+                // stall can be triaged from the log alone.
+                std::cerr << "[SIF-iop] RPC CALL sid=- client=0x" << std::hex << clientPtr
+                          << " rpc_number=0x" << rpcNumber
+                          << " send_size=0x" << sendSize
+                          << " receive=0x" << receiveAddr
+                          << " recv_size=0x" << recvSize
+                          << " rmode=0x" << rmode
+                          << " server=0x" << server
+                          << " recv_before=" << recvBefore[0] << "," << recvBefore[1] << ","
+                          << recvBefore[2] << "," << recvBefore[3] << std::dec << std::endl;
+
+                // The IOP answers a call by placing the service's response in the
+                // caller's receive buffer, then completing the call with an RPC
+                // END whose +0x20 names the request cid: _SifRpcEndHandler
+                // (0x117fa0) then runs client->end_function and signals
+                // client->hdr.sema_id, which is what sceSifCallRpc waits on.
+                for (uint32_t offset = 0u; offset + 4u <= recvSize; offset += 4u)
+                {
+                    runtime->Store32(rdram, ctx, receiveAddr + offset, 0u);
+                }
+
+                // Version query: answer with the emulated IOP module version so
+                // the guest's module/version check (FUN_0011cfe0) accepts the
+                // service instead of retrying the whole bind+call sequence.
+                if (rpcNumber == kSifRpcGetVersion && sendSize == 0u && recvSize >= 4u)
+                {
+                    runtime->Store32(rdram, ctx, receiveAddr, kSifIopModuleVersion);
+                }
+
+                uint32_t reply[12] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+                reply[0] = 0x30u;          // psize = 0x30, dsize = 0
+                reply[2] = kSifCmdRpcEnd;  // cid   = 80000008h
+                reply[4] = recId;          // rec_id
+                reply[5] = clientPktAddr;  // pkt_addr
+                reply[6] = rpcId;          // rpc_id
+                reply[7] = clientPtr;      // client
+                reply[8] = kSifCmdRpcCall; // request this END finishes
+                reply[9] = server;         // server
+
+                const bool posted = postIopSifCommand(rdram, ctx, runtime, reply, 12u);
+                std::cerr << "[SIF-iop] RPC CALL client=0x" << std::hex << clientPtr
+                          << (posted ? " -> RPC END posted" : " -> RPC END FAILED")
+                          << std::dec << std::endl;
+                return;
+            }
+
+            const uint32_t sid = runtime->Load32(rdram, ctx, packet + 0x20u);
+            const uint32_t server = sifRpcServerAddr(runtime, sid);
+            const uint32_t clientSema = runtime->Load32(rdram, ctx, clientPtr + 0x08u);
+
+            // SifRpcRendPkt: {SifCmdHeader sifcmd; rec_id; pkt_addr; rpc_id;
+            //                 SifRpcClientData *client; u32 cid;
+            //                 SifRpcServerData *server; void *buff, *cbuff;}
+            uint32_t reply[12] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+            // The SIF header's first word is the packet size in bytes, and the
+            // receiver copies ceil(psize/16) quadwords (see _SifCmdIntHandler at
+            // 0x117ad4/0x117af0).  The whole 0x30-byte SifRpcRendPkt has to be
+            // declared, otherwise pkt+0x1c..0x28 are never copied and the END
+            // handler reads stale stack instead of the bind answer.
+            reply[0] = 0x30u;          // psize = 0x30, dsize = 0
+            reply[2] = kSifCmdRpcEnd;  // cid   = 80000008h
+            reply[4] = recId;          // rec_id
+            reply[5] = clientPktAddr;  // pkt_addr
+            reply[6] = rpcId;          // rpc_id
+            reply[7] = clientPtr;      // client
+            reply[8] = kSifCmdRpcBind; // request this END finishes
+            reply[9] = server;         // server -> client->server
+            reply[10] = 0u;            // buff   -> client->buf
+
+            const uint32_t preServer = runtime->Load32(rdram, ctx, clientPtr + 0x24u);
+            g_lastRpcClientPtr = clientPtr;
+            g_lastRpcServerWanted = server;
+
+            // TEMP DIAGNOSTIC: did the guest's own _SifCmdIntHandler consume the
+            // previous reply?  It clears pktbuf[0] as it dequeues the command.
+            uint32_t pkt0Before = 0u;
+            {
+                const uint32_t cdAddr = sifCmdDataAddr();
+                if (cdAddr != 0u)
+                {
+                    pkt0Before = runtime->Load32(rdram, ctx, runtime->Load32(rdram, ctx, cdAddr));
+                }
+            }
+
+            const bool posted = postIopSifCommand(rdram, ctx, runtime, reply, 12u);
+            std::cerr << "[SIF-iop] RPC BIND sid=0x" << std::hex << sid
+                      << " pre_server=0x" << preServer
+                      << " pkt0_before=0x" << pkt0Before
+                      << " rec_id=" << std::dec << recId
+                      << " client=0x" << std::hex << clientPtr
+                      << " sema=" << static_cast<int32_t>(clientSema)
+                      << " server=0x" << server
+                      << (posted ? " -> RPC END posted" : " -> RPC END FAILED") << std::dec << std::endl;
         }
 
         struct SifStateInitializer
@@ -554,6 +886,16 @@ namespace ps2_stubs
             {
                 value = it->second;
             }
+            // The emulated IOP reports its own boot progress: once the game has
+            // handed it the module list (Reboot IOP) the DMA, SIFCMD and IOP boot
+            // milestones all hold, so SMFLG reads them back set.  The game spin
+            // waits on the 0x40000 "IOP finished booting" bit before it will
+            // leave its SIF bring-up loop.
+            if (reg == kSifRegSmflg && g_sifIopBooted)
+            {
+                value |= kSifSmflgBootedMask;
+                g_sifRegs[reg] = value;
+            }
             shouldLog = shouldTraceSifReg(reg) && g_sifGetRegLogCount < 128u;
             if (shouldLog)
             {
@@ -850,6 +1192,8 @@ namespace ps2_stubs
                 // The emulated IOP answers the SIFCMD initialization commands
                 // it just received (see emulateIopSifCmdInitHandshake).
                 emulateIopSifCmdInitHandshake(rdram, ctx, runtime, xfer);
+                dumpSifCmdHandlersOnce(rdram, ctx, runtime, xfer);
+                emulateIopSifRpc(rdram, ctx, runtime, xfer);
             }
         }
 
@@ -871,6 +1215,25 @@ namespace ps2_stubs
 
         std::cerr << "[SIF-SetDma] ok=1 pending=" << pendingCount << std::dec << std::endl;
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
+
+        // TEMP DIAGNOSTIC (raw-SIFRPC bridge): what the guest's own handlers
+        // made of the reply we just posted.
+        if (g_lastRpcClientPtr != 0u)
+        {
+            const uint32_t postServer = runtime->Load32(rdram, ctx, g_lastRpcClientPtr + 0x24u);
+            const uint32_t postSema = runtime->Load32(rdram, ctx, g_lastRpcClientPtr + 0x08u);
+            uint32_t pkt0 = 0u;
+            const uint32_t cmdData = sifCmdDataAddr();
+            if (cmdData != 0u)
+            {
+                pkt0 = runtime->Load32(rdram, ctx, runtime->Load32(rdram, ctx, cmdData));
+            }
+            std::cerr << "[SIF-iop] post-bind client=0x" << std::hex << g_lastRpcClientPtr
+                      << " server=0x" << postServer << " want=0x" << g_lastRpcServerWanted
+                      << " pkt0=0x" << pkt0 << " sema=" << std::dec
+                      << static_cast<int32_t>(postSema) << std::endl;
+            g_lastRpcClientPtr = 0u;
+        }
 
         setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
     }
