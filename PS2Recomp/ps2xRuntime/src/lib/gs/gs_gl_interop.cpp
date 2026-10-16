@@ -307,7 +307,7 @@ namespace
                 auto wait = d.request_semaphore(VK_SEMAPHORE_TYPE_BINARY, released->get_semaphore(), false);
                 wait->signal_external();
                 wait->set_signal_is_foreign_queue();
-                d.add_wait_semaphore(Vulkan::CommandBuffer::Type::Generic, std::move(wait), VK_PIPELINE_STAGE_2_TRANSFER_BIT, true);
+                d.add_wait_semaphore(Vulkan::CommandBuffer::Type::Generic, std::move(wait), VK_PIPELINE_STAGE_2_COPY_BIT, true);
                 pendingRelease = false;
             }
 
@@ -315,10 +315,10 @@ namespace
 
             if (produced)
                 cmd->acquire_image_barrier(*image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                           VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
             else
                 cmd->image_barrier(*image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                   VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                                   VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
             cmd->copy_image(*image, source);
             // Release into GENERAL, not SHADER_READ_ONLY_OPTIMAL: SHADER_READ_ONLY_OPTIMAL is a
@@ -327,7 +327,7 @@ namespace
             // GL_LAYOUT_GENERAL_EXT signal/wait and the GENERAL oldLayout the acquire barrier above
             // declares, making the external ownership transfer coherent.
             cmd->release_image_barrier(*image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                                       VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
             d.submit(cmd);
             // Borrow the owned external binary semaphore for this one submission.
             auto signal = d.request_semaphore(VK_SEMAPHORE_TYPE_BINARY, ready->get_semaphore(), false);

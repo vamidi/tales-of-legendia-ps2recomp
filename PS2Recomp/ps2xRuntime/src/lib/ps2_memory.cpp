@@ -3,7 +3,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
-#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -109,50 +108,6 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
-
-    // DIAGNOSTIC(temporary): report guest stores that land on a GS privileged MMIO
-    // register (which offset, which access width, what value), so we can tell
-    // whether the guest programs PMODE/SMODE1/SMODE2/SYNCV/DISPFB/DISPLAY at all.
-    void diagGsMmioWrite(uint32_t regOff, uint32_t bytes, uint64_t value)
-    {
-        struct Slot
-        {
-            uint32_t off;
-            uint32_t size;
-            unsigned hits;
-        };
-        static Slot slots[24] = {};
-        static unsigned used = 0;
-        for (unsigned i = 0; i < used; ++i)
-        {
-            if (slots[i].off != regOff || slots[i].size != bytes)
-                continue;
-            if (slots[i].hits >= 4u)
-                return;
-            ++slots[i].hits;
-            fprintf(stderr, "[MMIO] gs priv off=0x%04x size=%u value=0x%016llx (hit %u)\n", regOff, bytes,
-                    (unsigned long long)value, slots[i].hits);
-            return;
-        }
-        if (used >= 24u)
-            return;
-        slots[used++] = Slot{regOff, bytes, 1u};
-        fprintf(stderr, "[MMIO] gs priv off=0x%04x size=%u value=0x%016llx (hit 1)\n", regOff, bytes,
-                (unsigned long long)value);
-    }
-
-    // DIAGNOSTIC(temporary): a store whose PHYSICAL address sits in the GS register
-    // window but whose virtual address missed isGsPrivReg(), i.e. a TLB-alias write
-    // that would otherwise be silently dropped.
-    void diagGsMmioMissed(uint32_t vaddr, uint32_t physAddr, uint32_t bytes)
-    {
-        static unsigned logged = 0;
-        if (logged >= 12u)
-            return;
-        ++logged;
-        fprintf(stderr, "[MMIO] gs priv write NOT routed: vaddr=0x%08x phys=0x%08x size=%u\n", vaddr, physAddr,
-                bytes);
-    }
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
@@ -943,11 +898,6 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
 
-    // DIAGNOSTIC(temporary): byte stores into the GS-priv MMIO window are not
-    // modeled by write8; report them so dropped PMODE/SMODE1 byte writes are visible.
-    if (isGsPrivReg(address) || Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
-        diagGsMmioMissed(address, physAddr, 1u);
-
     if (scratch)
     {
         m_scratchpad[physAddr] = value;
@@ -990,11 +940,6 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
-
-    // DIAGNOSTIC(temporary): halfword stores into the GS-priv MMIO window are not
-    // modeled by write16; report them so dropped PMODE/SMODE1 halfword writes are visible.
-    if (isGsPrivReg(address) || Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
-        diagGsMmioMissed(address, physAddr, 2u);
 
     if (scratch)
     {
@@ -1049,20 +994,12 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             writeGsRegister(gs_regs, reg, newVal);
-            diagGsMmioWrite(regOff, 4u, value);
-        }
-        else
-        {
-            diagGsMmioMissed(address, address, 4u);
         }
         return;
     }
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
-
-    if (Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
-        diagGsMmioMissed(address, physAddr, 4u);
 
     if (scratch)
     {
@@ -1113,20 +1050,12 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             writeGsRegister(gs_regs, reg, value);
-            diagGsMmioWrite(regOff, 8u, value);
-        }
-        else
-        {
-            diagGsMmioMissed(address, address, 8u);
         }
         return;
     }
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
-
-    if (Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
-        diagGsMmioMissed(address, physAddr, 8u);
 
     if (scratch)
     {
@@ -1183,19 +1112,16 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
 
     // GS-priv MMIO: model 128-bit stores as two 64-bit register stores so QWC
-    // stores to PMODE/SMODE1/... reach GSRegisters (write64 applies CSR handling
-    // and the one-time [MMIO] diagnostic). Previously these stores were dropped.
+    // stores to PMODE/SMODE1/... reach GSRegisters (write64 applies CSR handling).
+    // Previously these stores were dropped.
     if (isGsPrivReg(address))
     {
         const uint64_t lo = _mm_extract_epi64(value, 0);
         const uint64_t hi = _mm_extract_epi64(value, 1);
-        diagGsMmioWrite((address - PS2_GS_PRIV_REG_BASE) & ~0x7u, 16u, lo);
         write64(address, lo);
         write64(address + 8, hi);
         return;
     }
-    if (Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE))
-        diagGsMmioMissed(address, physAddr, 16u);
 
     if (scratch)
     {

@@ -34,20 +34,6 @@ namespace ps2_syscalls
             configureGsCrt(runtime->memory().gs(), interlaced, videoMode, frameMode);
         }
 
-        // Always-on diagnostic (RUNTIME_LOG is compiled out): capture the exact
-        // SetGsCrt arguments and the resulting SMODE1/SMODE2 so the parallel-gs
-        // "Unknown video format." fallthrough can be traced to a specific combo.
-        std::cerr << "[GS] SetGsCrt: interlaced=" << interlaced
-                  << " videoMode=0x" << std::hex << videoMode << std::dec
-                  << " frameMode=" << frameMode;
-        if (runtime)
-        {
-            const GSRegisters &gs = runtime->memory().gs();
-            std::cerr << " smode1=0x" << std::hex << gs.smode1
-                      << " smode2=0x" << gs.smode2 << std::dec;
-        }
-        std::cerr << std::endl;
-
         RUNTIME_LOG("PS2 GsSetCrt: interlaced=" << interlaced
                                                 << ", videoMode=" << videoMode
                                                 << ", frameMode=" << frameMode << std::endl);

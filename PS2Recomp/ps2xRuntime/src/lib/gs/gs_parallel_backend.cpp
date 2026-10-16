@@ -22,10 +22,9 @@ namespace
         return value;
     }
 
-    // DIAGNOSTIC(temporary): parallel-gs warns "Unknown video format." when the
-    // SMODE1 CMOD/LC pair matches none of its scanout branches. Report the exact
-    // mode registers the frontend feeds it, once per change, so the unhandled
-    // combination is visible instead of inferred.
+    // One-time log (per mode change) of the exact video-mode registers fed to
+    // parallel-gs: confirms that the CRT seed / guest pmode-SMODE programming
+    // actually reaches scanout, and shows which SMODE1 combo is in use.
     void logPresentationModeOnce(const GSPresentationRequest &request)
     {
         static uint64_t lastPmode = ~0ull;
@@ -53,77 +52,6 @@ namespace
                 (unsigned long long)(request.smode1 & 1ull), (unsigned long long)request.smode2,
                 (unsigned long long)(request.smode2 & 1ull), (unsigned long long)((request.smode2 >> 1) & 1ull),
                 (unsigned long long)request.dispfb1, (unsigned long long)request.display1);
-    }
-
-    // DIAGNOSTIC(temporary): parallel-gs's OWN privileged register state, sampled
-    // before Present() overwrites it from the frontend request. If these are
-    // non-zero while the presented values are zero, the guest programmed the video
-    // mode somewhere Present() does not observe, and Present() is clobbering it.
-    void logUpstreamPrivOnce(const ParallelGS::PrivRegisterState &p)
-    {
-        static const char *names[6] = {"PMODE", "SMODE1", "SMODE2", "SYNCV", "DISPFB1", "DISPLAY1"};
-        static const unsigned index[6] = {0, 2, 4, 12, 14, 16};
-        static uint64_t last[6] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
-        for (unsigned i = 0; i < 6; ++i)
-        {
-            const uint64_t value = p.qwords_lo[index[i]];
-            if (value == last[i])
-                continue;
-            last[i] = value;
-            fprintf(stderr, "[GS] upstream priv %s=0x%016llx (pre-clobber)\n", names[i],
-                    (unsigned long long)value);
-        }
-    }
-
-    // DIAGNOSTIC(temporary): which raw register codes actually reach the backend,
-    // and does the guest's GIF stream contain A+D (descriptor 0xE) writes?
-    void logRawRegOnce(uint8_t addr, uint64_t value)
-    {
-        static unsigned char seen[128] = {};
-        static unsigned logged = 0;
-        if (seen[addr] || logged >= 32)
-            return;
-        seen[addr] = 1;
-        ++logged;
-        fprintf(stderr, "[GS] raw reg addr=0x%02x value=0x%016llx\n", unsigned(addr),
-                (unsigned long long)value);
-    }
-
-    void logGifAdTagOnce(uint64_t tagLo, uint64_t tagHi)
-    {
-        static uint64_t seen[12] = {};
-        static unsigned logged = 0;
-        if (logged >= 12)
-            return;
-        unsigned nreg = unsigned((tagLo >> 60) & 0xFu);
-        if (nreg == 0u)
-            nreg = 16u;
-        bool hasAd = false;
-        for (unsigned r = 0; r < nreg; ++r)
-            if (((tagHi >> (r * 4)) & 15u) == 14u)
-                hasAd = true;
-        if (!hasAd)
-            return;
-        for (unsigned i = 0; i < logged; ++i)
-            if (seen[i] == tagHi)
-                return;
-        seen[logged++] = tagHi;
-        char regs[32] = {};
-        for (unsigned r = 0; r < nreg; ++r)
-            snprintf(regs + r * 2, 3, "%x", unsigned((tagHi >> (r * 4)) & 15u));
-        fprintf(stderr, "[GS] gif A+D tag: flg=%u nloop=%u nreg=%u regs=%s lo=0x%016llx hi=0x%016llx\n",
-                unsigned((tagLo >> 58) & 3u), unsigned(tagLo & 0x7FFFu), nreg, regs,
-                (unsigned long long)tagLo, (unsigned long long)tagHi);
-    }
-
-    void logGifAdWriteOnce(uint8_t addr, uint64_t value)
-    {
-        static unsigned logged = 0;
-        if (logged >= 24)
-            return;
-        ++logged;
-        fprintf(stderr, "[GS] gif A+D write: addr=0x%02x value=0x%016llx\n", unsigned(addr),
-                (unsigned long long)value);
     }
 
     unsigned bitsPerPixel(unsigned psm)
@@ -254,8 +182,6 @@ namespace
                 if (state.loop == state.tag.NLOOP)
                 {
                     std::memcpy(&state.tag, data + offset, 16);
-                    const uint64_t *tagWords = reinterpret_cast<const uint64_t *>(&state.tag);
-                    logGifAdTagOnce(tagWords[0], tagWords[1]);
                     state.reg = state.loop = 0;
                     offset += 16;
                     continue;
@@ -277,7 +203,6 @@ namespace
                         const uint8_t adAddr = uint8_t(word(data + offset + 8) & 127);
                         const uint64_t adValue = word(data + offset);
                         observeRegister(adAddr, adValue);
-                        logGifAdWriteOnce(adAddr, adValue);
                     }
                     unsigned count = state.tag.FLG == 0 ? 1 : 2;
                     while (count-- && state.loop < state.tag.NLOOP)
@@ -379,7 +304,6 @@ namespace
             if (addr >= 128)
                 return; // Reserved addresses never index upstream's 128-entry table.
             observeRegister(addr, value);
-            logRawRegOnce(addr, value);
             // Compatibility aliases used by native stubs, not actual GIF registers.
             switch (addr)
             {
@@ -467,7 +391,6 @@ namespace
             logPresentationModeOnce(request);
             gs.flush();
             auto &p = gs.get_priv_register_state();
-            logUpstreamPrivOnce(p);
             p.qwords_lo[0] = request.pmode;
             p.qwords_lo[2] = request.smode1;
             p.qwords_lo[4] = request.smode2;
@@ -480,7 +403,7 @@ namespace
             ParallelGS::VSyncInfo info{};
             info.phase = request.field;
             info.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            info.dst_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            info.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
             info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
             info.crtc_offsets = true;
             return interop.present(gs.vsync(info));

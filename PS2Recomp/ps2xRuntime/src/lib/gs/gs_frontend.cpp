@@ -5,7 +5,6 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -1075,19 +1074,9 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         break;
     }
     case 0x0F:
-    {
-        // DIAGNOSTIC(temporary): packed-mode descriptor 0xF (AD/ADR auto-data pair)
-        // is silently dropped here. Report the first few so an AD-driven register
-        // write is visible instead of invisible.
-        static unsigned logged = 0;
-        if (logged < 8u)
-        {
-            ++logged;
-            fprintf(stderr, "[GSFE] packed desc 0x0F dropped: lo=0x%016llx hi=0x%016llx\n",
-                    static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
-        }
+        // Packed descriptor 0xF (A+D auto-data pair) is not modeled yet; the pair
+        // words are consumed by the caller's data stream and dropped here.
         break;
-    }
     default:
         writeRegisterUnlocked(regDesc, lo);
         break;
@@ -1104,19 +1093,6 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
     if (m_backend && m_backend->UsesRawCommands())
     {
-        // DIAGNOSTIC(temporary): with a raw-command backend every register write is
-        // forwarded to WriteRegisterRaw and the frontend switch below never runs.
-        // Report the distinct register codes once so privileged-adjacent codes
-        // (0x59-0x5F stub aliases, 0x0E/0x0F AD) are visible at this boundary.
-        static unsigned char seen[256] = {};
-        static unsigned logged = 0;
-        if (!seen[regAddr] && logged < 32u)
-        {
-            seen[regAddr] = 1;
-            ++logged;
-            fprintf(stderr, "[GSFE] raw-forward reg=0x%02x value=0x%016llx\n",
-                    static_cast<unsigned>(regAddr), static_cast<unsigned long long>(value));
-        }
         m_backend->WriteRegisterRaw(regAddr, value);
         return;
     }
