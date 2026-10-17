@@ -226,6 +226,21 @@ namespace ps2_stubs
         constexpr uint32_t kSifIopModuleVersion = 0x30303033u; // "3000"
         constexpr uint32_t kSifRpcGetVersion = 0xFFu;
 
+        // Deci2 handshake reply.
+        //
+        // Once the SIF layer is up the guest's libdbc asks the DBCMAN IOP
+        // service for its version (rpc 0x80001363, no meaningful request) and
+        // warns
+        //     libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 0.00]
+        // when the answer does not match the 3.10 it was built against; it then
+        // stops making progress.
+        //
+        // The version is BCD, so 0x0310 reads as "3.10", and it is repeated
+        // across the reply.  This is the same value ps2xIOP's HLE dbcman service
+        // reports (ps2xIOP/src/modules/dbcman.cpp, kReportedVersion).
+        constexpr uint32_t kDbcManRpcCheckVersion = 0x80001363u;
+        constexpr uint32_t kDbcManReportedVersion = 0x00000310u; // BCD "3.10"
+
         // SIF_SMFLG (register 4) carries the boot progress handshake flags:
         //   0x10000 - SIF DMA/hardware initialized
         //   0x20000 - SIFCMD initialized
@@ -463,6 +478,17 @@ namespace ps2_stubs
                 if (rpcNumber == kSifRpcGetVersion && sendSize == 0u && recvSize >= 4u)
                 {
                     runtime->Store32(rdram, ctx, receiveAddr, kSifIopModuleVersion);
+                }
+
+                // Deci2/dbcman version query (see kDbcManReportedVersion): the
+                // guest compares the answer against its own libdbc version and
+                // stalls when it mismatches, so report the 3.10 it expects.
+                if (rpcNumber == kDbcManRpcCheckVersion && recvSize >= 16u)
+                {
+                    for (uint32_t offset = 0u; offset < 16u; offset += 4u)
+                    {
+                        runtime->Store32(rdram, ctx, receiveAddr + offset, kDbcManReportedVersion);
+                    }
                 }
 
                 uint32_t reply[12] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
