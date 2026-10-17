@@ -1500,9 +1500,16 @@ namespace
     // none inside [0x394300, 0x394400)).
     //
     // The guest's own definition of "every stage is ready" is exactly those
-    // six u64 stores, so apply that once, the first time the guest enters the
-    // staged-init cluster. Nothing else in the image ever writes these words,
-    // so the release cannot be undone and firing slightly early is harmless.
+    // six u64 stores, so apply that once -- but at the moment the guest itself
+    // asks for the handshake, which is when it blocks on semaphore 65.
+    //
+    // Timing matters. Firing on first entry to the staged-init cluster
+    // (0x19A6F0) was tried and is too early: the stage-chain threads (3, 4, 5)
+    // were released and exited six log lines later, long before the sem-60/65
+    // handshake ran, so by the time thread 1 created semaphore 65 and waited on
+    // it there was nothing left that could signal it. Release only when thread 1
+    // reaches the sem-65 wait instead, so the stage chain is still parked and
+    // has a live semaphore to complete.
     void releaseStagedInitGates(uint8_t *rdram, uint32_t targetPc, uint32_t sourcePc)
     {
         static bool s_released = false;
@@ -1510,10 +1517,11 @@ namespace
         {
             return;
         }
-        // Entering the staged-init cluster is what says the boot has reached
-        // the handshake: that range holds the gate waiters, both drivers, the
-        // flag setter and the init body.
-        if (targetPc < 0x198000u || targetPc >= 0x19B000u)
+        // entry_00119c64_0x119c64: `jal func_114720` (the WaitSema wrapper) with
+        // a0 = s0 (the sem-65 id), reached from the `bnez` at 0x119c4c. Match the
+        // JAL's source address, not the label: mid-function branches are inlined
+        // gotos and never reach dispatchGuestBranch, but every JAL does.
+        if (sourcePc != 0x119C64u)
         {
             return;
         }

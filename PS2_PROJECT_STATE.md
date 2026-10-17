@@ -16,6 +16,40 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 12d - HLE release RETIMED to the sem-65 wait; blocker moves to thread 5
+
+**Prompt:** user chose "Retime the HLE release".
+
+**Change** (`src/lib/ps2_runtime.cpp`, `releaseStagedInitGates`): the trigger moved
+from "first entry to the staged-init cluster" (`targetPc` in `[0x198000,0x19B000)`,
+which fired at `0x19A6F0`) to the guest's own ask:
+
+    if (sourcePc != 0x119C64u) return;
+
+`0x119C64` is the `jal func_114720` (WaitSema wrapper) in
+`entry_00119c64_0x119c64` whose `a0 = s0` is the **sem-65 id** — i.e. exactly the
+instruction where thread 1 blocks on the handshake. Note the first attempt matched
+`targetPc` and **never fired**: `0x119C64` is a mid-function label reached by an
+inlined `goto`, and mid-function branches never call `dispatchGuestBranch`. Match
+the JAL's *source* address instead — every JAL does dispatch.
+
+**Result (run58), vs the old timing (run56):**
+- `[HLE-staged-init] released six ready gates ... target=0x114720 source=0x119c64`
+  (fires; old timing fired at `0x19A6F0`).
+- Ordering is now correct: release -> thread 1 `wait id=65` -> threads 3 and 4
+  `[EE-exit] delete=1` **immediately after**. Previously the chain was released and
+  exited ~430 log lines *before* the handshake existed, leaving nothing to signal 65.
+- Baseline untouched: `RPC END posted=54`, `RPC CALL=82`, Deci2=4, DVCI=1.
+- **New, tighter blocker:** thread 5 no longer exits. It advances to
+  `pc=0x19902c` (`entry=0x198f38`, `sp=0x399ba0`) and parks:
+  `status=3 wait=1 waitId=0 suspend=1`. Thread 1 is still `waitId=65`
+  (`[EE-sem] id=65 count=0 max=1 waiters=1`), and **still nothing signals 65**.
+
+So the sem-65 signal is meant to come from the stage-chain tail, and the next
+target is what **thread 5 does at `pc=0x19902c`** (and why it comes up
+`suspend=1` rather than finishing). Thread 2 also shows `suspend=1` at the old
+gate-spin entry `0x198c60`.
+
 ## Session 12c - the CreateSema change was WRONG (reverted); sem-65 handshake mapped
 
 **Committed/pushed:** `a791617` (HLE staged-init gate release + the Sema change),
