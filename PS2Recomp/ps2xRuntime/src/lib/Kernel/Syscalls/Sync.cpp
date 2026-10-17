@@ -112,22 +112,22 @@ namespace ps2_syscalls
         // ee_sema_t from ps2sdk. The IOP attr/option/init/max ordering is not
         // accepted by the EE runtime.
         //
-        // The EE kernel takes the INITIAL COUNT from the first field (`count`).
-        // `init_count` is a status field that only ReferSemaStatus fills; the
-        // guest leaves it (and attr/option) as stale stack data. Reading the
-        // initial count from `init_count` seeded every semaphore with garbage,
-        // which broke handshakes whose first wait must block (the staged-init
-        // semaphores 60/62 came up pre-signalled, so their waiter sailed
-        // through and the later SignalSema had no waiter).
+        // The initial count is `init_count` (third field), NOT `count` (first
+        // field). Reading `count` was tried in a791617 and refuted by hardware
+        // behaviour: the id=4 create -> iSignalSema -> WaitSema handshake is
+        // built with init_count==0 / max_count==1, so reading `count` (==1 at
+        // that call site) seeded the semaphore at 1 and the immediate
+        // iSignalSema returned -420 (KE_SEMA_OVF). The handshake then no longer
+        // blocked and the boot regressed from 54 RPC completions to 5.
         const int semId = scheduler(rdram, ctx, runtime)
-                              .createSemaphore(param->count,
+                              .createSemaphore(param->init_count,
                                                param->max_count,
                                                param->attr,
                                                param->option);
         if (semTraceBudget(static_cast<uint32_t>(semId), 0))
         {
             std::cerr << "[SEM] create id=" << semId
-                      << " count=" << param->count
+                      << " init=" << param->init_count
                       << " max=" << param->max_count
                       << " attr=0x" << std::hex << param->attr << std::dec
                       << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec
