@@ -16,7 +16,63 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
-## Session 12b - REAL BUG FOUND: CreateSema read the wrong initial-count field
+## Session 12c - the CreateSema change was WRONG (reverted); sem-65 handshake mapped
+
+**Committed/pushed:** `a791617` (HLE staged-init gate release + the Sema change),
+then `ff40f15` (**revert** of the Sema change). Remote `master` == `ff40f15`.
+
+**The Sema change in `a791617` was wrong.** It read the initial count from
+`ee_sema_t.count` (field 1) instead of `.init_count` (field 3). The EE's own
+behaviour refutes it:
+
+```
+run54 (init_count): create id=4 init=0 -> isignal id=4 ret=4      -> wait blocks
+run55 (count):      create id=4 count=1 -> isignal id=4 ret=-420  -> wait no longer blocks
+```
+
+`-420` is `KE_SEMA_OVF`. The staged `id=4` handshake (create -> iSignalSema ->
+WaitSema) is built with `init_count==0` / `max_count==1`; reading `count` (==1
+at that call site) seeded it at 1 and the immediate `iSignalSema` overflowed, so
+the handshake no longer blocked. The boot then regressed hard: RPC completions
+54 -> 5, staged-init never reached, and the game wedged in the SIF-RPC poll loop
+`0x11cf1c <-> 0x11d6f0/0x11d8f4 -> 0x166360/0x166370` (with `v0=-1`) instead of
+progressing. Session 12b below is therefore **retracted** on that point. After
+the revert (`run56`) the build matches the pre-`a791617` baseline exactly:
+`RPC END posted=54`, `RPC CALL=82`, `HLE-staged-init` released, Deci2/DVCI
+present, `KE_SEMA_OVF` absent. The HLE gate release is unaffected and stays.
+
+**Sem-65 handshake mapped (run56 line order):**
+- L11853 `[HLE-staged-init] released six ready gates 0x394378..0x3943C8
+  target=0x19a6f0 source=0x1663ac`
+- L11859/61/63 -- **six lines later** -- `[EE-exit] thread=3/4/5 delete=1`,
+  `v0=0x3943a0/0x3943b0/0x3943c0` (gate-block addresses). Their traces form a
+  *continuation* (`...->0x198d50` / `0x198d50->0x198f04` / `0x198e58->0x199038`),
+  i.e. a task **chain**: stage thread 3 -> 4 -> 5, each handing off then exiting.
+- L12225-12283, much later, the sem-60/65 handshake:
+  `create 60 (init=1) ra=0x119428` -> `wait 60 ra=0x11945c` -> `create 65
+  (init=0) ra=0x119be0` -> `signal 60 ra=0x119c4c` -> **`wait 65 ra=0x119c6c`
+  blocks forever** (thread 1: `waitId=65`, `pc=0x119c6c`).
+
+**Disassembly of the sites** (the `0x119b9c`/`0x119c40`/`0x119c64`/`0x119c9c`/
+`0x119cc8`/`0x119cf8` runner files are fragments of ONE large staged-init driver
+function; the `entry_` names are mid-function entries):
+- `FUN_00119440` (0x119440-0x11946c) = helper `{ func_1193E8(); WaitSema(*(0x3876F4)); }`
+  -- the sem id comes from the **global 0x3876F4**, not a literal.
+- `func_119470` (0x119470-0x11947c) = the **signal** helper (its `ra` is preserved,
+  so the syscall logs as `ra=0x119c4c` from the JAL at 0x119c44).
+- `0x119c64`: `jal func_114720` (WaitSema wrapper) with `a0 = s0` -> **s0 is the
+  sem-65 id**; then `0x119c78 bgez v1 -> return`, and only when `v1 < 0`:
+  `0x119c80 WaitSema(*(0x3876F8))`, `0x119c88 sw $zero,4(s3)`,
+  `0x119c8c SignalSema(*(0x3876F8))` -> so `func_114700` is the SignalSema wrapper.
+
+**Conclusion:** nothing in the entire run signals sem 65, and the handshake's
+signaller is a **separate thread that never runs** (or a stage-chain step that
+should signal 65 and does not). The stage chain exits immediately *after* the
+HLE release, so the prime suspect is the **release timing**: setting all six
+gates at first entry to the range lets the stage chain run and exit
+independently of / before the sem-60/65 handshake that is meant to gate it.
+
+## Session 12b - RETRACTED: CreateSema read the wrong initial-count field
 
 **Prompt:** user asked whether the sem-65 trace helps with the black screen. It does: the game's
 main thread (`id=1`, `entry=0x100008`) is parked on sem 65, and while it is parked the game can
