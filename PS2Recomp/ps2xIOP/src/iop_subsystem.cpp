@@ -25,6 +25,7 @@ namespace ps2x::iop
             coreServices.emplace_back(detail::createLibSdService(host));
             coreServices.emplace_back(detail::createLoadFileService(
                 host, [this](std::string_view path) { return loadModuleImpl(path, nullptr, 0u); }));
+            coreServices.emplace_back(detail::createFileIoService(host));
             refreshServiceModuleKeys();
             rebuildRoutes();
         }

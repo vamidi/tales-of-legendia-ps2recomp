@@ -16,6 +16,27 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 10 (in progress) - Stage C DONE (fileio on SID 0x80000001); the next gate is a RECOMPILER DISCOVERY GAP, not I/O
+**Done this session.** Stage C is implemented and verified; the `0x1666b4` trap is gone.
+- **New `fileio` HLE service** (`ps2xIOP/src/modules/fileio.cpp`, SID `0x80000001`), registered via a one-line factory decl in `ps2xIOP/src/module_factories.h`, a source line in `ps2xIOP/CMakeLists.txt`, and an `emplace_back` in `IopSubsystem::Impl`'s ctor. Reuses the host VFS bridge already used by `iop_cdvd.cpp` (`IopHost::translateGuestPath` / `openHostFile` / `hostFileSize` / `readHostFile` / `closeHostFile`).
+- **`rpc 0xff` (init handshake)** -> reply `{0x30303033 ("3000"), 2}`: this is what `FUN_00119568` needs (`[0x3E1F68]=recv[0]=="3000"` consumed by `FUN_00119770`, `[0x3876F0]=(recv[1]==2)` consumed by `FUN_00119030`, the cid `0x80000011` handler).
+- **`rpc 0x0` (open)** -> decodes the request header (`+0x00` sema, `+0x04` EE result pointer, `+0x08` result size, `+0x0C` flags, `+0x10` caller arg, `+0x14` NUL path), resolves it through the VFS, opens it, and writes the reply word.
+- **Verified (run47/48):** `[IOP:fileio] open slot=0 flags=0x1 size=64 path='cdrom0:\AFS\PTN_INFO.BIN;1' -> host='…\data\CD\AFS\PTN_INFO.BIN' handled=1`, `[SIF-iop] RPC ROUTE sid=0x80000001 rpc=0x0 … handled=1`. The guest now leaves `FUN_001664d0` **without** taking `0x166514: bltz $s4, 0x1666b4`; the infinite trap at `0x1666b4` is gone.
+- Only **one** open is issued (the `.NAM` open at `0x16650c` never happens), so the guest does not return to that call site - it blocks inside the loader.
+
+**New blocker (session 10): the guest stalls on a "subsystem ready" flag that no compiled code ever sets.**
+- The loader thread spins forever in `FUN_00198c60` / `entry_00198c88` (`pc=0x198c88`/`0x198c90`, 26 consecutive heartbeats, `trace=0x198c90 -> 0x198c90 -> …`) waiting for `*(uint64*)0x394378 != 0`. 90s adds only ~11 KB to the log (vs 1.18 MB in 30s before) and there are **zero RPCs after the open** — it is a hard stall, not slow progress.
+- `0x394378` is written by **exactly one** function: **`FUN_00199938` (0x199938)**, which sets **six** consecutive ready-flags `0x394378/0x394388/0x394398/0x3943A8/0x3943B8/0x3943C8` to `1` and returns. It is the game's "all resource subsystems initialized" notifier, and it is one case of a multi-entry block `entry_00199914` → `FUN_00199938` (0x199914-0x199988).
+- **`FUN_00199938` is called by nothing.** A tree-wide search of `runner/*.cpp` finds only its registration line in `register_functions.cpp` — no `jal`/`j`/`jalr` caller, and no `entry_00199914` caller either. A raw scan of the whole ELF for any instruction that could materialise `0x199938` (`lui 0x19 + addiu 0x9938`, `lui 0x1A + addiu 0xF938`, any `addiu`/`ori`/`lui` with immediate `0x9938`/`0xF938`) finds **none**, and a byte-scan for it as a **data pointer** finds **0 hits**. So whatever calls it is **outside the compiled function set** - i.e. the same class of gap session 7 patched via `[general].entry_points`.
+- Corroborating: a thread was created with entry **`0x1B30F0`** (`JALR source=0x1acd58 target=0x1b30f0 a1=0x3b0bc0`) and was immediately **retired** (`[EE-dormant-missing] thread=3 pc=0x1b30f0`). `0x1B30F0` is not a compiled function: it sits in a **0x60-byte gap** (`0x1B30F0`-`0x1B3150`) between `FUN_001b30e8` (ends exactly at 0x1B30F0) and `FUN_001b3150` that Ghidra never identified, and that gap decodes to `if (p == 0) for(;;); n = *p; while (n > 0) n--;` — a bounded busy-wait (so it is a *wait* helper, not the flag setter). Neither address appears as a 4-byte data pointer anywhere in the ELF, so both are reached through computed pointers/offsets the analyzer did not follow.
+- Reader-thread syscall identified and closed out: `[EE-syscall] id=0xffffffd1` = `-0x2F` = **`GetThreadId`** — it is just the yield inside the spin loop, not a file-read attempt. No further `fileio` RPCs are expected until the stall clears.
+
+**Curio found while hunting:** `data/map.csv` line 11416 is a corrupted row — `FUN_001978f0,0x001978F0,0x0019F710,60` (End 0x19F710 with Size 60) claims the whole `0x1978F0`-`0x19F710` region (which contains the loader helpers *and* `FUN_00199938`) as one function. Only this one row is wildly inconsistent (the other ~1088 End/Size mismatches are ≤44 bytes of alignment rounding). Worth checking whether it perturbs the analyzer's region handling.
+
+**Cost analysis for any fix that needs the recompiler (recorded so the decision is cheap):**
+- `PS2Recompiler::writeToFile` (`ps2xRecomp/src/lib/ps2_recompiler.cpp:2263`) writes **unconditionally** (`std::ofstream file(path); …`), so *any* recompiler run rewrites all ~53k generated files and the unity build (`PS2X_ENABLE_RUNNER_UNITY_BUILD`, batch 32 → ~1660 batches) recompiles everything.
+- Cheap mitigation available: regenerate into a **scratch** output dir (`[general].output`), then copy only the **content-differing** files into `PS2Recomp/ps2xRuntime/src/runner` with mtime preserved, so only the affected unity batches rebuild. That is how the "1515 files gained VU0 macro-mode hooks" adoption was kept tractable.
+
 ## Session 9 (in progress) - the IOP is REAL: the game's own modules load, run, and answer their own RPCs
 **Done this session (breakthrough).** The game's own IOP modules now load *into the emulated IOP and execute there*, and the sound system comes up.
 - **New `loadfile` HLE service** (`ps2xIOP/src/modules/loadfile.cpp`, SID `0x80000006`): `rpc 0xff` -> version, `rpc 0x0` -> load the IRX named in the call. The EE call buffer is `{int result; int moduleId; char name[]}`, so the module name starts at `send+8`, and the reply is `{result (0=ok, 0xffffffff=fail); moduleId}`. The guest **retries forever on a negative result** (measured run41 vs run42), which is how the reply layout was pinned down.
@@ -54,7 +75,7 @@
 - Shell calls should be **single-purpose and clearly labelled** (the user declined a combined multi-part `Select-String` call).
 
 ## Current Phase
-PHASE_ASSET_LOADING - **the game's own IOP is real**: all 9 of its modules load and execute in the emulated IOP, the sound system comes up (the DTX gate is clear), and the guest has moved on to loading its first asset file. Current trap: the file I/O service (SID `0x80000001`) is unserved, so `sceOpen("cdrom0:\AFS\PTN_INFO.BIN;1")` fails and the guest lands in its error trap at `0x1666b4`.
+PHASE_ASSET_LOADING - **the game's own IOP is real and Stage C (fileio) is live**: all 9 of its modules load and execute in the emulated IOP, the sound system comes up (DTX gate clear), and the guest now opens its first real asset file through the new `fileio` HLE service (SID `0x80000001`) - `cdrom0:\AFS\PTN_INFO.BIN;1` resolves to the host file and the `0x1666b4` error trap is gone. Current trap: the loader stalls on a "subsystem ready" flag (`*(uint64*)0x394378`) whose only writer, `FUN_00199938`, is **never called by any compiled code** - a recompiler discovery gap (see session 10).
 Displayed content: still to be confirmed on screen.
 
 ## SIF / RPC Bring-up (the whole session-4/5 arc)
@@ -86,11 +107,21 @@ Ordered by the guest's actual boot sequence:
 **Run evidence (run18, 50s, before):** `BIND=7 CALL=5`; textures loaded; main thread cycling the retry loop.
 **Run evidence (run17, 50s, before the SMFLG fix):** `BIND=3 CALL=2`; main thread stuck spinning at `pc=0x1662d0`/`0x11ddd0` on `sceSifGetReg(4)`.
 
-## Open Decision (session 9 - awaiting the user)
+## Open Decision (session 10 - awaiting the user)
+**NEW (session 10) - which way to close the discovery gap?** Stage C (fileio, SID `0x80000001`) is **done and verified** (see the session-10 summary at the top), but the very next step in the boot path is blocked by a **missing function**: the loader spins on `*(uint64*)0x394378`, which only `FUN_00199938` writes, and nothing in the compiled set calls it (nor can its address be materialised by any instruction in the ELF, nor found as a data pointer). A second thread was retired the same way at entry `0x1B30F0`, an address inside a gap Ghidra never identified. This is the same class of defect session 7 fixed with `[general].entry_points` (358 functions added), so it needs a **recompiler/analyzer decision**, not a runtime one. Options:
+ (a) **Regenerate now with an extended `[general].entry_points`** (`0x1B30F0` + its neighbours + the block at `0x199914`) - designed mechanism, mechanical, but the recompiler rewrites every generated file, so unless the scratch-output + content-diff adopt step is scripted, the unity build recompiles ~1660 batches.
+ (b) **Do the deferred analyzer discovery pass** (the open item below): make discovery follow computed pointers / gap regions so this whole class of gap closes at once, then regenerate once.
+ (c) **Keep probing the stall first** (e.g. instrument the six ready-flags and the loader's call chain in a runtime diagnostic) before committing to a long rebuild, in case another mechanism is supposed to satisfy those flags.
+ (d) Stop here for now and leave boot at this stage.
+No work on (a)/(b) has started - this is the decision point.
+
+**Still open (session 9) - consent for three runtime-internal headers** touched in session 9 (`ps2xIOP/src/module_factories.h`, `ps2xIOP/src/iop_service.h`, `ps2xRuntime/src/lib/ps2_iop_transport.h`); none is included by `runner/*`, so there is no mass rebuild. With session 10 the same applies to the `fileio` service's registration edits.
+**Still queued (user's step 2) - the analyzer discovery pass** to make session 7's `entry_points` reproducible in code; it is now also option (b) above.
+
+## Open Decision (session 9 - resolved) - the IOP route
 **Decision taken (session 8): route (A) - implement the EE-facing services in `ps2xIOP`.** It is now **implemented and verified**: module loads are real (SID `0x80000006`), all 9 of the game's modules load and execute inside the emulator, and IXAUDIO answers DTX (see the session-9 summary at the top). Routes (B) boot the real IOP OS and (C) HLE the DTX service were not needed.
-**New open point (session 9): Stage C - the file I/O service on SID `0x80000001`.** The guest now opens its first asset file (`cdrom0:\AFS\PTN_INFO.BIN;1`) and traps at `0x1666b4` because the fileio/ioman service it binds is unserved (IOPRP's ioman is not loaded). Options: (i) add a `fileio` HLE service on SID `0x80000001` in `ps2xIOP`, backed by the host VFS through `IopHost::translateGuestPath`/`openHostFile`/`hostFileSize`/`readHostFile` (mirrors `loadfile`; recommended), or (ii) load IOPRP300.IMG's real `ioman`/`FILEIO_service` into the emulator.
-Also open: consent for the three runtime-internal headers touched in session 9 (`ps2xIOP/src/module_factories.h`, `ps2xIOP/src/iop_service.h`, `ps2xRuntime/src/lib/ps2_iop_transport.h`) - none is included by `runner/*`, so no mass rebuild.
-Also queued (user's step 2, still open): the **analyzer discovery pass** to make session 7's `entry_points` reproducible.
+**Stage C (session 9's open point) - the file I/O service on SID `0x80000001` - is DONE (session 10).** The guest now opens `cdrom0:\AFS\PTN_INFO.BIN;1` through the new `fileio` HLE service instead of trapping at `0x1666b4`. Option (ii) (load IOPRP300.IMG's real `ioman`/`FILEIO_service`) was not needed.
+> Historical text (for context): the guest opened its first asset file (`cdrom0:\AFS\PTN_INFO.BIN;1`) and trapped at `0x1666b4` because the fileio/ioman service it binds was unserved (IOPRP's ioman is not loaded); the chosen fix was the HLE service backed by the host VFS through `IopHost::translateGuestPath`/`openHostFile`/`hostFileSize`/`readHostFile`, mirroring `loadfile`.
 
 ## Resolved Root Causes (committed `ad27d73` + cleanup `33ccc7e`, both PUSHED)
 - **Black screen:** the guest **never programs GS video mode** — every instrumented guest-write path ran **zero times** (`[MMIO]` GS-priv = 0, `[GSFE]` = 0, `WriteRegisterRaw` = 0, GIF AD tag = 0, `SetGsCrt` syscall = 0). Fix: BIOS-like CRT seed in `syncCoreSubsystems()` — `ps2_syscalls::configureGsCrt(m_gs(), 1u, 2u, 0u)` gated on `smode1 == 0` → `smode1=0x4101`, `smode2=0x1`, `pmode |= EN1`. Verified: `Unknown video format.` 3780→0.
