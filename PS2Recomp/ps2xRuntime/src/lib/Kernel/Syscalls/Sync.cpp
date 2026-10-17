@@ -21,18 +21,22 @@ namespace ps2_syscalls
 
         // TEMP DIAGNOSTIC (sem65 trace): cap each (op,id) pair so a polling loop
         // cannot flood the log. opTag: 0=create 1=signal 2=wait 3=poll.
+        // Ids outside [0,255] are bucketed together so that signals carrying an
+        // invalid/garbage id (KE_UNKNOWN_SEMID, 0xFFFFFFFF, large ids) are still
+        // visible instead of being silently dropped.
         bool semTraceBudget(uint32_t id, int opTag)
         {
-            static uint32_t s_counts[4][256] = {};
-            if (opTag < 0 || opTag > 3 || id >= 256u)
+            static uint32_t s_counts[4][257] = {};
+            if (opTag < 0 || opTag > 3)
             {
                 return false;
             }
-            if (s_counts[opTag][id] >= 10u)
+            const uint32_t bucket = id < 256u ? id : 256u;
+            if (s_counts[opTag][bucket] >= 10u)
             {
                 return false;
             }
-            ++s_counts[opTag][id];
+            ++s_counts[opTag][bucket];
             return true;
         }
 

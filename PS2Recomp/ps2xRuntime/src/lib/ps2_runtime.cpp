@@ -1510,6 +1510,31 @@ namespace
     // it there was nothing left that could signal it. Release only when thread 1
     // reaches the sem-65 wait instead, so the stage chain is still parked and
     // has a live semaphore to complete.
+    // TEMP DIAGNOSTIC (sem65 trace): the staged-init stage handlers live in the
+    // 0x119xxx..0x11Cxxx family and each acquire sem 60 through FUN_00119440.
+    // Record which of them actually execute, and in what order, so the frontier
+    // where the stage machine stops is visible.
+    void watchStageRegion(uint32_t targetPc, uint32_t sourcePc)
+    {
+        static uint32_t s_lines = 0u;
+        if (targetPc < 0x119000u || targetPc >= 0x11C800u)
+        {
+            return;
+        }
+        if (s_lines >= 1200u)
+        {
+            if (s_lines == 1200u)
+            {
+                ++s_lines;
+                std::cerr << "[STAGE] (cap reached)" << std::endl;
+            }
+            return;
+        }
+        ++s_lines;
+        std::cerr << "[STAGE] -> 0x" << std::hex << targetPc
+                  << " from 0x" << sourcePc << std::dec << std::endl;
+    }
+
     void releaseStagedInitGates(uint8_t *rdram, uint32_t targetPc, uint32_t sourcePc)
     {
         static bool s_released = false;
@@ -1547,6 +1572,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     watchAssetInitBranch(targetPc, sourcePc, fallthroughPc, kind, debugName, ctx);
+    watchStageRegion(targetPc, sourcePc);
     releaseStagedInitGates(rdram, targetPc, sourcePc);
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 

@@ -16,6 +16,65 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 12h - the stage machine stops after its first handler
+
+Added a TEMP `[STAGE]` probe in `dispatchGuestBranch` that logs every dispatch whose target is in the
+stage region `0x119000..0x11C800`, and widened `semTraceBudget` so signals carrying out-of-range ids
+(`>= 256`, `0xFFFFFFFF`) are visible instead of being dropped. Result: **no 65 signal, and no
+out-of-range signal at all** - so the "wrong id" escape hatch is closed too.
+
+**Only 7 stage-region entries happen in the whole run:**
+
+    L10390  [STAGE] -> 0x119800 from 0x1662f8     (during boot)
+    L12233  [STAGE] -> 0x119a68 from 0x1664f8     <- the one and only stage handler
+    L12234  [STAGE] -> 0x119440 from 0x119abc     acquire sem 60 (FUN_00119440)
+    L12235  [STAGE] -> 0x1193e8 from 0x119448     create sem 60
+    L12238  [STAGE] -> 0x119568 from 0x119ad4
+    L12272  [STAGE] -> 0x119770 from 0x119adc
+    L12295  [STAGE] -> 0x119470 from 0x119c44     signal helper
+    L12296  [SEM] signal id=60
+    L12298  [SEM] wait id=65   -> blocks forever
+
+**The dispatcher is `FUN_001664D0`** (`0x1664d0-0x1667d8`, the function containing `0x1664f8`). It is
+a per-frame update loop with a **6-slot loop** (`0x1667a4: sltiu v0, s1, 0x6; bnez -> 0x166708`) -
+the six slots matching the six ready gates (`0x394378..0x3943C8`) exactly. It calls the staged-init
+handlers in order:
+
+    0x1664f8 / 0x16650c  jal func_119A68     <- the only one that ever runs
+    0x16652c..0x166564   jal func_119E70
+    0x1665a4 / 0x1665b8  jal func_11A0B0
+    0x1665c4 / 0x1665cc  jal func_119CF8
+    plus func_1013B0, func_1013E0, func_1654D0, func_1654F0, func_165460, func_10B7E8,
+    func_10B3E0, func_1013C0, func_196058, func_196460, func_19A080
+
+**So the machine stops inside its very first handler.** `func_119A68` creates a fresh sem, arms its
+stage descriptor, runs the sub-stages, signals the sem-60 mutex and then blocks in `wait 65` - which
+means the dispatcher never reaches `0x1665c4` (`func_119CF8`) or any later slot in that frame or any
+later frame.
+
+Exactly what the handler does, verified from `entry_00119b9c`:
+
+    0x119bd8  jal func_1146E0            CreateSema(a0 = sp+0x10, init=0, max=1)
+    0x119be0  s0 = v0                   -> id 65
+    0x119be4  sw s2, 0x4(s1)
+    0x119bec  sw s0, 0x0(s1)            -> sem id published at descriptor+0
+    0x119bf0  sw 4,  0x8(s1)
+    0x119c18  jal func_118ED0           sceSifCallRpc(cd=0x3E1F40, ..., endfunc=t3=0, endparam=[sp]=0)
+    0x119c44  jal func_119470           signal sem 60
+    0x119c64  jal func_114720           WaitSema(sem 65)  -> blocks
+    0x119c6c  jal func_1146F0           DeleteSema(sem 65)
+
+**The stage workers cannot be the signaller.** All five semaphore wrappers were scanned in the worker
+cluster `0x198000..0x19A000`: `func_114700` (SignalSema), `func_114710` (iSignalSema),
+`func_117F10`, `func_114720` (WaitSema) and `func_1146F0` (DeleteSema) have **zero** call sites
+there. The workers only spin on the six gate words and exit - they never touch a semaphore.
+
+By contrast the stage cluster `0x118000..0x11C800` is dense: 14 SignalSema sites, 39 WaitSema sites,
+72 DeleteSema sites - i.e. every stage handler follows the same
+`create -> arm -> work -> signal mutex -> wait own sem -> delete own sem` shape. The signaller of
+sem 65 must therefore be **another member of this 26-function stage-handler family** (or an interrupt
+path), and none of them ever execute because the first handler blocks.
+
 ## Session 12g - sem-65 producer located: the peer that waits on sem 60 is never scheduled
 
 Probe added (`RPC.cpp`, TEMP): log every `SifCallRpc` completion with sid/rpc/mode/endFunc/endParam/sema.
