@@ -15,8 +15,11 @@
 
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
-> **Last merged:** 2026-10-17 (session 6) — **VU1/VIF1 STALL ROOT-CAUSED AND FIXED; THE GUEST NOW BUILDS AND RUNS REAL RENDER WORK.** `Unit::reset()` zeroed the VU *execution clock* while the runtime's VU clock kept counting, so the next lazy drain (`Runtime::advanceUnit`) tried to run the unit forward by ~1.2e8 cycles **in one call** — and with an unfinished microprogram (all-zero VU1 code) that burned the EE thread for minutes with no output at all. Fixed by preserving the cycle time base across `reset()`, plus a permanent `[VU-clock]` resync guard. The guest now parses its whole 718 KB VIF1 blob, follows real DMA chains, **uploads its VU1 microprogram** (`[VIF1-mpg]` x7), **runs it to completion** (`[VU-wait] vu1 returned after spins=1 status=0`), submits real GS DIRECT packets, and finally settles **idle in an async invocation at `pc=0x11f650`** (stack `0x1f07ff0`, `ra=0`).
-> **Repo HEAD == `origin/master` == `37cc40d`** (DBCMAN version answer) plus this session's runtime fix (`vu_unit.cpp`, `vu_runtime.cpp`, `ps2_runtime.cpp` diagnostics) committed with this doc update.
+> **Last merged:** 2026-10-17 (session 7) — **RECOMPILER DISCOVERY GAP CLOSED; THE "IDLE" STATE IS GONE AND THE GUEST RUNS A FULL BOOT WORKLOAD.** The "guest idle at `0x11f650`" state was never a wait — it was a **missing recompiled function**. `FUN_001a8f80` is a trampoline calling a function pointer (`if (v0) v0(0x1A8CE8, 0)`); its target `0x1b1948` was never emitted, so `reportMissingFunction` **retired the main thread** (`id=1`, `status=5` Dormant, `wait=None`, all semaphores `waiters=0`). Compiling that whole class (function-pointer tables) — and the ~530 similar gaps — via the designed `[general].entry_points` config mechanism (411 targets → **358 new functions**, additive: 53222/53222 existing files reproduced by name) immediately unblocked boot.
+> **The checked-in runner was also stale:** it predated the runtime's VU0 **macro-mode** support — `beforeVu0Access`/`afterVu0Access` (VU0 state import/export + pipeline interlock, `Runtime::beforeAccess`/`afterAccess`) are emitted by the current recompiler into **1515 files** and were absent from **every** checked-in file. The tree was regenerated end-to-end from the current tool and rebuilt, so VU0 macro-mode syncing is now live.
+> **Result (run38, 30s):** `[guest-branch:missing-target]` 1→**0**, `[EE-dormant-missing]` 1→**0**, `[EE-hb] IDLE` → **0**; the main thread executes ~6.5M calls of real boot work (`[VIF1-mpg]` 7→**49**, `mscal` 12→**48**, `[VIF1-direct]` 66) and then reaches a *legitimate* game **fatal-halt loop** at `0x1b6b80`.
+> **New blocker:** `SJX_Init` cannot allocate IOP heap — the guest prints `E0100301: SJX_Init can't allocate IOP Heap.` (`0x3C62F8`; also `E0100302 ...can't create DTX.` at `0x3C6328`) and spins in `for(;;);`. It needs a real IOP **RPC reply** for `func_11CA18`'s allocation call (through `func_118628`, the SIF RPC caller) — same family as the DBCMAN/version handshakes.
+> **Repo HEAD == `origin/master` == `81488a7`** (VU clock fix). The session-7 regeneration is **local only**: `data/*`, `ps2xRuntime/src/runner` and `ps2_recompiled_functions.h` are **gitignored** → see the *Reproducibility gap*.
 
 ## Objective
 - Port **Tales of Legendia** (SLUS_212.01, NTSC-U) to PC via PS2Recomp.
@@ -28,7 +31,8 @@
 - ~~9-entry retry loop `entry_00166360 → FUN_0011d6b8` around the module **version handshake**.~~ **RESOLVED & COMMITTED** (session 5, in `4fc7fa7`).
 - ~~Deci2 / `dbcman` check-version reply (`sid 0x80001300`, `rpc 0x80001363` must be BCD `0x0310`).~~ **RESOLVED & COMMITTED** (`37cc40d`, answered locally in `SIF.cpp`).
 - ~~VU1/VIF1 deadlock: a parked microprogram froze the EE thread (and, after bounding it, a VU *clock desync* burned minutes silently).~~ **RESOLVED & COMMITTED** (session 6: cycle time base preserved across `Unit::reset()` + `[VU-clock]` guard).
-- **Current goal:** work out what the async invocation at `0x11f650` is waiting for (the guest has no runnable thread, so an emulated interrupt/event is not being delivered) and reach visible drawing.
+- ~~Guest "idle" after boot (async invocation looping at `0x11f650`): a main thread **retired** by an indirect call to a function the recompiler never emitted.~~ **RESOLVED** (session 7: regenerated with `entry_points` — 358 functions added, VU0 macro-mode hooks restored).
+- **Current goal:** answer the IOP RPC that `SJX_Init` needs (IOP heap allocation) so boot leaves the `E0100301` fatal halt at `0x1b6b80`, then reach visible drawing. In parallel: make the discovery repeatable in code (analyzer discovery pass — *Reproducibility gap*).
 
 ## Requirements (constraints on every fix)
 - **Incremental builds only:** `cmake --build PS2Recomp\out\build` (vcvars64-wrapped). Never clean flags.
@@ -74,18 +78,16 @@ Ordered by the guest's actual boot sequence:
 **Run evidence (run18, 50s, before):** `BIND=7 CALL=5`; textures loaded; main thread cycling the retry loop.
 **Run evidence (run17, 50s, before the SMFLG fix):** `BIND=3 CALL=2`; main thread stuck spinning at `pc=0x1662d0`/`0x11ddd0` on `sceSifGetReg(4)`.
 
-## Open Decision (new workstream — awaiting the user)
-**The repo already contains an IOP HLE service framework that answers exactly this call, but the raw SIF path bypasses it.**
+## Open Decision (session 7 - awaiting the user)
+**The guest now halts on a legitimate *game* error: `SJX_Init` cannot allocate IOP heap.** `func_11CA18(0x8D0)` is the game's own SIF-RPC exchange (arg word `0x8D0` at `0x3E20C0`, reply at `0x3E2080`, driven by `func_118628`); our emulated IOP returns 0, so the guest prints `E0100301: SJX_Init can't allocate IOP Heap.` (`0x3C62F8`) and enters `for(;;);` at `0x1b6b80`. A second message follows on the alternate path: `E0100302: SJX_Init can't create DTX.` (`0x3C6328`).
 
-- `PS2Recomp/ps2xIOP` implements HLE IOP modules as `IopService`s with a SID table: **`dbcman.cpp` serves `sid 0x80001300`** and handles **`kRpcCheckVersion = 0x80001363`** by writing **`0x0310` (BCD "3.10") ×4 words** into `request.receive` — precisely what `libdbc` (`libdbc.a = 3.10`) expects. Also present: `mcserv` (`IOP_SID_MCSERV`), `libsd`.
-- The wiring exists for the **syscall** RPC path: `Kernel/Syscalls/RPC.cpp` (L533-556) builds a `ps2x::iop::RpcRequest` and calls `PS2IopTransport::handleRpc` → `PS2Runtime::handleIopRpc` → `IopSubsystem::handleRpc`, which routes by `request.sid` to a loaded HLE service (`iop_subsystem.cpp` L202-213, `canBindRpc` L193, routes built by `rebuildRoutes()` from the module manager). Tests exist: `ps2xTest/src/ps2_sif_rpc_tests.cpp` (`loadIopModule("rom0:DBCMAN")` → `sid 0x80001300`) and `ps2xIOP/tests/iop_compatibility_tests.cpp`.
-- ToL does **not** use those syscalls: its libkernel SIFRPC runs as recompiled guest code and reaches the runtime only through the **raw SIF DMA stub** (`SIF.cpp` `sceSifSetDma` → `emulateIopSifRpc`), which answers everything itself and never consults the HLE framework.
+Two workstreams compete for priority (this is the decision):
+- **(i) Answer the IOP heap-allocation RPC** - advances the port toward drawing. Track the `client -> SID` binding from the BIND packets the responder already parses (`SIF.cpp`), then for the allocation call return a **non-zero IOP address** in the 4-byte receive buffer (`0x3E2080`) when the arg word is `0x8D0`; then handle the follow-up `E0100302` gate. *Recommended first.*
+- **(ii) Analyzer discovery pass** - makes session 7 durable: the 411 `entry_points` live in **gitignored** `data/config.toml`, so auto-discovering function-pointer targets in `ps2xAnalyzer`/`ps2xRecomp` is what makes the fix reproducible (and finds future gaps automatically).
 
-Options for the user:
-- **(A) Wire the raw SIF RPC path into the existing HLE framework** (architecturally intended; serves dbcman/mcserv/libsd and every future service). Requires: (i) track `client → sid` from the BIND packets we already parse; (ii) obtain the send-buffer EE address for the CALL (not in the CALL packet — it is the *preceding* data DMA descriptor in the same `sceSifSetDma` chain, i.e. `pending[i-1]`); (iii) route the CALL through `PS2IopTransport::handleRpc` and copy `result.resultAddress` into `receive`; (iv) load the HLE modules named by the Reboot-IOP module list (`runtime->loadIopModule(path)` per entry) so `rebuildRoutes()` has routes. Then drop the local `"3000"` heuristic (or keep it as the fallback for unrouted services).
-- **(B) Quick targeted patch in `SIF.cpp`** now: for `sid 0x80001300` / `rpc 0x80001363`, write `0x0310` into the receive buffer (duplicating the HLE constant) — unblocks this handshake immediately, defers (A).
-- **(C) Commit/push the verified session-5 fix first**, then start (A) as a separate workstream.
+Architectural note carried over from session 6: the repo already contains an **IOP HLE service framework** (`PS2Recomp/ps2xIOP` - `dbcman` serves `sid 0x80001300`, `mcserv`, `libsd`), wired only into the runtime's **syscall** RPC path (`Kernel/Syscalls/RPC.cpp` -> `PS2IopTransport::handleRpc` -> `IopSubsystem::handleRpc`). ToL reaches the runtime only through the **raw SIF DMA** path (`SIF.cpp` `sceSifSetDma` -> `emulateIopSifRpc`), which answers everything itself. If/when services multiply, wiring the raw path into that framework is the intended direction; for now the quickest correct unblock is to answer the allocation locally, as was done for the DBCMAN version handshake.
 
+The session-6 Deci2/`dbcman` decision is **closed**: the local answer (`37cc40d`) holds in every run since.
 ## Resolved Root Causes (committed `ad27d73` + cleanup `33ccc7e`, both PUSHED)
 - **Black screen:** the guest **never programs GS video mode** — every instrumented guest-write path ran **zero times** (`[MMIO]` GS-priv = 0, `[GSFE]` = 0, `WriteRegisterRaw` = 0, GIF AD tag = 0, `SetGsCrt` syscall = 0). Fix: BIOS-like CRT seed in `syncCoreSubsystems()` — `ps2_syscalls::configureGsCrt(m_gs(), 1u, 2u, 0u)` gated on `smode1 == 0` → `smode1=0x4101`, `smode2=0x1`, `pmode |= EN1`. Verified: `Unknown video format.` 3780→0.
 - **First-present abort:** Debug ⇒ Granite `VULKAN_DEBUG` ⇒ `VK_ASSERT` ⇒ `abort()` at `command_buffer.cpp:464` (legacy-layout lint). Offender: `gs_gl_interop.cpp` `Slot::copy()` release barrier `SHADER_READ_ONLY_OPTIMAL` → fixed to `VK_IMAGE_LAYOUT_GENERAL`. Verified: `[ERROR]=0`, survived 95s, per-frame interop copies.
@@ -126,7 +128,12 @@ Options for the user:
 - [x] IOP-boot (SMFLG `0x40000`) emulated — guest leaves the SIF boot spin (uncommitted)
 - [x] Guest loads real texture assets (640x512, 512x128)
 - [x] Module-version handshake answered (`rpc 0xff` → `"3000"`) — 9-entry retry loop cleared; 11× 512-byte transfers run (uncommitted)
-- [ ] Deci2 / `dbcman` check-version answered (`sid 0x80001300`, `rpc 0x80001363` → `0x0310`) — **CURRENT BLOCKER**
+- [x] Deci2 / `dbcman` check-version answered (`37cc40d`) — verified: `version mismatch` = 0 ever since
+- [x] Recompiler discovery gap closed for the observed class (`entry_points`, 411 targets -> 358 functions) — local regeneration (session 7)
+- [x] Stale runner regenerated from the current tool (VU0 macro-mode `beforeVu0Access`/`afterVu0Access` restored, 1515 files) — local (session 7)
+- [x] Guest main thread no longer retired/idle — run38: 0 missing targets, 0 dormant, ~6.5M calls (session 7)
+- [ ] **CURRENT BLOCKER:** `SJX_Init` can't allocate IOP heap -> `E0100301`, fatal `for(;;);` at `0x1b6b80` (session 7)
+- [ ] **Reproducibility gap:** the fix lives in gitignored `data/config.toml` + the generated runner; needs the analyzer discovery pass to be durable
 - [ ] Visual confirmation of rendered content on screen (inline PowerShell `CopyFromScreen` + vision analysis)
 - [ ] Commit + push the uncommitted `SIF.cpp` fixes + this doc
 
@@ -191,7 +198,8 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 | `WaitSema` block after first CALL | game `sceSifCallRpc` (`FUN_00118628`) | runtime never answered `cid 0x8000000A`; main thread blocked in `WaitSema` | Runtime C++ `SIF.cpp` `emulateIopSifRpc` CALL branch posts RPC END reply | Verified: CALL answered; thread resumes | **RESOLVED** (uncommitted) |
 | retry loop `pc=0x11d6b8` (9-entry) | game RPC wrapper `FUN_0011d6b8` via `entry_00166360` | module **version handshake**: `FUN_0011cfe0` = `memcmp(reply,"3000",4)` then `memcmp(reply,"....",4)`, else `memcmp("3000","....")>0` = always `1`; the runtime's zero reply failed both equalities → `FUN_0011d6b8` returned `0xFFFEFFFC` → retry | Runtime C++ `SIF.cpp`: answer the version query (`rpc 0xff`, no send, ≥4-byte reply) with `0x30303033` (`"3000"`) | Verified (run19): loop gone; 11× 512-byte transfers run | **RESOLVED** (uncommitted, session 5) |
 | stall after `sid=0x80001300` call (**CURRENT**) | Deci2 / `dbcman.irx` service (`libdbc`) | guest binds `sid 0x80001300`, calls `rpc 0x80001363` (0x90/0x90, buf `0x3dbc40`); our zero reply → guest logs `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 0.00]`; then no heartbeats (blocked) | Either wire the raw SIF path to the existing `ps2xIOP` HLE `dbcman` service (`0x0310`), or answer `0x0310` locally (see *Open Decision*) | — | **OPEN** |
-
+| guest **retired**, no idle thread | EE scheduler / recompiler output | `FUN_001a8f80` indirect call -> `0x1b1948` never emitted -> `reportMissingFunction` retires thread 1 (`status=5` Dormant, `wait=None`, all sems `waiters=0`) | Regenerate with `[general].entry_points` for the 411 discovered targets (+358 functions) | Verified (run38): missing-target 1->0, dormant 1->0 | **RESOLVED** (session 7, local regeneration) |
+| fatal `for(;;);` at `0x1b6b80` | game `SJX_Init` / IOP heap allocation RPC | `func_11CA18(0x8D0)` -> `func_118628` RPC returns 0 -> guest prints `E0100301: SJX_Init can't allocate IOP Heap.` then spins | Answer the IOP allocation RPC on the SIF RPC path (see *Open Decision (session 7)*) | — | **OPEN** |
 ## Resolved Stubs
 | Address | Handler | Binding Method | Status | Notes |
 | ------- | ------- | -------------- | ------ | ----- |
@@ -233,7 +241,13 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - [x] **SIFCMD init-handshake spin (`sregs[0]`)**: RESOLVED (`95120b1`, pushed).
 - [x] **RPC BIND retry loop + first CALL block + SIF boot SMFLG spin**: RESOLVED (uncommitted).
 - [x] **9-entry retry loop (module version handshake)**: RESOLVED (uncommitted, session 5) — reply `"3000"` to `rpc 0xff`.
-- [ ] **Deci2 / `dbcman` check-version (current blocker)**: guest expects `0x0310` from `sid 0x80001300` / `rpc 0x80001363`; the reply is zero → `libdbc: Module version mismatch`. See *Open Decision*.
+- [x] **Deci2 / `dbcman` check-version**: RESOLVED (`37cc40d`).
+- [x] **Guest "idle" after boot**: RESOLVED (session 7 — it was a recompiler discovery gap; 358 functions added).
+- [x] **Stale generated runner (no VU0 macro-mode hooks)**: RESOLVED (session 7 — regenerated from the current tool).
+- [ ] **CURRENT BLOCKER — `SJX_Init` IOP-heap allocation**: `E0100301: SJX_Init can't allocate IOP Heap.` (`0x3C62F8`); `func_11CA18(0x8D0)` returns 0 and the guest halts at `0x1b6b80`. Needs a real RPC reply (see *Open Decision (session 7)*).
+- [ ] **Reproducibility gap**: the discovery (411 `entry_points`) lives in **gitignored** `data/config.toml`, and the regenerated runner/headers are gitignored build artifacts -> the fix is not versioned. Durable fix: the **analyzer discovery pass**.
+- [ ] **Candidate-filter false positives**: the skip-aware code bitmap + neighbour/boundary rule still admits zero-filled *data* addresses that look like `nop` padding (`entry_3bdc88` 1295 unhandled-instruction errors, `entry_3cd4c0` 650, `entry_3c7780` 527, `entry_3cb4b0` 501, `entry_3b75e0` 462, `entry_3c5420` 352, `entry_3c3680` 248, ...). Dead code today; exclude targets inside `skip` regions before making discovery default.
+- [ ] **`[guest-branch:missing-target]` fires once per run** (each miss retires the thread) — gap enumeration must be static, not repeated runs.
 - [ ] **Version-query heuristic not sid-scoped**: `SIF.cpp` answers any `rpc 0xff`/no-send/≥4-byte with `"3000"`; only `sid 0x80000006` has been observed. Scope it to the bound SID when routing lands.
 - [ ] **Visual confirmation pending**: `[GS] present mode` logged (≥1 Present) but on-screen content not yet confirmed.
 - [ ] Packed GIF descriptor `0x0F` (A+D pair) unhandled in `gs_frontend.cpp` (latent gap).
@@ -254,41 +268,34 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 
 ## Work State
 
-### Completed
-- Repo `HEAD == origin/master == 95120b1` (pushed): commits `ad27d73`, `33ccc7e`, `95120b1`.
-- **Committed in `95120b1`:** (A) SetupThread returns stack top; (B) async-callback stacks grow up; SIFCMD init-handshake emulation; plus the temp diagnostics.
-- **Uncommitted (`SIF.cpp`), session 4:**
-  1. **BIND reply psize fix** — `reply[0]` = real packet size in bytes (`0x30`), not `0x20`; `_SifCmdIntHandler` copies `ceil(psize/16)` quadwords, so a short psize made the END handler read stale stack and the bind branch never fired. BIND count **65 → 2**.
-  2. **RPC CALL branch in `emulateIopSifRpc`** — decode `rpc_number/send_size/receive/recv_size/rmode/server`, zero-fill `receive`, post the END reply (`reply[0]=0x30`, `cid=0x80000008`, request cid `0x8000000A`, rec_id, pkt_addr, rpc_id, client, server). Unblocks the first `sceSifCallRpc`.
-  3. **Reboot-IOP handling** — `kSifCmdRebootIop = 0x80000003`: latch `g_sifIopBooted`, `g_sifRegs[kSifRegSmflg] |= kSifSmflgBootedMask (0x00070000)`; `sceSifGetReg` ORs the boot mask into reg-4 reads. Unblocks the `FUN_0011ddc0` SMFLG spin.
-- **Uncommitted (`SIF.cpp`), session 5:**
-  4. **Module-version handshake** — `kSifIopModuleVersion = 0x30303033` (`"3000"`), `kSifRpcGetVersion = 0xFF`: an `rpc 0xff` CALL with `send_size == 0` and `recv_size >= 4` gets the version written into its receive buffer. Clears the 9-entry retry loop (`entry_00166360`).
-- **Verified 50s runs:**
-  - run18 (session 4): `BIND=7 CALL=5`; textures loaded `[ID 5] 640x512 R8G8B8A8`, `[ID 6] 512x128`; main thread cycling the 9-entry retry loop.
-  - run19 (session 5): `BIND=8 CALL=18`; retry loop gone; **11×** `rpc 0x0 / send 0x200 / recv 0x8` transfers; then `sid 0x80001300` bind + `rpc 0x80001363` call → `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 0.00]`; no heartbeats (blocked).
-- (Prior sessions, pushed: GS CRT seed, interop layout fix, write128 GS-priv routing, GS diagnostic cleanup; boot-stall root causes A/B; SIFCMD handshake.)
+### Completed (session 7 - discovery gap + stale runner)
+- **Root-caused the "idle" state**: not a blocked wait - thread 1 was **retired** by `reportMissingFunction` on an indirect call (`FUN_001a8f80` -> pointer `0x1b1948`, `ra=0x1a8f94`). `[EE-hb] IDLE` reported `id=1 status=5 wait=None` and **all semaphores `waiters=0`**.
+- **Scale measured**: function-pointer tables at `0x3A6A98...`/`0x3AC6C0...` (shape `p,p,p,0,...`, preceded by data pointers); whole-image scan found **530** distinct code-range targets living in data with no `map.csv` start and no runner file (461 gap targets + 69 mid-function).
+- **Discovery implemented + dry-run**: appended **411** verified targets to `[general].entry_points` in `data/config.toml` (the designed config mechanism - it also covers targets *inside* decoded functions via resume-entry wrappers; see the comment at `ps2_recompiler.cpp:1917-1920`). `ps2_recomp.exe data\config.toml` -> exit 0, `synthesized 358 standalone configured guest entry point(s)`, **53580** `.cpp`. Name diff vs the checked-in runner: shared 53222, only-in-new **358**, only-in-runner **0** -> **purely additive by name**.
+- **Tool-drift test (decisive)**: pristine config regenerated into `data/output_base` -> exit 0, 53222 files, name set identical (0 diff) but **1627/53222 size mismatches**. Characterised with feature markers: `beforeVu0Access` present in **1515** baseline files vs **0** checked-in; instruction comments identical (53164 both) -> the checked-in runner came from an **older** recompiler than the tree's: it was **stale**, not the tool.
+- **Full adopt (user's choice)**: `data/output/*.cpp` -> `PS2Recomp/ps2xRuntime/src/runner/`, `ps2_recompiled_functions.h`/`ps2_recompiled_stubs.h` -> `.../include/`; the hand-written `talesOfLegendiaGhostLeaf_0x1b1948` override in `game_overrides.cpp` was reverted (the regenerated tree contains the real `entry_1b1948_0x1b1960.cpp`). Incremental build: exit 0 (unity build folded the 358 new + ~1627 changed files).
+- **Verified (run38, 30s, `%TEMP%\ps2_run38.err`, 11692 lines)**: `guest-branch:missing-target` **0**, `EE-dormant-missing` **0**, `IDLE` **0**, `status=5` **0**; guest executes ~6.5M calls; `VIF1-mpg` **49** (was 7), `mscal` **48** (was 12), `VIF1-direct` 66, `VIF1] done` 14, `DMA-chain-done` 8, `VU-clock` 0.
+- **New blocker characterised**: guest halts in `FUN_001b6ae8` at `0x1b6b80` - `func_11CA18(0x8D0)` (IOP heap alloc via `func_118628` RPC) returned 0 -> `func_1173C8(0x3C62F8)` prints **`E0100301: SJX_Init can't allocate IOP Heap.`** -> `for(;;);` at `0x1b6b80` (`b . -6` + `eeCheckpointDue`).
+- (Earlier sessions, pushed: `81488a7` VU clock desync; `37cc40d` DBCMAN version; `4fc7fa7` module version; `95120b1` boot-stall A/B + SIFCMD; `ad27d73` CRT seed + interop; `33ccc7e` cleanup.)
 
 ### Active
-- **Awaiting the user's decision on the `dbcman` workstream** (Open Decision (A)/(B)/(C) above). Meanwhile the verified session-5 fix is ready to commit.
-- Root cause of the cleared loop is fully understood (see SIF/RPC step 6) and the remaining stall is characterised (step 7).
+- **Awaiting a priority decision**: (i) implement the IOP **heap-allocation RPC** answer (advances boot) vs (ii) implement the **analyzer discovery pass** (makes the session-7 fix durable/automatic). Recommendation: (i) first, then (ii).
 
 ### Blocked
-- (none hard — new workstream needs a decision)
+- (none hard - the `SJX_Init` RPC needs the IOP service semantics; see *Open Decision (session 7)*)
 
 ### Working tree
-- `M PS2Recomp/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp` (psize fix + CALL reply + Reboot-IOP + module-version handshake + diagnostics)
-- `M PS2_PROJECT_STATE.md` (this update)
-- untracked, **not mine — leave alone**: `.opencode/opencode.json.backup`, `PS2Recomp/run_build.bat`, `scripts/`
-
+- Tracked changes: `M PS2Recomp/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp` (temp `[EE-thread]`/`[EE-sem]`/`[EE-evf]` dumps - strip before the final commit), `M PS2_PROJECT_STATE.md` (this update).
+- Gitignored/local (not committable): `data/config.toml` (411 `entry_points`), the regenerated `PS2Recomp/ps2xRuntime/src/runner/` + `include/ps2_recompiled_functions.h`, dry-run dirs `data/output` + `data/output_base`.
+- untracked, **not mine - leave alone**: `.opencode/opencode.json.openchamber.backup`, `PS2Recomp/run_build.bat`, `scripts/`.
 ## Next Move (ordered)
-1. **Decision needed (user):** wire the raw SIF RPC path to the existing `ps2xIOP` HLE services (Open Decision (A)), or answer `sid 0x80001300`/`rpc 0x80001363` with `0x0310` locally (B). Either way, the Deci2/`dbcman` check-version must return `0x0310`.
-2. **Commit + push** the verified `SIF.cpp` fixes (psize + CALL + Reboot-IOP + version handshake) and this doc — the retry-loop fix is a milestone and must not be lost.
-3. Implement the chosen option; rebuild (`taskkill` first) and run ~50s; confirm the guest's `libdbc` no longer reports a mismatch and the main thread advances past Deci2.
-4. Triage subsequent stalls (expect further service calls; each needs its real reply payload). Watch for `[EE-hb]` heartbeats to distinguish blocked vs spinning.
-5. Once drawing is reached, strip temp diagnostics (`EeScheduler.cpp`: `[EE-boot]`/`[EE-dormant]`/`[EE-dormant-missing]`/`[EE-exit]`/`[EE-startThread]`/dispatch ring/`[EE-hb]`/`formatHexWords`/`[IRQ-dmac]`; `Dispatcher.cpp`: `[EE-syscall]`; `SIF.cpp`: `[SIF-SetDma]`/`dumpSifCmdHandlersOnce`/pre-post bind-call logs), keep `[SIF-iop]` + seed/present-mode logs; rebuild; ~50s run.
-6. Verify displayed content via inline PowerShell screen capture (`CopyFromScreen` on the window rect) + vision analysis.
-7. Latent gaps for later: packed GIF descriptor `0x0F` (A+D pair) in `gs_frontend.cpp`; guest main stack and async-callback pool share `[0x1F00000, PS2_RAM_SIZE)` (now growing toward each other); sid-scope the version-query heuristic.
-
+1. **Decision needed (user):** priority - (i) answer the `SJX_Init` IOP-heap allocation RPC (advances boot toward drawing), or (ii) implement the analyzer discovery pass (makes the discovery durable). *Recommended: (i), then (ii).*
+2. **Implement the IOP heap-allocation RPC**: bind the client first (to learn the SID), then have the SIF responder (`SIF.cpp` `emulateIopSifRpc`) or the `ps2xIOP` HLE path return a **non-zero IOP address** in the 4-byte receive buffer (`0x3E2080`) for the allocation request whose arg word is `0x8D0`. Then watch the guest's next gate (`E0100302 ...can't create DTX.`, `0x3C6328`).
+3. Rebuild (taskkill first) and run 30s; confirm `E0100301` is gone and the thread keeps making progress (`[EE-hb]` heartbeats, pc moving past `0x1b6b80`).
+4. **Analyzer discovery pass** (durable fix): in `ps2xAnalyzer`/`ps2xRecomp`, scan the image's data words for pointers into the code range that are not `map.csv` starts, filter with the validated rule (skip-aware code bitmap; `[0x100000,0x3DAF80)`; exclude words *inside* `skip` regions; require a compiled-function pointer within +/-0x20 bytes **and** a `nop`/`j`/`jal`/`jr` boundary at `T-4`/`T-8`), and emit them as `entry_points` (or directly as synthesized functions). Target: the 411 verified targets minus the ~12 known data false positives.
+5. Strip the session-7 temp diagnostics (`EeScheduler.cpp` `[EE-thread]`/`[EE-sem]`/`[EE-evf]`) once the SJX blocker is cleared; keep `[EE-wd]`/`[EE-hb]`/`[VU-*]`/`[SIF-iop]` until drawing.
+6. Verify displayed content via inline PowerShell screen capture (`CopyFromScreen`) + vision analysis.
+7. Cleanup: delete the dry-run dirs `data/output` + `data/output_base` once the adopt is confirmed; keep the pristine config backup at `%TEMP%\opencode\config.toml.bak`.
 ## Relevant Files
 | File | Why it matters |
 | ---- | -------------- |
@@ -328,6 +335,18 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 | `data\SLUS_212.01` | ELF32 source of the version literals (see Important Context) |
 | `.opencode\skills\ps2-recomp\resources\09-ps2tek.md` | SIF spec — `SifRpcRendPkt` L4556-4569, `SifCmd` Init L4537-4541, SMFLG bit meanings |
 | Run logs | `%TEMP%\ps2_run17.err` (pre-SMFLG), `%TEMP%\ps2_run18.err` (textures + retry loop), `%TEMP%\ps2_run19.err` (loop cleared, `dbcman` mismatch) |
+| `PS2Recomp\ps2xRecomp\src\lib\ps2_recompiler.cpp` | `parseFunctionSelector` (L237), `discoverAdditionalEntryPoints` (L1898), `m_entryPointHintStarts` (L852/L899), synthesis comment (L1917-1920) - the `entry_points` mechanism used for this fix |
+| `PS2Recomp\ps2xRecomp\src\lib\config_manager.cpp` | `[general].entry_points` parsing (L81-100) + emission into the regenerated config (L304) |
+| `PS2Recomp\ps2xAnalyzer\src\elf_analyzer.cpp` | `importGhidraMap` (L1770) appends unknown map starts - the natural home for the discovery pass |
+| `PS2Recomp\ps2xRecomp\src\lib\instruction_translator.cpp` / `vu_translator.cpp` | VU0 access-hook emission (`beforeVu0Access`/`afterVu0Access`; L213-219 / L21) - the feature the stale runner lacked |
+| `PS2Recomp\ps2xRuntime\src\lib\vu\vu_runtime.cpp` | `Runtime::beforeAccess`/`afterAccess` (L315/L394) - VU0 macro-mode import/export + pipeline interlock |
+| `PS2Recomp\ps2xRuntime\src\runner\FUN_001a8f80_0x1a8f80.cpp` | The indirect-call trampoline (`if (v0) v0(0x1A8CE8, 0)`) whose missing target retired the main thread |
+| `PS2Recomp\ps2xRuntime\src\runner\entry_1b1948_0x1b1960.cpp` | The discovered target that ended the retirement; naming is `entry_<entryAddr>_0x<boundingEnd>` |
+| `PS2Recomp\ps2xRuntime\src\runner\FUN_001b6ae8_0x1b6ae8.cpp` | **Current blocker**: the SJX init function; `label_1b6b80` is the `for(;;);` fatal halt after `func_11CA18`/`func_1173C8` |
+| `PS2Recomp\ps2xRuntime\src\runner\FUN_0011ca18_0x11ca18.cpp` | EE-side IOP **heap allocation** wrapper: builds args (`0x8D0` at `0x3E20C0`), calls the SIF RPC caller `func_118628`, returns `*(0x3E2080)` |
+| `PS2Recomp\ps2xRuntime\src\runner\FUN_00166490_0x166490.cpp` | Called from the halt path (`jal func_19A068`) - a 40-byte leaf in the SJX init sequence |
+| `data\SLUS_212.01` @ `0x3C62F8` / `0x3C6328` | The two fatal strings: `E0100301: SJX_Init can't allocate IOP Heap.` / `E0100302: SJX_Init can't create DTX.` |
+| Run logs (session 7) | `%TEMP%\ps2_run38.err` (post-fix: 0 missing targets, SJX halt), `%TEMP%\ps2_recomp.log` (regeneration; 4205 unhandled-instruction errors from the data false positives) |
 
 ## Important Context
 - Build: `cmd /c '"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1 && cmake --build PS2Recomp\out\build 2>&1'` (Ninja, 7 steps). Debug ⇒ Granite `VULKAN_DEBUG` ⇒ `VK_ASSERT` aborts.
@@ -364,6 +383,14 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - **Current diagnostics in tree**: `[EE-wd]` watchdog + `diagStage`/`diagCalls` (`ps2_runtime.cpp`), `[DMA-*]` + `[GIFsubmit]` (`ps2_memory.cpp`), `[VIF1*]`/`[VIF1-progress]`/`[VIF1-direct]` (`ps2_vif1_interpreter.cpp`), `[VU-wait]`/`[VU-stall]`/`[VU-clock]` (`vu_runtime.cpp`), `[SIF-*]` (`SIF.cpp`), `[EE-hb]`/`[EE-syscall]` (`EeScheduler.cpp`/`Dispatcher`). The one-off `[VU-run-probe]`/`[VU-adv-loop]` probes were removed after localising the hang.
 - **No debugger is installed** (`cdb`/`procdump` absent) — in-process instrumentation read from the host thread is the working technique.
 - No issue/PR was provided in this session, so nothing was linked via OpenChamber.
+- **`data/` and the generated runner are gitignored** (`.gitignore:3:/data/*`; `PS2Recomp/.gitignore:21:ps2xRuntime/src/runner`, `:16:ps2xRuntime/include/ps2_recompiled_functions.h`) - `git ls-files` shows **0** tracked files there. The regeneration is a local build artifact; only *code* fixes are versioned.
+- **`entry_points` TOML syntax:** `[general].entry_points = ["0x001AD360", ...]` - a bare literal address or `"name@0xADDR"`. Synthesized entries are named `entry_<entryAddr>` and written as `entry_<entryAddr>_0x<boundingEnd>.cpp` (lowercase hex in the new tool).
+- **Validated discovery rule (411 targets accepted):** build a code bitmap from `map.csv` rows whose start is **not** in the config `skip` list (skip = data); scan 4-aligned ELF dwords **not** in code whose value lies in `[0x100000, 0x3DAF80)` and is neither a `map.csv` start nor an existing runner file; then require **BOTH** (a) a compiled-function pointer within +/-0x20 bytes of the word's location (the word sits inside/near a real pointer table) **AND** (b) a boundary: word at `T-4 == 0` (nop) or word at `T-8` is `j`/`jal` (opcode 2/3) or `jr` (`opcode 0`, funct 8). Counts: 947 candidate words -> 479 selected by both -> 398 staged (411 in the final list).
+- **ELF shape (why the recompiler's `isExecutableAddress` filter is a no-op here):** one `PT_LOAD` `[0]` `off=0x80 vaddr=0x100000 filesz=0x2DAF80 memsz=0x3E9B80 flags=7`; section `[4]` has `flags=0x7` EXEC covering the whole image; the ELF is **stripped** (`.symtab` size 0, 8 sections, `e_shoff=0x2DB070`). Code offset in file = `0x80 + vaddr - 0x100000`.
+- **Build uses unity TUs** (`ps2xRuntime/CMakeFiles/ps2EntryRunner.dir/Unity/unity_N_cxx.cxx.obj`) - the 358 new + ~1627 changed runner files cost ~1685 ninja steps, not ~2000 compiles.
+- **`[guest-branch:missing-target]` fires only for the first miss per run**, and each miss retires the thread - so gap enumeration must be static (or use a skip policy), not repeated runs.
+- **`func_1173C8` is the error printer** (called with an ASCII message address such as `0x3C62F8`); a *legitimate* game halt looks like `nop...nop; b . -6` followed by a `runtime->eeCheckpointDue()` return - look for that shape to tell a game halt from an emulator stall.
+- **Fastest way to name the current blocker:** grep the regenerated runner for the `jal`-target address, then dump the ELF string referenced by the error call (file offset = `0x80 + vaddr - 0x100000`).
 
 ## Learned Patterns (Auto-growing)
 - "Unknown video format." is parallel-gs's GSVIDEO/SMODE1 mode decoder (`gs_renderer.cpp` LOGW), NOT an FMV/asset issue.
@@ -402,8 +429,19 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - **A silent multi-minute burn at 100% CPU with zero output is one long-bounded call, not a loop**: loop counters stay frozen/high while all the work happens inside a single iteration.
 - **"Half-built" guest data can be genuine, not a runtime bug**: the first 718 KB VIF1 blob really was garbage (chain placeholders jumped to address 0, so RDRAM was copied as VIF1 data and misparsed into MSCALs) — yet once the runtime stopped hanging, the guest built correct chains itself.
 - **`[VIF1-progress]` (byte-based) beats `ops & 0xFFFFF`**: the old progress log never fired on a 718 KB blob, hiding "the parser is fine, it just has far to go".
+- **A thread that is "idle" may have been *retired*, not blocked**: `EeScheduler` reports `status=5` (Dormant) with `wait=None` and **every semaphore `waiters=0`** when `reportMissingFunction` retires the caller. Distinguish that from a real wait before hunting for a missing interrupt.
+- **In a statically recompiled binary, an indirect call is a coverage cliff**: a function pointer loaded from data (`if (v0) v0(..., 0)`) can target a function the recompiler never emitted, so the *recompiler* - not the runtime - owns that class of "hang". Scan the image's data for code-range pointers and make them entry points.
+- **A stale generated tree can silently regress a whole feature**: the checked-in runner had **zero** VU0 access hooks while the current recompiler emits them into 1515 files. Before adopting a regeneration, diff *feature markers* (`beforeVu0Access`, comment style, file counts) across both trees - a size diff alone cannot tell you which side is newer.
+- **The longest-lived generated artifact usually predates its tool**: `PS2Recomp/.gitignore` ignores the runner, so checked-in output can drift arbitrarily; regenerate (and re-verify markers) as a distinct step when a milestone lands.
+- **A game "fatal error then spin" is progress, not a stall**: `E0100301: SJX_Init can't allocate IOP Heap.` is the guest *telling you* what it wanted. Read the string (file offset `0x80 + vaddr - 0x100000`) and find the callee that returned 0, rather than chasing the `for(;;);`.
+- **When a component the runtime implements is never called, suspect a stale artifact, not a runtime bug**: `beforeVu0Access`/`afterVu0Access` existed in the runtime and were referenced by tests, yet the checked-in runner never emitted the calls.
+- **Region-based filtering must treat `skip` regions as data**: a zero-filled data region reads as `nop` padding and passes both "near a pointer" and "boundary" rules -> 12 false-positive entries, one of which produced 1295 unhandled-instruction errors. Exclude targets inside `skip` regions before promoting discovery to a default.
 
 ## Session Log
+### 2026-10-17 (session 7 - "idle" root cause was a recompiler discovery gap; runner regenerated; SJX_Init IOP-heap blocker)
+- **Actions**: (1) Read the `[EE-hb] IDLE` dump: main thread `id=1` (entry `0x100008`) at `status=5` (Dormant), `wait=None`, **all eight semaphores `waiters=0`** -> **retired**, not blocked. (2) Traced the retirement to `[guest-branch:missing-target] kind=IndirectCall op=JALR source=0x1a8f8c target=0x1b1948`; `entry_001a8f80` is a trampoline `if (v0) v0(0x1A8CE8, 0)`. (3) Validated a game override for `0x1b1948` (run37: `[game_overrides] ... bound Ghidra-missed leaf 0x1b1948`), which immediately exposed the **next** miss (`0x1ad360`, `ra=0x1a8f94`) -> a whole *class* of gaps, not one function. (4) Measured the class: function-pointer tables at `0x3A6A98...`/`0x3AC6C0...` (shape `p,p,p,0,...`), ~28% of a 29-entry sample absent from `map.csv`; whole-image scan -> **530** distinct un-emitted code-range targets in data. (5) Built the skip-aware candidate rule (code bitmap from non-`skip` `map.csv` starts; 4-aligned dwords in `[0x100000,0x3DAF80)` not in code, not a start, no runner file; **AND** a compiled-function pointer within +/-0x20 **AND** a `nop`/`j`/`jal`/`jr` boundary), yielding **411** targets. (6) Wrote them to `[general].entry_points` (the designed mechanism - it also covers in-function targets via resume-entry wrappers) and dry-regenerated: exit 0, `synthesized 358 ...`, 53580 `.cpp`, name diff **+358 / -0**. (7) Drift test with the pristine config (`data/output_base`): same 53222 names, 1627 size mismatches; feature markers showed the checked-in runner has **0** `beforeVu0Access` files vs **1515** in fresh output -> the checked-in runner was **stale**. (8) The user chose a **full adopt**; copied the regenerated tree over the runner + headers, reverted the now-redundant `0x1b1948` game override, rebuilt (exit 0). (9) **run38 (30s)**: missing-target 1->0, dormant-missing 1->0, IDLE 0, ~6.5M calls of real work, `VIF1-mpg` 7->49, `mscal` 12->48. (10) The guest then halts **legitimately**: `func_11CA18(0x8D0)` (IOP heap alloc via `func_118628`) -> 0 -> `E0100301: SJX_Init can't allocate IOP Heap.` -> `for(;;);` at `0x1b6b80`.
+- **Discovered**: `entry_points` semantics, synthesis naming and the resume-entry code path; the runner/`data` gitignores; the candidate rule and its 12 data false positives; that the checked-in runner predated the VU0 macro-mode hooks; that `[guest-branch:missing-target]` fires once per run.
+- **Current Blocker**: `SJX_Init` IOP-heap allocation RPC (`E0100301`, halt at `0x1b6b80`) - needs a real reply on the SIF RPC path; plus the reproducibility gap (gitignored inputs) whose durable fix is the analyzer discovery pass.
 ### 2026-10-17 (session 6 — VU clock desync fixed; real VU1 microprograms now run; guest idle in an async invocation)
 - **Actions**: (1) Confirmed the DBCMAN local answer (`37cc40d`) holds — `version mismatch` = 0 in every run since. (2) Replaced guesswork with a **host-thread watchdog** (`[EE-wd]`): it reported the EE thread frozen with `livePc=0x139230` (the VIF1 CHCR store in `FUN_00139190`) at 100% CPU, and new stage markers proved the thread was inside `ps2vu::Runtime::advance` (`diagStage=1` with `diagCalls` frozen). (3) Ruled out loop-based burns: `Runtime::run` returns after a single `advance`, and an `[VU-adv-loop]` counter never fired — so the burn was a **single** `target.advance(remaining)` call. (4) **Root cause:** `VUExecutor::reset()` memsets `m_state` (so `state().cycles = 0`) and sets `m_cycle = 0`, while `Runtime::m_cycle` keeps counting (~1.18e8 by then). The wait-bound's `unit(vu1).reset()` therefore desynchronised the unit clock, and the very next lazy drain in `Runtime::advanceUnit` tried to catch up ~1.18e8 VU cycles in one call — and an unfinished (all-zero) microprogram never ends, so it burned minutes silently. (5) **Fix:** `Unit::reset()` now preserves the cycle time base across the reset (restores `m_executor.m_cycle` and `state().cycles`); added a permanent guard in `advanceUnit` that resynchronises and reports (`[VU-clock]`) any gap > `1<<20` cycles, which no legitimate gap can reach (dispatch = 8 cycles, time slice = 65536). (6) Verified: VU unit tests **94/94**; run34/run35 (`%TEMP%\ps2_run34.err`, `%TEMP%\ps2_run35.err`) show no desync and no unbounded drain.
 - **Result (run35, 30s)**: the guest **completes** the 718104-byte blob (`[VIF1] done size=718104`), walks real chains (`[DMA-chain-done] tags=1056` then `tags=21`), and does genuine render work: `[VIF1-direct] qwCount=145/89/333/11`, **`[VIF1-mpg] dest=0x0/0x800/0x1000/0x1800/0x2000/0x2800/0x3000 count=256 bytes=2048`** (7 microprogram uploads), `[VIF1-mscal] pc=0x0` with real code (`100e03f0 2ff 81f4737c 2ff`), and **`[VU-wait] vu1 returned after spins=1 status=0`** — the VU1 microprogram runs to completion. `[EE-hb]` heartbeats return (16; 11 DMA starts, 8 completions).
