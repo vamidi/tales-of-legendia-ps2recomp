@@ -314,7 +314,12 @@ namespace ps2_syscalls
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const int result = ee.suspendThread(static_cast<int>(getRegU32(ctx, 4)), false);
+        const uint32_t target = getRegU32(ctx, 4);
+        const int result = ee.suspendThread(static_cast<int>(target), false);
+        // TEMP DIAGNOSTIC (stage-chain suspend triage)
+        std::cerr << "[EE-suspend] target=" << target << " ret=" << result
+                  << " caller=" << ee.currentThreadId()
+                  << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }
@@ -322,7 +327,12 @@ namespace ps2_syscalls
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const int result = ee.resumeThread(static_cast<int>(getRegU32(ctx, 4)), false);
+        const uint32_t target = getRegU32(ctx, 4);
+        const int result = ee.resumeThread(static_cast<int>(target), false);
+        // TEMP DIAGNOSTIC (stage-chain suspend triage)
+        std::cerr << "[EE-resume] target=" << target << " ret=" << result
+                  << " caller=" << ee.currentThreadId()
+                  << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }

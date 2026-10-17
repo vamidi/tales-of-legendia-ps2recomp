@@ -265,6 +265,13 @@ void EeScheduler::run()
                         for (const auto &[id, item] : m_threads)
                         {
                             const R5900Context &threadContext = item.activeContext();
+                            // TEMP DIAGNOSTIC (stage-chain poll triage): the stage
+                            // thread body spins on *(s6) and sets *(s7) = 1, so dump
+                            // both pointer registers and the words they address.
+                            const uint32_t ts6 = getRegU32(&threadContext, 22);
+                            const uint32_t ts7 = getRegU32(&threadContext, 23);
+                            const uint32_t ts2 = getRegU32(&threadContext, 18);
+                            const uint32_t tas4 = getRegU32(&threadContext, 20);
                             std::cerr << "[EE-thread] id=" << id
                                       << " status=" << static_cast<int>(item.status)
                                       << " wait=" << static_cast<int>(item.wait.reason)
@@ -275,7 +282,15 @@ void EeScheduler::run()
                                       << " pc=0x" << std::hex << threadContext.pc
                                       << " ra=0x" << getRegU32(&threadContext, 31)
                                       << " sp=0x" << getRegU32(&threadContext, 29)
-                                      << " entry=0x" << item.entry << std::dec << std::endl;
+                                      << " entry=0x" << item.entry
+                                      << " s2=0x" << ts2
+                                      << " s2*=" << formatHexWords(m_rdram, ts2 & 0x01FFFFF8u, 2u)
+                                      << " s4=0x" << tas4
+                                      << " s6=0x" << ts6
+                                      << " s6*=" << formatHexWords(m_rdram, ts6 & 0x01FFFFF8u, 2u)
+                                      << " s7=0x" << ts7
+                                      << " s7*=" << formatHexWords(m_rdram, ts7 & 0x01FFFFF8u, 2u)
+                                      << std::dec << std::endl;
                         }
                         for (const auto &[id, item] : m_semaphores)
                         {

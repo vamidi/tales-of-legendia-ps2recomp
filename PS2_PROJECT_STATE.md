@@ -16,6 +16,51 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 12e - sem-65 deadlock characterised: orphans two suspensions of the workers
+
+Instrumentation added (all TEMP, stripped later): per-thread `s2/s4/s6/s7` + the words
+they address in the `[EE-thread]` dump (`EeScheduler.cpp`), and `[EE-suspend]` /
+`[EE-resume]` traces in `Thread.cpp`.
+
+**Stage-thread body is a poll loop** (`entry_00198f38`..`0x199038`):
+
+    0x198fa0  ld/sd   (*s4)++                      iteration counter
+    0x198fac  jal     func_1B7888                  (per-iteration work / wait)
+    0x198fb4  sw      s1, 0(s3) ; sw 0, 0(s3)
+    0x19902c  ld      v0, 0(s6) ; beqz v0 -> 0x198FA0    <- spin on *(s6)
+    0x199038  ... sd 1, (ret_1991E8 + 0x43C0) ; ExitDeleteThread
+
+**Thread 5 is not stuck, it is SUSPENDED with its condition already met:**
+
+    id=5 pc=0x19902c s6=0x3943b8 s6*=1  s7=0x3943e8 s7*=1  suspend=1  status=3
+
+`s6` (`0x3943B8`) is literally one of the six gates the HLE release writes, and it reads 1.
+So nothing is missing on the gate side; thread 5 simply never runs its epilogue, and its
+`sd 1, (ret_1991E8 + 0x43C0)` stage-done marker is therefore never written.
+
+**Suspend/resume ledger (run60, full run):**
+
+    L11857 suspend(2)    L11862 suspend(5)   <- orphaned, never resumed
+    L11864 resume(2)     L11865 suspend(2)   L11867 resume(2)
+    L11868 suspend(2)    L11869 resume(2)
+    L12228 suspend(2)    L12230 resume(2)    L12231 suspend(2)
+    L12232 create sem60  L12233 wait 60 (succeeds, init=1)
+    L12269 create sem65
+    L12289 signal 60     L12290 HLE release  L12291 **wait 65 -> blocks**
+    L12297/98 EE-exit thread=3, thread=4
+
+Every resume targets thread 2. Routing is not the gap: `0x39` and `-0x3A` both dispatch to
+`ResumeThread`, `0x37`/`-0x38` to `SuspendThread`. The helper at `FUN_00199268(id)` is an
+*idempotent* suspend: `ReferThreadStatus(id); if (status == 8 /*THS_SUSPEND*/ || status == 0xC
+/*THS_WAITSUSPEND*/) return; SuspendThread(id)`, and `rawThreadStatus()` maps our enum to the
+ps2sdk `THS_*` values correctly, so that is not the gap either.
+
+**Conclusion:** at the moment thread 1 blocks on sem 65, **both worker threads are suspended**
+(thread 2 at L12231, thread 5 at L11862) and threads 3/4 have exited. Nothing live remains that
+could signal 65. The orphaned `suspend(5)` is the sharpest clue: the game pairs
+suspend/resume through `FUN_00199268` + `entry_00199240`, and thread 5's half of that pair is
+never executed.
+
 ## Session 12d - HLE release RETIMED to the sem-65 wait; blocker moves to thread 5
 
 **Prompt:** user chose "Retime the HLE release".
