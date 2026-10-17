@@ -16,6 +16,66 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 11 (in progress) - ROOT CAUSE OF THE STALL: an IOP-side handshake, NOT the discovery gap
+
+**Decision carried in:** user chose "do the analyzer discovery pass properly" (close the
+gap class, then regenerate once). This session investigated that gap to design the fix —
+and found the stall is **not** caused by it. Full evidence: `docs/analyzer-discovery-pass.md`.
+
+**The stall reduced to one flag, decoded exactly.**
+- `FUN_00198c60`/`entry_00198c88` is `while (*(u64*)0x394378 == 0) ++*(u64*)0x394320;`
+  then `*(u64*)0x394380 = 1; ExitDeleteThread();`. The "poll" `FUN_00198c48` is not a
+  hardware poll — it is a **spin counter** (`ld v0,0(0x394320); addiu v0,1; sd v0,…`).
+  Note `0x198c78` is `bnel` (**branch-likely**): its delay slot `lui $v0,0x39` runs only
+  when taken, which is what makes `s0 = 0x394378` on the not-taken path.
+- `0x394378..0x3943D0` is a six-record **staged-init handshake block**: each stage thread
+  waits on flag N, sets flag N+1, and exits. The six subsystem inits (`0x199A20`,
+  `0x199AF0`, `0x199BC0`, `0x199C90`, `0x199D60`, `0x199E30`) each read one stage flag.
+
+**PROVEN: no EE code can write `0x394378`** (four independent proofs, all in the doc):
+1. Deterministic backward-slice census of **every store in the image** into
+   `[0x394370,0x3943D0)` → 12 stores; the only writer of `0x394378` is
+   `sd` at `0x19996C` inside **`FUN_00199938`** (which writes all six). The other five
+   stage flags are written by the stage threads themselves (`0x198CAC`, `0x198D44`,
+   `0x198E48`, `0x198F28`, `0x199064`).
+2. No `j`/`jal`/branch in the whole image targets it (only callers of `0x199938` are
+   `0x1999A8` in `FUN_00199988` and `0x19A570` in `FUN_0019a550` — both themselves
+   unreachable: no control transfer, no materialised address, no data pointer).
+3. No `lui`+`addiu`/`ori` materialisation of `0x199938`/`0x199988`/`0x19A550`/`0x19A2B0`
+   anywhere (the 19 materialisations in `[0x198000,0x19A600)` are callback entries:
+   `0x198BF8`, `0x198C20`, `0x198C60`, `0x198A28`, `0x198AB0`, …).
+4. **Runtime:** an entry watch on `lookupFunction` (covers generated calls *and*
+   scheduler dispatches, hence fall-through entries) recorded all of
+   `0x199938/0x199988/0x19A550/0x19A2B0/0x19A1C8/0x19A1EC/0x19A250` as **never entered**,
+   while `0x166490`, `0x19A068`, `0x19A120`, `0x198C60`, `0x198C88` *were* entered.
+
+⇒ The value of `*(u64*)0x394378` must arrive from **outside the EE** (IOP / SIF / DMA).
+⇒ **The analyzer discovery pass cannot unblock the boot** (no analyzer change makes an EE
+instruction appear that this binary does not contain). **New blocker → IOP workstream.**
+
+**Corroborating runtime evidence:** every SIF DMA in the last run is **EE→IOP**
+(`[SIF-SetDma] ent0 w0=0x3b6a80 w1=0x137a40 …`, `pc=0x117a04` / `0x1ace2c`); **no IOP→EE
+transfer occurs**. The HLE path *can* write EE RAM (RPC replies land and the guest reads
+them), so synthesising the handshake is feasible — the open question is the trigger.
+
+**Analyzer defects confirmed along the way (real; for a later cycle):**
+- `loadGhidraFunctionMap` (`elf_parser.cpp:2115`) **parses the `size` column and discards
+  it**, using only `End` clamped to the section. Measured: **31 rows** with
+  `(end-start) - size > 64` (worst `FUN_00256bc8` +109308; `FUN_001978f0` +32228;
+  `FUN_00255808` +17304) → 32 KB–109 KB monoliths; `FUN_001978f0` registers **5881**
+  function-table slots. **23 rows** with `size > end-start` (e.g. `FUN_0020fe10` size=928
+  vs extent=36 → 892 bytes of code unattributed). **1031 rows** with ≤64 B alignment
+  surplus (must be left alone or 1031 files churn). Plus unattributed regions that are
+  clean MIPS (`[0x19A1EC,0x19A250)`: thunk + once-guard; `[0x19A2C4,0x19A550)`: lock/unlock
+  pair + a 0x1E8-byte subsystem init registering callbacks 6 and 7) — real code, dead by
+  reference.
+- The monolith also **shadows** its whole range for range-based queries, so a naive
+  "already covered?" check hides the gap.
+
+**Temp diagnostic in the tree (uncommitted, still useful):** the WATCH/entry-watch
+helpers in `ps2xRuntime/src/lib/ps2_runtime.cpp` (`watchAssetInitBranch` +
+`watchAssetInitEntry`, hooked from `dispatchGuestBranch` and `lookupFunction`).
+
 ## Session 10 (in progress) - Stage C DONE (fileio on SID 0x80000001); the next gate is a RECOMPILER DISCOVERY GAP, not I/O
 **Done this session.** Stage C is implemented and verified; the `0x1666b4` trap is gone.
 - **New `fileio` HLE service** (`ps2xIOP/src/modules/fileio.cpp`, SID `0x80000001`), registered via a one-line factory decl in `ps2xIOP/src/module_factories.h`, a source line in `ps2xIOP/CMakeLists.txt`, and an `emplace_back` in `IopSubsystem::Impl`'s ctor. Reuses the host VFS bridge already used by `iop_cdvd.cpp` (`IopHost::translateGuestPath` / `openHostFile` / `hostFileSize` / `readHostFile` / `closeHostFile`).
