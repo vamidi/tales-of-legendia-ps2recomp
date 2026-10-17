@@ -16,6 +16,60 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 12g - sem-65 producer located: the peer that waits on sem 60 is never scheduled
+
+Probe added (`RPC.cpp`, TEMP): log every `SifCallRpc` completion with sid/rpc/mode/endFunc/endParam/sema.
+It logged **0 lines**, so no EE-side call goes through `Kernel/Syscalls/RPC.cpp` at all - all RPC
+traffic for this game is handled in `Kernel/Stubs/SIF.cpp` (`[SIF-iop]`).
+
+**Semaphores are fully enumerated** (`[SEM]` trace covers every id, capped only per (op,id)):
+
+- Sem 65 is created (`init=0`, `attr=0x1187c4` - a *static* `ee_sema_t` in the 0x118xxx blob,
+  `ra=0x119be0`) and waited **once** (`ra=0x119c6c`), and is **never signalled by anything in the
+  entire run**. Ids 63 and 34 are likewise created but unused.
+- The wait site's real shape (`entry_00119c64`):
+
+      0x119c64  WaitSema(s0 = sem65)          <- blocks here
+      0x119c6c  DeleteSema(s0 = sem65)        <- one-shot event, deleted after the wait
+      0x119c74  lw v1, 0x30(sp)
+      0x119c78  bgez v1 -> 0x119c9c
+      0x119c80  WaitSema(*(0x3876F8))         ; 0x119c8c SignalSema(*(0x3876F8))   (mutex pair)
+
+- Derived: **`*(0x3876F4)` = sem 60** and **`*(0x3876F8)` = sem 62**. Proof: `[SEM] signal id=62
+  ra=0x1196a8` matches the `SignalSema(*(0x3876F8))` site at `0x1196A0` (ra = 0x1196A8), and
+  `FUN_00119440 = { func_1193E8(); WaitSema(*(0x3876F4)); }` is the `wait id=60 ra=0x11945c` line.
+
+**The RPC-completion semaphore mechanism demonstrably works.** The driver's own `sceSifCallRpc`
+client is `0x3E1F40` - exactly `s6 + 0x1F40` from the call site at `0x119c18` - and its two calls
+are routed to the HLE `fileio` service and answered:
+
+    L12255/L12261  RPC CALL client=0x3e1f40 rpc=0xff -> RPC END posted
+    L12265/66      [SEM] isignal id=64 ra=0x118048 (IRQ cb) ; wait id=64 ra=0x1187ec
+    L12276/L12283  RPC CALL client=0x3e1f40 rpc=0x0  -> RPC END posted
+    L12287/88      [SEM] isignal id=66 ra=0x118048 (IRQ cb) ; wait id=66 ra=0x1187ec
+
+i.e. "create sem(init=0) -> arm the RPC client header with that id -> call -> the completion's IRQ
+callback signals it" works for 64 and 66. Sem 65 is simply never armed on any client, and no RPC
+carries `sema=65`.
+
+**Root cause of the stall.** The driver (thread 1) goes
+
+    L12289  [SEM] signal id=60 ra=0x119c4c        <- released the peer
+    L12291  [SEM] wait id=65 ra=0x119c6c          <- blocks forever
+
+and the `signal 60` **has no receiver**: the only `wait id=60` in the whole run is the driver's own
+earlier wait at `L12233` (which consumed the `init=1` count). Final state is `id=60 count=1
+waiters=0`. The peer that must be blocked in `WaitSema(*(0x3876F4))` is `FUN_00119440`
+(`0x119440` = `{ func_1193E8(); WaitSema(sem60); }`), which has **26 direct callers**
+(`0x1194AC`, `0x119854`, `0x11998C`, `0x119ABC`, `0x119D24` ... `0x11C7F0` - a whole stage-function
+family) and is **never executed at all**: `0x119440` does not appear anywhere in the run log.
+
+So the stalled handshake is: driver signals 60 -> peer (a stage function calling `FUN_00119440`)
+runs -> peer signals 65 -> driver's `wait 65` completes. The peer thread is never created or never
+scheduled, so nothing ever signals 65. Threads observed so far: entries `0x100008` (root/thread 1),
+`0x198f38` (thread 5), `0x198c60` (thread 2), spawned via the spawner at `0x166464`/`0x166490`
+-> `0x19A068` -> `FUN_00199F40`.
+
 ## Session 12f - orphaned suspends completed; sem-65 signaller is none of the workers
 
 User chose "complete the orphaned suspend pair". Implemented as a TEMP HLE hook in

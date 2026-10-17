@@ -635,6 +635,20 @@ namespace ps2_syscalls
                     (!handled ? kSifRpcDebugFlagUnhandled : 0u) |
                     (copiedFallback ? kSifRpcDebugFlagFallbackCopy : 0u) |
                     (zeroedFallback ? kSifRpcDebugFlagFallbackZero : 0u);
+                // TEMP DIAGNOSTIC (sem65 trace): who should signal the caller's
+                // completion semaphore, and did we actually do it?
+                std::cerr << "[RPC-done] sid=0x" << std::hex << sid
+                          << " rpc=" << rpcNum
+                          << " mode=" << mode
+                          << " endFunc=0x" << endFunction
+                          << " endParam=0x" << endParameter
+                          << " sema=" << std::dec << completionSemaphore
+                          << " handled=" << (iopResult.handled ? 1 : 0)
+                          << " cb=" << (callbackCompleted ? 1 : 0)
+                          << " nowait=" << ((mode & kSifRpcModeNowait) ? 1 : 0)
+                          << " serverDispatch=" << (serverDispatched ? 1 : 0)
+                          << " ra=0x" << std::hex << getRegU32(&base, 31)
+                          << std::dec << std::endl;
                 fillRpcDebugPreview(rdram, sendBuf, sendSize, event.sendPreview, event.sendPreviewSize);
                 fillRpcDebugPreview(rdram, receiveBuffer, receiveSize, event.recvPreview, event.recvPreviewSize);
                 event.result = 0;
