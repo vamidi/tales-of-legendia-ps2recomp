@@ -394,6 +394,25 @@ namespace ps2_stubs
         uint32_t g_lastRpcClientPtr = 0u;
         uint32_t g_lastRpcServerWanted = 0u;
 
+        // raw-SIFRPC -> emulated-IOP routing.
+        //
+        // The guest's own statically linked libkernel (not the runtime's
+        // sceSif* stubs) drives the SIF RPC protocol, so this responder is the
+        // only place a guest call can reach the emulated IOP.  Two things are
+        // needed to route one:
+        //   * which sid the calling client bound (recovered from the bind
+        //     exchange below), and
+        //   * the EE address of the call's send payload, which the guest hands
+        //     over as a sibling DMA descriptor of the command packet
+        //     (sceSifSendCmd issues one descriptor for the packet and one for
+        //     the payload, in either order).
+        std::unordered_map<uint32_t, uint32_t> g_sifRpcClientSid;
+        uint32_t g_sifRpcPayloadPrecedingEeAddr = 0u;
+        uint32_t g_sifRpcPayloadPrecedingSize = 0u;
+        uint32_t g_sifRpcPayloadFollowingEeAddr = 0u;
+        uint32_t g_sifRpcPayloadFollowingSize = 0u;
+        uint64_t g_sifRpcRoutedCallCount = 0u;
+
         void emulateIopSifRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
                               const Ps2SifDmaTransfer &xfer)
         {
@@ -462,32 +481,107 @@ namespace ps2_stubs
                           << " recv_before=" << recvBefore[0] << "," << recvBefore[1] << ","
                           << recvBefore[2] << "," << recvBefore[3] << std::dec << std::endl;
 
-                // The IOP answers a call by placing the service's response in the
-                // caller's receive buffer, then completing the call with an RPC
-                // END whose +0x20 names the request cid: _SifRpcEndHandler
-                // (0x117fa0) then runs client->end_function and signals
-                // client->hdr.sema_id, which is what sceSifCallRpc waits on.
-                for (uint32_t offset = 0u; offset + 4u <= recvSize; offset += 4u)
+                // IOP routing: when the service this client bound is owned by
+                // the emulated IOP (a loaded IRX) or by an HLE service, hand the
+                // call over instead of fabricating a reply.  The IOP side copies
+                // the send payload out of EE memory into the service's buffer and
+                // writes the response straight into the caller's EE receive
+                // buffer, so no extra plumbing is required here.
+                bool iopHandled = false;
+                uint32_t boundSid = 0u;
                 {
-                    runtime->Store32(rdram, ctx, receiveAddr + offset, 0u);
-                }
-
-                // Version query: answer with the emulated IOP module version so
-                // the guest's module/version check (FUN_0011cfe0) accepts the
-                // service instead of retrying the whole bind+call sequence.
-                if (rpcNumber == kSifRpcGetVersion && sendSize == 0u && recvSize >= 4u)
-                {
-                    runtime->Store32(rdram, ctx, receiveAddr, kSifIopModuleVersion);
-                }
-
-                // Deci2/dbcman version query (see kDbcManReportedVersion): the
-                // guest compares the answer against its own libdbc version and
-                // stalls when it mismatches, so report the 3.10 it expects.
-                if (rpcNumber == kDbcManRpcCheckVersion && recvSize >= 16u)
-                {
-                    for (uint32_t offset = 0u; offset < 16u; offset += 4u)
+                    const auto clientSid = g_sifRpcClientSid.find(clientPtr);
+                    if (clientSid != g_sifRpcClientSid.end())
                     {
-                        runtime->Store32(rdram, ctx, receiveAddr + offset, kDbcManReportedVersion);
+                        boundSid = clientSid->second;
+                    }
+                }
+
+                if (boundSid != 0u && PS2IopTransport::canBindRpc(runtime, boundSid))
+                {
+                    // Locate the payload descriptor: prefer the sibling whose
+                    // recorded size matches the call's declared send size.
+                    uint32_t sendEeAddr = 0u;
+                    if (sendSize != 0u)
+                    {
+                        if (g_sifRpcPayloadPrecedingSize == sendSize)
+                        {
+                            sendEeAddr = g_sifRpcPayloadPrecedingEeAddr;
+                        }
+                        else if (g_sifRpcPayloadFollowingSize == sendSize)
+                        {
+                            sendEeAddr = g_sifRpcPayloadFollowingEeAddr;
+                        }
+                    }
+
+                    if (sendSize == 0u || sendEeAddr != 0u)
+                    {
+                        ps2x::iop::RpcRequest request{};
+                        request.clientAddress = clientPtr;
+                        request.serverAddress = server;
+                        request.sid = boundSid;
+                        request.function = rpcNumber;
+                        request.mode = rmode;
+                        request.send = {sendEeAddr, sendSize};
+                        request.receive = {receiveAddr, recvSize};
+                        request.endFunction = 0u;
+                        request.endParameter = 0u;
+
+                        const ps2x::iop::RpcResult routed =
+                            PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+                        iopHandled = routed.handled;
+                        ++g_sifRpcRoutedCallCount;
+
+                        std::cerr << "[SIF-iop] RPC ROUTE sid=0x" << std::hex << boundSid
+                                  << " rpc=0x" << rpcNumber
+                                  << " send=0x" << sendEeAddr
+                                  << " send_size=0x" << sendSize
+                                  << " receive=0x" << receiveAddr
+                                  << " recv_size=0x" << recvSize
+                                  << std::dec
+                                  << " handled=" << (iopHandled ? 1 : 0)
+                                  << std::endl;
+                    }
+                    else
+                    {
+                        std::cerr << "[SIF-iop] RPC ROUTE sid=0x" << std::hex << boundSid
+                                  << " rpc=0x" << rpcNumber
+                                  << " send_size=0x" << sendSize
+                                  << std::dec
+                                  << " payload descriptor not found -> fabricating"
+                                  << std::endl;
+                    }
+                }
+
+                if (!iopHandled)
+                {
+                    // The IOP answers a call by placing the service's response in the
+                    // caller's receive buffer, then completing the call with an RPC
+                    // END whose +0x20 names the request cid: _SifRpcEndHandler
+                    // (0x117fa0) then runs client->end_function and signals
+                    // client->hdr.sema_id, which is what sceSifCallRpc waits on.
+                    for (uint32_t offset = 0u; offset + 4u <= recvSize; offset += 4u)
+                    {
+                        runtime->Store32(rdram, ctx, receiveAddr + offset, 0u);
+                    }
+
+                    // Version query: answer with the emulated IOP module version so
+                    // the guest's module/version check (FUN_0011cfe0) accepts the
+                    // service instead of retrying the whole bind+call sequence.
+                    if (rpcNumber == kSifRpcGetVersion && sendSize == 0u && recvSize >= 4u)
+                    {
+                        runtime->Store32(rdram, ctx, receiveAddr, kSifIopModuleVersion);
+                    }
+
+                    // Deci2/dbcman version query (see kDbcManReportedVersion): the
+                    // guest compares the answer against its own libdbc version and
+                    // stalls when it mismatches, so report the 3.10 it expects.
+                    if (rpcNumber == kDbcManRpcCheckVersion && recvSize >= 16u)
+                    {
+                        for (uint32_t offset = 0u; offset < 16u; offset += 4u)
+                        {
+                            runtime->Store32(rdram, ctx, receiveAddr + offset, kDbcManReportedVersion);
+                        }
                     }
                 }
 
@@ -511,6 +605,10 @@ namespace ps2_stubs
             const uint32_t sid = runtime->Load32(rdram, ctx, packet + 0x20u);
             const uint32_t server = sifRpcServerAddr(runtime, sid);
             const uint32_t clientSema = runtime->Load32(rdram, ctx, clientPtr + 0x08u);
+
+            // Remember what this client bound so a later call can be routed to
+            // the emulated IOP when it (or an HLE service) owns the sid.
+            g_sifRpcClientSid[clientPtr] = sid;
 
             // SifRpcRendPkt: {SifCmdHeader sifcmd; rec_id; pkt_addr; rpc_id;
             //                 SifRpcClientData *client; u32 cid;
@@ -662,6 +760,11 @@ namespace ps2_stubs
     void resetSifState()
     {
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        g_sifRpcClientSid.clear();
+        g_sifRpcPayloadPrecedingEeAddr = 0u;
+        g_sifRpcPayloadPrecedingSize = 0u;
+        g_sifRpcPayloadFollowingEeAddr = 0u;
+        g_sifRpcPayloadFollowingSize = 0u;
         seedDefaultSifRegsLocked();
     }
 
@@ -1185,6 +1288,10 @@ namespace ps2_stubs
 
         if (ok)
         {
+            // Track each command packet's sibling descriptors so the responder
+            // can locate an RPC call's send payload (see g_sifRpcPayload*).
+            uint32_t previousEntrySrc = 0u;
+            uint32_t previousEntrySize = 0u;
             for (uint32_t i = 0; i < pendingCount; ++i)
             {
                 const Ps2SifDmaTransfer &xfer = pending[i];
@@ -1215,11 +1322,21 @@ namespace ps2_stubs
                                                                         static_cast<uint32_t>(xfer.size),
                                                                     });
                 }
+                g_sifRpcPayloadPrecedingEeAddr = previousEntrySrc;
+                g_sifRpcPayloadPrecedingSize = previousEntrySize;
+                g_sifRpcPayloadFollowingEeAddr =
+                    (i + 1u < pendingCount) ? pending[i + 1u].src : 0u;
+                g_sifRpcPayloadFollowingSize =
+                    (i + 1u < pendingCount) ? static_cast<uint32_t>(pending[i + 1u].size) : 0u;
+
                 // The emulated IOP answers the SIFCMD initialization commands
                 // it just received (see emulateIopSifCmdInitHandshake).
                 emulateIopSifCmdInitHandshake(rdram, ctx, runtime, xfer);
                 dumpSifCmdHandlersOnce(rdram, ctx, runtime, xfer);
                 emulateIopSifRpc(rdram, ctx, runtime, xfer);
+
+                previousEntrySrc = xfer.src;
+                previousEntrySize = sizeBytes;
             }
         }
 
