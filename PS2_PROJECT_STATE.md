@@ -16,6 +16,30 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 12j - diagnostics stripped
+
+Removed the whole session-12 instrumentation, leaving behaviour untouched (203 deletions, no
+insertions):
+
+- `Kernel/Syscalls/Sync.cpp` - `semTraceBudget`/`semTrace` helpers and all their call sites (`[SEM]`).
+- `Kernel/Syscalls/RPC.cpp` - the `[RPC-done]` probe.
+- `Kernel/Syscalls/Thread.cpp` - `[THREAD-new]`, `[EE-suspend]`, `[EE-resume]`.
+- `Kernel/EeScheduler.cpp` - `[IRQ-dmac]`/`[IRQ-intc]` blocks, the `[EE-thread]` `s2/s4/s6/s7`
+  register dump, and the `[HLE-poll]` log line (the orphan-resume hook itself is kept).
+- `ps2_runtime.cpp` - `watchStageDispatcher`, `watchStageRegion` and their call sites, and the
+  `[SEM-globals]` dump (the `[HLE-staged-init]` line and the six-gate write are kept).
+
+Verified after the strip with a 45 s run: every removed tag logs zero lines, and the baseline is
+unchanged - `RPC END posted=54`, `RPC CALL=82`, `Deci2=4`, `DVCI=1`, `[HLE-staged-init]` once,
+`[EE-exit]` x3 - with total output down from 12710 to 12185 lines.
+
+Still present (older, pre-session-12 triage instrumentation, left for a separate decision):
+`[EE-hb]`/`[EE-sem]`/`[EE-evf]` and the dispatch trace in `EeScheduler.cpp`; the boot-stall phase
+markers/`watchAssetInitBranch` in `ps2_runtime.cpp`; boot-stall triage in `ps2_memory.cpp`,
+`ps2_vif1_interpreter.cpp`, `vu/vu_runtime.cpp`; black-content triage in `Kernel/Syscalls/Dispatcher.cpp`;
+raw-SIFRPC bridge and session-11 blocks in `Kernel/Stubs/SIF.cpp`; the IOP->EE write census in
+`ps2_iop_host.cpp`.
+
 ## Session 12i - the staged-init chain is unreachable dead code
 
 Three new probes: a `[DISP]` tracer for the per-frame dispatcher `FUN_001664D0`, an `[IRQ-intc]` log for

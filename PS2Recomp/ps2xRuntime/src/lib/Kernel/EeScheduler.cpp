@@ -281,11 +281,6 @@ void EeScheduler::run()
                             {
                                 continue;
                             }
-                            std::cerr << "[HLE-poll] resuming orphaned poller id=" << id
-                                      << " pc=0x" << std::hex << pollContext.pc
-                                      << " gate=0x" << pollGate
-                                      << " suspend=" << std::dec << item.suspendCount
-                                      << std::endl;
                             while (item.suspendCount > 0)
                             {
                                 resumeThread(id, false);
@@ -315,13 +310,6 @@ void EeScheduler::run()
                         for (const auto &[id, item] : m_threads)
                         {
                             const R5900Context &threadContext = item.activeContext();
-                            // TEMP DIAGNOSTIC (stage-chain poll triage): the stage
-                            // thread body spins on *(s6) and sets *(s7) = 1, so dump
-                            // both pointer registers and the words they address.
-                            const uint32_t ts6 = getRegU32(&threadContext, 22);
-                            const uint32_t ts7 = getRegU32(&threadContext, 23);
-                            const uint32_t ts2 = getRegU32(&threadContext, 18);
-                            const uint32_t tas4 = getRegU32(&threadContext, 20);
                             std::cerr << "[EE-thread] id=" << id
                                       << " status=" << static_cast<int>(item.status)
                                       << " wait=" << static_cast<int>(item.wait.reason)
@@ -333,13 +321,6 @@ void EeScheduler::run()
                                       << " ra=0x" << getRegU32(&threadContext, 31)
                                       << " sp=0x" << getRegU32(&threadContext, 29)
                                       << " entry=0x" << item.entry
-                                      << " s2=0x" << ts2
-                                      << " s2*=" << formatHexWords(m_rdram, ts2 & 0x01FFFFF8u, 2u)
-                                      << " s4=0x" << tas4
-                                      << " s6=0x" << ts6
-                                      << " s6*=" << formatHexWords(m_rdram, ts6 & 0x01FFFFF8u, 2u)
-                                      << " s7=0x" << ts7
-                                      << " s7*=" << formatHexWords(m_rdram, ts7 & 0x01FFFFF8u, 2u)
                                       << std::dec << std::endl;
                         }
                         for (const auto &[id, item] : m_semaphores)
@@ -1513,35 +1494,6 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
             m_runtime.hasFunction(handler.handler))
         {
             matching.push_back(handler);
-        }
-    }
-    // TEMP DIAGNOSTIC
-    if (dmac)
-    {
-        std::cerr << "[IRQ-dmac] cause=" << cause << " handlers=" << handlers.size()
-                  << " matching=" << matching.size() << std::dec << std::endl;
-        for (const EeIrqHandler &h : matching)
-        {
-            std::cerr << "[IRQ-dmac]   -> handler=0x" << std::hex << h.handler
-                      << " arg=0x" << h.argument << " gp=0x" << h.gp << std::dec << std::endl;
-        }
-    }
-    else
-    {
-        // TEMP DIAGNOSTIC (sem65 trace): is the INTC still delivering interrupts
-        // (VSync / timers) while the main thread is blocked in WaitSema(65)?
-        static uint32_t s_intcCounts[32] = {};
-        const uint32_t slot = cause < 32u ? cause : 31u;
-        if (s_intcCounts[slot] < 40u)
-        {
-            ++s_intcCounts[slot];
-            std::cerr << "[IRQ-intc] cause=" << cause << " handlers=" << handlers.size()
-                      << " matching=" << matching.size() << std::dec << std::endl;
-            for (const EeIrqHandler &h : matching)
-            {
-                std::cerr << "[IRQ-intc]   -> handler=0x" << std::hex << h.handler
-                          << " arg=0x" << h.argument << std::dec << std::endl;
-            }
         }
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)

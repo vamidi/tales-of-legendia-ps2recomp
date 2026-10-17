@@ -220,15 +220,6 @@ namespace ps2_syscalls
             }
         }
 
-        // TEMP DIAGNOSTIC (sem65 trace): which threads does the game actually
-        // create? The stage peer that must be blocked in WaitSema(sem 60) has to
-        // be one of them.
-        std::cerr << "[THREAD-new] func=0x" << std::hex << param->func
-                  << " stack=0x" << param->stack
-                  << " size=0x" << static_cast<uint32_t>(param->stack_size)
-                  << " ra=0x" << getRegU32(ctx, 31)
-                  << " prio=" << std::dec << param->initial_priority
-                  << " attr=" << param->attr << std::endl;
         // PS2SDK EE t_ee_thread: status, func, stack, stack_size, gp_reg,
         // initial_priority, current_priority, attr, option.
         const EeThreadCreateParams decoded{
@@ -325,10 +316,6 @@ namespace ps2_syscalls
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
         const uint32_t target = getRegU32(ctx, 4);
         const int result = ee.suspendThread(static_cast<int>(target), false);
-        // TEMP DIAGNOSTIC (stage-chain suspend triage)
-        std::cerr << "[EE-suspend] target=" << target << " ret=" << result
-                  << " caller=" << ee.currentThreadId()
-                  << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }
@@ -338,10 +325,6 @@ namespace ps2_syscalls
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
         const uint32_t target = getRegU32(ctx, 4);
         const int result = ee.resumeThread(static_cast<int>(target), false);
-        // TEMP DIAGNOSTIC (stage-chain suspend triage)
-        std::cerr << "[EE-resume] target=" << target << " ret=" << result
-                  << " caller=" << ee.currentThreadId()
-                  << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }

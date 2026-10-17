@@ -19,38 +19,6 @@ namespace ps2_syscalls
             return result;
         }
 
-        // TEMP DIAGNOSTIC (sem65 trace): cap each (op,id) pair so a polling loop
-        // cannot flood the log. opTag: 0=create 1=signal 2=wait 3=poll.
-        // Ids outside [0,255] are bucketed together so that signals carrying an
-        // invalid/garbage id (KE_UNKNOWN_SEMID, 0xFFFFFFFF, large ids) are still
-        // visible instead of being silently dropped.
-        bool semTraceBudget(uint32_t id, int opTag)
-        {
-            static uint32_t s_counts[4][257] = {};
-            if (opTag < 0 || opTag > 3)
-            {
-                return false;
-            }
-            const uint32_t bucket = id < 256u ? id : 256u;
-            if (s_counts[opTag][bucket] >= 10u)
-            {
-                return false;
-            }
-            ++s_counts[opTag][bucket];
-            return true;
-        }
-
-        void semTrace(const char *what, uint32_t id, uint32_t ra, int result, bool hasResult)
-        {
-            std::cerr << "[SEM] " << what << " id=" << id
-                      << " ra=0x" << std::hex << ra << std::dec;
-            if (hasResult)
-            {
-                std::cerr << " ret=" << result;
-            }
-            std::cerr << std::endl;
-        }
-
         void deleteSemaphoreImpl(uint8_t *rdram,
                                  R5900Context *ctx,
                                  PS2Runtime *runtime,
@@ -70,10 +38,6 @@ namespace ps2_syscalls
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
             const uint32_t id = getRegU32(ctx, 4);
             const int result = ee.signalSemaphore(static_cast<int>(id), interruptSafe);
-            if (semTraceBudget(id, 1))
-            {
-                semTrace(interruptSafe ? "isignal" : "signal", id, getRegU32(ctx, 31), result, true);
-            }
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -128,15 +92,6 @@ namespace ps2_syscalls
                                                param->max_count,
                                                param->attr,
                                                param->option);
-        if (semTraceBudget(static_cast<uint32_t>(semId), 0))
-        {
-            std::cerr << "[SEM] create id=" << semId
-                      << " init=" << param->init_count
-                      << " max=" << param->max_count
-                      << " attr=0x" << std::hex << param->attr << std::dec
-                      << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec
-                      << std::endl;
-        }
         setReturnS32(ctx, semId);
     }
 
@@ -163,10 +118,6 @@ namespace ps2_syscalls
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t id = getRegU32(ctx, 4);
-        if (semTraceBudget(id, 2))
-        {
-            semTrace("wait", id, getRegU32(ctx, 31), 0, false);
-        }
         scheduler(rdram, ctx, runtime).waitSemaphore(static_cast<int>(id));
     }
 
@@ -174,10 +125,6 @@ namespace ps2_syscalls
     {
         const uint32_t id = getRegU32(ctx, 4);
         const int result = scheduler(rdram, ctx, runtime).pollSemaphore(static_cast<int>(id));
-        if (semTraceBudget(id, 3))
-        {
-            semTrace("poll", id, getRegU32(ctx, 31), result, true);
-        }
         setReturnS32(ctx, result);
     }
 
