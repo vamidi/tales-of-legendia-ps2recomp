@@ -16,7 +16,15 @@ namespace ps2vu
 
     void Unit::reset() noexcept
     {
+        // Keep the execution clock continuous across a reset. The unit's cycle
+        // counter is the time base the runtime drains it against (Runtime::
+        // advanceUnit), so zeroing it makes the next catch-up look like millions
+        // of cycles of pending work -- which an unfinished microprogram never
+        // burns through.
+        const uint64_t cycles = state().cycles;
         m_executor.reset();
+        m_executor.m_cycle = cycles;
+        state().cycles = cycles;
         m_failure = {};
         m_status = UnitStatus::Ready;
     }

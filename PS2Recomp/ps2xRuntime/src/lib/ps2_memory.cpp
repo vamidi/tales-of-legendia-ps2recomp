@@ -1370,6 +1370,33 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 uint32_t chcr = value;
                 uint32_t mode = (chcr >> 2) & 0x3;
 
+                // TEMP DIAGNOSTIC (boot-stall triage).
+                std::cerr << "[DMA-start] base=0x" << std::hex << channelBase << " chcr=0x" << value
+                          << " madr=0x" << madr << " qwc=0x" << qwc << std::dec
+                          << " mode=" << mode << " gsVram=" << (m_gsVRAM != nullptr ? 1 : 0) << std::endl;
+                if (mode == 1u)
+                {
+                    auto dumpWords = [&](const char *label, uint32_t base, uint32_t bytes)
+                    {
+                        std::cerr << "[DMA-dump] " << label << " @0x" << std::hex << base << ":";
+                        for (uint32_t i = 0u; i + 4u <= bytes; i += 4u)
+                        {
+                            uint32_t word = 0u;
+                            if (isScratchpad(base + i))
+                                std::memcpy(&word, m_scratchpad + ((base + i) & (PS2_SCRATCHPAD_SIZE - 1u)), sizeof(word));
+                            else
+                                std::memcpy(&word, m_rdram + ((base + i) & (PS2_RAM_SIZE - 1u)), sizeof(word));
+                            std::cerr << " " << word;
+                        }
+                        std::cerr << std::dec << std::endl;
+                    };
+                    dumpWords("TADR", m_ioRegisters[channelBase + 0x30], 64u);
+                    dumpWords("TADR-0x20", (m_ioRegisters[channelBase + 0x30] - 0x20u) & 0x1FFFFFFFu, 0xE0u);
+                    dumpWords("pay3EF570", 0x3EF570u, 64u);
+                    dumpWords("gpDma(0x3DB060)", 0x3DB060u, 0x30u);
+                    dumpWords("RDRAM0", 0u, 32u);
+                }
+
                 if (mode == 0 && qwc > 0)
                 {
                     enqueueTransfer(madr, qwc);
@@ -1547,6 +1574,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
+                        if (tagsProcessed <= 8)
+                        {
+                            std::cerr << "[DMA-tag] n=" << tagsProcessed << " tagAddr=0x" << std::hex << currentTagAddr
+                                      << " raw=0x" << static_cast<uint32_t>(tag >> 32) << ":"
+                                      << static_cast<uint32_t>(tag & 0xFFFFFFFFu)
+                                      << " id=" << std::dec << id << " qwc=" << tagQwc
+                                      << " irq=" << (irq ? 1 : 0) << " data=0x" << std::hex << dataAddr
+                                      << std::dec << " chainBytes=" << chainBuf.size() << std::endl;
+                        }
+
                         if (transferTagData)
                             appendVifTagData(currentTagAddr);
 
@@ -1557,6 +1594,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (endChain)
                             break;
                     }
+
+                    // TEMP DIAGNOSTIC (boot-stall triage).
+                    std::cerr << "[DMA-chain-done] tags=" << tagsProcessed
+                              << " bytes=" << chainBuf.size()
+                              << " nextTag=0x" << std::hex << tagAddr << std::dec
+                              << " vif1Pending=" << m_pendingVif1Transfers.size() << std::endl;
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
@@ -1995,6 +2038,11 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         flushMaskedPath3Packets(false);
     }
 
+    const bool bigPacket = sizeBytes >= 8192u; // TEMP DIAGNOSTIC (boot-stall triage)
+    if (bigPacket)
+        std::cerr << "[GIFsubmit] begin path=" << static_cast<int>(pathId) << " size=" << sizeBytes
+                  << " drain=" << (drainImmediately ? 1 : 0) << std::endl;
+
     if (m_gifArbiter)
         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
     else if (m_gifPacketCallback)
@@ -2002,6 +2050,9 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     if (m_gifArbiter && drainImmediately)
         m_gifArbiter->drain();
+
+    if (bigPacket)
+        std::cerr << "[GIFsubmit] end path=" << static_cast<int>(pathId) << " size=" << sizeBytes << std::endl;
 }
 
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)

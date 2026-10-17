@@ -547,8 +547,16 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
+// TEMP DIAGNOSTIC (boot-stall triage): phase markers for the EE thread's
+// re-entrancy path EeScheduler::accountCycles -> advanceIopEeCycles, so the
+// host-thread watchdog can report which call is actually stalled. Read from
+// another thread for diagnostics only.
+static volatile uint32_t s_diagStage = 0u; // 1=vu advance, 2=iop runEeCycles, 3=done
+static volatile uint32_t s_diagCalls = 0u;
+
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
+    ++s_diagCalls; // TEMP DIAGNOSTIC (boot-stall triage)
     if (m_vu)
     {
         auto *context = m_eeScheduler->currentContext();
@@ -556,13 +564,16 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
         while (remaining)
         {
             const auto cycles = static_cast<uint32_t>(std::min<uint64_t>(remaining, UINT32_MAX));
+            s_diagStage = 1u; // TEMP DIAGNOSTIC
             m_vu->advance(cycles, context ? *context : m_cpuContext);
+            s_diagStage = 2u; // TEMP DIAGNOSTIC
             remaining -= cycles;
         }
         if (m_vu->failed())
             m_eeScheduler->requestStop();
     }
     m_iopSubsystem->runEeCycles(eeCycles);
+    s_diagStage = 3u; // TEMP DIAGNOSTIC
     if (m_iopSubsystem->fault().active)
         m_eeScheduler->requestStop();
 }
@@ -2436,6 +2447,46 @@ void PS2Runtime::run()
                                                    << std::endl);
                 }
             });
+            // TEMP DIAGNOSTIC (boot-stall triage): when the EE scheduler thread
+            // gets stuck inside a single recompiled invocation the scheduler-side
+            // heartbeats stop entirely, because the loop never comes back around.
+            // Sample the *live* guest instruction pointer from this host thread
+            // while that lasts so the spinning code shows up in the log.
+            {
+                static uint32_t s_watchdogDbgPc = 0xFFFFFFFFu;
+                static auto s_watchdogSince = std::chrono::steady_clock::now();
+                static int s_watchdogReports = 0;
+                const uint32_t watchdogDbgPc = m_debugPc.load(std::memory_order_relaxed);
+                const auto watchdogNow = std::chrono::steady_clock::now();
+                if (watchdogDbgPc != s_watchdogDbgPc)
+                {
+                    s_watchdogDbgPc = watchdogDbgPc;
+                    s_watchdogSince = watchdogNow;
+                    s_watchdogReports = 0;
+                }
+                else if (s_watchdogReports < 8 &&
+                         std::chrono::duration_cast<std::chrono::seconds>(watchdogNow - s_watchdogSince).count() >= 3)
+                {
+                    ++s_watchdogReports;
+                    const R5900Context *watchdogLive = m_eeScheduler->currentContext();
+                    std::cerr << "[EE-wd] report=" << s_watchdogReports
+                              << " executing=" << (m_eeScheduler->isExecutingGuest() ? 1 : 0)
+                              << " tid=" << m_eeScheduler->currentThreadId()
+                              << " diagStage=" << s_diagStage
+                              << " diagCalls=" << s_diagCalls
+                              << " dbgPc=0x" << std::hex << watchdogDbgPc;
+                    if (watchdogLive != nullptr)
+                    {
+                        std::cerr << " livePc=0x" << watchdogLive->pc
+                                  << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(watchdogLive->r[31], 0))
+                                  << " sp=0x" << static_cast<uint32_t>(_mm_extract_epi32(watchdogLive->r[29], 0))
+                                  << " a0=0x" << static_cast<uint32_t>(_mm_extract_epi32(watchdogLive->r[4], 0))
+                                  << " v0=0x" << static_cast<uint32_t>(_mm_extract_epi32(watchdogLive->r[2], 0));
+                    }
+                    std::cerr << std::dec << std::endl;
+                }
+            }
+
             uint32_t presentWidth = FB_WIDTH;
             uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
             UploadFrame(frameTex, this, presentWidth, presentHeight);

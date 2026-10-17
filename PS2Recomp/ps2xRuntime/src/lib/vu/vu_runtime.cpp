@@ -5,11 +5,33 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
 namespace ps2vu
 {
+    // Guard against a VU microprogram that never reaches its end (E-bit / program
+    // end). This runtime waits *synchronously* for the running microprogram before
+    // starting the next one, so a program that never terminates -- one waiting on
+    // VIF data that cannot arrive while the EE thread is blocked here, or one
+    // started on microcode that was never uploaded -- would hang the emulator
+    // forever with no output. Bound the wait, report the stuck state, then reset the
+    // unit so the next start/resume is legal (reset() is the only transition back
+    // to Ready; start() rejects Running/Fault and resume() requires Ready).
+    // The spin budgets are deliberately small: wait() normally exits immediately
+    // (the VU clock drains the running program as the EE clock advances), so this
+    // loop only spins when the program is genuinely stuck. 4096 spins = 262144 VU
+    // cycles ~= 10% of one PAL frame -- far above any legitimate drain, while the
+    // forced reset stays cheap enough to survive repeated hits (a Debug-build
+    // interpreter costs ~75us per 64-cycle step).
+    constexpr uint64_t kWaitSpinBudgetVu1 = 1ull << 12; // ~262k VU cycles (~1.8ms of VU time)
+    constexpr uint64_t kWaitSpinBudgetVu0 = 1ull << 14; // ~1.05M VU cycles (~7ms of VU time)
+    constexpr uint64_t kWaitWarnEverySpins = 1ull << 10;
+    constexpr uint32_t kWaitMaxWarnReports = 4u;
+    constexpr uint64_t kTransferSpinBudget = 1ull << 12;
+    constexpr uint32_t kTransferMaxWarnReports = 4u;
+
     Runtime::Runtime(PS2Memory &memory, std::function<void(uint32_t)> advanceClock)
         : m_memory(memory), m_advanceClock(std::move(advanceClock))
     {
@@ -52,6 +74,11 @@ namespace ps2vu
         {
             if (vu1 && unit(false).status() == UnitStatus::Running)
             {
+                // TEMP DIAGNOSTIC (boot-stall triage): VU1 stalls entirely while VU0 runs.
+                static uint64_t s_vu1StarvedByVu0 = 0u;
+                if ((++s_vu1StarvedByVu0 % 8192u) == 0u)
+                    std::cerr << "[VU-run] vu1 starved by vu0 pc=0x" << std::hex << unit(false).state().pc
+                              << std::dec << std::endl;
                 m_advanceClock(1);
                 reportFailure();
                 --cycles;
@@ -76,8 +103,55 @@ namespace ps2vu
 
     void Runtime::wait(bool vu1)
     {
+        // Bounded (see kWaitSpinBudgetVu1): a microprogram that never reaches its
+        // end must not deadlock the EE thread. Report progress a few times, then
+        // reset the unit and let the guest continue.
+        const uint64_t spinBudget = vu1 ? kWaitSpinBudgetVu1 : kWaitSpinBudgetVu0;
+        const uint8_t *code = vu1 ? m_memory.getVU1Code() : m_memory.getVU0Code();
+        const uint32_t codeSize = vu1 ? PS2_VU1_CODE_SIZE : PS2_VU0_CODE_SIZE;
+        auto reportStuck = [&](uint64_t spins, const char *label)
+        {
+            const VU1State &vuState = unit(vu1).state();
+            uint32_t word0 = 0u;
+            uint32_t word1 = 0u;
+            if (code != nullptr && vuState.pc + 8u <= codeSize)
+            {
+                std::memcpy(&word0, code + vuState.pc, sizeof(word0));
+                std::memcpy(&word1, code + vuState.pc + 4u, sizeof(word1));
+            }
+            std::cerr << label << " vu" << (vu1 ? 1 : 0) << " spins=" << spins
+                      << " (~" << (spins * 64ull) << " cycles)"
+                      << " pc=0x" << std::hex << vuState.pc
+                      << " w0=0x" << word0 << " w1=0x" << word1 << std::dec
+                      << " ebit=" << (vuState.ebit ? 1 : 0)
+                      << " top=0x" << std::hex << vuState.top << " itop=0x" << vuState.itop << std::dec
+                      << " otherStatus=" << static_cast<int>(unit(!vu1).status()) << std::endl;
+        };
+
+        uint64_t spins = 0u;
+        uint32_t reports = 0u;
         while (unit(vu1).status() == UnitStatus::Running)
+        {
             run(vu1, 64);
+            ++spins;
+            if ((spins % kWaitWarnEverySpins) == 0u && reports < kWaitMaxWarnReports)
+            {
+                ++reports;
+                reportStuck(spins, "[VU-wait]");
+            }
+            if (spins >= spinBudget)
+            {
+                reportStuck(spins, "[VU-stall]");
+                std::cerr << "[VU-stall] vu" << (vu1 ? 1 : 0)
+                          << " microprogram never ended; resetting the unit so the EE thread can continue"
+                          << std::endl;
+                unit(vu1).reset();
+                break;
+            }
+        }
+        if (spins != 0u) // TEMP DIAGNOSTIC (boot-stall triage): a wait that had to spin.
+            std::cerr << "[VU-wait] vu" << (vu1 ? 1 : 0) << " returned after spins=" << spins
+                      << " status=" << static_cast<int>(unit(vu1).status()) << std::endl;
         reportFailure();
     }
 
@@ -120,6 +194,10 @@ namespace ps2vu
 
     void Runtime::start1(uint32_t pc, uint32_t top, uint32_t itop, bool resume)
     {
+        // TEMP DIAGNOSTIC (boot-stall triage).
+        std::cerr << "[VU1-mscal] pc=0x" << std::hex << pc << " top=0x" << top << " itop=0x" << itop << std::dec
+                  << " resume=" << (resume ? 1 : 0)
+                  << " running=" << (unit(true).status() == UnitStatus::Running ? 1 : 0) << std::endl;
         wait(true);
         const bool started = resume ? unit(true).resume(top, itop) : unit(true).start(pc, top, itop);
         if (!started)
@@ -127,6 +205,7 @@ namespace ps2vu
             reportFailure();
             throw std::runtime_error("VIF startup requested while VU1 is stopped");
         }
+        std::cerr << "[VU1-mscal-done] status=" << static_cast<int>(unit(true).status()) << std::endl;
     }
 
     void Runtime::flush0(R5900Context &context)
@@ -138,10 +217,34 @@ namespace ps2vu
 
     void Runtime::flush1(bool gif)
     {
+        // TEMP DIAGNOSTIC (boot-stall triage).
+        std::cerr << "[VU1-flush] gif=" << (gif ? 1 : 0)
+                  << " status=" << static_cast<int>(unit(true).status())
+                  << " transferring=" << (unit(true).transferring() ? 1 : 0) << std::endl;
         wait(true);
+        // TEMP DIAGNOSTIC (boot-stall triage).
+        std::cerr << "[VU1-flush] wait returned status=" << static_cast<int>(unit(true).status()) << std::endl;
         if (gif)
+        {
+            uint64_t transferSpins = 0u;
+            uint32_t reports = 0u;
             while (unit(true).transferring())
+            {
                 run(true, 2);
+                ++transferSpins;
+                if ((transferSpins % kWaitWarnEverySpins) == 0u && reports < kTransferMaxWarnReports)
+                {
+                    ++reports;
+                    std::cerr << "[VU1-flush] still transferring, spins=" << transferSpins << std::endl;
+                }
+                if (transferSpins >= kTransferSpinBudget)
+                {
+                    std::cerr << "[VU1-flush] XGKICK transfer never completed after " << transferSpins
+                              << " spins; abandoning the wait so the EE thread can continue" << std::endl;
+                    break;
+                }
+            }
+        }
     }
 
     void Runtime::advance(uint32_t cycles, R5900Context &context) noexcept
@@ -177,6 +280,26 @@ namespace ps2vu
         {
             if (target.status() != UnitStatus::Fault)
                 target.state().cycles = cycle;
+            return;
+        }
+
+        // A running unit can only be one time slice behind this clock, so a far
+        // larger gap means its counter was desynchronised (a mid-run reset used
+        // to zero it). Draining that gap would run the microprogram for a huge
+        // number of cycles -- and an unfinished microprogram never ends -- so
+        // snap the counter forward and report it instead.
+        constexpr uint64_t kMaxCatchUpCycles = 1ull << 20;
+        const uint64_t gap = cycle - target.state().cycles;
+        if (gap > kMaxCatchUpCycles)
+        {
+            static uint64_t s_resyncReports = 0u;
+            if (s_resyncReports < 8u)
+            {
+                ++s_resyncReports;
+                std::cerr << "[VU-clock] vu" << (vu1 ? 1 : 0) << " unit cycles=" << target.state().cycles
+                          << " clock=" << cycle << " gap=" << gap << "; resynchronising" << std::endl;
+            }
+            target.state().cycles = cycle;
             return;
         }
 
