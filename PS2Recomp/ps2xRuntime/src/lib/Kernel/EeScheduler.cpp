@@ -260,6 +260,35 @@ void EeScheduler::run()
                         s_idleLast = now;
                         std::cerr << "[EE-hb] IDLE pending=" << m_pendingInvocations.size()
                                   << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+                        // TEMP DIAGNOSTIC (boot-stall triage): with no runnable
+                        // thread, dump what every guest thread is blocked on.
+                        for (const auto &[id, item] : m_threads)
+                        {
+                            const R5900Context &threadContext = item.activeContext();
+                            std::cerr << "[EE-thread] id=" << id
+                                      << " status=" << static_cast<int>(item.status)
+                                      << " wait=" << static_cast<int>(item.wait.reason)
+                                      << " waitId=" << waitObjectId(item.wait)
+                                      << " suspend=" << item.suspendCount
+                                      << " wake=" << item.wakeupCount
+                                      << " inv=" << item.invocations.size()
+                                      << " pc=0x" << std::hex << threadContext.pc
+                                      << " ra=0x" << getRegU32(&threadContext, 31)
+                                      << " sp=0x" << getRegU32(&threadContext, 29)
+                                      << " entry=0x" << item.entry << std::dec << std::endl;
+                        }
+                        for (const auto &[id, item] : m_semaphores)
+                        {
+                            std::cerr << "[EE-sem] id=" << id << " count=" << item.count
+                                      << " max=" << item.maxCount
+                                      << " waiters=" << item.waiters.size() << std::endl;
+                        }
+                        for (const auto &[id, item] : m_eventFlags)
+                        {
+                            std::cerr << "[EE-evf] id=" << id << " bits=0x" << std::hex << item.bits
+                                      << " init=0x" << item.initBits << std::dec
+                                      << " waiters=" << item.waiters.size() << std::endl;
+                        }
                     }
                 }
                 waitForEvent();
@@ -307,6 +336,9 @@ void EeScheduler::run()
             {
                 s_hbLast = now;
                 std::cerr << "[EE-hb] run iters=" << s_hbIters << " id=" << running->id
+                          << " kind=" << (running->invocations.empty()
+                                              ? -1
+                                              : static_cast<int>(running->invocations.back().kind))
                           << " pc=0x" << std::hex << context.pc
                           << " ra=0x" << getRegU32(&context, 31)
                           << " sp=0x" << getRegU32(&context, 29)

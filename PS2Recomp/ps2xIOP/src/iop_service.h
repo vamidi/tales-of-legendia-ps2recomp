@@ -23,6 +23,12 @@ namespace ps2x::iop::detail
         {
             return {};
         }
+        // Services the emulated IOP always provides, even though the module that
+        // would own them really lives in the IOP OS image (IOPRP300.IMG).
+        [[nodiscard]] virtual bool alwaysAvailable() const
+        {
+            return false;
+        }
         virtual void reset() = 0;
 
         [[nodiscard]] virtual RpcAbi selectRpcAbi(const RpcAbiRequest &request) const

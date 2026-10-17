@@ -23,13 +23,15 @@ namespace ps2x::iop
             coreServices.emplace_back(detail::createMcservService(host));
             coreServices.emplace_back(detail::createDbcmanService(host));
             coreServices.emplace_back(detail::createLibSdService(host));
+            coreServices.emplace_back(detail::createLoadFileService(
+                host, [this](std::string_view path) { return loadModuleImpl(path, nullptr, 0u); }));
             refreshServiceModuleKeys();
             rebuildRoutes();
         }
 
         bool serviceActive(const detail::IopService &service) const
         {
-            return moduleManager.isLoaded(service.moduleAliases());
+            return service.alwaysAvailable() || moduleManager.isLoaded(service.moduleAliases());
         }
 
         void refreshServiceModuleKeys()
@@ -41,6 +43,37 @@ namespace ps2x::iop
                     keys.emplace_back(alias);
             }
             moduleManager.setServiceModuleKeys(std::move(keys));
+        }
+
+        ModuleLoadResult loadModuleImpl(std::string_view path, const void *arguments, uint32_t argumentSize)
+        {
+            const ParsedPs2Path parsed = parsePs2Path(path);
+            if (!parsed)
+                return {true, -1, -1};
+
+            if (parsed.device != Ps2PathDevice::Rom0)
+            {
+                ModuleLoadResult physical = emulator.loadModule(path, arguments, argumentSize);
+                if (physical.moduleId > 0)
+                {
+                    moduleManager.observePhysicalLoad(physical.moduleId, path);
+                    rebuildRoutes();
+                    return physical;
+                }
+            }
+
+            ModuleLoadResult hle = moduleManager.loadHle(path);
+            if (hle.moduleId > 0)
+            {
+                rebuildRoutes();
+                if (parsed.device != Ps2PathDevice::Rom0)
+                    recordLoadOutcome(path, true);
+            }
+            else
+            {
+                recordLoadOutcome(path, false);
+            }
+            return hle;
         }
 
         void rebuildRoutes()
@@ -116,33 +149,7 @@ namespace ps2x::iop
 
     ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
-        const ParsedPs2Path parsed = parsePs2Path(path);
-        if (!parsed)
-            return {true, -1, -1};
-
-        if (parsed.device != Ps2PathDevice::Rom0)
-        {
-            ModuleLoadResult physical = m_impl->emulator.loadModule(path, arguments, argumentSize);
-            if (physical.moduleId > 0)
-            {
-                m_impl->moduleManager.observePhysicalLoad(physical.moduleId, path);
-                m_impl->rebuildRoutes();
-                return physical;
-            }
-        }
-
-        ModuleLoadResult hle = m_impl->moduleManager.loadHle(path);
-        if (hle.moduleId > 0)
-        {
-            m_impl->rebuildRoutes();
-            if (parsed.device != Ps2PathDevice::Rom0)
-                m_impl->recordLoadOutcome(path, true);
-        }
-        else
-        {
-            m_impl->recordLoadOutcome(path, false);
-        }
-        return hle;
+        return m_impl->loadModuleImpl(path, arguments, argumentSize);
     }
 
     ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)

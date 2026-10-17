@@ -51,4 +51,17 @@ public:
             runtime->resetIop();
         }
     }
+
+    // The EE and the IOP are separate processors, and a guest module registers
+    // its RPC servers from the start-up thread its entry creates.  Letting the
+    // emulated IOP run a bounded number of EE cycles before the guest's first
+    // call to a service it does not own yet keeps the two in step, since the
+    // host loop otherwise lets the EE run far ahead of the module it loaded.
+    static void catchUp(PS2Runtime *runtime, uint64_t eeCycles)
+    {
+        if (runtime)
+        {
+            runtime->advanceIopEeCycles(eeCycles);
+        }
+    }
 };

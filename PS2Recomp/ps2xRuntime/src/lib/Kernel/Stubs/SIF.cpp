@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <unordered_set>
 #include <vector>
 
 namespace ps2_stubs
@@ -413,6 +414,51 @@ namespace ps2_stubs
         uint32_t g_sifRpcPayloadFollowingSize = 0u;
         uint64_t g_sifRpcRoutedCallCount = 0u;
 
+        // SIDs already given a bounded IOP catch-up (see catchUpIopForSid).
+        std::unordered_set<uint32_t> g_sifIopCatchUpTriedSids;
+
+        // The EE and the IOP are separate processors: a guest module registers
+        // its RPC servers from the start-up thread its entry creates, and that
+        // thread only runs while the IOP is pumped - SIF traffic itself is
+        // usually what releases it.  A call from a client whose bound service
+        // the emulated IOP does not own yet is therefore given a bounded
+        // catch-up first, otherwise the EE reaches its first call before the
+        // module it just loaded has finished starting.
+        constexpr uint32_t kIopCatchUpRounds = 32u;
+        constexpr uint64_t kIopCatchUpEeCycles = 1048576u;
+
+        void catchUpIopForSid(PS2Runtime *runtime, uint32_t sid)
+        {
+            if (runtime == nullptr || sid == 0u)
+                return;
+            if (g_sifIopCatchUpTriedSids.count(sid) != 0u)
+                return;
+
+            g_sifIopCatchUpTriedSids.insert(sid);
+            if (PS2IopTransport::canBindRpc(runtime, sid))
+                return;
+
+            for (uint32_t round = 0u; round < kIopCatchUpRounds; ++round)
+            {
+                PS2IopTransport::catchUp(runtime, kIopCatchUpEeCycles);
+                if (PS2IopTransport::canBindRpc(runtime, sid))
+                {
+                    std::cerr << "[SIF-iop] IOP catch-up: sid=0x" << std::hex << sid
+                              << std::dec << " claimed by the emulated IOP after "
+                              << (round + 1u) << " round(s)" << std::endl;
+                    return;
+                }
+            }
+
+            const ps2x::iop::DebugSnapshot snapshot = runtime->iopDebugSnapshot();
+            std::cerr << "[SIF-iop] IOP catch-up: sid=0x" << std::hex << sid << std::dec
+                      << " still unclaimed after " << kIopCatchUpRounds
+                      << " round(s); iop cycles=" << snapshot.emulatorCycles
+                      << " modules=" << snapshot.emulatorLoadedModules
+                      << " threads=" << snapshot.emulatorThreads
+                      << " rpcServers=" << snapshot.emulatorRpcServers << std::endl;
+        }
+
         void emulateIopSifRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
                               const Ps2SifDmaTransfer &xfer)
         {
@@ -496,6 +542,8 @@ namespace ps2_stubs
                         boundSid = clientSid->second;
                     }
                 }
+
+                catchUpIopForSid(runtime, boundSid);
 
                 if (boundSid != 0u && PS2IopTransport::canBindRpc(runtime, boundSid))
                 {
@@ -761,6 +809,7 @@ namespace ps2_stubs
     {
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
         g_sifRpcClientSid.clear();
+        g_sifIopCatchUpTriedSids.clear();
         g_sifRpcPayloadPrecedingEeAddr = 0u;
         g_sifRpcPayloadPrecedingSize = 0u;
         g_sifRpcPayloadFollowingEeAddr = 0u;
