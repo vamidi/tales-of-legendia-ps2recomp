@@ -16,6 +16,36 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 12f - orphaned suspends completed; sem-65 signaller is none of the workers
+
+User chose "complete the orphaned suspend pair". Implemented as a TEMP HLE hook in
+`EeScheduler.cpp` (inside the scheduler loop, so **no header change / no generated-chain
+rebuild**): once the staged-init gate word `0x3943B8` is nonzero, resume any thread that is
+suspended while parked in a staged-init wait — either the gate-spin cluster
+(`0x198C60..0x198D50`) or the stage poll loop (`0x198F38..0x199038`) — dropping the orphaned
+suspend with the existing `resumeThread()`.
+
+**run61** (poll loop only) and **run62** (both ranges):
+
+    L12292 [HLE-poll] resuming orphaned poller id=2 pc=0x198c60 gate=0x1 suspend=1
+    L12293 [HLE-poll] resuming orphaned poller id=5 pc=0x19902c gate=0x1 suspend=1
+    L12295 [EE-exit] thread=2 ... v0=0x394380      (gate block, i.e. it consumed gate 0)
+    L12301 [EE-exit] thread=3 ... v0=0x3943a0
+    L12302 [EE-exit] thread=4 ... v0=0x3943b0
+    thread 5: suspend=0, park in its poll loop
+    thread 1: still waitId=65
+
+So all four stage workers now run to completion (2 consumes the gate and exits; 3/4 exit;
+5 finished its iteration) and **sem 65 is still never signalled**. Baseline preserved:
+`RPC END posted=54`, `RPC CALL=82`, Deci2=4, DVCI=1.
+
+**Conclusion: none of threads 2/3/4/5 is the sem-65 signaller.** The stall is now maximally
+clean — every worker done, only thread 1 blocked on 65 — so the missing signal must come from
+outside the stage chain: an interrupt/callback path, the IOP, or a thread that is never
+created. The one registered-but-never-invoked callback is `FUN_001b7580(6, 0x198BF8)` →
+`FUN_00198bf8`, but that function is only a tail-call wrapper
+(`FUN_00198b20(*(0x39436C), *(0x3942E8))`), so it is not a direct `SignalSema`.
+
 ## Session 12e - sem-65 deadlock characterised: orphans two suspensions of the workers
 
 Instrumentation added (all TEMP, stripped later): per-thread `s2/s4/s6/s7` + the words

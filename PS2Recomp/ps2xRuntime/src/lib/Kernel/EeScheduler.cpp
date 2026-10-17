@@ -246,6 +246,56 @@ void EeScheduler::run()
 
         if (m_currentThreadId == 0)
         {
+            // TEMP HLE (Tales of Legendia SLUS_212.01, boot-stall triage):
+            // complete the orphaned half of the game's own suspend/resume pair.
+            //
+            // Thread 1 suspends the staged-init pollers through FUN_00199268()
+            // before the sem-60/65 handshake, and the matching entry_00199240()
+            // resume is never reached for thread 5. By that point the word the
+            // poller spins on (0x3943B8, one of the six gates written by
+            // releaseStagedInitGates) is already 1, so the thread is runnable in
+            // every respect except the unbalanced suspend. Resuming it once lets
+            // its epilogue write the stage-done marker at (ret_1991E8 + 0x43C0).
+            {
+                static bool s_pollResumeDone = false;
+                if (!s_pollResumeDone && m_rdram)
+                {
+                    uint64_t pollGate = 0;
+                    std::memcpy(&pollGate, m_rdram + 0x3943B8u, sizeof(pollGate));
+                    if (pollGate != 0)
+                    {
+                        for (auto &[id, item] : m_threads)
+                        {
+                            if (item.suspendCount == 0)
+                            {
+                                continue;
+                            }
+                            const R5900Context &pollContext = item.activeContext();
+                            // Staged-init waits only: the gate-spin cluster
+                            // (FUN_00198c60 / FUN_00198cb8) and the stage poll
+                            // loop (entry_00198f38 .. 0x199038).
+                            const bool stagedWait =
+                                (pollContext.pc >= 0x198C60u && pollContext.pc < 0x198D50u) ||
+                                (pollContext.pc >= 0x198F38u && pollContext.pc < 0x199038u);
+                            if (!stagedWait)
+                            {
+                                continue;
+                            }
+                            std::cerr << "[HLE-poll] resuming orphaned poller id=" << id
+                                      << " pc=0x" << std::hex << pollContext.pc
+                                      << " gate=0x" << pollGate
+                                      << " suspend=" << std::dec << item.suspendCount
+                                      << std::endl;
+                            while (item.suspendCount > 0)
+                            {
+                                resumeThread(id, false);
+                            }
+                        }
+                        s_pollResumeDone = true;
+                    }
+                }
+            }
+
             GuestThread *next = selectReady();
             if (!next && m_pendingInvocations.empty())
             {
