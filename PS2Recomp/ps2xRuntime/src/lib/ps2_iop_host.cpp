@@ -12,11 +12,61 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <mutex>
+#include <sstream>
 #include <utility>
 
 #if !defined(_WIN32)
 #include <sys/types.h>
 #endif
+
+// TEMP DIAGNOSTIC (session 11): census of every IOP -> EE guest write, with a
+// dedicated report for the 0x3943xx staged-init handshake block that the EE boot
+// chain waits on. Strip once the handshake investigation is settled.
+namespace
+{
+    void watchIopGuestWrite(uint32_t address, uint32_t size, const char *op, const void *source)
+    {
+        static std::mutex mutex;
+        static uint32_t total = 0u;
+        static uint32_t inBlock = 0u;
+        static uint32_t blockReported = 0u;
+        static uint32_t censusReported = 0u;
+        std::lock_guard<std::mutex> lock(mutex);
+        ++total;
+
+        const uint64_t lo = address;
+        const uint64_t hi = static_cast<uint64_t>(address) + size;
+        if (hi > 0x394300ull && lo < 0x394400ull)
+        {
+            ++inBlock;
+            if (blockReported < 40u)
+            {
+                ++blockReported;
+                std::ostringstream out;
+                out << "[WATCH-IOPW] #" << inBlock << ' ' << op
+                    << " addr=0x" << std::hex << address << " size=0x" << size << " bytes=";
+                if (source != nullptr)
+                {
+                    const auto *bytes = static_cast<const uint8_t *>(source);
+                    for (uint32_t i = 0u; i < size && i < 16u; ++i)
+                        out << std::hex << static_cast<unsigned>(bytes[i]) << ' ';
+                }
+                out << std::dec;
+                std::cerr << out.str() << std::endl;
+                return;
+            }
+        }
+        if (censusReported < 60u)
+        {
+            ++censusReported;
+            std::ostringstream census;
+            census << "[WATCH-IOPW-census] #" << total << ' ' << op
+                   << " addr=0x" << std::hex << address << " size=0x" << size << std::dec;
+            std::cerr << census.str() << std::endl;
+        }
+    }
+}
 
 PS2IopHostAdapter::CallScope::CallScope(PS2IopHostAdapter &owner, R5900Context *context, uint8_t *rdram)
     : m_lock(owner.m_callMutex),
@@ -162,6 +212,7 @@ bool PS2IopHostAdapter::writeGuest(uint32_t address, const void *source, size_t 
     {
         uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
         ps2TraceGuestRangeWrite(rdram, address, static_cast<uint32_t>(size), "IopHost::writeGuest", nullptr);
+        watchIopGuestWrite(address, static_cast<uint32_t>(size), "writeGuest", source);
         std::memcpy(destination, source, size);
     }
     return true;
@@ -178,6 +229,7 @@ bool PS2IopHostAdapter::zeroGuest(uint32_t address, size_t size)
     {
         uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
         ps2TraceGuestRangeWrite(rdram, address, static_cast<uint32_t>(size), "IopHost::zeroGuest", nullptr);
+        watchIopGuestWrite(address, static_cast<uint32_t>(size), "zeroGuest", nullptr);
         std::memset(destination, 0, size);
     }
     return true;

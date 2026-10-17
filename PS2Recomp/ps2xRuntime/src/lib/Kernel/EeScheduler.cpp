@@ -335,6 +335,10 @@ void EeScheduler::run()
             if (std::chrono::duration_cast<std::chrono::seconds>(now - s_hbLast).count() >= 3)
             {
                 s_hbLast = now;
+                // TEMP DIAGNOSTIC (session 11): the loader stalls on `ld v0,0(s0)`
+                // at 0x198c90 and loops while it is zero; s0 is set by the caller,
+                // so dump s0 (and the word it waits on) here.
+                const uint32_t hbS0 = getRegU32(&context, 16);
                 std::cerr << "[EE-hb] run iters=" << s_hbIters << " id=" << running->id
                           << " kind=" << (running->invocations.empty()
                                               ? -1
@@ -345,6 +349,10 @@ void EeScheduler::run()
                           << " gp=0x" << getRegU32(&context, 28)
                           << " t9=0x" << getRegU32(&context, 25)
                           << " inv=" << running->invocations.size()
+                          << " s0=0x" << hbS0
+                          << " v0=0x" << getRegU32(&context, 2)
+                          << " v1=0x" << getRegU32(&context, 3)
+                          << " waitAt=" << formatHexWords(m_rdram, hbS0 & 0x1FFFFFF8u, 4u)
                           << " s387658=" << formatHexWords(m_rdram, 0x387658u, 1u)
                           << " s387660=" << formatHexWords(m_rdram, 0x387660u, 1u)
                           << " cmd=" << formatHexWords(m_rdram, 0x3DED98u, 8u)

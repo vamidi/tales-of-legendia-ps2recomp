@@ -16,7 +16,103 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
-## Session 11 (in progress) - ROOT CAUSE OF THE STALL: an IOP-side handshake, NOT the discovery gap
+## Session 12b - REAL BUG FOUND: CreateSema read the wrong initial-count field
+
+**Prompt:** user asked whether the sem-65 trace helps with the black screen. It does: the game's
+main thread (`id=1`, `entry=0x100008`) is parked on sem 65, and while it is parked the game can
+never reach its render loop.
+
+**Trace (temporary `[SEM]` instrumentation in `src/lib/Kernel/Syscalls/Sync.cpp`; `ra` at the
+syscall is the guest call site):**
+- `create id=65 count=.. max=1 ra=0x119be0`, then `signal 60 ra=0x119c4c`, then `wait 65
+  ra=0x119c6c` -- a create/signal/wait hand-off inside the staged-init cluster.
+- A worker waits on sem 60 at `ra=0x11945c` (`func_119470`, called at `0x119c30`).
+- **Nothing ever signals sem 65**, and the end-state table showed `id=60 count=1 waiters=0`,
+  `id=62 count=1 waiters=0` -- the signals land with no waiter, i.e. the consumers had already
+  sailed through.
+- `[EE-exit] thread=3/4/5 delete=1 v0=0x3943a0/0x3943b0/0x3943c0` -- the staged worker threads
+  ran the staged-init code and exited.
+
+**Root cause (real bug, one line):** `ee_sema_t` in `Kernel/Syscalls/Helpers/State.h` is correct
+(`count`, `max_count`, `init_count`, `wait_threads`, `attr`, `option`), but `CreateSema` passed
+`param->init_count` as the initial count. The EE kernel takes the initial count from the **first**
+field (`count`); `init_count` is a **status** field that only `ReferSemaStatus` fills, and the guest
+leaves it (and `attr`/`option`) as stale stack data. Proof: the logged `attr` values were
+`0x3dec40`/`0x3defc0` (stack pointers), `0x49a340` (heap pointer), `0x1187c4` (code address) -- not
+attributes at all. So every semaphore was seeded with garbage: sem 60 should have started **0** (its
+first wait must block) but started **1**, so the worker sailed through, main's later `SignalSema(60)`
+found no waiter, and nothing ever signalled 65.
+
+**Fix:** `src/lib/Kernel/Syscalls/Sync.cpp` -- pass `param->count` (comment records why). One line,
+no header change, no regeneration.
+
+**Result (run55):**
+- The `[EE-sem]`/`[EE-thread]` stall dumps are gone entirely and thread 1 is **running**
+  (`inv=0`), no longer `waitId=65`.
+- The EE now sustains a live main loop:
+  `0x11cf1c -> 0x11d6f0 -> 0x11d8f4 -> 0x166370 -> 0x166360 -> 0x11f650 -> 0x11d6b8 -> 0x1146e0
+  -> 0x1184cc -> ...` (`iters` climbing), i.e. it services SIF (`0x11f650`) and runs game logic.
+- GS init still healthy: `[GS] BIOS-like CRT seed`, `[GS] present mode`, Vulkan layer present.
+
+**Still black:** no per-frame GIF/DMA traffic yet (`gif`/`draw`/`prim` counts are 0 in run55;
+run54's higher GS/gif/chain counts were pre-fix boot noise). Open loop to close next:
+`0x11cf1c <-> 0x11d6f0/0x11d8f4 -> 0x166360/0x166370` with failing-looking returns
+(`v0=0xffffffff`) -- find what that loop waits for and why it never emits a GIF DMA chain.
+
+## Session 12 - STALL CLEARED BY THE HLE STAGED-INIT RELEASE
+
+**Decision carried in:** user chose "HLE handshake now (recommended)" after the session-12
+trace answered the earlier question. Implemented and verified in one run.
+
+**Trace answer (the requested investigation): the IOP never writes the gate.**
+- Every IOP->EE write funnels through `PS2IopHostAdapter::writeGuest`/`zeroGuest`
+  (`Kernel/iop/ps2_iop_host.cpp`) and every applied IOP->EE copy through
+  `SIF.cpp::writeEeRange`. Instrumented both for a whole run: **39 IOP->EE writes**,
+  only to `0x3e2200/0x3dbc40/0x3ddf40/0x49a340/0x3e1480/0x1fffd30/0x3b6a80/0x3b0bc0`
+  (none inside `[0x394300,0x394400)`), plus **54** `writeEeRange` copies all to the SIF
+  command buffer `0x203decc0`. The IOP is healthy (game IRX modules loaded, game's own
+  servers registered, IXAUDIO RPCs served, no faults/unhandled imports). **There is no
+  dropped IOP->EE write to fix; the IOP is never asked.**
+
+**Why the EE cannot write it either (now proven decisively).**
+- `FUN_00199938` is exactly six `sd` of 1 into `0x394378/0x394388/0x394398/0x3943A8/
+  0x3943B8/0x3943C8` (confirmed by reading the generated function).
+- Its only callers are `FUN_00199988` (`jal`@`0x1999A8`) and `FUN_0019a550` (`jal`@`0x19A570`),
+  and both are **counter gated**: `if (--*(u32*)0x3942C4 == 0) { FUN_00199938(); <subsystem
+  inits>; <callbacks>; }`.
+- An image-wide scan (Int64-correct) of `j`/`jal`/branches plus `lui`+`addiu/ori`
+  materialisations finds only the *inbound* edges listed below; **nothing initialises the
+  `0x3942C4` counter** (its only accesses are the load/store inside the two drivers
+  themselves), so the countdown can never reach zero. The staged-init release is dead code
+  in this image.
+- Inbound edges into the cluster (for reference): `0x166438 jal 0x1997A8`,
+  `0x1997E0 bnel 0x199914`, `0x19A2BC jal 0x199988`, `0x19A4FC/0x19A510 jal 0x1B7580`,
+  `0x19A660 jal 0x1B75D8`, `0x1999A8 jal 0x199938`, `0x19A570 jal 0x199938`,
+  `0x166498 jal 0x19A068`, `0x198C88 jal 0x198C48`, `0x198DFC jal 0x19A120`.
+
+**Fix applied (src/lib only, no regeneration, no header change):**
+`src/lib/ps2_runtime.cpp` — `releaseStagedInitGates()` called from `dispatchGuestBranch`:
+once, the first time the guest enters `[0x198000,0x19B000)`, it writes the six u64 gates as
+`1`. That is byte-for-byte the game's own definition of "all stages ready"
+(`FUN_00199938`), and since nothing else in the image ever writes those words the release
+cannot be undone. Logs `[HLE-staged-init] released six ready gates ...`.
+
+**Result (run53, one 50 s diagnostic):**
+- `[HLE-staged-init] released six ready gates ... target=0x19a6f0 source=0x1663ac`.
+- The gate spin is gone. Thread 2 is no longer spinning at `0x198c90` (now `suspend=1` at
+  `0x198c60`), and `[guest-branch:missing-target]` count is **0** (the 0x1B30F0 retirement
+  no longer happens on this path).
+- The boot now runs **new** code: `0x166490 <-> 0x11f650`, `[Deci2Call:kputs] DVCI:
+  Invalidate filelist buffer pointer.` (DVD filesystem stage), and a stream of RPCs to the
+  game's **own IOP server** `sid=0x90000200` / `moduleFn=0x6d390` (`rpc=0x2, 0x403, 0x40c`,
+  all `handled=1`, replies via `writeGuest addr=0x49a340`).
+
+**New blocker (next session):** the game's main thread (id=1, `entry=0x100008`) now blocks
+on **semaphore 65** (`[EE-sem] id=65 count=0 waiters=1`), while the anonymous context spins
+`0x166490 <-> 0x11f650` and `[EE-hb] IDLE pending=0`. Something is expected to signal sem 65
+(likely a staged-init callback or an IOP reply) and never does. `h=1 0 0 ...` in `[EE-hb]`.
+
+## Session 11 - ROOT CAUSE OF THE STALL: an IOP-side handshake, NOT the discovery gap
 
 **Decision carried in:** user chose "do the analyzer discovery pass properly" (close the
 gap class, then regenerate once). This session investigated that gap to design the fix —

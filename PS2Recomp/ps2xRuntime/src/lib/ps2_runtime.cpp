@@ -1138,9 +1138,15 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
     }
 }
 
+namespace
+{
+    void watchAssetInitEntry(uint32_t address); // defined below
+}
+
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
+    watchAssetInitEntry(address);
 
     uint32_t slot = 0u;
     if (generatedFunctionTableSlot(address, slot))
@@ -1346,6 +1352,183 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+namespace
+{
+    // TEMP DIAGNOSTIC (session 10): the asset-init chain that is expected to
+    // raise the six "subsystem ready" flags at 0x394378..0x3943C8, which the
+    // loader currently waits on forever from 0x198c88. Remove once the loader
+    // no longer stalls.
+    const char *watchedAssetInitBranch(uint32_t address)
+    {
+        switch (address)
+        {
+        case 0x198BF8u: return "callback registered by FUN_001997a8";
+        case 0x198C60u: return "FUN_00198c60 (ready-flag spin)";
+        case 0x198C88u: return "entry_00198c88 (ready-flag spin)";
+        case 0x1997A8u: return "FUN_001997a8 (registers the id-6 callback)";
+        case 0x199914u: return "entry_00199914";
+        case 0x199938u: return "FUN_00199938 (sets the six ready flags)";
+        case 0x199988u: return "FUN_00199988 (calls the flag setter)";
+        case 0x19A2C4u: return "code region Ghidra never identified";
+        case 0x19A4FCu: return "func_1B7580 registration (monolith only)";
+        case 0x19A550u: return "FUN_0019a550 (calls the flag setter)";
+        case 0x1B30F0u: return "retired thread entry";
+        case 0x1B7580u: return "FUN_001b7580 (RAM callback table writer)";
+        default: return nullptr;
+        }
+    }
+
+    // TEMP DIAGNOSTIC (session 10): label the asset-init chain's functions and
+    // the two orphaned regions that only the bogus FUN_001978f0 monolith
+    // implements. Used by the entry watch below.
+    const char *assetInitEntryLabel(uint32_t address)
+    {
+        switch (address)
+        {
+        case 0x166464u: return "thread entry (spawner)";
+        case 0x166490u: return "thread entry -> FUN_0019a068(0)";
+        case 0x1664C0u: return "thread entry (second spawn)";
+        case 0x199F40u: return "FUN_00199f40 (init body)";
+        case 0x19A068u: return "FUN_0019a068 (thunk -> FUN_00199f40)";
+        case 0x19A098u: return "FUN_0019a098";
+        case 0x19A120u: return "FUN_0019a120";
+        case 0x19A1A0u: return "FUN_0019a1a0";
+        case 0x19A1C8u: return "FUN_0019a1c8 (ends at 0x19A1EC)";
+        case 0x19A1ECu: return "ORPHAN region 0x19A1EC-0x19A250 (monolith only)";
+        case 0x19A250u: return "FUN_0019a250";
+        case 0x19A298u: return "entry_0019a298";
+        case 0x19A29Cu: return "entry_0019a29c";
+        case 0x19A2B0u: return "FUN_0019a2b0 (j FUN_00199988)";
+        case 0x19A2C4u: return "ORPHAN region 0x19A2C4-0x19A550 (monolith only)";
+        case 0x19A4FCu: return "orphan region: func_1B7580 registration site";
+        case 0x19A550u: return "FUN_0019a550 (jal FUN_00199938)";
+        case 0x199988u: return "FUN_00199988 (jal FUN_00199938)";
+        case 0x199938u: return "FUN_00199938 (sets the six ready flags)";
+        case 0x198C60u: return "FUN_00198c60 (ready-flag spin)";
+        case 0x198C88u: return "entry_00198c88 (ready-flag spin)";
+        case 0x1B75D8u: return "FUN_001b75d8 (invokes callback for event id)";
+        case 0x113B50u: return "func_113B50 (thread/entry registration)";
+        case 0x1ACD58u: return "the jalr that created the retired thread 3";
+        default: return nullptr;
+        }
+    }
+
+    // Entry watch: fires on every scheduler dispatch and every generated call,
+    // i.e. also on fall-through entries into a neighbouring function.
+    void watchAssetInitEntry(uint32_t address)
+    {
+        const char *label = assetInitEntryLabel(address);
+        if (label == nullptr)
+        {
+            return;
+        }
+
+        static std::mutex s_entryMutex;
+        static std::unordered_map<uint32_t, uint32_t> s_entryCounts;
+        static uint32_t s_entryBudget = 400u;
+        std::lock_guard<std::mutex> lock(s_entryMutex);
+        if (s_entryBudget == 0u)
+        {
+            return;
+        }
+        uint32_t &count = s_entryCounts[address];
+        if (count >= 3u)
+        {
+            return;
+        }
+        ++count;
+        --s_entryBudget;
+
+        std::ostringstream out;
+        out << "[WATCH-ENTRY] #" << count << " pc=0x" << std::hex << address
+            << " (" << label << ")" << std::dec;
+        std::cerr << out.str() << std::endl;
+    }
+
+    void watchAssetInitBranch(uint32_t targetPc,
+                              uint32_t sourcePc,
+                              uint32_t fallthroughPc,
+                              PS2Runtime::GuestBranchKind kind,
+                              const char *debugName,
+                              R5900Context *ctx)
+    {
+        const char *watched = watchedAssetInitBranch(targetPc);
+        if (watched == nullptr || ctx == nullptr)
+        {
+            return;
+        }
+
+        static std::mutex s_watchMutex;
+        static std::unordered_map<uint32_t, uint32_t> s_watchCounts;
+        std::lock_guard<std::mutex> lock(s_watchMutex);
+        uint32_t &count = s_watchCounts[targetPc];
+        if (count >= 4u)
+        {
+            return;
+        }
+        ++count;
+
+        std::ostringstream out;
+        out << "[WATCH] #" << count << " target=0x" << std::hex << targetPc
+            << " (" << watched << ")"
+            << " source=0x" << sourcePc
+            << " fallthrough=0x" << fallthroughPc
+            << " kind=" << describeGuestBranchKind(kind)
+            << " op=" << (debugName ? debugName : "?")
+            << " ra=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+            << " a0=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0))
+            << " a1=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0))
+            << std::dec;
+        std::cerr << out.str() << std::endl;
+    }
+}
+
+    // HLE staged-init release for Tales of Legendia (SLUS_212.01).
+    //
+    // The guest's boot parks in entry_00198c88 spinning on the u64 gate at
+    // 0x394378 forever. That gate block is the game's own staged-init
+    // handshake: FUN_00199938 writes six u64 gates (0x394378 .. 0x3943C8) all
+    // equal to 1, and its only two callers FUN_00199988 / FUN_0019a550 are
+    // counter gated on a countdown at 0x3942C4.
+    //
+    // In this image that whole handshake is unreachable: a full scan finds no
+    // transfer that targets FUN_00199938 or either driver, no lui/addiu
+    // materialisation of them, and the only reads/writes of the 0x3942C4
+    // counter are inside the two drivers themselves, so the countdown can
+    // never reach zero and nothing ever releases the stages. The IOP never
+    // writes the gate either (instrumented: 39 IOP->EE writes in a whole run,
+    // none inside [0x394300, 0x394400)).
+    //
+    // The guest's own definition of "every stage is ready" is exactly those
+    // six u64 stores, so apply that once, the first time the guest enters the
+    // staged-init cluster. Nothing else in the image ever writes these words,
+    // so the release cannot be undone and firing slightly early is harmless.
+    void releaseStagedInitGates(uint8_t *rdram, uint32_t targetPc, uint32_t sourcePc)
+    {
+        static bool s_released = false;
+        if (s_released)
+        {
+            return;
+        }
+        // Entering the staged-init cluster is what says the boot has reached
+        // the handshake: that range holds the gate waiters, both drivers, the
+        // flag setter and the init body.
+        if (targetPc < 0x198000u || targetPc >= 0x19B000u)
+        {
+            return;
+        }
+        s_released = true;
+
+        for (uint32_t gate = 0x394378u; gate <= 0x3943C8u; gate += 0x10u)
+        {
+            *reinterpret_cast<uint64_t *>(rdram + gate) = 1ull;
+        }
+
+        std::cerr << "[HLE-staged-init] released six ready gates 0x394378..0x3943C8"
+                  << " target=0x" << std::hex << targetPc
+                  << " source=0x" << sourcePc << std::dec << std::endl;
+    }
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1355,6 +1538,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      const char *debugName)
 {
     ctx->pc = targetPc;
+    watchAssetInitBranch(targetPc, sourcePc, fallthroughPc, kind, debugName, ctx);
+    releaseStagedInitGates(rdram, targetPc, sourcePc);
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
     // Every inter-function transfer is also a deterministic EE safe point.

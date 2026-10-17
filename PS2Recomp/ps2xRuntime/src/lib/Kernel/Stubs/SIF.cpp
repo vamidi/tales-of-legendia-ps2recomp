@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <limits>
+#include <mutex>
+#include <sstream>
 #include <unordered_set>
 #include <vector>
 
@@ -792,6 +795,25 @@ namespace ps2_stubs
         {
             if ((!source && sizeBytes != 0u) || !canAccessEeRange(rdram, address, sizeBytes))
                 return false;
+            // TEMP DIAGNOSTIC (session 11): every EE-side application of an IOP ->
+            // EE copy, with a dedicated report for the 0x3943xx handshake block.
+            {
+                static std::mutex watchMutex;
+                static uint32_t watchTotal = 0u;
+                std::lock_guard<std::mutex> lock(watchMutex);
+                ++watchTotal;
+                const uint64_t lo = address;
+                const uint64_t hi = static_cast<uint64_t>(address) + sizeBytes;
+                const bool inBlock = (hi > 0x394300ull && lo < 0x394400ull);
+                if (inBlock || watchTotal <= 60u)
+                {
+                    std::ostringstream out;
+                    out << "[WATCH-SIFW] #" << watchTotal << " addr=0x" << std::hex << address
+                        << " size=0x" << sizeBytes
+                        << (inBlock ? " <== HANDSHAKE BLOCK" : "") << std::dec;
+                    std::cerr << out.str() << std::endl;
+                }
+            }
             ps2TraceGuestRangeWrite(rdram, address, sizeBytes, "SIF IOP-to-EE DMA", nullptr);
             const auto *bytes = static_cast<const uint8_t *>(source);
             for (uint32_t i = 0u; i < sizeBytes; ++i)
