@@ -16,6 +16,71 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 12i - the staged-init chain is unreachable dead code
+
+Three new probes: a `[DISP]` tracer for the per-frame dispatcher `FUN_001664D0`, an `[IRQ-intc]` log for
+INTC delivery, a `[THREAD-new]` log for every `CreateThread`, and a dump of the semaphore globals at
+the exact moment `WaitSema(65)` is reached.
+
+**1. The dispatcher runs exactly once, at slot 0, and never returns.**
+
+    L12268  [DISP] 0x16647c -> 0x1664d0  s1(slot)=0x0
+    L12269  [DISP] 0x1664f8 -> 0x119a68  s1(slot)=0x0
+
+Nothing else ever enters or calls out of `FUN_001664D0`, so slots 1..5 (`func_119E70`,
+`func_11A0B0`, `func_119CF8`, ...) are never reached in that frame or any later frame.
+
+**2. Interrupts stay alive during the stall, and signal nothing.** `[IRQ-intc]` keeps logging right up
+to the end of the run: `cause=11 -> handler=0x11f650` (1 matching handler), plus causes 2 and 3. So the
+advance is not blocked by a dead INTC - and no interrupt-context code signals sem 65 (`0x11Fxxx` has
+no `SignalSema` call site).
+
+**3. The game creates exactly five threads.**
+
+    L1265   func=0x1153e0
+    L11887  func=0x198c60 stack=0x3943f0 size=0x800  ra=0x199314 prio=119
+    L11890  func=0x198d50 stack=0x395bf0 size=0x1000 ra=0x19947c prio=119
+    L11893  func=0x198e58 stack=0x396bf0 size=0x1000 ra=0x199504 prio=119
+    L11895  func=0x198f38 stack=0x397bf0 size=0x2000 ra=0x19958c prio=119
+
+**No thread is ever created with a stage-region entry**, and the four workers live in
+`0x198000..0x19A000`, which contains no semaphore syscall at all. So the peer of the sem-60 handshake
+cannot be a thread.
+
+**4. The semaphore globals at the wait.** The `[SEM-globals]` dump fires on the `WaitSema(65)` JAL:
+
+    0x3876F0=1  0x3876F4=0x3C(60)  0x3876F8=0x3E(62)  0x3876FC=0x3F(63)  0x387700=0x3BEFC8
+
+`attr=` in the `[SEM] create` lines is the *attribute word*, not the param address - for sem 65 it
+reads `0x1187c4`, which is stale stack garbage (that vaddr is code). Sem 65's `init_count=0`,
+`max_count=1` is genuine.
+
+**5. `SignalSema` arguments are usually loaded in the DELAY SLOT.** Scanning those (which the earlier
+scans missed completely) gives the real dynamic-id signallers:
+
+    jal func_114700 ; lw a0,0x76F8(reg)   -> 0x118E24 0x118EB0 0x118FF0 0x119C8C   = SignalSema(sem 62)
+    jal func_114700 ; lw a0,0x76FC(reg)   -> 0x119FC8 0x11A20C 0x11A47C 0x11A708 0x11C228 = SignalSema(sem 63)
+
+**There is no static site anywhere that signals a semaphore id read from a struct at offset 0** (checked
+before the jal and in the delay slot, for both `func_114700` and `func_114710`). Sem 65 lives only at
+descriptor+0, so it has **no static producer at all**. Sem 63 is the same story: created (`init=1`,
+`ra=0x118db0`) but never waited or signalled, because its signallers never run.
+
+**6. The staged-init chain has no reachable entry point.** `FUN_00199988` and `FUN_0019A550` are the
+only callers of the whole init chain (`FUN_00199938` = the six-gate writer, `FUN_00199AF0`,
+`FUN_00199C90`, `FUN_00199BC0`, `FUN_00199E30`). Both have:
+
+- **0** `jal` call sites,
+- **0** data references (`0x00199988` / `0x0019A550` appear nowhere in the image as a literal),
+- **0** `lui`/`ori`/`addiu` immediate constructions (halfwords `0x9988` and `0xA550` appear nowhere).
+
+They are **unreachable dead code**, and with them the six-gate writer and the rest of the init chain.
+
+**Conclusion.** `releaseStagedInitGates()` fakes the *effect* of code that cannot be reached, which
+lets the live stage handler `func_119A68` run; that handler then blocks forever in `WaitSema(65)`
+because the producer side of the staged-init protocol is part of the same dead chain. The gate HLE is
+therefore the wrong lever - it resurrects a consumer whose producer does not exist.
+
 ## Session 12h - the stage machine stops after its first handler
 
 Added a TEMP `[STAGE]` probe in `dispatchGuestBranch` that logs every dispatch whose target is in the

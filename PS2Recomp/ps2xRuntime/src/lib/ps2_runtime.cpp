@@ -1510,6 +1510,36 @@ namespace
     // it there was nothing left that could signal it. Release only when thread 1
     // reaches the sem-65 wait instead, so the stage chain is still parked and
     // has a live semaphore to complete.
+    // TEMP DIAGNOSTIC (sem65 trace): FUN_001664D0 (0x1664d0-0x1667d8) is the
+    // per-frame update loop with the six-slot stage loop. Record every call it
+    // makes and every entry into it, with the loop variable $s1 (the slot index),
+    // so we can tell whether the later slots are ever reached.
+    void watchStageDispatcher(uint32_t targetPc, uint32_t sourcePc, R5900Context *ctx)
+    {
+        static uint32_t s_lines = 0u;
+        const bool srcIn = (sourcePc >= 0x1664D0u && sourcePc < 0x1667D8u);
+        const bool dstIn = (targetPc >= 0x1664D0u && targetPc < 0x1667D8u);
+        if (!srcIn && !dstIn)
+        {
+            return;
+        }
+        if (s_lines >= 700u)
+        {
+            if (s_lines == 700u)
+            {
+                ++s_lines;
+                std::cerr << "[DISP] (cap reached)" << std::endl;
+            }
+            return;
+        }
+        ++s_lines;
+        std::cerr << "[DISP] 0x" << std::hex << sourcePc << " -> 0x" << targetPc
+                  << " s1(slot)=0x" << (ctx ? getRegU32(ctx, 17) : 0u)
+                  << " s4=0x" << (ctx ? getRegU32(ctx, 20) : 0u)
+                  << " v0=0x" << (ctx ? getRegU32(ctx, 2) : 0u)
+                  << std::dec << std::endl;
+    }
+
     // TEMP DIAGNOSTIC (sem65 trace): the staged-init stage handlers live in the
     // 0x119xxx..0x11Cxxx family and each acquire sem 60 through FUN_00119440.
     // Record which of them actually execute, and in what order, so the frontier
@@ -1560,6 +1590,20 @@ namespace
         std::cerr << "[HLE-staged-init] released six ready gates 0x394378..0x3943C8"
                   << " target=0x" << std::hex << targetPc
                   << " source=0x" << sourcePc << std::dec << std::endl;
+        // TEMP DIAGNOSTIC (sem65 trace): which semaphore ids does the stage code
+        // publish in its globals at the moment it reaches WaitSema(65)?
+        {
+            static const uint32_t kWords[] = {0x3876F0u, 0x3876F4u, 0x3876F8u,
+                                              0x3876FCu, 0x387700u, 0x387704u};
+            std::cerr << "[SEM-globals]";
+            for (uint32_t addr : kWords)
+            {
+                const uint32_t value =
+                    *reinterpret_cast<const uint32_t *>(rdram + addr);
+                std::cerr << " 0x" << std::hex << addr << "=" << value;
+            }
+            std::cerr << std::dec << std::endl;
+        }
     }
 
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
@@ -1572,6 +1616,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     watchAssetInitBranch(targetPc, sourcePc, fallthroughPc, kind, debugName, ctx);
+    watchStageDispatcher(targetPc, sourcePc, ctx);
     watchStageRegion(targetPc, sourcePc);
     releaseStagedInitGates(rdram, targetPc, sourcePc);
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);

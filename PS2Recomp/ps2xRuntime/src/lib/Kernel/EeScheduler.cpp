@@ -1526,6 +1526,24 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
                       << " arg=0x" << h.argument << " gp=0x" << h.gp << std::dec << std::endl;
         }
     }
+    else
+    {
+        // TEMP DIAGNOSTIC (sem65 trace): is the INTC still delivering interrupts
+        // (VSync / timers) while the main thread is blocked in WaitSema(65)?
+        static uint32_t s_intcCounts[32] = {};
+        const uint32_t slot = cause < 32u ? cause : 31u;
+        if (s_intcCounts[slot] < 40u)
+        {
+            ++s_intcCounts[slot];
+            std::cerr << "[IRQ-intc] cause=" << cause << " handlers=" << handlers.size()
+                      << " matching=" << matching.size() << std::dec << std::endl;
+            for (const EeIrqHandler &h : matching)
+            {
+                std::cerr << "[IRQ-intc]   -> handler=0x" << std::hex << h.handler
+                          << " arg=0x" << h.argument << std::dec << std::endl;
+            }
+        }
+    }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
     for (const EeIrqHandler &handler : matching)

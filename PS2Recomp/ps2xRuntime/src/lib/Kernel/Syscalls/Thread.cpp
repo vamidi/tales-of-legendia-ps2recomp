@@ -220,6 +220,15 @@ namespace ps2_syscalls
             }
         }
 
+        // TEMP DIAGNOSTIC (sem65 trace): which threads does the game actually
+        // create? The stage peer that must be blocked in WaitSema(sem 60) has to
+        // be one of them.
+        std::cerr << "[THREAD-new] func=0x" << std::hex << param->func
+                  << " stack=0x" << param->stack
+                  << " size=0x" << static_cast<uint32_t>(param->stack_size)
+                  << " ra=0x" << getRegU32(ctx, 31)
+                  << " prio=" << std::dec << param->initial_priority
+                  << " attr=" << param->attr << std::endl;
         // PS2SDK EE t_ee_thread: status, func, stack, stack_size, gp_reg,
         // initial_priority, current_priority, attr, option.
         const EeThreadCreateParams decoded{
