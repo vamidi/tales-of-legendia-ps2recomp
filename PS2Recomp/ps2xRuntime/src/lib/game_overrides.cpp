@@ -181,36 +181,3 @@ namespace ps2_game_overrides
         }
     }
 }
-
-// ----------------------------------------------------------------------------
-// Registered game overrides
-// ----------------------------------------------------------------------------
-
-// Tales of Legendia (USA) - SLUS_212.01
-// Load CD assets from an extracted directory tree (data\CD next to the ELF)
-// instead of sector-reading the ISO image. cdRoot is pinned to the extracted
-// tree and cdImage is cleared, so every sceCdSearchFile/sceCdRead resolves
-// through registered host files (pseudo-LBNs). Unresolved LBNs report loudly
-// on stderr, which makes any hardcoded-LBN access visible immediately.
-static void talesOfLegendiaAssetPaths(PS2Runtime & /*runtime */)
-{
-    PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
-    const std::filesystem::path extracted = paths.elfDirectory / "CD";
-
-    std::error_code ec;
-    if (std::filesystem::is_directory(extracted, ec) && !ec)
-    {
-        paths.cdRoot = extracted;
-        paths.cdImage.clear();
-        PS2Runtime::setIoPaths(paths);
-        std::cerr << "[game_overrides] Tales of Legendia (USA): CD assets from extracted tree '"
-                  << extracted.string() << "' (ISO image disabled)" << std::endl;
-    }
-    else
-    {
-        std::cerr << "[game_overrides] Tales of Legendia (USA): extracted CD tree not found at '"
-                  << extracted.string() << "'; leaving ISO image mount in place." << std::endl;
-    }
-}
-
-PS2_REGISTER_GAME_OVERRIDE("Tales of Legendia (USA)", "SLUS_212.01", 0, 0, talesOfLegendiaAssetPaths);

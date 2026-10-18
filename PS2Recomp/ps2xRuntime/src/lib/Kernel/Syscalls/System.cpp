@@ -3,35 +3,26 @@
 
 namespace ps2_syscalls
 {
-    void configureGsCrt(GSRegisters &gs, uint32_t interlaced, uint32_t videoMode, uint32_t frameMode)
-    {
-        gs.smode2 = (static_cast<uint64_t>(interlaced) & 0x1ull) | ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
- 
-        const uint64_t cmod = videoMode == 3 ? 3u : videoMode == 2 ? 2u : 0u;
-        const uint64_t lc = (videoMode == 0x51 || videoMode == 0x52) ? 22u :
-                            (videoMode >= 0x1a && videoMode <= 0x4a) ? 15u : 32u;
-        // SMODE1.INT (bit 0) selects interlace field ordering. The progressive
-        // (CMOD=0) + INT=1 combination has no decoder branch downstream, so keep
-        // INT consistent with CMOD: clear it for progressive, follow the caller
-        // otherwise.
-        const uint64_t intf = (cmod == 0ull) ? 0ull : (static_cast<uint64_t>(interlaced) & 0x1ull);
-        gs.smode1 = (gs.smode1 & ~((127ull << 3) | (3ull << 13) | 1ull)) | (lc << 3) | (cmod << 13) | intf;
- 
-        if ((gs.pmode & 0x3ull) == 0ull)
-        {
-            gs.pmode |= 0x1ull;
-        }
-    }
-
     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
-        int videoMode = getRegU32(ctx, 5);  // $a1 - GS CRT mode (2=NTSC, 3=PAL, 0x50=480p)
+        int videoMode = getRegU32(ctx, 5);  // $a1 - 0=NTSC, 1=PAL, 2=VESA, 3=HiVision
         int frameMode = getRegU32(ctx, 6);  // $a2 - 0=field, 1=frame
 
         if (runtime)
         {
-            configureGsCrt(runtime->memory().gs(), interlaced, videoMode, frameMode);
+            auto &gs = runtime->memory().gs();
+            const uint64_t smode2 =
+                (static_cast<uint64_t>(interlaced) & 0x1ull) |
+                ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
+
+            gs.smode2 = smode2;
+
+            // Keep CRT1 enabled after the BIOS syscall selects a display mode.
+            if ((gs.pmode & 0x3ull) == 0ull)
+            {
+                gs.pmode |= 0x1ull;
+            }
         }
 
         RUNTIME_LOG("PS2 GsSetCrt: interlaced=" << interlaced
@@ -430,7 +421,6 @@ namespace ps2_syscalls
             parent.r[2] = completed.r[2];
         };
         scheduler.invokeCurrent(std::move(invocation));
-        return true;
     }
 
     static bool tryResolveGuestSyscallMirrorAddr(uint32_t syscallIndex, uint32_t &guestAddr)
@@ -501,23 +491,25 @@ namespace ps2_syscalls
                                        : 0u;
         if (stack == 0xFFFFFFFFu)
         {
-            // Kernel-allocated stack. Reserve `stackSize` bytes just below the
-            // top of RAM, then hand back the TOP of that region: the guest stack
-            // grows downward, so $sp must start at the high end. Returning the
-            // low end drops the very first frame into the game heap, which games
-            // commonly clear with one large memset; that destroys the saved
-            // return addresses and sends the thread to PC 0 (a silent hang).
-            const uint32_t requestedSize = stackSizeSigned > 0
-                                               ? static_cast<uint32_t>(stackSizeSigned)
-                                               : 0u;
-            initialStack = (requestedSize > 0u && requestedSize < PS2_RAM_SIZE)
-                               ? PS2_RAM_SIZE - requestedSize
-                               : 0u;
-            sp = PS2_RAM_SIZE;
+            if (stackSizeSigned > 0)
+            {
+                const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
+                if (requestedSize < PS2_RAM_SIZE)
+                {
+                    sp = PS2_RAM_SIZE - requestedSize;
+                }
+                else
+                {
+                    sp = PS2_RAM_SIZE;
+                }
+            }
+            else
+            {
+                sp = PS2_RAM_SIZE;
+            }
         }
         else if (stack != 0u)
         {
-            initialStack = stack;
             if (stackSizeSigned > 0)
             {
                 sp = stack + static_cast<uint32_t>(stackSizeSigned);
@@ -529,6 +521,23 @@ namespace ps2_syscalls
         }
 
         sp &= ~0xFu;
+        if (stack == 0xFFFFFFFFu)
+        {
+            initialStack = sp;
+            // `stack == -1` requests the default stack, and this value is loaded straight into $sp
+            // by the caller (crt0: `move $sp, $v0`), so it must be the TOP of the reserved stack
+            // window - a stack grows down from its pointer. Returning the window's BASE (in `sp`
+            // above) placed $sp exactly at the end of this game's heap, which is
+            // [0x4E9B80, 0x1F00000) because the game reserves the top 1 MB of RAM for its stack.
+            // The heap's own memset then zeroed the live stack frame, so the returning function
+            // loaded a $ra of 0, jumped to pc 0, and the EE scheduler read that as "thread
+            // finished" (makeDormant) - the guest never reached the GS.
+            sp = PS2_RAM_SIZE - 0x10u;
+        }
+        else if (stack != 0u)
+        {
+            initialStack = stack;
+        }
 
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
         setReturnU32(ctx, sp);

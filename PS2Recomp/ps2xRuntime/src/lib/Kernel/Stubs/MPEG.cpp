@@ -2320,7 +2320,6 @@ namespace ps2_stubs
                         }
                         sceMpegGetPicture(rdram, &resumeContext, runtime);
                     });
-                return;
             }
 
             if (!playback.decodedFrames.empty())
@@ -2357,7 +2356,6 @@ namespace ps2_stubs
                             }
                             sceMpegGetPicture(rdram, &resumeContext, runtime);
                         });
-                    return;
                 }
 
                 frame = std::move(playback.decodedFrames.front());
@@ -2572,5 +2570,4 @@ namespace ps2_stubs
         getPlaybackState(mpegAddr).imageBufferAddr = imageBufferAddr;
         setReturnS32(ctx, 0);
     }
-
 }

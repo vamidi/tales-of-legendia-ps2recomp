@@ -4,14 +4,45 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cstring>
 #include <iostream>
 #include <limits>
-#include <sstream>
 #include <stdexcept>
-#include <string>
+
+// [DIAG:pc-ring] temporary probe - remove after Phase 0 diagnosis
+namespace {
+constexpr size_t kDiagPcRing = 32;
+uint32_t g_diagPc[kDiagPcRing] = {};
+int g_diagThread[kDiagPcRing] = {};
+size_t g_diagInv[kDiagPcRing] = {};
+size_t g_diagPcCount = 0u;
+
+void diagRecordDispatch(uint32_t pc, int threadId, size_t invocations)
+{
+    const size_t idx = g_diagPcCount % kDiagPcRing;
+    g_diagPc[idx] = pc;
+    g_diagThread[idx] = threadId;
+    g_diagInv[idx] = invocations;
+    ++g_diagPcCount;
+}
+
+size_t g_diagT1Logs = 0u;
+
+void diagDumpRing(const char *why)
+{
+    const size_t count = g_diagPcCount < kDiagPcRing ? g_diagPcCount : kDiagPcRing;
+    std::cerr << "[diag:pc-ring] " << why << " total=" << std::dec << g_diagPcCount
+              << " last " << count << " (newest first):";
+    for (size_t k = 0; k < count; ++k)
+    {
+        const size_t idx = (g_diagPcCount - 1u - k) % kDiagPcRing;
+        std::cerr << " 0x" << std::hex << g_diagPc[idx] << std::dec
+                  << "(t" << g_diagThread[idx] << ",inv" << g_diagInv[idx] << ")";
+    }
+    std::cerr << std::endl;
+}
+} // namespace
 
 namespace
 {
@@ -39,68 +70,6 @@ namespace
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
-
-    // TEMP DIAGNOSTIC (black-content triage): recent guest dispatch PCs, mirroring
-    // PS2Runtime's dispatch history which is file-local to ps2_runtime.cpp. Dumped
-    // when a thread goes dormant so the execution tail that led to PC=0 is visible.
-    constexpr uint32_t kDispatchTraceSize = 24u;
-    std::array<uint32_t, kDispatchTraceSize> g_dispatchTrace{};
-    uint32_t g_dispatchTraceNext = 0u;
-    bool g_dispatchTraceWrapped = false;
-    int g_dormantTraceBudget = 3;
-    int g_exitTraceBudget = 3;
-    int g_startThreadTraceBudget = 20;
-
-    void pushDispatchTrace(uint32_t pc)
-    {
-        g_dispatchTrace[g_dispatchTraceNext] = pc;
-        g_dispatchTraceNext = (g_dispatchTraceNext + 1u) % kDispatchTraceSize;
-        if (g_dispatchTraceNext == 0u)
-        {
-            g_dispatchTraceWrapped = true;
-        }
-    }
-
-    std::string formatDispatchTrace()
-    {
-        const uint32_t count = g_dispatchTraceWrapped ? kDispatchTraceSize : g_dispatchTraceNext;
-        if (count == 0u)
-        {
-            return "(empty)";
-        }
-        std::ostringstream oss;
-        for (uint32_t i = 0u; i < count; ++i)
-        {
-            const uint32_t idx = (g_dispatchTraceNext + kDispatchTraceSize - count + i) % kDispatchTraceSize;
-            if (i != 0u)
-            {
-                oss << " -> ";
-            }
-            oss << "0x" << std::hex << g_dispatchTrace[idx];
-        }
-        return oss.str();
-    }
-
-    // TEMP DIAGNOSTIC: dump a small region of guest RAM as hex words.
-    std::string formatHexWords(uint8_t *rdram, uint32_t base, uint32_t words)
-    {
-        if (!rdram)
-        {
-            return "(no-ram)";
-        }
-        std::ostringstream oss;
-        for (uint32_t i = 0u; i < words; ++i)
-        {
-            uint32_t value = 0u;
-            std::memcpy(&value, rdram + (base + i * 4u), sizeof(value));
-            if (i != 0u)
-            {
-                oss << " ";
-            }
-            oss << std::hex << value;
-        }
-        return oss.str();
-    }
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
@@ -173,7 +142,6 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_enabledIntcMask = 0xFFFFFFFFu;
     m_enabledDmacMask = 0xFFFFFFFFu;
     m_currentThreadId = 0;
-    m_transferPending = false;
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
@@ -216,17 +184,6 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
                   std::chrono::steady_clock::now() + kVBlankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
-    g_dispatchTrace = {};
-    g_dispatchTraceNext = 0u;
-    g_dispatchTraceWrapped = false;
-    g_dormantTraceBudget = 3;
-    g_exitTraceBudget = 3;
-    g_startThreadTraceBudget = 20;
-    std::cerr << "[EE-boot] main thread entry=0x" << std::hex << mainContext.pc
-              << " ra=0x" << getRegU32(&mainContext, 31)
-              << " sp=0x" << getRegU32(&mainContext, 29)
-              << " gp=0x" << getRegU32(&mainContext, 28)
-              << " t9=0x" << getRegU32(&mainContext, 25) << std::dec << std::endl;
     publishSnapshot();
 }
 
@@ -237,7 +194,6 @@ void EeScheduler::run()
 
     while (!m_stopRequested.load(std::memory_order_acquire))
     {
-        m_transferPending = false;
         processPendingEvents();
         if (m_stopRequested.load(std::memory_order_acquire))
         {
@@ -246,97 +202,12 @@ void EeScheduler::run()
 
         if (m_currentThreadId == 0)
         {
-            // TEMP HLE (Tales of Legendia SLUS_212.01, boot-stall triage):
-            // complete the orphaned half of the game's own suspend/resume pair.
-            //
-            // Thread 1 suspends the staged-init pollers through FUN_00199268()
-            // before the sem-60/65 handshake, and the matching entry_00199240()
-            // resume is never reached for thread 5. By that point the word the
-            // poller spins on (0x3943B8, one of the six gates written by
-            // releaseStagedInitGates) is already 1, so the thread is runnable in
-            // every respect except the unbalanced suspend. Resuming it once lets
-            // its epilogue write the stage-done marker at (ret_1991E8 + 0x43C0).
-            {
-                static bool s_pollResumeDone = false;
-                if (!s_pollResumeDone && m_rdram)
-                {
-                    uint64_t pollGate = 0;
-                    std::memcpy(&pollGate, m_rdram + 0x3943B8u, sizeof(pollGate));
-                    if (pollGate != 0)
-                    {
-                        for (auto &[id, item] : m_threads)
-                        {
-                            if (item.suspendCount == 0)
-                            {
-                                continue;
-                            }
-                            const R5900Context &pollContext = item.activeContext();
-                            // Staged-init waits only: the gate-spin cluster
-                            // (FUN_00198c60 / FUN_00198cb8) and the stage poll
-                            // loop (entry_00198f38 .. 0x199038).
-                            const bool stagedWait =
-                                (pollContext.pc >= 0x198C60u && pollContext.pc < 0x198D50u) ||
-                                (pollContext.pc >= 0x198F38u && pollContext.pc < 0x199038u);
-                            if (!stagedWait)
-                            {
-                                continue;
-                            }
-                            while (item.suspendCount > 0)
-                            {
-                                resumeThread(id, false);
-                            }
-                        }
-                        s_pollResumeDone = true;
-                    }
-                }
-            }
-
             GuestThread *next = selectReady();
             if (!next && m_pendingInvocations.empty())
             {
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
                 publishSnapshot();
-                {
-                    static auto s_idleLast = std::chrono::steady_clock::now();
-                    const auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration_cast<std::chrono::seconds>(now - s_idleLast).count() >= 3)
-                    {
-                        s_idleLast = now;
-                        std::cerr << "[EE-hb] IDLE pending=" << m_pendingInvocations.size()
-                                  << " trace=" << formatDispatchTrace() << std::dec << std::endl;
-                        // TEMP DIAGNOSTIC (boot-stall triage): with no runnable
-                        // thread, dump what every guest thread is blocked on.
-                        for (const auto &[id, item] : m_threads)
-                        {
-                            const R5900Context &threadContext = item.activeContext();
-                            std::cerr << "[EE-thread] id=" << id
-                                      << " status=" << static_cast<int>(item.status)
-                                      << " wait=" << static_cast<int>(item.wait.reason)
-                                      << " waitId=" << waitObjectId(item.wait)
-                                      << " suspend=" << item.suspendCount
-                                      << " wake=" << item.wakeupCount
-                                      << " inv=" << item.invocations.size()
-                                      << " pc=0x" << std::hex << threadContext.pc
-                                      << " ra=0x" << getRegU32(&threadContext, 31)
-                                      << " sp=0x" << getRegU32(&threadContext, 29)
-                                      << " entry=0x" << item.entry
-                                      << std::dec << std::endl;
-                        }
-                        for (const auto &[id, item] : m_semaphores)
-                        {
-                            std::cerr << "[EE-sem] id=" << id << " count=" << item.count
-                                      << " max=" << item.maxCount
-                                      << " waiters=" << item.waiters.size() << std::endl;
-                        }
-                        for (const auto &[id, item] : m_eventFlags)
-                        {
-                            std::cerr << "[EE-evf] id=" << id << " bits=0x" << std::hex << item.bits
-                                      << " init=0x" << item.initBits << std::dec
-                                      << " waiters=" << item.waiters.size() << std::endl;
-                        }
-                    }
-                }
                 waitForEvent();
                 continue;
             }
@@ -366,47 +237,19 @@ void EeScheduler::run()
         {
             auto completion = std::move(running->resumeCompletion);
             running->resumeCompletion = {};
-            completion(running->activeContext());
-            if (m_transferPending || m_currentThreadId == 0)
+            try
+            {
+                completion(running->activeContext());
+            }
+            catch (const EeDispatcherTransfer &)
+            {
+            }
+            if (m_currentThreadId == 0)
             {
                 continue;
             }
         }
         R5900Context &context = running->activeContext();
-        {
-            static auto s_hbLast = std::chrono::steady_clock::now();
-            static uint64_t s_hbIters = 0;
-            ++s_hbIters;
-            const auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - s_hbLast).count() >= 3)
-            {
-                s_hbLast = now;
-                // TEMP DIAGNOSTIC (session 11): the loader stalls on `ld v0,0(s0)`
-                // at 0x198c90 and loops while it is zero; s0 is set by the caller,
-                // so dump s0 (and the word it waits on) here.
-                const uint32_t hbS0 = getRegU32(&context, 16);
-                std::cerr << "[EE-hb] run iters=" << s_hbIters << " id=" << running->id
-                          << " kind=" << (running->invocations.empty()
-                                              ? -1
-                                              : static_cast<int>(running->invocations.back().kind))
-                          << " pc=0x" << std::hex << context.pc
-                          << " ra=0x" << getRegU32(&context, 31)
-                          << " sp=0x" << getRegU32(&context, 29)
-                          << " gp=0x" << getRegU32(&context, 28)
-                          << " t9=0x" << getRegU32(&context, 25)
-                          << " inv=" << running->invocations.size()
-                          << " s0=0x" << hbS0
-                          << " v0=0x" << getRegU32(&context, 2)
-                          << " v1=0x" << getRegU32(&context, 3)
-                          << " waitAt=" << formatHexWords(m_rdram, hbS0 & 0x1FFFFFF8u, 4u)
-                          << " s387658=" << formatHexWords(m_rdram, 0x387658u, 1u)
-                          << " s387660=" << formatHexWords(m_rdram, 0x387660u, 1u)
-                          << " cmd=" << formatHexWords(m_rdram, 0x3DED98u, 8u)
-                          << " h=" << formatHexWords(m_rdram, 0x3DEF40u, 32u)
-                          << " pkt=" << formatHexWords(m_rdram, 0x3E0000u, 4u)
-                          << " trace=" << formatDispatchTrace() << std::dec << std::endl;
-            }
-        }
         if (m_debugPublishCountdown == 0u)
         {
             copyMainContextToRuntime();
@@ -422,27 +265,29 @@ void EeScheduler::run()
 
         if (context.pc == 0u)
         {
+            // [DIAG:thread-retire] temporary probe - remove after Phase 0 diagnosis
+            diagDumpRing("PC==0");
+            std::cerr << "[diag:thread-retire] thread=" << running->id
+                      << " entry=0x" << std::hex << running->entry
+                      << " ra=0x" << getRegU32(&context, 31)
+                      << " sp=0x" << getRegU32(&context, 29)
+                      << " invocations=" << std::dec << running->invocations.size()
+                      << std::endl;
             if (!running->invocations.empty())
             {
                 GuestInvocation completed = std::move(running->invocations.back());
                 running->invocations.pop_back();
                 if (completed.onComplete)
                 {
-                    completed.onComplete(completed.context, running->activeContext());
+                    try
+                    {
+                        completed.onComplete(completed.context, running->activeContext());
+                    }
+                    catch (const EeDispatcherTransfer &)
+                    {
+                    }
                 }
                 continue;
-            }
-            if (g_dormantTraceBudget > 0)
-            {
-                --g_dormantTraceBudget;
-                std::cerr << "[EE-dormant] thread=" << running->id
-                          << " pc=0x" << std::hex << context.pc
-                          << " ra=0x" << getRegU32(&context, 31)
-                          << " sp=0x" << getRegU32(&context, 29)
-                          << " gp=0x" << getRegU32(&context, 28)
-                          << " v0=0x" << getRegU32(&context, 2)
-                          << " t9=0x" << getRegU32(&context, 25)
-                          << " trace=" << formatDispatchTrace() << std::dec << std::endl;
             }
             makeDormant(*running);
             m_currentThreadId = 0;
@@ -466,6 +311,11 @@ void EeScheduler::run()
 
         if (!m_runtime.hasFunction(context.pc))
         {
+            // [DIAG:unmapped-pc] temporary probe - remove after Phase 0 diagnosis
+            std::cerr << "[diag:unmapped-pc] pc=0x" << std::hex << context.pc << std::dec
+                      << " thread=" << running->id
+                      << " invocations=" << running->invocations.size() << std::endl;
+            diagDumpRing("unmapped-pc");
             if (!running->invocations.empty())
             {
                 context.pc = 0u;
@@ -478,21 +328,12 @@ void EeScheduler::run()
                                                 context.pc,
                                                 PS2Runtime::GuestBranchKind::DirectJump,
                                                 "EE scheduler");
-                if (g_dormantTraceBudget > 0)
-                {
-                    --g_dormantTraceBudget;
-                    std::cerr << "[EE-dormant-missing] thread=" << running->id
-                              << " pc=0x" << std::hex << context.pc
-                              << " ra=0x" << getRegU32(&context, 31)
-                              << " trace=" << formatDispatchTrace() << std::dec << std::endl;
-                }
                 makeDormant(*running);
                 m_currentThreadId = 0;
             }
             continue;
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
-        pushDispatchTrace(context.pc);
 
         if (checkpointDue(kGuestDispatchCycles))
         {
@@ -503,13 +344,37 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            const uint32_t diagPcBefore = context.pc; // [DIAG:pc0-inline]
+            diagRecordDispatch(context.pc, running->id, running->invocations.size());
+            // [DIAG:t1-main] temporary probe - remove after Phase 0 diagnosis
+            if (running->id == 1 && running->invocations.empty() && g_diagT1Logs < 300u)
+            {
+                ++g_diagT1Logs;
+                std::cerr << "[diag:t1-main] pc=0x" << std::hex << context.pc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " sp=0x" << getRegU32(&context, 29) << std::dec << std::endl;
+            }
             function(m_rdram, &context, &m_runtime);
+            // [DIAG:pc0-inline] temporary probe - remove after Phase 0 diagnosis
+            if (context.pc == 0u)
+            {
+                std::cerr << "[diag:pc0-inline] thread=" << running->id
+                          << " entry=0x" << std::hex << running->entry
+                          << " dispatched=0x" << diagPcBefore << std::dec
+                          << " invocations=" << running->invocations.size()
+                          << " tag=" << (running->invocations.empty() ? "main" : "invocation")
+                          << std::endl;
+            }
+            m_guestExecuting.store(false, std::memory_order_release);
+            m_insideInterrupt = false;
+        }
+        catch (const EeDispatcherTransfer &)
+        {
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
         catch (...)
         {
-            m_insideInterrupt = false;
             m_guestExecuting.store(false, std::memory_order_release);
             m_running.store(false, std::memory_order_release);
             publishSnapshot();
@@ -564,7 +429,6 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
     {
-        m_transferPending = true;
         return true;
     }
 
@@ -572,7 +436,6 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
     {
         m_checkpointPending.store(true, std::memory_order_release);
-        m_transferPending = true;
         return true;
     }
 
@@ -586,7 +449,6 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
-        m_transferPending = true;
         return true;
     }
 
@@ -695,14 +557,6 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
         return KE_NOT_DORMANT;
     }
 
-    if (g_startThreadTraceBudget > 0)
-    {
-        --g_startThreadTraceBudget;
-        std::cerr << "[EE-startThread] id=" << id
-                  << " entry=0x" << std::hex << target->entry
-                  << " arg=0x" << arg << std::dec << std::endl;
-    }
-
     target->context = R5900Context{};
     target->context.pc = target->entry;
     target->arg = arg;
@@ -722,23 +576,12 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     return KE_OK;
 }
 
-void EeScheduler::exitCurrent(bool deleteThreadRecord)
+[[noreturn]] void EeScheduler::exitCurrent(bool deleteThreadRecord)
 {
     assertExecutor();
     GuestThread *exiting = currentThread();
     assert(exiting != nullptr);
     const int id = exiting->id;
-    if (g_exitTraceBudget > 0)
-    {
-        --g_exitTraceBudget;
-        R5900Context &exitingContext = exiting->activeContext();
-        std::cerr << "[EE-exit] thread=" << id
-                  << " delete=" << (deleteThreadRecord ? 1 : 0)
-                  << " pc=0x" << std::hex << exitingContext.pc
-                  << " ra=0x" << getRegU32(&exitingContext, 31)
-                  << " v0=0x" << getRegU32(&exitingContext, 2)
-                  << " trace=" << formatDispatchTrace() << std::dec << std::endl;
-    }
     const uint32_t ownedStack = deleteThreadRecord && exiting->ownsStack ? exiting->stack : 0u;
     makeDormant(*exiting);
     m_currentThreadId = 0;
@@ -751,7 +594,7 @@ void EeScheduler::exitCurrent(bool deleteThreadRecord)
         m_runtime.guestFree(ownedStack);
     }
     publishSnapshot();
-    m_transferPending = true;
+    throw EeDispatcherTransfer{};
 }
 
 int EeScheduler::terminateThread(int id, uint32_t &ownedStack, bool interruptSafe)
@@ -1040,7 +883,7 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     publishSnapshot();
-    m_transferPending = true;
+    throw EeDispatcherTransfer{};
 }
 
 int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option)
@@ -1331,7 +1174,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     m_checkpointPending.store(true, std::memory_order_release);
 }
 
-void EeScheduler::invokeCurrent(GuestInvocation invocation)
+[[noreturn]] void EeScheduler::invokeCurrent(GuestInvocation invocation)
 {
     assertExecutor();
     GuestThread *owner = currentThread();
@@ -1343,10 +1186,10 @@ void EeScheduler::invokeCurrent(GuestInvocation invocation)
     invocation.sequence = ++m_invocationSequence;
     owner->invocations.push_back(std::move(invocation));
     publishSnapshot();
-    m_transferPending = true;
+    throw EeDispatcherTransfer{};
 }
 
-void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
+[[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
 {
     assertExecutor();
     GuestThread *owner = currentThread();
@@ -1362,7 +1205,7 @@ void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations
         owner->invocations.push_back(std::move(*it));
     }
     publishSnapshot();
-    m_transferPending = true;
+    throw EeDispatcherTransfer{};
 }
 
 bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
@@ -1545,7 +1388,7 @@ uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_
     return previous;
 }
 
-void EeScheduler::waitVSync(uint64_t afterTick, int fixedResult, std::function<void(R5900Context &)> completion)
+[[noreturn]] void EeScheduler::waitVSync(uint64_t afterTick, int fixedResult, std::function<void(R5900Context &)> completion)
 {
     blockCurrent(EeWaitState{
         EeWaitReason::VSync,
@@ -1608,7 +1451,7 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
     publishSnapshot();
 }
 
-void EeScheduler::waitExternal(EeWaitReason reason,
+[[noreturn]] void EeScheduler::waitExternal(EeWaitReason reason,
                                             uint32_t type,
                                             uint64_t token,
                                             std::function<void(R5900Context &)> completion)
@@ -1913,7 +1756,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
     publishSnapshot();
-    m_transferPending = true;
+    throw EeDispatcherTransfer{};
 }
 
 void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
@@ -1961,7 +1804,6 @@ void EeScheduler::applyPendingPreemption()
     assert(self != nullptr);
     enqueueReady(*self, !m_timeSliceExpired);
     m_currentThreadId = 0;
-    m_transferPending = false;
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
 }

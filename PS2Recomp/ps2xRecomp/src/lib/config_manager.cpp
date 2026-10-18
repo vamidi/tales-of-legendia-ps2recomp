@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <limits>
 #include <thread>
-#include <filesystem>
 
 namespace ps2recomp
 {
@@ -62,9 +61,6 @@ namespace ps2recomp
                 }
             }
             config.outputWorkerThreads = static_cast<uint32_t>(clampedOutputWorkers);
-            if (data.contains("vu1"))
-                throw std::runtime_error("The [vu1] catalog has been retired. Remove [vu1] and [[vu1.programs]]; VU0/VU1 use the runtime interpreter.");
-
             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);

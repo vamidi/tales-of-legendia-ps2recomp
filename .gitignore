@@ -20,7 +20,10 @@
 
 # Opencode
 opencode.json
+*.backup
 
 # Local runtime/agent artifacts
 imgui.ini
 logs/
+
+ps2_log.txt

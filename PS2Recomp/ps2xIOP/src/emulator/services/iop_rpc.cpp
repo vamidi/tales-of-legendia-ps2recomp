@@ -9,8 +9,6 @@
 #include <array>
 #include <cstring>
 #include <limits>
-#include <sstream>
-#include <string>
 #include <vector>
 
 namespace ps2x::iop::detail
@@ -223,14 +221,6 @@ namespace ps2x::iop::detail
             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
             server.queue = m_memory.read32(stackPointer + 24u);
             m_servers[server.sid] = server;
-            {
-                // TEMP DIAGNOSTIC (strip once the IOP bring-up is done)
-                std::ostringstream out;
-                out << "[IOP] RegisterRpc sid=0x" << std::hex << server.sid
-                    << " fn=0x" << server.function << " buf=0x" << server.buffer
-                    << " sdata=0x" << server.serverData << std::dec;
-                m_host.log(LogLevel::Info, out.str());
-            }
             if (server.serverData != 0u)
             {
                 m_memory.write32(server.serverData + 0x20u, server.sid);
@@ -288,25 +278,9 @@ namespace ps2x::iop::detail
         RpcResult result{};
         const auto serverIt = m_servers.find(request.sid);
         if (serverIt == m_servers.end() || serverIt->second.function == 0u)
-        {
-            // TEMP DIAGNOSTIC (strip once the IOP bring-up is done)
-            std::ostringstream miss;
-            miss << "[IOP] RPC dispatch sid=0x" << std::hex << request.sid
-                 << " rpc=0x" << request.function << " -> NO SERVER" << std::dec;
-            m_host.log(LogLevel::Info, miss.str());
             return result;
-        }
 
         RpcServer &server = serverIt->second;
-        {
-            // TEMP DIAGNOSTIC (strip once the IOP bring-up is done)
-            std::string info = "[IOP] RPC dispatch sid=" + std::to_string(request.sid) +
-                               " rpc=" + std::to_string(request.function) +
-                               " -> moduleFn=" + std::to_string(server.function) +
-                               " send=" + std::to_string(request.send.address) +
-                               " recv=" + std::to_string(request.receive.address);
-            m_host.log(LogLevel::Info, info);
-        }
         if (request.send.size != 0u && server.buffer != 0u)
         {
             const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize));

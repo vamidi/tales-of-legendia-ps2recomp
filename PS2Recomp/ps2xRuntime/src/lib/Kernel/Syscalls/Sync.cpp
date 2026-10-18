@@ -36,8 +36,7 @@ namespace ps2_syscalls
                                  bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
-            const uint32_t id = getRegU32(ctx, 4);
-            const int result = ee.signalSemaphore(static_cast<int>(id), interruptSafe);
+            const int result = ee.signalSemaphore(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -79,20 +78,12 @@ namespace ps2_syscalls
 
         // ee_sema_t from ps2sdk. The IOP attr/option/init/max ordering is not
         // accepted by the EE runtime.
-        //
-        // The initial count is `init_count` (third field), NOT `count` (first
-        // field). Reading `count` was tried in a791617 and refuted by hardware
-        // behaviour: the id=4 create -> iSignalSema -> WaitSema handshake is
-        // built with init_count==0 / max_count==1, so reading `count` (==1 at
-        // that call site) seeded the semaphore at 1 and the immediate
-        // iSignalSema returned -420 (KE_SEMA_OVF). The handshake then no longer
-        // blocked and the boot regressed from 54 RPC completions to 5.
-        const int semId = scheduler(rdram, ctx, runtime)
-                              .createSemaphore(param->init_count,
-                                               param->max_count,
-                                               param->attr,
-                                               param->option);
-        setReturnS32(ctx, semId);
+        setReturnS32(ctx,
+                     scheduler(rdram, ctx, runtime)
+                         .createSemaphore(param->init_count,
+                                          param->max_count,
+                                          param->attr,
+                                          param->option));
     }
 
     void DeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -117,15 +108,13 @@ namespace ps2_syscalls
 
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t id = getRegU32(ctx, 4);
-        scheduler(rdram, ctx, runtime).waitSemaphore(static_cast<int>(id));
+        scheduler(rdram, ctx, runtime).waitSemaphore(static_cast<int>(getRegU32(ctx, 4)));
     }
 
     void PollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t id = getRegU32(ctx, 4);
-        const int result = scheduler(rdram, ctx, runtime).pollSemaphore(static_cast<int>(id));
-        setReturnS32(ctx, result);
+        setReturnS32(ctx,
+                     scheduler(rdram, ctx, runtime).pollSemaphore(static_cast<int>(getRegU32(ctx, 4))));
     }
 
     void iPollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

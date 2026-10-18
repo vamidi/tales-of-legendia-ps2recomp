@@ -67,7 +67,7 @@ namespace ps2_syscalls
             return 0;
         }
 
-        void exitThreadWithHandlers(int tid,
+        [[noreturn]] void exitThreadWithHandlers(int tid,
                                                  R5900Context *ctx,
                                                  PS2Runtime *runtime,
                                                  bool deleteThread)
@@ -94,7 +94,6 @@ namespace ps2_syscalls
             if (invocations.empty())
             {
                 ee.exitCurrent(deleteThread);
-                return;
             }
             invocations.back().onComplete = [runtime, deleteThread](const R5900Context &, R5900Context &)
             {
@@ -314,8 +313,7 @@ namespace ps2_syscalls
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const uint32_t target = getRegU32(ctx, 4);
-        const int result = ee.suspendThread(static_cast<int>(target), false);
+        const int result = ee.suspendThread(static_cast<int>(getRegU32(ctx, 4)), false);
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }
@@ -323,8 +321,7 @@ namespace ps2_syscalls
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const uint32_t target = getRegU32(ctx, 4);
-        const int result = ee.resumeThread(static_cast<int>(target), false);
+        const int result = ee.resumeThread(static_cast<int>(getRegU32(ctx, 4)), false);
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }

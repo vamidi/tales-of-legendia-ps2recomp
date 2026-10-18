@@ -28,10 +28,6 @@ if(ANDROID)
 endif()
 
 set(PS2X_IS_ARM_TARGET OFF)
-if(PS2X_BUILD_TEST OR PS2X_BUILD_STUDIO)
-    enable_testing()
-endif()
-
 set(PS2X_IS_AARCH64_TARGET OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
     set(PS2X_IS_ARM_TARGET ON)
@@ -83,22 +79,20 @@ if(PS2X_IS_ARM_TARGET)
     endif()
 endif()
 
-# Include modules required by enabled consumers even if their own option is OFF.
-# Tests use all three libraries; Studio also uses the test library.
-if(PS2X_BUILD_RECOMP OR PS2X_BUILD_ANALYZER OR PS2X_BUILD_TEST OR PS2X_BUILD_STUDIO)
+if(PS2X_BUILD_RECOMP)
     add_subdirectory("ps2xRecomp")
 endif()
 
-if(PS2X_BUILD_RUNTIME OR PS2X_BUILD_TEST OR PS2X_BUILD_STUDIO)
+if(PS2X_BUILD_RUNTIME)
     add_subdirectory("ps2xIOP")
     add_subdirectory("ps2xRuntime")
 endif()
 
-if(PS2X_BUILD_ANALYZER OR PS2X_BUILD_TEST OR PS2X_BUILD_STUDIO)
+if(PS2X_BUILD_ANALYZER)
     add_subdirectory("ps2xAnalyzer")
 endif()
 
-if(PS2X_BUILD_TEST OR PS2X_BUILD_STUDIO)
+if(PS2X_BUILD_TEST)
     add_subdirectory("ps2xTest")
 endif()
 

@@ -1,7 +1,6 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include <cstring>
-#include <iostream>
 
 enum VIFCmd : uint8_t
 {
@@ -143,19 +142,6 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
         {
-            if (m_vuFlushCallback[0]) m_vuFlushCallback[0](opcode != VIF_FLUSHE);
-            continue;
-        }
-        else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
-        {
-            vif0_regs.itop = vif0_regs.itops & 0x3ff;
-            if (m_vuMscalCallback[0]) m_vuMscalCallback[0]((imm & 0x1ffu) * 8, 0, vif0_regs.itop);
-            continue;
-        }
-        else if (opcode == VIF_MSCNT)
-        {
-            vif0_regs.itop = vif0_regs.itops & 0x3ff;
-            if (m_vuMscntCallback[0]) m_vuMscntCallback[0](0, vif0_regs.itop);
             continue;
         }
         else if (opcode == VIF_STMASK)
@@ -184,7 +170,6 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MPG)
         {
-            if (m_vuFlushCallback[0]) m_vuFlushCallback[0](false);
             const uint32_t destAddr = static_cast<uint32_t>(imm & 0x1FFu) * 8u;
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
@@ -196,7 +181,8 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
                     copyBytes = PS2_VU0_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
                 {
-                    writeVuCode(false, destAddr, {data + pos, copyBytes});
+                    std::memcpy(m_vu0Code + destAddr, data + pos, copyBytes);
+                    markVU0CodeModified();
                 }
             }
 
@@ -315,11 +301,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         return;
 
     uint32_t pos = 0;
-    uint64_t ops = 0u;           // TEMP DIAGNOSTIC (boot-stall triage)
-    uint32_t lastLogPos = 0u;    // TEMP DIAGNOSTIC (boot-stall triage)
-
-    // TEMP DIAGNOSTIC (boot-stall triage).
-    std::cerr << "[VIF1] process size=" << sizeBytes << std::endl;
 
     while (pos + 4 <= sizeBytes)
     {
@@ -339,11 +320,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 (static_cast<uint64_t>(kGifFmtImage) << 58);
             std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
             std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            // TEMP DIAGNOSTIC (boot-stall triage).
-            std::cerr << "[VIF1-path2] pending=" << m_vif1PendingPath2ImageQwc << " chunkQw=" << chunkQw
-                      << " pos=" << pos << " size=" << sizeBytes << std::endl;
             submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-            std::cerr << "[VIF1-path2] submitted chunkQw=" << chunkQw << std::endl;
 
             pos += chunkQw * 16u;
             m_vif1PendingPath2ImageQwc -= chunkQw;
@@ -357,23 +334,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint32_t cmd;
         memcpy(&cmd, data + pos, 4);
         pos += 4;
-        ++ops; // TEMP DIAGNOSTIC (boot-stall triage)
-        if (pos - lastLogPos >= 0x10000u) // TEMP DIAGNOSTIC (every 64KB)
-        {
-            lastLogPos = pos;
-            std::cerr << "[VIF1-progress] ops=" << ops << " pos=" << pos << " size=" << sizeBytes
-                      << " cmd=0x" << std::hex << cmd << std::dec << std::endl;
-        }
 
         uint8_t opcode = (cmd >> 24) & 0x7F;
         uint16_t imm = cmd & 0xFFFF;
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
-
-        if (ops <= 64) // TEMP DIAGNOSTIC (boot-stall triage)
-            std::cerr << "[VIF1-op] n=" << ops << " pos=" << pos << " cmd=0x" << std::hex << cmd
-                      << " opcode=0x" << (int)opcode << " imm=0x" << imm << std::dec
-                      << " num=" << (int)num << " irq=" << (irq ? 1 : 0) << std::endl;
 
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
@@ -433,13 +398,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
         {
-            if (m_vuFlushCallback[1]) m_vuFlushCallback[1](opcode != VIF_FLUSHE);
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
-            if (opcode == VIF_MSCALF && m_vuFlushCallback[1]) m_vuFlushCallback[1](true);
-            uint32_t startPC = (imm & 0x7ffu) * 8u;
+            uint32_t startPC = (uint32_t)imm * 8u;
 
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
@@ -453,24 +416,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
-            // TEMP DIAGNOSTIC (boot-stall triage).
-            std::cerr << "[VIF1-mscal] pc=0x" << std::hex << startPC << " top=0x" << runTop
-                      << " itop=0x" << runItop << std::dec << " opcode=0x" << std::hex << (int)opcode << std::dec
-                      << std::endl;
-            // TEMP DIAGNOSTIC (boot-stall triage): is microcode present at the entry?
-            if (m_vu1Code != nullptr && startPC + 16u <= PS2_VU1_CODE_SIZE)
-            {
-                std::cerr << "[VIF1-mscal-code] pc=0x" << std::hex << startPC << ":";
-                for (uint32_t w = 0u; w < 16u; w += 4u)
-                {
-                    uint32_t word = 0u;
-                    std::memcpy(&word, m_vu1Code + startPC + w, sizeof(word));
-                    std::cerr << " " << word;
-                }
-                std::cerr << std::dec << std::endl;
-            }
-            if (m_vuMscalCallback[1])
-                m_vuMscalCallback[1](startPC, runTop, runItop);
+            if (m_vu1MscalCallback)
+                m_vu1MscalCallback(startPC, runTop, runItop);
             continue;
         }
         else if (opcode == VIF_MSCNT)
@@ -487,8 +434,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
-            if (m_vuMscntCallback[1])
-                m_vuMscntCallback[1](runTop, runItop);
+            if (m_vu1MscntCallback)
+                m_vu1MscntCallback(runTop, runItop);
             continue;
         }
         else if (opcode == VIF_STMASK)
@@ -519,7 +466,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MPG)
         {
-            if (m_vuFlushCallback[1]) m_vuFlushCallback[1](false);
             uint32_t destAddr = (uint32_t)imm * 8u;
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
@@ -530,14 +476,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
                 {
-                    writeVuCode(true, destAddr, {data + pos, copyBytes});
+                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                    markVU1CodeModified();
                 }
             }
-            // TEMP DIAGNOSTIC (boot-stall triage).
-            std::cerr << "[VIF1-mpg] dest=0x" << std::hex << destAddr << std::dec
-                      << " count=" << instructionCount << " bytes=" << mpgBytes
-                      << " fits=" << ((pos + mpgBytes <= sizeBytes) ? 1 : 0)
-                      << " pos=" << pos << " size=" << sizeBytes << std::endl;
             pos += mpgBytes;
             if (pos > sizeBytes)
                 break;
@@ -556,11 +498,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
-                // TEMP DIAGNOSTIC (boot-stall triage).
-                std::cerr << "[VIF1-direct] qwCount=" << qwCount << " hl=" << (directHl ? 1 : 0)
-                          << " pos=" << pos << " size=" << sizeBytes << std::endl;
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
-                std::cerr << "[VIF1-direct] submitted qwCount=" << qwCount << std::endl;
 
                 const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
                 if (pendingImageQw != 0u)
@@ -842,7 +780,4 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             continue;
         }
     }
-
-    // TEMP DIAGNOSTIC (boot-stall triage).
-    std::cerr << "[VIF1] done size=" << sizeBytes << " ops=" << ops << " pos=" << pos << std::endl;
 }

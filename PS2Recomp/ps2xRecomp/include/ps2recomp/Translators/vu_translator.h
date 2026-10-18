@@ -15,7 +15,6 @@ namespace ps2recomp
         std::string translate(const Instruction &inst);
 
     private:
-        std::string translateOperation(const Instruction &inst);
         CodeGenerator &m_codeGenerator;
     };
 }

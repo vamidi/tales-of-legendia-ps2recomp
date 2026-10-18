@@ -97,16 +97,6 @@ namespace
         }
     }
 
-    inline void writeGsRegister(GSRegisters &gs, uint64_t *reg, uint64_t value)
-    {
-        if (reg == &gs.dispfb1)
-            gs.writeDisplayFramebuffer(0, value);
-        else if (reg == &gs.dispfb2)
-            gs.writeDisplayFramebuffer(1, value);
-        else
-            *reg = value;
-    }
-
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
@@ -873,26 +863,6 @@ __m128i PS2Memory::read128(uint32_t address)
     return _mm_setzero_si128();
 }
 
-bool PS2Memory::writeVuCode(bool vu1, uint32_t offset, std::span<const uint8_t> bytes)
-{
-    auto *code = vu1 ? m_vu1Code : m_vu0Code;
-    if (!code)
-        throw std::logic_error("VU code memory is not initialized");
-
-    const auto size = vu1 ? PS2_VU1_CODE_SIZE : PS2_VU0_CODE_SIZE;
-    inRange(offset, bytes.size(), size, "VU code write", offset);
-    const bool changed = !bytes.empty() && std::memcmp(code + offset, bytes.data(), bytes.size()) != 0;
-    if (changed)
-    {
-        std::memmove(code + offset, bytes.data(), bytes.size());
-        if (vu1)
-            markVU1CodeModified();
-        else
-            markVU0CodeModified();
-    }
-    return changed;
-}
-
 void PS2Memory::write8(uint32_t address, uint8_t value)
 {
     const bool scratch = isScratchpad(address);
@@ -913,10 +883,11 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint8_t), vuOffset, vuLimit))
         {
             (void)vuLimit;
-            if (vuMem == m_vu0Code || vuMem == m_vu1Code)
-                writeVuCode(vuMem == m_vu1Code, vuOffset, {&value, 1});
-            else
-                vuMem[vuOffset] = value;
+            vuMem[vuOffset] = value;
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
+                markVU1CodeModified();
             return;
         }
     }
@@ -955,10 +926,11 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
         {
-            if (vuMem == m_vu0Code || vuMem == m_vu1Code)
-                writeVuCode(vuMem == m_vu1Code, vuOffset, {reinterpret_cast<const uint8_t *>(&value), sizeof(value)});
-            else
-                storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
+            storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
+                markVU1CodeModified();
             return;
         }
     }
@@ -993,7 +965,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         {
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
-            writeGsRegister(gs_regs, reg, newVal);
+            *reg = newVal;
         }
         return;
     }
@@ -1018,10 +990,11 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
         {
-            if (vuMem == m_vu0Code || vuMem == m_vu1Code)
-                writeVuCode(vuMem == m_vu1Code, vuOffset, {reinterpret_cast<const uint8_t *>(&value), sizeof(value)});
-            else
-                storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
+            storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
+                markVU1CodeModified();
             return;
         }
     }
@@ -1049,7 +1022,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
-            writeGsRegister(gs_regs, reg, value);
+            *reg = value;
         }
         return;
     }
@@ -1072,10 +1045,11 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         uint32_t vuLimit = 0;
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
         {
-            if (vuMem == m_vu0Code || vuMem == m_vu1Code)
-                writeVuCode(vuMem == m_vu1Code, vuOffset, {reinterpret_cast<const uint8_t *>(&value), sizeof(value)});
-            else
-                storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
+            storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
+                markVU1CodeModified();
             return;
         }
     }
@@ -1111,18 +1085,6 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         return;
     }
 
-    // GS-priv MMIO: model 128-bit stores as two 64-bit register stores so QWC
-    // stores to PMODE/SMODE1/... reach GSRegisters (write64 applies CSR handling).
-    // Previously these stores were dropped.
-    if (isGsPrivReg(address))
-    {
-        const uint64_t lo = _mm_extract_epi64(value, 0);
-        const uint64_t hi = _mm_extract_epi64(value, 1);
-        write64(address, lo);
-        write64(address + 8, hi);
-        return;
-    }
-
     if (scratch)
     {
         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "write128 scratchpad", address);
@@ -1141,10 +1103,11 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(__m128i), vuOffset, vuLimit))
         {
             inRange(vuOffset, sizeof(__m128i), vuLimit, "write128 vu", address);
-            if (vuMem == m_vu0Code || vuMem == m_vu1Code)
-                writeVuCode(vuMem == m_vu1Code, vuOffset, {reinterpret_cast<const uint8_t *>(&value), sizeof(value)});
-            else
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
+                markVU1CodeModified();
             return;
         }
     }
@@ -1210,7 +1173,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
-            writeGsRegister(gs_regs, reg, (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u)));
+            *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -1369,33 +1332,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                 uint32_t chcr = value;
                 uint32_t mode = (chcr >> 2) & 0x3;
-
-                // TEMP DIAGNOSTIC (boot-stall triage).
-                std::cerr << "[DMA-start] base=0x" << std::hex << channelBase << " chcr=0x" << value
-                          << " madr=0x" << madr << " qwc=0x" << qwc << std::dec
-                          << " mode=" << mode << " gsVram=" << (m_gsVRAM != nullptr ? 1 : 0) << std::endl;
-                if (mode == 1u)
-                {
-                    auto dumpWords = [&](const char *label, uint32_t base, uint32_t bytes)
-                    {
-                        std::cerr << "[DMA-dump] " << label << " @0x" << std::hex << base << ":";
-                        for (uint32_t i = 0u; i + 4u <= bytes; i += 4u)
-                        {
-                            uint32_t word = 0u;
-                            if (isScratchpad(base + i))
-                                std::memcpy(&word, m_scratchpad + ((base + i) & (PS2_SCRATCHPAD_SIZE - 1u)), sizeof(word));
-                            else
-                                std::memcpy(&word, m_rdram + ((base + i) & (PS2_RAM_SIZE - 1u)), sizeof(word));
-                            std::cerr << " " << word;
-                        }
-                        std::cerr << std::dec << std::endl;
-                    };
-                    dumpWords("TADR", m_ioRegisters[channelBase + 0x30], 64u);
-                    dumpWords("TADR-0x20", (m_ioRegisters[channelBase + 0x30] - 0x20u) & 0x1FFFFFFFu, 0xE0u);
-                    dumpWords("pay3EF570", 0x3EF570u, 64u);
-                    dumpWords("gpDma(0x3DB060)", 0x3DB060u, 0x30u);
-                    dumpWords("RDRAM0", 0u, 32u);
-                }
 
                 if (mode == 0 && qwc > 0)
                 {
@@ -1574,16 +1510,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
-                        if (tagsProcessed <= 8)
-                        {
-                            std::cerr << "[DMA-tag] n=" << tagsProcessed << " tagAddr=0x" << std::hex << currentTagAddr
-                                      << " raw=0x" << static_cast<uint32_t>(tag >> 32) << ":"
-                                      << static_cast<uint32_t>(tag & 0xFFFFFFFFu)
-                                      << " id=" << std::dec << id << " qwc=" << tagQwc
-                                      << " irq=" << (irq ? 1 : 0) << " data=0x" << std::hex << dataAddr
-                                      << std::dec << " chainBytes=" << chainBuf.size() << std::endl;
-                        }
-
                         if (transferTagData)
                             appendVifTagData(currentTagAddr);
 
@@ -1594,12 +1520,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (endChain)
                             break;
                     }
-
-                    // TEMP DIAGNOSTIC (boot-stall triage).
-                    std::cerr << "[DMA-chain-done] tags=" << tagsProcessed
-                              << " bytes=" << chainBuf.size()
-                              << " nextTag=0x" << std::hex << tagAddr << std::dec
-                              << " vif1Pending=" << m_pendingVif1Transfers.size() << std::endl;
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
@@ -2038,11 +1958,6 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         flushMaskedPath3Packets(false);
     }
 
-    const bool bigPacket = sizeBytes >= 8192u; // TEMP DIAGNOSTIC (boot-stall triage)
-    if (bigPacket)
-        std::cerr << "[GIFsubmit] begin path=" << static_cast<int>(pathId) << " size=" << sizeBytes
-                  << " drain=" << (drainImmediately ? 1 : 0) << std::endl;
-
     if (m_gifArbiter)
         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
     else if (m_gifPacketCallback)
@@ -2050,9 +1965,6 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     if (m_gifArbiter && drainImmediately)
         m_gifArbiter->drain();
-
-    if (bigPacket)
-        std::cerr << "[GIFsubmit] end path=" << static_cast<int>(pathId) << " size=" << sizeBytes << std::endl;
 }
 
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)

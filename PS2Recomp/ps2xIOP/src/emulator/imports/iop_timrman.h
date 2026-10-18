@@ -63,7 +63,5 @@ namespace ps2x::iop::detail
         std::array<Timer, 6> m_timers{};
         uint32_t m_holdMode = 0u;
         bool m_servicing = false;
-        mutable bool m_deadlineDirty = true;
-        mutable uint64_t m_nextEventCycle = UINT64_MAX;
     };
 }

@@ -24,8 +24,6 @@
 #include <span>
 #include <sstream>
 #include <utility>
-#include <cstdio>
-#include <exception>
 
 namespace ps2x::iop::detail
 {
@@ -127,7 +125,6 @@ namespace ps2x::iop::detail
             timrman.reset();
             ioman.reset();
             pendingDmaInterrupts.clear();
-            nextDmaInterruptCycle = UINT64_MAX;
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
@@ -135,7 +132,7 @@ namespace ps2x::iop::detail
             totalInstructions = 0;
             eeCycleCarry = 0;
             activeCpu = nullptr;
-            executionFault = {};
+            lastError.clear();
             servicingDmaInterrupts = false;
             servicingGuestCallbacks = false;
             callDepth = 0u;
@@ -179,18 +176,8 @@ namespace ps2x::iop::detail
 
         void schedulePendingDma()
         {
-            schedulePendingDma(totalCycles);
-        }
-
-        void schedulePendingDma(uint64_t issueCycle)
-        {
             if (const auto dma = memory.takeDmaStart())
-            {
-                pendingDmaInterrupts[dma->irq] = issueCycle + dma->delayCycles;
-                nextDmaInterruptCycle = UINT64_MAX;
-                for (const auto &[irq, cycle] : pendingDmaInterrupts)
-                    nextDmaInterruptCycle = std::min(nextDmaInterruptCycle, cycle);
-            }
+                pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const
@@ -239,7 +226,7 @@ namespace ps2x::iop::detail
             if (!pending)
                 return false;
             cpu.cop0[13] |= 0x400u;
-            cpuCore.raiseException(cpu, 0u, cpu.pc, cpu.branchPending);
+            cpuCore.raiseException(cpu, 0u, cpu.pc, false);
             return true;
         }
 
@@ -371,15 +358,6 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
-        void fail(uint32_t pc, const char *reason) noexcept
-        {
-            if (executionFault.active)
-                return;
-            executionFault.active = true;
-            executionFault.pc = pc;
-            std::snprintf(executionFault.reason.data(), executionFault.reason.size(), "%s", reason);
-        }
-
         bool step(CpuState &cpu)
         {
             if (cpu.stopped)
@@ -391,23 +369,16 @@ namespace ps2x::iop::detail
             }
             if (physicalAddress(cpu.pc) >= kRamSize)
             {
-                fail(cpu.pc, "Instruction fetch outside IOP RAM");
+                std::ostringstream out;
+                out << "[IOP] execution outside RAM pc=0x" << std::hex << cpu.pc;
+                log(LogLevel::Error, out.str());
                 cpu.stopped = true;
                 return false;
             }
             if (checkInterrupt(cpu))
                 return true;
 
-            if (cpu.pc & 3u)
-            {
-                cpuCore.raiseException(cpu, 4u, cpu.pc, cpu.branchPending, cpu.pc);
-                ++totalInstructions;
-                ++totalCycles;
-                return true;
-            }
-
-            const uint32_t instruction = memory.read32(cpu.pc);
-            if (const auto import = imports.decode(cpu.pc, instruction))
+            if (const auto import = imports.decode(cpu.pc))
             {
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
@@ -419,47 +390,28 @@ namespace ps2x::iop::detail
                 return !cpu.stopped;
             }
 
-            const bool executed = cpuCore.executeInstruction(cpu, instruction);
+            const bool running = cpuCore.executeInstruction(cpu);
+            schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
-            if (memory.hasDmaStart())
-                schedulePendingDma(totalCycles - 1);
-            if (!executed) return false;
-            return !cpu.stopped;
+            return running;
         }
 
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
         {
-            struct ActiveGuard
-            {
-                CpuState *&slot;
-                CpuState *previous;
-                ~ActiveGuard() { slot = previous; }
-            } guard{activeCpu, activeCpu};
+            CpuState *previous = activeCpu;
             activeCpu = &cpu;
             const uint64_t start = totalInstructions;
-            try
+            while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
             {
-                while (!executionFault.active && !cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
-                {
+                if (!step(cpu))
+                    break;
+                if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                     servicePendingDmaInterrupts();
+                if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
                     servicePendingGuestCallbacks();
-                    timrman.serviceDue(totalCycles, *this);
-                    const auto consumed = totalInstructions - start;
-                    if (consumed >= instructionBudget || executionFault.active)
-                        break;
-                    if (!step(cpu))
-                        break;
-                }
             }
-            catch (const std::exception &error)
-            {
-                fail(cpu.pc, error.what());
-            }
-            catch (...)
-            {
-                fail(cpu.pc, "Unknown IOP execution failure");
-            }
+            activeCpu = previous;
             return static_cast<uint32_t>(totalInstructions - start);
         }
 
@@ -531,18 +483,16 @@ namespace ps2x::iop::detail
         // Not that good to use exception handling for control flow but will do for now
         void servicePendingDmaInterrupts()
         {
-            if (servicingDmaInterrupts || totalCycles < nextDmaInterruptCycle)
+            if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
                 return;
 
             servicingDmaInterrupts = true;
 
             std::vector<int> completed;
-            nextDmaInterruptCycle = UINT64_MAX;
             for (auto it = pendingDmaInterrupts.begin(); it != pendingDmaInterrupts.end();)
             {
                 if (it->second > totalCycles)
                 {
-                    nextDmaInterruptCycle = std::min(nextDmaInterruptCycle, it->second);
                     ++it;
                     continue;
                 }
@@ -608,7 +558,7 @@ namespace ps2x::iop::detail
             try
             {
                 const uint64_t target = totalCycles + cycles;
-                while (!executionFault.active && totalCycles < target)
+                while (totalCycles < target)
                 {
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
@@ -617,7 +567,8 @@ namespace ps2x::iop::detail
                     if (!next)
                     {
                         uint64_t nextWake = kernel.nextWakeCycle(target);
-                        nextWake = std::min(nextWake, nextDmaInterruptCycle);
+                        for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                            nextWake = std::min(nextWake, completionCycle);
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
@@ -631,13 +582,9 @@ namespace ps2x::iop::detail
                         ++totalCycles;
                 }
             }
-            catch (const std::exception &error)
-            {
-                fail(activeCpu ? activeCpu->pc : 0u, error.what());
-            }
             catch (...)
             {
-                fail(activeCpu ? activeCpu->pc : 0u, "Unknown IOP scheduling failure");
+                // Runtime scheduling must never throw through EeScheduler::accountCycles().
             }
         }
 
@@ -749,7 +696,6 @@ namespace ps2x::iop::detail
         IopLoadcore loadcore;
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
-        uint64_t nextDmaInterruptCycle = UINT64_MAX;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
@@ -757,7 +703,7 @@ namespace ps2x::iop::detail
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
         CpuState *activeCpu = nullptr;
-        ExecutionFault executionFault;
+        std::string lastError;
         bool servicingDmaInterrupts = false;
         bool servicingGuestCallbacks = false;
         uint32_t callDepth = 0u;
@@ -800,11 +746,6 @@ namespace ps2x::iop::detail
         m_impl->eeCycleCarry = total % 8u;
         if (iopCycles)
             m_impl->runCycles(iopCycles);
-    }
-
-    const ExecutionFault &IopEmulator::fault() const noexcept
-    {
-        return m_impl->executionFault;
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

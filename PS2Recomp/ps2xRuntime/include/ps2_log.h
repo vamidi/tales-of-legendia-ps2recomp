@@ -31,8 +31,6 @@
         ps2_log::append_runtime_log_text(_ps2_runtime_error_text);                                                      \
     } while (0)
 
-#define RUNTIME_WARNING(x) std::cout << x
-
 namespace ps2_log
 {
 struct RuntimeLogEntry

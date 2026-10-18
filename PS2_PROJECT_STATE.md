@@ -16,6 +16,537 @@
 # PS2 Recomp — Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 14 - pink screen Phase 0: the entry_points gap is NOT the cause
+
+**Trigger:** user asked "should we start at the GS renderer?" and then "let's start with phase 0".
+Phase 0 = pin the cause before fixing. Read-only diffs + one instrumented run.
+
+**Phase 0b - `data/map.csv` is byte-identical to `data/map.csv.bak`.** SHA-256
+`C9930CC4B47FA087B6A61F8946FB01CE39AD8AEC3F75A7E8DA34D15A10EAEDE3` on both, 2151867 bytes each
+(10/10 vs 10/18 mtime). **The Ghidra export did not change** - no function was lost or added; the
+two data-as-code ranges (`entry_003a3198`, `entry_003c7590`) existed in the session-7 export too.
+The ONLY difference vs session 7 is the regenerated `config.toml` losing its 411 `entry_points`.
+
+**Phase 0a - NO missing function was ever reported. This corrects session 13.** `reportMissingFunction`
+writes its `[guest-branch:missing-target]` dump to `std::cerr` (`ps2_runtime.cpp:1323`), and
+`lookupFunction` writes `"No exact recompiled function for guest PC"` to `std::cerr` (`:1151`).
+`logs/pink_test.err.log` contained exactly ONE line (`[SetupHeap] ...`); `ps2_log.txt` is 100% enter/exit
+traces. So `reportMissingFunction` was never called -> **the `0x1B1948` / `entry_points` gap is not what
+retires thread 1 on this build, and restoring `entry_points` would NOT have fixed the pink screen.**
+(The trampoline `FUN_001a8f80`, `0x1b1948`, `0x1ad360`, `0x1b30f0`, `0x199938` appear **0 times** in
+the run trace, consistent with this.)
+
+**Phase 0c - what actually ends the thread.** `EeScheduler::run()` treats `context.pc == 0` as
+"thread finished": `EeScheduler.cpp:231` (`if (context.pc == 0u)`) -> `:249 makeDormant(*running)` ->
+`:252 publishIdleDebugContext()`. So the debug panel's `thread 1: DORMANT/NONE` means **the guest's
+`pc` reached 0**. Also: the `pc=0x0 ra=0x0 sp=0x1efffc0` seen in `[run:tick]` and the panel is the
+published **IDLE** context (async stack floor), NOT thread 1's real state - session 13's reading of that
+line was wrong. `sp=0x1EFFFC0 = invocationStackTop()`-ish (async callback stack floor 0x01F00000).
+`activeThreads=1` just counts the idle/invocation holder.
+
+**Trace corrections (from reading the generated C++):**
+- `FUN_00109108` (0x109108-0x1091C8) is **`memset`** (`sltiu $a2,8` -> byte loop; else `pcpyh` 16-byte
+  fill; returns `$v0 = $a0`). `entry_00109144/174/188/1c0_0x1091xx` are its INTERIOR loop labels, and
+  `entry_001091c0` is literally memset's `jr $ra`. Those top-level `entry_*` dispatches in the trace are
+  **checkpoint-resume wrappers**, not calls.
+- The `0x11f650` "spin" is the **scheduler idle path**, not guest work.
+- `entry_0x100008` is PS2 `crt0/_start` (0x100008-0x100218): `SetSyscall` via `syscall` with `$v1=0x3C`
+  and `0x3D` (handleSyscall correctly falls back to `$v1` when the encoded id is 0, `ps2_runtime.cpp:1468`),
+  `sp = $v0`, `FlushCache(0)`, then `jal func_165AD0` and a **tail `j func_1072B8`** (0x100210) emitted as
+  `FUN_001072b8_0x1072b8(rdram, ctx, runtime); return;`.
+- **`entry_0x100008` exits without reaching 0x100210** and `FUN_001072b8` (exists, 14859 bytes, table slots
+  7340+) is **never entered** -> the game's `__libc_init`/main chain never runs. The last dispatch before
+  idling was the bare `jr $ra` wrapper `entry_001091c0_0x1091c0`.
+
+**Working hypothesis (to be confirmed by the probe):** the thread is resumed at an INTERIOR pc (memset loop
+labels / `jr $ra`) with a stale/zero `$ra`, so `jr $ra` yields `ctx->pc = 0` and the scheduler retires
+thread 1. Note this would be caused by the auto-collected resumable entry points (475624 of them), i.e. the
+**opposite** of the `entry_points` theory - more entries, not fewer.
+
+**Diagnostic build (revertible, tagged `[DIAG:...]`; `src/lib/*.cpp` only, no headers):**
+- `ps2_runtime.cpp` `dispatchGuestBranch`: when a callee leaves `ctx->pc == 0`, print
+  `[diag:pc0-dispatch] callee/caller/fallthrough/kind/name/trace=` (uses the existing file-local
+  `formatDispatchHistory()`), capped at 50.
+- `EeScheduler.cpp` pc==0 branch: print `[diag:thread-retire] thread/entry/ra/sp/invocations`; added
+  `#include <iostream>`.
+- Built incrementally: `[3/5] Linking ps2_runtime.lib`, `[4/5] Linking ps2EntryRunner.exe` - only 2 TUs.
+- Deliberately did NOT use the existing `PS2X_STRICT_RETURN_DIAGNOSTICS` CMake option (default OFF): it
+  routes EVERY `jr $ra` through `dispatchGuestBranch`, adding a `checkpointDue()` per return and changing
+  the resume cadence, so the bug may not reproduce.
+
+**Probe run result: ROOT CAUSE FOUND.** Runs 2-3 of `scripts/pink_test.ps1` (`-Seconds 12/18`) gave:
+
+```
+[diag:pc0-inline] thread=1 entry=0x100008 dispatched=0x100270 invocations=0 tag=main
+[diag:pc-ring] PC==0 newest first: 0x100270(t1,inv0) 0x1091c0(t1,inv0) 0x109188 0x109174 0x109144 ×12 ...
+[diag:t1-main] pc=0x100008 ra=0x0      sp=0x1fffff0
+[diag:t1-main] pc=0x1001f0 ra=0x1001f0  sp=0x1f00000      <-- sp == 0x1F00000
+[diag:t1-main] pc=0x109144 ra=0x100270  sp=0x1efff80      <-- the memset
+[diag:t1-main] pc=0x100270 ra=0x100270  sp=0x1efff80      <-- epilogue
+```
+
+and crucially **`[diag:pc0-dispatch]` NEVER fired** and **`[diag:unmapped-pc]` NEVER fired** - so `pc = 0`
+was not produced by a missing function nor through `dispatchGuestBranch`.
+
+### THE BUG: the game's heap overlaps the main-thread stack
+
+1. `entry_0x100008` (crt0) calls `syscall` with `$v1 = 0x3C` = **`SetupThread`**
+   (`Dispatcher.cpp:147`, `System.cpp:473`) with `$a0=gp=0x3E2BF0`, `$a1=stack=-1`,
+   `$a2=stack_size=0x100000`, `$a3=0x3DB700`, `$t0=root=0x100220`, then `0x1001CC: move $sp, $v0`.
+2. `System.cpp:492-500`: `stack == 0xFFFFFFFF && requestedSize < PS2_RAM_SIZE`
+   -> **`sp = PS2_RAM_SIZE - requestedSize` = `0x02000000 - 0x100000` = `0x01F00000`**
+   (the *bottom* of the reserved stack window, but `$sp` must be the *top*).
+3. The game reserves the top 1 MB for its stack: `FUN_00131be0` computes the heap size as
+   `0x02000000 - (0x4E9B80 + 0x100000)` = `0x1A16480` and `FUN_00131bd0` returns base `0x4E9B80`.
+   So the game's heap is `[0x4E9B80, 0x1F00000)` - i.e. it starts exactly where the runtime put `$sp`.
+4. `FUN_00100230` (0x100230, `__heap_init`) prologue: `sp -= 0x40`, `sd $ra, 0x30($sp)` at 0x100234,
+   then `jal memset` (0x100268) with `a0=0x4E9B80, a1=0, a2=0x1A16480`.
+   `FUN_00109108` = `memset`; it zeroes `[0x4E9B80, 0x1F00000)` - **including the live stack frame at
+   `0x1EFFF80..0x1EFFFC0` and the saved return address at `0x1EFFFB0`.**
+5. The memset hits a checkpoint, so the C stack unwinds to the scheduler; the scheduler resumes
+   memset's interior labels (`0x109144` x12, `0x109174`, `0x109188`), memset finishes at
+   `0x1091c0` (`jr $ra` -> `$ra = 0x100270`), and the scheduler dispatches `0x100270`.
+6. `FUN_00100230` resumes at `label_100270` and runs to `0x100350: ld $ra, 0x30($sp)` -> reads the
+   zeroed slot `0x1EFFFB0` -> **`$ra = 0`**; `0x100364: jr $ra` -> `ctx->pc = 0`.
+7. `EeScheduler::run()` (`:232`) treats `context.pc == 0` as "thread finished" -> `makeDormant(thread 1)`
+   -> `publishIdleDebugContext()`. The guest never touches the GS, so `ps2_runtime.cpp:417` presents
+   its `GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA)` placeholder = **the flat #FF00FF pink screen**.
+
+**Therefore the pink screen is a `SetupThread` stack-pointer bug in our runtime, not a recompiler bug,
+not a GS bug, and not the missing `entry_points`.** The heap end constant `kDefaultGuestHeapEnd =
+0x01F00000` (`System.cpp:546`) already matches the game's own heap end exactly - only the returned `$sp`
+is wrong.
+
+### Proposed fix (NOT APPLIED - awaiting approval)
+
+`System.cpp`, `SetupThread`, the `stack == 0xFFFFFFFFu` branch: the value returned in `$v0` is used
+directly as `$sp`, so it must be the TOP of the reserved window, not its base. Return
+`PS2_RAM_SIZE` instead of `PS2_RAM_SIZE - requestedSize`
+(i.e. sp = 0x02000000; the stack then lives in the top 1 MB `[0x1F00000, 0x2000000)` that the game
+reserves, and `[0x4E9B80, 0x1F00000)` stays a clean heap).
+
+Diagnostic probes (`[DIAG:...]`) are still in `ps2_runtime.cpp` / `EeScheduler.cpp` and should be
+removed after the fix is verified.
+
+### Fix #1 APPLIED and verified (System.cpp)
+
+`SetupThread` now returns `PS2_RAM_SIZE - 0x10u` as `$v0` for `stack == -1`, matching the main
+context's initial `$sp` (`ps2_runtime.cpp:2368`). Verified by a `-Seconds 40` run: the first
+`FUN_00100230` call's frame moved from `sp=0x1efff80` (inside the heap) to `sp=0x1ffff70` (above the
+heap's `0x1F00000` end), and execution continued past `label_100270` to `pc=0x165c74` /
+`pc=0x165aec`. 3 shots taken; screen still 29.5% `#FF00FF`.
+
+### BLOCKER #2 (found during that verification): handler stacks vs the main thread stack
+
+`PS2Runtime::reserveAsyncCallbackStack` (`ps2_runtime.cpp:1994`) allocates downwards from
+`m_asyncCallbackStackTop`, which starts at `PS2_RAM_SIZE` (`:517`, `:976`) with floor `0x01F00000`
+(`kGuestHeapHardLimit`, `:93`), and returns `top - 0x10` (`:2029`). So the FIRST invocation ("async
+callback") stack has sp = `0x01FFFFF0` - byte-identical to the EE main thread stack top
+(`ps2_runtime.cpp:2368`, and now also `SetupThread`). Direct evidence: the probe log shows the
+invocation context itself as `thread=1 ... sp=0x1fffff0 invocations=1`.
+
+`EeScheduler::queueInterrupt` (`:1344-1354`) sets a handler's `$sp = 0` and `$ra = 0` by design
+(`$ra = 0` is how a handler signals completion -> `pc = 0`), and `run()` substitutes
+`invocationStackTop()` for the zero sp. A handler therefore descends through the SAME addresses as
+the interrupted thread's live frames and **stores a literal 0 into `sp + 0x30`**. That is the second
+cause of `pc = 0`:
+
+- `FUN_00100230` 2nd call frame `[0x1ffff30, 0x1ffff70)`, `$ra` slot `0x1ffff60` -> zeroed.
+- `FUN_00100230` 1st call frame `[0x1ffff70, 0x1ffffb0)`, `$ra` slot `0x1ffffa0` -> also reachable.
+
+Fix #1 alone makes this *more* likely: before it the main stack top was `0x01F00000`, disjoint from
+the async region `[0x01F00000, 0x02000000)`; fix #1 correctly moves the stack to `0x01FFFFF0`, which
+is exactly where the async region starts. Fixes #1 and #2 must land together.
+
+### Proposed fix #2 (NOT APPLIED - needs a size decision)
+
+The game hardcodes its heap end at `0x01F00000` (`FUN_00131be0`), so the EE main-thread stack MUST
+live in the top 1 MB `[0x01F00000, 0x02000000)` - which is exactly the async callback region. The two
+must share it, so the window has to be split: reserve a slice at the top for the main stack and make
+`m_asyncCallbackStackTop` start below it.
+
+### Fix #2 APPLIED (768 KB main stack / 256 KB handler stacks - user's choice)
+
+- `ps2_runtime.h`: `static constexpr uint32_t kEeMainThreadStackReserve = 0x000C0000u;` (768 KB) next to
+  the async members, and the `m_asyncCallbackStackTop` default is now
+  `PS2_RAM_SIZE - kEeMainThreadStackReserve`.
+- `ps2_runtime.cpp:507` and `:976`: the same expression at both init sites.
+- Result: async region `[0x01F00000, 0x01F40000)`, EE main stack `[0x01F40000, 0x02000000)` with
+  `$sp = 0x01FFFFF0` - 768 KB of headroom below the stack top, disjoint from the handler stacks.
+
+### Build system - measured, because it is now the bottleneck (session 14)
+
+- **`ps2_runtime.h` is included by all 1664 `ps2EntryRunner` unity TUs**
+  (`out/build/ps2xRuntime/CMakeFiles/ps2EntryRunner.dir/Unity/unity_*_cxx.cxx.obj`, index 0-1663), so
+  editing it is a multi-hour rebuild. The fix #1 edit (`System.cpp`) cost only ~2 TUs because it is a
+  lib-only source. **Rule: keep runtime-internal constants out of public headers**; a lib-only edit is
+  ~2 TUs + relink and is the intended iteration path.
+- Individual unity TUs are pathological in Debug. `.ninja_log` per-edge times observed: 366 s, 609 s,
+  1581 s and **2167 s (36 min) for `unity_187`**. This is not lock contention - the `cl` processes burn
+  CPU the whole time.
+- A CMake configure is **253.5 s**, of which `Generating done` alone is **232.8 s**
+  (`logs/configure_probe.log`, `CONFIGURE EXIT: 0 ELAPSED_SEC: 253.5`).
+- **`ninja -n` LIES about "Re-running CMake".** The `VERIFY_GLOBS` edge has `restat = 1` plus the
+  always-dirty `VerifyGlobs.cmake_force` input, so a dry run can never prove the sentinel is unchanged
+  and always prints `[0/2] Re-checking globbed directories... / [1/2] Re-running CMake...`. To get the
+  truth, run the script the way the rule does and re-check the sentinel mtime:
+  `cmake -P out/build/CMakeFiles/VerifyGlobs.cmake` -> exit 0, and `
+  out/build/CMakeFiles/cmake.verify_globs` (78 bytes) mtime unchanged => globs stable, no real
+  reconfigure pending. Do not "fix" a phantom reconfigure loop again.
+- `scripts\build-runtime.bat` (new; the user's requested wrapper, verified with `--check`): locates
+  `VsDevCmd.bat` via `vswhere` + fallbacks, calls it `-arch=x64 -host_arch=x64`, `cd`s to `PS2Recomp`
+  itself (so the relative `out/build` always resolves - the two usual bare-`cmd.exe` failures),
+  `taskkill /F /IM ps2EntryRunner.exe`, then runs `cmake --build out/build --config Debug %*`.
+  `NO_PAUSE=1` suppresses the double-click pause. Never add `--clean-first`.
+- **`ps2EntryRunner.exe` was still `4:04:05 PM / 510964224 bytes`** (pre-fix-#2) well after the lib was
+  relinked at `4:16:59 PM`: a build that compiles the unity TUs but is killed before the link leaves the
+  old exe in place, and the timestamps alone do not reveal it. Confirm the exe mtime after every build.
+  All 1664 unity objects ended up newer than the `4:16:19` header edit.
+- **Rebuild 10/18 21:00** via `scripts\build-runtime.bat` (`--target ps2EntryRunner`, no clean): 3 unity
+  TUs rebuilt (`unity_180/181/182`) + link, `20:16:07 -> 21:00:51` (~45 min, the pathological-TU effect
+  again), exit 0. `ps2EntryRunner.exe` is now **`9:00:50 PM / 510963712 bytes`** (was `4:04:05 PM /
+  510964224`), i.e. the exe did relink - confirm mtime after every build as above.
+
+### VERIFICATION of fixes #1+#2 (exe rebuilt 9:00:50 PM) - THE BUG IS FIXED, a DIFFERENT one appears
+
+Run: `powershell -ExecutionPolicy Bypass -File scripts\pink_test.ps1 -Seconds 45`. The `.ps1` is blocked
+by execution policy otherwise - it exits in 0.2 s and silently leaves the OLD logs in place, so ALWAYS
+assert the log mtimes are current before believing a result. The exe (510963712 bytes) links a lib
+(4:16:59 PM) older than itself with no source newer than it, so it carries fix #1 + fix #2 + the probes.
+
+| check | pre-fix | post-fix |
+| ----- | ------- | -------- |
+| `[diag:pc0-inline] ... tag=main` | 1 | **0** |
+| `[diag:thread-retire] thread=1 ... invocations=0` | 1 | **0** |
+| main-thread trace tail (`[diag:t1-main]`) | ends `pc=0x100270 ra=0x100270` (the zeroed-`$ra` `jr`) | `pc=0x117df8`/`0x117e00`, `sp=0x1fffe80`, thread alive |
+| `ps2_log.txt` | 6,378 lines | **13,080,330 lines / 425 MB** |
+
+Both fixes are confirmed: thread 1 no longer retires; it executes millions of instructions past
+`__heap_init` and into the game's SIF initialisation. `[diag:pc0-dispatch]` and `[diag:unmapped-pc]`
+remain 0, and the 17 by-design `tag=invocation` retires are unchanged.
+
+**NEW BLOCKER (a different bug): the guest spins on a flag no recompiled code ever writes.**
+
+- `entry_00117df8_0x117df8.cpp` is literally `while (func_1174F8(0) == 0);` followed by
+  `sceSifSetReg(0x80000002, 1)` - and `0x80000002` is `kSifRegMsCom` (`SIF.cpp:86`, handled at `:114`).
+- `FUN_001174f8_0x1174f8.cpp` is a table accessor: `return *(uint32*)(0x3DEF40 + index*4)`
+  (`lui $v0, 0x3E` + `addiu -0x10C0`). Called with `$a0 = 0`, so the spin tests `*(0x3DEF40) != 0`.
+- `0x3DEF40` is **BSS** (the segment's filesz `0x2DAF80` ends before vaddr `0x3DEF40`), so it starts 0.
+- The ONLY code touching `0x3DEF40` is the `0x1174f8`-`0x117628` cluster: the reader above and
+  `FUN_00117540_0x117540` (0x117540-0x117628), which **zeroes** it (`sw $zero, 0x7C($v0)`) - and that one
+  **DID run**. Its overlapping entries `entry_00117590_0x117590` / `entry_001175f8_0x1175f8` (which never
+  executed) are interior labels of that same function, not separate setters.
+- False lead to avoid: `FUN_00118d58` also contains `addiu $v1, -0x10C0`, but its `lui` is `0x3C`, so its
+  base is `0x3BEF40` - a different table. Grepping that constant alone conflates the two.
+- No statically-addressed store to `0x3DEF40` exists anywhere: the recompiler emits
+  `ps2TraceGuestWrite(rdram, <addr>, ...)` for statically-known targets, and the only 0x3DE-page hits are
+  `0x3DE018`, `0x3DE428`, `0x3DE880/884/888` and `0x3DED98/9C/A0/A4/A8/AC/B0/B4`.
+- `activeThreads=1` throughout, i.e. the game has not created any worker thread yet, so no other EE
+  thread can be the signaller.
+
+=> The flag must come from outside the game's own instructions: the IOP (SIF DMA into EE RAM) or the
+runtime's SIF/IOP HLE - the same family as the session-11/12 IOP-handshake blockers. `dma/gif/gsw/vif`
+are still 0 and the capture is still 29.60% `#FF00FF`, so the pink screen now has this NEW cause.
+
+**Cost note:** `PS2_FUNCTION_LOG_TRACKER` is ON, so the spin produced a 425 MB `ps2_log.txt` and the run
+took 226 s. Disable it for long runs.
+
+**Next step (needs approval - runtime change):** find the writer of `0x3DEF40`.
+(i) Cheapest and decisive: a lib-only probe (`EeScheduler.cpp`, ~2 TUs + relink) sampling the word at
+`0x3DEF40` each scheduler iteration and logging any change with the current guest PC - it either names
+the writer or proves "never written by guest code". Do NOT hook `Ps2FastWrite32`/`WRITE32`: normal-RAM
+writes go through the inline macro in the runner's `ps2_runtime_macros.h`, so that costs a full 1664-TU
+rebuild. (ii) Read the runtime's SIF HLE (`SIF.cpp` `sceSifSetReg`, `emulateIopSifCmdInitHandshake`,
+`emulateIopSifRpc`, `postIopSifCommand`) to see whether the IOP INIT handshake is supposed to set a
+guest-visible flag that nothing currently delivers.
+
+### LINEAGE FINDING - the tree we build is MISSING committed work, incl. the fix for this very spin
+
+Answered by `git log`: HEAD already contains what we re-derived this session. `95120b1` (10/17)
+"Runtime boot fixes: SetupThread stack top, async-callback stacks, SIFCMD init handshake" = **fix #1 +
+fix #2 + the fix for the 0x117df8 spin**, and its message names the loop we are stuck on:
+
+> "SIF.cpp: sceSifSetDma now emulates the IOP side of the documented SIFCMD init handshake - on an
+> outgoing SIF_CMD_INIT_CMD (0x80000002) with opt != 0 it sets sregs[SIF_SREG_RPCINIT] = 1 in the guest
+> _sif_cmd_data, so the guest's own in-ELF sceSifInitRpc leaves its **0x117df8** spin (verified:
+> heartbeat h=1, iters 17->731)."
+
+It is not in the tree we build: HEAD's `SIF.cpp` has `emulateIopSifCmdInitHandshake` (`kSifSregRpcInit = 0`,
+`Store32(sregs + 0, 1)`); the working tree has **no** RPCINIT handling anywhere (the only grep hits are
+`rpcInitialized` in the debug panel). Confirmed on both sides.
+
+Runtime evidence agrees exactly. From the 9:45 PM stderr log:
+
+```
+[sceSifSetReg] reg=0x80000001 prev=0x0 value=0x3ded98     <- SIF_SYSREG_MAINADDR = &_sif_cmd_data
+[sceSifSetDma:DESC] i=0 src=0x3ded80 dst=0x0 size=0x14 attr=0x44
+...(spin at 0x117df8)...
+[sceSifSetDma:DESC] i=0 src=0x3df000 dst=0x0 size=0x10 attr=0x44
+```
+
+i.e. the EE posts the SIFCMD init packet twice (the two packets HEAD's comment describes, opt=0 then
+opt=1), the runtime copies them into IOP memory, `PS2IopTransport::notifyTransfer` hands them to
+`ps2x::iop`, and **nothing ever answers with Set SREG**. `_sif_cmd_data` = 0x3DED98, so the sregs mirror
+is `*(0x3DED98 + 0x1C)` = `*(0x3DEDB4)` - the slot the guest's own init writes (0x3DEDB4 is in the
+statically-known store list above) - and `sregs[0]` is the 0x3DEF40 word we spin on.
+
+**Shape of the divergence** (`git status`: 123 entries = 80 modified, 34 deleted, 9 untracked;
+ps2xRuntime 64, ps2xIOP 23, ps2xTest 20, ps2xRecomp 11):
+
+- Deleted vs HEAD: all of `include/runtime/vu/**` (replaced by the untracked `ps2_vu1*`), the GS parallel
+  backend (`gs_parallel_backend.h`, `cmake/ParallelGS*.cmake`), and `ps2xIOP/src/modules/fileio.cpp` +
+  `loadfile.cpp`.
+- It is NOT merely an older tree: the working tree is a deliberate *refactor*. `sceSifSetDma` now reads
+  EE->IOP payloads and calls `PS2IopTransport::notifyTransfer({SifTransferKind::SetDma,
+  SifTransferPhase::BeforeCopy/AfterCopy, src, dest, size})` -> `IopSubsystem::onSifTransfer` ->
+  `IopRpcBridge`/`IopEmulator` (a real MIPS IOP with iop_cpu/iop_kernel/iop_memory/iop_module_manager),
+  where HEAD emulated the IOP inline inside the SIF stubs. That is why SIF.cpp lost ~697 lines. The
+  SIFCMD-init handshake was simply not carried across.
+- Not caused by git: `git reflog` shows only plain commits and `git stash list` is empty (no
+  reset/checkout/stash). The only `.bak`s are `data/config.toml.bak`, `data/config.toml.linux.bak`,
+  `data/map.csv.bak`. So the divergence is uncommitted working state, not a repo accident.
+
+**The later HEAD commits are the map past this point** (all reachable, none of it in the working tree):
+
+| commit | gate it clears |
+| ------ | -------------- |
+| `4fc7fa7` | IOP module-version handshake, rpc 0xff -> "3000" (killed the boot retry loop) |
+| `37cc40d` | DBCMAN version RPC 0x80001363 -> 0x0310 x4 (version mismatch) |
+| `8180d04` | route raw SIFRPC calls to the emulated IOP subsystem |
+| `277c230` | IOP: load the game's own modules and answer their RPCs (DTX/sound gate) |
+| `aad416a` | iop Stage C: serve the fileio service |
+| `ad27d73` | GS rendering fixes: BIOS-like CRT seed + interop layout - "full porting snapshot" |
+
+Note `4fc7fa7`'s responder lived in `ps2xIOP/src/modules/fileio.cpp`, a file the working tree deleted,
+so those gates need re-porting too (or restoring), not just the handshake.
+
+**Decision needed before any code:** the current refactor replaces HLE IOP emulation with a real emulated
+IOP, so 95120b1's *code* is not drop-in - only its *fix* (write 1 to the guest sregs mirror when the EE
+posts INIT_CMD with opt != 0) and its *roadmap* transfer. Two paths:
+(A) keep the refactor; add the ~40-line handshake at the new hook (`sceSifSetDma`'s AfterCopy notify, or
+the IOP side) - unblocks immediately, but may be the first of several ports (fileio/loadfile gates).
+(B) treat the refactor as incomplete and restore the missing HEAD functionality via
+`git show HEAD:<path> > <path>` (never checkout/reset) - bigger, risky against uncommitted work.
+
+### FIX APPLIED (option A) - the SIFCMD init handshake, re-homed onto PS2IopTransport
+
+One file, lib-only: `ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp`.
+
+- Added `answerSifCmdInitHandshake(rdram, ctx, runtime, xfer)` to the file's anonymous namespace
+  (next to `shouldTraceSifReg`) and call it from `sceSifSetDma` immediately after the
+  `PS2IopTransport::notifyTransfer(..., SifTransferPhase::AfterCopy, ...)` of each successful transfer.
+- Logic, identical to 95120b1 but re-targeted at the current path: the outgoing header's cid at
+  `xfer.src + 8` must be `0x80000002` (SIF_CMD_INIT_CMD) and its opt at `+0xC` must be non-zero;
+  `cmdData = g_sifRegs[0x80000001]` (SIF_SYSREG_MAINADDR - the working tree's `sceSifSetReg` records it);
+  `sregs = Load32(cmdData + 0x1C)`; `Store32(sregs + 0, 1)` (slot = `sregs + SIF_SREG_RPCINIT*4`, i.e. 0).
+- The addresses are proven by the guest's own code (`runner/entry_00117590_0x117590.cpp`):
+  `$v0 = $s2 - 0x1268` with `$s2 = 0x3E0000` gives `_sif_cmd_data = 0x3DED98` (runtime log agrees:
+  `[sceSifSetReg] reg=0x80000001 value=0x3ded98`), and `$a0 = 0x3E0000 - 0x10C0 = 0x3DEF40` is stored at
+  `0x1C($v0)` -> `sregs = 0x3DEF40`. The spin reads `sregs[0]`, which is exactly that word.
+- Diagnostics: a one-shot `[SIF-iop] SIFCMD init opt=...: answered Set SREG RPCINIT=1 at 0x...
+  (_sif_cmd_data=0x... sregs=0x...)` and a 4-shot failure line for "sregs unavailable", both inside
+  `PS2_IF_AGRESSIVE_LOGS` (active in Debug, as the existing `[sceSifSetDma:CALL]` lines prove).
+- Also changed this session: new `scripts\pink_test.cmd` (lifts the execution policy, forwards args, so
+  `pink_test -Seconds 45` works from cmd) and `scripts\pink_test.ps1` (header note + an end-of-run
+  freshness table printing mtime/size of every log/PNG it wrote).
+
+**Verification plan (all must hold):**
+1. `[SIF-iop] SIFCMD init ... answered Set SREG RPCINIT=1 at 0x3def40` appears.
+2. The `[diag:t1-main]` tail is no longer `pc=0x117df8`/`0x117e00` - the main thread leaves
+   `sceSifInitRpc` instead of spinning there.
+3. `ps2_log.txt` gets past SIFRPC init (and if it reaches the crt0 tail, `FUN_001072b8` finally appears).
+4. Expect the NEXT gate to be the one HEAD hit right after: the in-ELF `sceSifBindRpc`
+   (`SIF_CMD_RPC_BIND`, cid 0x80000009, sid 0x80000003) blocking in `WaitSema` with no raw-SIFRPC
+   responder - which in HEAD was answered by `8180d04`/`4fc7fa7`, and `4fc7fa7`'s code lived in the
+   `ps2xIOP/src/modules/fileio.cpp` the working tree deleted.
+5. `dma`/`gif`/`gsw`/`vif` move off zero and the capture stops being flat `#FF00FF`.
+
+### FIX #3 VERIFIED (run 23:16, exe 23:15:21) - the SIFRPC-init spin is gone
+
+- `[SIF-iop] SIFCMD init opt=1: answered Set SREG RPCINIT=1 at 0x3def40 (_sif_cmd_data=0x3ded98
+  sregs=0x3def40)` - the statically derived addresses were exactly right.
+- The `0x117df8` spin is gone from the `[diag:t1-main]` tail, which now walks
+  `... -> 0x1174f8 (sregs read) -> 0x117e00 (beqz, taken once) -> 0x166298 -> 0x114720 (WaitSema)`.
+  `tag=main` pc0 = 0 and thread-1 retire = 0, as before.
+- The guest then executes the code that follows the spin in its own listing:
+  `[sceSifSetReg] reg=0x80000002 prev=0x0 value=0x1 pc=0x166298` (the `sceSifSetReg(SIF_REG_MSCOM, 1)`
+  at 0x117e08). So the whole guest sequence completed - this is not a partial unblock.
+- `ps2_log.txt` fell from **425 MB / 13,080,330 lines** to **252 KB / 7,590 lines**: the hot loop is
+  gone and the guest now *blocks* instead of burning the CPU.
+- Screen unchanged (`#FF00FF` 29.60%, 581 distinct sampled colours) and `dma/gif/gsw/vif` still 0 -
+  expected, the new gate is upstream of any GS work.
+
+**Next gate (same one 95120b1 documented as its "known next blocker"): the SIFRPC request.**
+Right after SIFRPC init completes the guest posts a third SIF DMA -
+`[sceSifSetDma:DESC] src=0x203defc0 dst=0x0 size=0x40 attr=0x44`, i.e. the 64-byte SIFRPC packet at
+0x3DEFC0 through the uncached mirror, sent from the same call site (pc=0x117a04, after
+`FUN_00117bf0` - a dcache writeback loop: `lui $t9,0xFFFF / ori $t9,0xFFC0`, 64-byte line mask) - and then
+`WaitSema(*(s1+8))` at `entry_00118524_0x118524` (0x118524-0x118534: `WaitSema` then `DeleteSema`
+0x1146F0, a one-shot completion wait). Nothing answers, thread 1 never runs again, and the scheduler
+idles for the rest of the run (`0x11f650` invoked 524 times, `t-1`). Per 95120b1 this is the in-ELF
+`sceSifBindRpc` (SIF_CMD_RPC_BIND, cid 0x80000009, sid 0x80000003 = BIOS IOP heap server) - the cid/sid
+are built at runtime (`lui 0x8000` + `ori N`), so no literal exists in the generated code to grep; a
+`[sceSifSetDma:HDR]` dump (cid/opt/rec_id/pkt_addr/rpc_id) was added next to the existing DESC log to
+read them out of the running guest.
+
+**Next work item (needs approval - this is much bigger than #1-#3):** a raw-SIFRPC responder for that
+packet, i.e. the EE-side half of what HEAD's `8180d04` (route raw SIFRPC to the emulated IOP) and
+`4fc7fa7` (IOP module-version handshake, rpc 0xff -> "3000") / `37cc40d` (DBCMAN version RPC
+0x80001363) / `277c230` (load the game's own modules + answer their RPCs) / `aad416a` (fileio) built -
+several of which lived in the `ps2xIOP/src/modules/fileio.cpp` + `loadfile.cpp` the refactor deleted.
+Options: port the responder logic from HEAD into the current `ps2xIOP` transfer path, or restore those
+two HLE modules from HEAD and adapt them to the current `IopSubsystem` interfaces.
+
+### GATE AUDIT AGAINST HISTORY (requested: "check every gate first against old commits")
+
+**Lineage, measured (closest revision per file, whole history):**
+
+| file | closest revision | diff |
+|---|---|---|
+| `Kernel/Stubs/SIF.cpp` | `6497b30` (and every rev up to `95120b1^` - it was untouched from the initial import) | +126 / -0 = **exactly the 126 lines I added** (97 helper + 5 call site + 24 HDR dump) |
+| `Kernel/Syscalls/Dispatcher.cpp` | `6497b30` | IDENTICAL |
+| `Kernel/Syscalls/Sync.cpp` | `acf8953` | IDENTICAL |
+| `Kernel/Syscalls/System.cpp` | `6497b30` | +9 / -0 (my fix #1) |
+| `Kernel/EeScheduler.cpp` | `6497b30` | +68 / -0 (my probe) |
+| `ps2_runtime.cpp` | `6497b30` | +18 / -2 (my edits) |
+| GS area (`lib/gs`, `include/runtime/gs`, `Stubs/GS.cpp`, `cmake/`) | `6497b30` | **0 files, 0 lines** |
+
+=> **The working tree is a checkout of `6497b30` ("chore: update claude code") + the local untracked VU
+replacement + my 4 edits.** It predates `ad27d73` ("full porting snapshot") and the entire 21-commit
+gate campaign. That is also why `gs_parallel_backend.cpp`, `gs_gl_interop.cpp`,
+`cmake/ParallelGS*.cmake` and the whole `vu/interpreter/**` tree show as *deleted* against HEAD:
+`ad27d73` **added** them, so they simply do not exist at `6497b30`.
+
+**Every gate - hit and ahead - is already implemented in old commits; none of it is in the worktree.**
+
+| gate | commit | code it adds | in worktree? |
+|---|---|---|---|
+| GS rendering (BIOS-like CRT seed + interop layout) + full porting snapshot (GS parallel backend, VU interpreter tree) | `ad27d73` | GS/VU | **no** (0 diffs vs `6497b30`) |
+| strip temp GS diagnostics, barrier TRANSFER->COPY | `33ccc7e` | GS | **no** |
+| SetupThread stack top / async-callback stacks | `95120b1` | `System.cpp` +14/-24 | no (I re-derived, fix #1/#2) |
+| SIFCMD init handshake (RPCINIT) | `95120b1` | `SIF.cpp` `emulateIopSifCmdInitHandshake` (87 lines) | no (I re-derived, fix #3, verified) |
+| raw SIFRPC routing to the emulated IOP | `8180d04` | `SIF.cpp` routing + `g_sifRpcRoutedCallCount` | **no** |
+| **current gate** - RPC_BIND (cid 80000009) + module-version rpc 0xff -> "3000" + smflg booted | `4fc7fa7` | `SIF.cpp` `emulateIopSifRpc`, `postIopSifCommand`, `SifRpcServerSlot`, `kSifIopModuleVersion`, `kSifSmflgBootedMask` (~501 lines) | **no** |
+| DBCMAN version RPC 0x80001363 -> 0x0310 | `37cc40d` | `SIF.cpp` ~130 lines | **no** |
+| VU unbounded clock catch-up after reset | `81488a7` | `vu/vu_runtime.cpp` etc. | no - and it is in the VU tree the local work replaced |
+| SJX_Init IOP-heap blocker | `efe0030` | docs/state | - |
+| load the game's own modules + answer their RPCs | `277c230` | new `ps2xIOP/modules/loadfile.cpp`, `module_factories.h`, `iop_subsystem.cpp`, `SIF.cpp` IOP catch-up | **no** (file absent) |
+| serve the fileio service | `aad416a` | new `ps2xIOP/modules/fileio.cpp` | **no** (file absent) |
+| HLE staged-init gate release + Sema init count | `a791617` | `EeScheduler.cpp`, `SIF.cpp`, `Sync.cpp`, `ps2_runtime.cpp` | **no** |
+| revert the Sema count change | `ff40f15` | `Sync.cpp` | no |
+| staged-init release on the guest's own sem-65 wait | `5dff8b0` | `ps2_runtime.cpp` | no |
+| resume the orphaned staged-init pollers (TEMP HLE) | `9eb6d5e` | `EeScheduler.cpp` | no |
+| diagnostics + "the staged-init chain is unreachable dead code" | `008b265`, `f2bd92e`, `c9eb3e1`, `2ce8930`, `78ddf13` | runtime | no |
+
+Campaign diff totals for the runtime: `System.cpp` +14/-24, `Dispatcher.cpp` +17, `Sync.cpp` +21/-10,
+`EeScheduler.cpp` +236, `ps2_runtime.cpp` +262/-17, `SIF.cpp` **+697/-0 (purely additive)**.
+
+**Port feasibility for the current gate - verified, not assumed.** HEAD's `SIF.cpp` needs only APIs the
+working tree already has: `runtime->`{allocateIopMemory, cpu, eeScheduler, freeIopMemory, guestCalloc,
+guestFree, guestMalloc, hasFunction, iopDebugSnapshot, isIopMemoryRange, Load32, readIopMemory, Store32,
+writeIopMemory} all declared; `eeScheduler().queueInvocation` present; `ps2x::iop::`{DebugSnapshot,
+RpcRequest, RpcResult, SifTransferKind, SifTransferPhase} present; all its includes present; and
+`SIF.h` (the stub registry) is **unchanged** by the campaign. `SIF.cpp` also has **zero local work** in
+it. So `git show HEAD:...SIF.cpp > ...SIF.cpp` is a near-drop-in that lands gates #3-#6 in one file
+(697 additive lines, nothing removed) and cannot clobber anything of the user's.
+
+**Consequence:** re-deriving these gates by hand (as with #1-#3) is unnecessary - the implementations,
+their order, and their measured failures all exist in the history. The remaining real decision is the
+VU/GS fork: `ad27d73`'s VU interpreter tree is what the local work replaced, so restoring the runtime
+side wholesale would conflict with it (see the "restore vs port" question above).
+
+---
+
+## Session 13 - fresh Ghidra export re-run; recompiler errors triaged; runner re-populated
+
+**Trigger:** user re-exported the Ghidra function list (`data/map.csv`, `data/config.toml`) and asked
+to run `ps2_recomp` on it, report the recompiler errors (no fixes yet), then copy the extracted
+output into the runner and check for the pink screen.
+
+**Build note.** `ps2_recomp.exe` and `ps2EntryRunner.exe` were absent from `PS2Recomp\out\build`
+(build dir had only CMake probe objects, no project objects). Built successfully with:
+`cmd /c "call "<VS18>\...\VsDevCmd.bat" -arch=x64 && cmake --build out/build --config Debug"`
+run **from `PS2Recomp\`**. The user's failure was `cmake --build out/build --config Debug` from the
+workspace root (no `out/` and no `CMakeLists.txt` there) and/or without the VS dev environment.
+
+**Recompiler run (`ps2_recomp.exe data\config.toml`): SUCCESS, exit 0.** Final report:
+- Functions discovered/processed 53221, recompiled 53166, stubs 55, skipped 0, **decode failures 0**.
+- Additional entrypoints 475624; generated functions 53221.
+- Indirect fallback promotions 5379 (923456 fallback entries).
+- Unhandled instructions 5347, warnings 5379, **correctness-critical guest fallbacks 0, failures 0**.
+- `[recompiler] collected 475624 resumable entry point(s) across 9409 owner function(s)`.
+
+**All 5347 "errors" come from exactly TWO functions, and they are DATA decoded as code, not real
+instructions:** `entry_003a3198` (@0x3A3198, 3641 errors) and `entry_003c7590` (@0x3C7590, 1706
+errors). Proof: the "opcodes" are ASCII (`0x74537465`="etSt", `0x746f6e20`=" not", `SJX_`, `MLON`)
+and IEEE floats (`0x41a00000`=20.0f, `0xd3d2d1d0`=byte table). Traced to the exact `map.csv` rows:
+
+    entry_003a3198,0x003A3198,0x003C74E0,148296   <- 148 KB "function"
+    entry_003c7590,0x003C7590,0x003D1480,40688    <- 40 KB "function"
+
+Note **size == extent** for both, so this is *not* the known analyzer `End`-clamping defect: the
+Ghidra export itself reported these data tables as single huge functions (a string/float table
+swallowed into code). Not fatal (no correctness-critical flag); they only yield dead stub bodies
+for ranges never executed as code.
+
+**The 5379 warnings are one class:** `unresolved JR/JALR; promoted N fallback entries`, concentrated
+in the `0x2E0000`/`0x2F0000` indirect-jump-table functions.
+
+**Extracted output** written to `data\output`: **53222 `.cpp`** (incl. `register_functions.cpp`,
+24 MB, table base `0x100008`, end `0x3D1CBC`, 739117 slots), `ps2_recompiled_functions.h` (4.6 MB),
+`ps2_recompiled_stubs.h`. 53224 files, 362.8 MB total.
+
+**Runner wiring (verified).** `ps2xRuntime/CMakeLists.txt` globs `src/runner/*.cpp` (non-recursive,
+`CONFIGURE_DEPENDS`) and uses `src/runner/main.cpp` **or `src/main.cpp`** (here `src/main.cpp`).
+PCH (ON) pulls in `include/ps2_recompiled_functions.h` + `include/ps2_recompiled_stubs.h`. So the
+generated files go: all `.cpp` -> `ps2xRuntime/src/runner/`, the two `.h` -> `ps2xRuntime/include/`
+(both paths gitignored). Before this session the runner dir held only a 438-byte placeholder
+`register_functions.cpp` (empty 0x0-0x1000000 table) - i.e. the tree was a **stub runner**.
+
+**Actions taken:** robocopy `data\output\*.cpp` -> `ps2xRuntime/src/runner/` (53222 copied, 358 MB),
+headers -> `ps2xRuntime/include/`; launched incremental `cmake --build out/build --target
+ps2EntryRunner` (MSVC Debug / Ninja / unity batch 32 -> 1668 unity TUs). No clean flags. Note:
+clang-cl is **not installed** on this machine, so the fast path is unavailable; MSVC Debug is it.
+Observed build rate: ~1658/1668 unity objects within ~6 min, so the full runner link is minutes,
+not hours (the 30 h figure applies to non-unity builds).
+
+**Build result:** the 1668-TU runner build **succeeded**, no compile/link errors. `ps2EntryRunner.exe`
+went from the 8.8 MB stub to **510,960,128 bytes (~487 MB)** (Debug, full 53k-function table).
+The "Exited with code 1" the shell reports for these piped builds is spurious (the tool prints
+`Recompilation completed successfully` / ninja completing with 0 errors).
+
+**Convention note (user):** helper PowerShell scripts live in `scripts/` at the project root
+(e.g. `scripts/pink_test.ps1`), not in temp. `scripts/pink_test.ps1` runs the runner for ~55 s,
+captures the runner window mid-run to `logs/pink_screen.png`, then kills it; logs to
+`logs/pink_test.log` / `logs/pink_test.err.log`.
+
+**PINK SCREEN CONFIRMED (run, 55 s).** `scripts/pink_test.ps1` raised the runner window topmost and
+captured it (`logs/pink_screen.png`, `logs/pink_screen_pw.png`). Pixel histogram: the viewport is
+**flat `#FF00FF` magenta** (28.7% / 34.1% of sampled pixels; the rest is the debug panel and black).
+No game graphics. Window title `PS2-Recomp | SLUS_212.01`.
+
+**Cause is visible in the runtime debugger overlay (OCR):**
+`Runtime: running`, **`EE executor: scheduler (thread 1: DORMANT/NONE)`**, `PC 0x00000000`.
+So the **main thread is Dormant** - i.e. it was retired by `reportMissingFunction`, exactly the
+session-7 failure mode.
+
+**Runtime log (`ps2_log.txt`, 9018 lines on this run):** boots and creates semaphores/sets syscalls,
+reaches `0x11f650` at **line 267** (~1-2 s), then spins there for the whole run; **zero** GS/CRT/
+draw/GIF/VIF markers. Nothing is ever presented -> the magenta is the uninitialised viewport.
+
+**Regression vs session 7:** the fresh export does **not** contain `0x1b1948` (the indirect target of
+trampoline `FUN_001a8f80`): no declaration in `ps2_recompiled_functions.h`, no `entry_*.cpp` file.
+Session 7 had compiled it (and ~358 friends) via `[general].entry_points`, but the newly generated
+`data/config.toml` has **no `entry_points` section** (`[general]` = input/output/ghidra_output/
+single_file_output/patch_syscalls/patch_cop0/patch_cache/stubs/untracked_stubs/skip, plus
+`[ghidra_export]`). The recompiler's own `Additional entrypoints: 475624` are auto-collected
+*resumable* labels, not that curated list.
+
+**Next (not yet done, awaiting user):** restore `[general].entry_points` (session-7's 411 targets)
+into `data/config.toml`, re-run the recompiler, re-copy, rebuild, re-test.
+
+**Open:** check `logs/pink_screen.png` (pink screen?) and `logs/pink_test.log` for this run.
+
 ## Session 12j - diagnostics stripped
 
 Removed the whole session-12 instrumentation, leaving behaviour untouched (203 deletions, no
@@ -714,7 +1245,13 @@ No work on (a)/(b) has started - this is the decision point.
 | Main | SLUS_212.01 | ELF (no ext) | D:\Personal\C++\tales-of-legendia-ps2recomp\data\SLUS_212.01 | D:\Personal\C++\tales-of-legendia-ps2recomp\data\config.toml | recompiled |
 
 ## Environment Setup
-- **Ghidra Install Path**: N/A (not used this session)
+- **Ghidra Install Path**: `C:\Users\Valencio Hoffman\Downloads\ghidra_12.1.3_PUBLIC` (12.1.3_PUBLIC)
+- **Ghidra Project**: `C:\Users\Valencio Hoffman\ps2.gpr`
+- **Ghidra Extension**: `ghidra-emotionengine-reloaded` v1.4.0 in `%APPDATA%\ghidra\ghidra_12.1.3_PUBLIC\Extensions\` (supplies the R5900/MMI sleigh spec)
+- **Ghidra Language (CONFIRMED 2026-10-18)**: `r5900:LE:32:default` — processor `MIPS-R5900`, little-endian, **32-bit**, variant PS2. Taken from `application.log` on the import that produced the current export. This is correct and must not be "fixed": the EE has 64-bit GPRs and 128-bit MMI/COP2, but the PS2 ELF and ABI are 32-bit, and **no `R5900:LE:64` language exists** (the extension ships exactly one language, `r5900:LE:32:default`).
+- **Ghidra Image Base (CONFIRMED 2026-10-18)**: `0x00100000` (= ELF LOAD[0] `p_vaddr`); entry `0x00100008` = ELF `e_entry`. Program addresses equal ELF virtual addresses — min `map.csv` start `0x00100008`, **0** rows below `0x00100000`, max end `0x003D1CC4` (inside LOAD[0] `0x00100000..0x004E9B80`). No offset skew.
+- **Main ELF facts**: `data\SLUS_212.01` = ELFCLASS32, ELFDATA2LSB, `e_machine = EM_MIPS (8)`, `e_ehsize = 0x34`, `e_phentsize = 0x20`, `e_flags = 0x20924000`.
+- **Export Script**: `PS2Recomp\ps2xRecomp\tools\ghidra\ExportPS2Functions.java` → `data\map.csv` + `data\config.toml` (last run 2026-10-18 13:21:35 → 11604 functions, 41617 labels, 53221 CSV rows).
 
 ## Build Configuration
 - **CMake Generator**: Ninja (canonical build dir: `PS2Recomp\out\build` — NOT `PS2Recomp\build`)
@@ -846,7 +1383,9 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 ### Working tree
 - Tracked changes: `M PS2Recomp/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp` (temp `[EE-thread]`/`[EE-sem]`/`[EE-evf]` dumps - strip before the final commit), `M PS2_PROJECT_STATE.md` (this update).
 - Gitignored/local (not committable): `data/config.toml` (411 `entry_points`), the regenerated `PS2Recomp/ps2xRuntime/src/runner/` + `include/ps2_recompiled_functions.h`, dry-run dirs `data/output` + `data/output_base`.
-- untracked, **not mine - leave alone**: `.opencode/opencode.json.openchamber.backup`, `PS2Recomp/run_build.bat`, `scripts/`.
+- untracked, **not mine - leave alone**: `.opencode/opencode.json.openchamber.backup`, `PS2Recomp/run_build.bat`.
+- untracked, **ours (local helper scripts)**: `scripts\pink_test.ps1` (runnable screen-capture test, needs
+  `-Seconds >= 35`), `scripts\build-runtime.bat` (VS-env + build wrapper).
 ## Next Move (ordered)
 1. **Decision needed (user):** priority - (i) answer the `SJX_Init` IOP-heap allocation RPC (advances boot toward drawing), or (ii) implement the analyzer discovery pass (makes the discovery durable). *Recommended: (i), then (ii).*
 2. **Implement the IOP heap-allocation RPC**: bind the client first (to learn the SID), then have the SIF responder (`SIF.cpp` `emulateIopSifRpc`) or the `ps2xIOP` HLE path return a **non-zero IOP address** in the 4-byte receive buffer (`0x3E2080`) for the allocation request whose arg word is `0x8D0`. Then watch the guest's next gate (`E0100302 ...can't create DTX.`, `0x3C6328`).
@@ -995,6 +1534,7 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - **A game "fatal error then spin" is progress, not a stall**: `E0100301: SJX_Init can't allocate IOP Heap.` is the guest *telling you* what it wanted. Read the string (file offset `0x80 + vaddr - 0x100000`) and find the callee that returned 0, rather than chasing the `for(;;);`.
 - **When a component the runtime implements is never called, suspect a stale artifact, not a runtime bug**: `beforeVu0Access`/`afterVu0Access` existed in the runtime and were referenced by tests, yet the checked-in runner never emitted the calls.
 - **Region-based filtering must treat `skip` regions as data**: a zero-filled data region reads as `nop` padding and passes both "near a pointer" and "boundary" rules -> 12 false-positive entries, one of which produced 1295 unhandled-instruction errors. Exclude targets inside `skip` regions before promoting discovery to a default.
+- **A PS2 main ELF is `ELFCLASS32` even though the R5900 has 64-bit GPRs**: "is this a 64-bit binary?" is answered by `e_ident[EI_CLASS]` (byte 4) and `e_ehsize` (`0x34` = 32-bit, `0x40` = 64-bit), never by register width. `r5900:LE:32:default` is the only correct Ghidra language for PS2 — there is no 64-bit variant — so a suspected 32/64 mismatch is never the cause of a bad export. Verify instead with `application.log` (language used at import) and by checking min/max `map.csv` addresses against the ELF `e_entry` and LOAD vaddrs (base must be `0x00100000`).
 
 ## Session Log
 ### 2026-10-17 (session 7 - "idle" root cause was a recompiler discovery gap; runner regenerated; SJX_Init IOP-heap blocker)
