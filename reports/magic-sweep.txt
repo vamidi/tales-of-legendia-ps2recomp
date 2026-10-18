@@ -1,0 +1,47 @@
+swept 4080664576 bytes of legendia.iso in 84.1 s
+(4080664576 bytes on disc)
+
+PATTERN                   HITS  FIRST OFFSETS / WHAT IT WOULD MEAN
+MSCF                         1  0xA2FDDC62
+CVMH                         1  0x7575652C
+ROFSBLD                      0  the CVM builder stamp
+SAMPLE_GAME_TITLE            0  CRI's unfilled default, on all nine Symphonia volumes
+PUBLISHER_NAME               0  CRI's other unfilled default
+CRI                         10  0x35FC51 0x35FEB9 0x35FF59 0x35FFC1
+SCPK                         0  the 2002 bundle container
+THEIRSCE                     0  Rebirth's per-bundle scenario chunk, 2004
+h4m                        214  0x9F6DC95 0xE639CEE 0xE8B4545 0xFE32079
+AFS\x00                     39  0x8082A 0x8102A 0x8182A 0x8202A
+CPS\x00                   7868  0x483000 0x2B1D000 0x2CC1000 0x2DCA800
+ADX                       3145  0x337F19 0x35A151 0x35A211 0x35A38B
+@UTF                         1  0xA3016480
+KORG                        35  0x831E7 0x83225 0x35FA41 0x3FA88E
+FILE.FPB                     0  Destiny 2's container name, 2002
+TIM2                         3  0x91EBD328 0xDF61DC5B 0xEAACEE96
+VAGp                         0  headered SPU audio
+\x00\x00\x01º           434793  0x1304D74 0x4A3B0FB 0x6CCDDA3 0xDEC83D6
+host0:                      11  0x359470 0x363A64 0x3D0D08 0x2A82508
+hostfs                       0  ditto
+mass:                        0  devkit mass storage
+MW MIPS                      4  0x3738C0 0x3FA260 0x2AAA8E0 0x2CC01AD
+CodeWarrior                  0  ditto
+GCC                        866  0x35FC8C 0x35FEF5 0x35FF95 0x35FFFD
+Symphonia                    0  Tales of Symphonia, 2003/2004
+symphonia                    0  ditto, lower case
+destiny                      0  Tales of Destiny, 1997 / Destiny 2, 2002
+DESTINY                      0  ditto, upper case
+TOD2                         1  0xE2BC1ED6
+tod2                         0  ditto, lower case
+TOP2                         2  0x92EBAFB 0x7A3D3CA9
+top2                         2  0x7B907412 0xC6614F21
+eternia                      0  Tales of Eternia, 2000
+phantasia                    0  Tales of Phantasia, 1995
+Venus                        0  Venus & Braves, shipped whole on the 2002 disc
+rebirth                      0  Tales of Rebirth, 2004
+REBIRTH                      0  ditto, upper case
+ToR                        216  0x216424E 0x3381DE7 0x3429B68 0x361936D
+legendia                     0  this game's own name, lower case
+LEGENDIA                     0  ditto, upper case
+Legendia                     0  ditto, mixed case
+ToL                        194  0x234645B 0x29F23FB 0x374559F 0x89BA243
+TOL                        263  0x363E5C 0x316B1C2 0x9869E8F 0x9CA1960

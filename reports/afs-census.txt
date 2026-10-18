@@ -1,0 +1,23 @@
+ARCHIVE         MEMBERS  KIND                        COUNT         PACKED       UNPACKED   RATIO
+SYS_REG.AFS         430  CPS (compressed)              430        1524262        3664448   41.6%
+FIELD.AFS          1831  CPS (compressed)             1823       32804726       63406848   51.7%
+                         CPS (stored, raw payload)        8                                      
+MAP.AFS             790  CPS (compressed)              790      791351853     1347418688   58.7%
+BATTLE.AFS         5501  CPS (stored, raw payload)     2957                                      
+                         ADX                          2544                                      
+SND.AFS           16261  ADX                         13099                                      
+                         other                        2739                                      
+                         CPS (stored, raw payload)      388                                      
+                         CPS (compressed)               35         855064        1056448   80.9%
+MOVIE.AFS            22  MPEG program stream            22                                      
+
+TOTAL             24835 members across 6 archives
+   ADX                           15643
+   CPS (stored, raw payload)      3353
+   CPS (compressed)               3078
+   other                          2739
+   MPEG program stream              22
+
+   CPS packed        826535905
+   CPS unpacked     1415546432
+   ratio                 58.4%

@@ -1,0 +1,44 @@
+ARCHIVE                               BYTES    SHARE
+SYS_REG.AFS                         2113536    0.05%
+    compressed game data            1524262    0.04%
+    (archive overhead)               589274    0.01%
+FIELD.AFS                          35233792    0.86%
+    compressed game data           32804726    0.80%
+    stored game data                 143488    0.00%
+    (archive overhead)              2285578    0.06%
+MAP.AFS                           792231936   19.41%
+    compressed game data          791351853   19.39%
+    (archive overhead)               880083    0.02%
+BATTLE.AFS                        661231616   16.20%
+    stored game data              589287184   14.44%
+    audio (CRI ADX)                65611186    1.61%
+    (archive overhead)              6333246    0.16%
+SND.AFS                           600033280   14.70%
+    audio (CRI ADX)               486398571   11.92%
+    other / unidentified           70160470    1.72%
+    stored game data               25093312    0.61%
+    compressed game data             855064    0.02%
+    (archive overhead)             17525863    0.43%
+MOVIE.AFS                         890425344   21.82%
+    video (MPEG-2)                890421248   21.82%
+    (archive overhead)                 4096    0.00%
+
+BY CONTENT                            BYTES    SHARE
+CDVD.000 (see docs/06)           1073676288   26.31%
+video (MPEG-2)                    890421248   21.82%
+compressed game data              826535905   20.25%
+stored game data                  614523984   15.06%
+audio (CRI ADX)                   552009757   13.53%
+other / unidentified               70160470    1.72%
+archive overhead                   27618140    0.68%
+executable                          2972228    0.07%
+I/O processor modules                982469    0.02%
+index and boot files                  99731    0.00%
+slack (unclaimed sectors)          21664356    0.53%
+TOTAL                            4080664576  100.00%
+
+video + audio                1442431005   35.35% of the disc
+  Rebirth 2004 (video + voice)              67.20%% of 4.51 GB
+  Tales of Tactics 2004 (all media)         63.30%% of 369 KB
+
+compressed game data unpacks to 2030016768 bytes

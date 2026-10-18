@@ -1,0 +1,17 @@
+SYS_REG.AFS        430 CPS members,     430 exact
+FIELD.AFS         1823 CPS members,    1823 exact
+MAP.AFS            790 CPS members,     790 exact
+BATTLE.AFS           0 CPS members,       0 exact
+SND.AFS             35 CPS members,      35 exact
+MOVIE.AFS            0 CPS members,       0 exact
+
+CPS compressed members decoded  (stored members excluded)
+CPS members     3078
+exact           3078
+mismatched      0
+packed bytes    826535905
+unpacked bytes  1415546432
+ratio           58.39%
+expanded        0  (members whose packed size >= unpacked)
+smallest        56 packed -> 128  (FIELD.AFS / field_grd0c_x00y00.mcd.cps)
+largest         3864151 packed -> 6162880  (MAP.AFS / scr_1twn_00mati_61i_0hir.mcd.cps)

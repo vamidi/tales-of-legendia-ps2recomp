@@ -1,0 +1,39 @@
+_work/legendia.iso  LBA 2311  1073676288 bytes  32 blocks of 33554432
+
+        OFFSET      BYTES    TOP    SHARE ENTROPY VALUES  READS AS
+             0   33554432   0x00   14.95%   7.200    256  structured data
+      33554432   33554432   0x00    7.48%   7.619    256  compressed / high entropy
+      67108864   33554432   0xFF    4.81%   7.768    256  compressed / high entropy
+     100663296   33554432   0xFF    3.68%   7.801    256  compressed / high entropy
+     134217728   33554432   0xFF    3.32%   7.834    256  compressed / high entropy
+     167772160   33554432   0xFF    3.81%   7.805    256  compressed / high entropy
+     201326592   33554432   0xFF    5.05%   7.803    256  compressed / high entropy
+     234881024   33554432   0xFF    5.15%   7.799    256  compressed / high entropy
+     268435456   33554432   0xFF    4.63%   7.813    256  compressed / high entropy
+     301989888   33554432   0xFF    4.70%   7.797    256  compressed / high entropy
+     335544320   33554432   0xFF    5.40%   7.807    256  compressed / high entropy
+     369098752   33554432   0x00    5.05%   7.687    256  compressed / high entropy
+     402653184   33554432   0x00   46.48%   2.009    256  structured data
+     436207616   33554432   0xFF   50.00%   1.000      2  structured data
+     469762048   33554432   0xFF   50.00%   1.000      2  structured data
+     503316480   33554432   0xFF   50.00%   1.000      2  structured data
+     536870912   33554432   0xFF   50.00%   1.000      2  structured data
+     570425344   33554432   0xFF   50.00%   1.000      2  structured data
+     603979776   33554432   0xFF   50.00%   1.000      2  structured data
+     637534208   33554432   0xFF   50.00%   1.000      2  structured data
+     671088640   33554432   0xFF   50.00%   1.000      2  structured data
+     704643072   33554432   0xFF   50.00%   1.000      2  structured data
+     738197504   33554432   0xFF   50.00%   1.000      2  structured data
+     771751936   33554432   0xFF   50.00%   1.000      2  structured data
+     805306368   33554432   0xFF   50.00%   1.000      2  structured data
+     838860800   33554432   0xFF   50.00%   1.000      2  structured data
+     872415232   33554432   0xFF   50.00%   1.000      2  structured data
+     905969664   33554432   0xFF   50.00%   1.000      2  structured data
+     939524096   33554432   0xFF   50.00%   1.000      2  structured data
+     973078528   33554432   0xFF   50.00%   1.000      2  structured data
+    1006632960   33554432   0xFF   50.00%   1.000      2  structured data
+    1040187392   33488896   0xFF   50.00%   1.000      2  structured data
+
+SUMMARY                               BYTES    SHARE
+structured data                   704577536   65.62%
+compressed / high entropy         369098752   34.38%

@@ -1,0 +1,20 @@
+CDVD.000 -- LBA 2311, 1073676288 bytes, ISO 9660 stamp 2004-08-11 17:08:31 +9
+The disc's other 36 files are stamped 2005-05-28 to 2005-07-22.
+
+Scanning the whole file for CPS-shaped headers, then decoding every one
+of them with tools/cps.py and checking the result against its own
+declared unpacked length.
+
+CPS-shaped headers   1430
+2048-byte aligned    1430 of 1430
+first                +0x002699800
+last                 +0x018348800
+span                 365621248 bytes (348.7 MB)
+
+stored members       0
+compressed members   1430
+decoded exact        1430
+mismatched           0
+packed bytes         350345144
+unpacked bytes       683107520
+ratio                51.29%

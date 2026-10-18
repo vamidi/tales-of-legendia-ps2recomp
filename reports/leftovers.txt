@@ -1,0 +1,959 @@
+=== SLPS_255.33  2972228 bytes, 922 text runs of 8+ characters
+--- devkit (4)
+    002BB300  cdrom0:\IRX\
+    002BB470  host0:C:\tox\fieldwork\dev\field\
+    002C1788  cdrom0:\MBS\
+    002C5A60  HST:host0:R:\
+--- debug (197)
+    002B8068  sceCdChgSys: Illegal_function_call
+    002B8090  libdbc: bind failed
+    002B8130  sceDbcSetWorkAddr: rpc error
+    002B8150  sceDbcCreateSocket: rpc error
+    002B8170  sceDbcDeleteSocket: rpc error
+    002B8190  sceDbcGetDepNumber: rpc error
+    002B81B0  sceDbcInitSocket: rpc error
+    002B81D0  sceDbcResetSocket: rpc error
+    002B81F0  sceDbcGetDeviceStatus: rpc error
+    002B8218  sceDbcSRData: rpc error
+    002B8238  sceDbcSendData: rpc error
+    002B82A8  sceDbcSendData2: rpc error
+    002B8318  sceDbcReceiveData: rpc error
+    002B9560  ## internel error in libkernl.a!
+    002B95E0  TTY: receive error
+    002BA478  bind error libmc 
+    002BA4E0  sceMcUdCheckNewCard RPC faild
+    002BA690  _sceMpegSliceA0(): error happens
+    002BA878  internal alignment error. _bstag:%d
+    002BA8A0  internal alignment error. _idct:%d
+    002BAA58  CSC handler error
+    002BAA90  [MPEG ERROR]%s
+    002BB0F0  PAD2 ERROR
+    002BC9C0  E02080848 ADXT_EntryFname: parameter error
+    002BCA10  E02080855 ADXT_EntryAfs: parameter error
+    002BCA68  E02080850 ADXT_StartSeamless: parameter error
+    002BCA98  E02080851 ADXT_SetSeamlessLp: parameter error
+    002BCAC8  E02080852 ADXT_StartFnameLp: parameter error
+    002BCAF8  E02080854 ADXT_GetNumFiles: parameter error
+    002BCB28  E02080849 ADXT_ResetEntry: parameter error
+    002BD600  E02080804 ADXT_Create: parameter error
+    002BD658  E02080805 ADXT_Destroy: parameter error
+    002BD680  E02080812 ADXT_StartSj: parameter error
+    002BD6A8  E02080813 ADXT_Stop: parameter error
+    002BD6D0  E02080814 ADXT_GetStat: parameter error
+    002BD6F8  E02080815 ADXT_GetTime: parameter error
+    002BD720  E02080817 ADXT_GetNumSmpl: parameter error
+    002BD750  E02080819 ADXT_GetSfreq: parameter error
+    002BD780  E02080820 ADXT_GetNumChan: parameter error
+    002BD7B0  E02080822 ADXT_GetHdrLen: parameter error
+    002BD7E0  E02080821 ADXT_GetFmtBps: parameter error
+    002BD810  E02080825 ADXT_SetOutPan: parameter error
+    002BD840  E8101208 ADXT_SetOutPan: parameter error
+    002BD870  E02080826 ADXT_GetOutPan: parameter error
+    002BD8A0  E02080870 ADXT_SetOutBalance: parameter error
+    002BD8D0  E02080871 ADXT_GetOutBalance: parameter error
+    002BD900  E02080823 ADXT_SetOutVol: parameter error
+    002BD930  E02080824 ADXT_GetOutVol: parameter error
+    002BD960  E02080840 ADXT_SetSvrFreq: parameter error
+    002BD990  E02080838 ADXT_SetReloadTime: parameter error
+    002BD9C0  E03111501 ADXT_ResetReloadTime: parameter error
+    002BD9F0  E02080839 ADXT_SetReloadSct: parameter error
+    002BDA20  E02080834 ADXT_GetNumSctIbuf: parameter error
+    002BDA50  E02080837 ADXT_GetNumSmplObuf: parameter error
+    002BDA80  E02080835 ADXT_GetIbufRemainTime: parameter error
+    002BDAB8  E02080836 ADXT_IsIbufSafety: parameter error
+    002BDAE8  E02080802 ADXT_IsCompleted: parameter error
+    002BDB18  E02080843 ADXT_GetErrCode: parameter error
+    002BDB48  E02080844 ADXT_ClearErrCode: parameter error
+    002BDB78  E02080829 ADXT_GetLpCnt: parameter error
+    002BDBA8  E02080828 ADXT_SetLpFlg: parameter error
+    002BDBD8  E02080833 ADXT_GetInputSj: parameter error
+    002BDC08  E02080830 ADXT_SetWaitPlayStart: parameter error
+    002BDC40  E02080831 ADXT_IsReadyPlayStart: parameter error
+    002BDC78  E02080846 ADXT_Pause: parameter error
+    002BDCA0  E02080847 ADXT_GetStatPause: parameter error
+    002BDCD0  E02080818 ADXT_GetDecNumSmpl: parameter error
+    002BDD00  E02080860 ADXT_SetKeyString: parameter error
+    002BDD30  E02080811 ADXT_StartAfs: parameter error
+    002BDD88  E02080807 ADXT_StartFname: parameter error
+    002BDDB8  E02080809 ADXT_StartMem2: parameter error
+    002BDE18  E02080810 ADXT_StartMemIdx: parameter error
+    002BDF08  E02080842 ADXT_ExecHndl: parameter error
+    002BDFD8  cvFsAddDev #1:illegal device name
+    002BE000  cvFsAddDev #2:illegal I/F func name
+    002BE028  cvFsAddDev #3:failed added a device
+    002BE050  cvFsDelDev #1:illegal device name
+    002BE078  cvFsSetDefDev #1:illegal device name
+    002BE0C8  cvFsOpen #1:illegal file name
+    002BE0E8  cvFsOpen #3:failed handle alloced
+    002BE110  cvFsOpen #2:illegal device name
+    002BE130  cvFsOpen #4:device not found
+    002BE150  cvFsOpen #5:vtbl error
+    002BE168  cvFsOpen #6:open failed
+    002BE180  cvFsClose #1:handle error
+    002BE1A0  cvFsClose #2:vtbl error
+    002BE1B8  cvFsTell #1:handle error
+    002BE1D8  cvFsTell #2:vtbl error
+    002BE1F0  cvFsSeek #1:handle error
+    002BE210  cvFsSeek #2:vtbl error
+    002BE228  cvFsReqRd #1:handle error
+    002BE248  cvFsReqRd #2:vtbl error
+    002BE260  cvFsReqWr #1:handle error
+    002BE280  cvFsReqWr #2:vtbl error
+    002BE298  cvFsStopTr #1:handle error
+    002BE2B8  cvFsStopTr #2:vtbl error
+    002BE2D8  cvFsGetStat #1:handle error
+    002BE2F8  cvFsGetStat #2:vtbl error
+    002BE318  cvFsGetFileSize #1:illegal file name
+    002BE340  cvFsGetFileSize #2:illegal device name
+    002BE368  cvFsGetFileSize #3:device not found
+    002BE390  cvFsGetFileSize #4:vtbl error
+    002BE3B0  cvFsGetFileSizeEx #1:illegal file name
+    002BE3D8  cvFsGetFileSizeEx #2:illegal device name
+    002BE408  cvFsGetFileSizeEx #3:device not found
+    002BE430  cvFsGetFileSizeEx #4:vtbl error
+    002BE450  cvFsGetFileSizeByHndl #1:illegal file handle
+    002BE480  cvFsGetFreeSize #5:device not found
+    002BE4A8  cvFsGetFreeSize #6:vtbl error
+    002BE4C8  cvFsGetSctLen #1:handle error
+    002BE4E8  cvFsGetSctLen #2:vtbl error
+    002BE508  cvFsSetSctLen #3:handle error
+    002BE528  cvFsSetSctLen #4:vtbl error
+    002BE548  cvFsGetNumTr #1:handle error
+    002BE568  cvFsGetNumTr #2:vtbl error
+    002BE588  cvFsChangeDir #1:illegal directory name
+    002BE5B0  cvFsChangeDir #2:illegal device name
+    002BE5D8  cvFsChangeDir #3:device not found
+    002BE600  cvFsChangeDir #4:vtbl error
+    002BE620  cvFsIsExistFile #1:illegal file name
+    002BE648  cvFsIsExistFile #2:illegal device name
+    002BE670  cvFsIsExistFile #3:device not found
+    002BE698  cvFsIsExistFile #4:vtbl error
+    002BE6B8  cvFsGetMaxByteRate #1:handle error
+    002BE6E0  cvFsGetMaxByteRate #2:vtbl error
+    002BE708  cvFsMakeDir #1:illegal directory name
+    002BE730  cvFsMakeDir #2:illegal device name
+    002BE758  cvFsMakeDir #3:device not found
+    002BE778  cvFsMakeDir #4:vtbl error
+    002BE798  cvFsRemoveDir #1:illegal directory name
+    002BE7C0  cvFsRemoveDir #2:illegal device name
+    002BE7E8  cvFsRemoveDir #3:device not found
+    002BE810  cvFsRemoveDir #4:vtbl error
+    002BE830  cvFsDeleteFile #1:illegal file name
+    002BE858  cvFsDeleteFile #2:illegal device name
+    002BE880  cvFsDeleteFile #3:device not found
+    002BE8A8  cvFsDeleteFile #4:vtbl error
+    002BE8C8  cvFsGetDevName #1:vtbl error
+    002BE8E8  cvFsOptFn1 #1:handle error
+    002BE908  cvFsOptFn1 #2:vtbl error
+    002BE928  cvFsOptFn2 #1:handle error
+    002BE948  cvFsOptFn2 #2:vtbl error
+    002BE968  cvFsSetCurVolume #1:illegal device name
+    002BE990  cvFsSetCurVolume #2:illegal image handle
+    002BE9C0  cvFsSetCurVolume #3:device not found
+    002BE9E8  cvFsAddVolumeEx #1:illegal device name
+    002BEA10  cvFsAddVolumeEx #2:illegal volume name
+    002BEA38  cvFsAddVolumeEx #3:illegal image handle
+    002BEA60  cvFsAddVolumeEx #3:device not found
+    002BEA88  cvFsDelVolume #1:illegal device name
+    002BEAB0  cvFsDelVolume #2:illegal volume name
+    002BEAD8  cvFsDelVolume #3:device not found
+    002BEB00  cvFsGetVolumeInfo #1:illegal device name
+    002BEB30  cvFsGetVolumeInfo #2:illegal volume name
+    002BEB60  cvFsGetVolumeInfo #3:device not found
+    002BEB88  cvFsSetDefVol #1:illegal device name
+    002BEBB0  cvFsSetDefVol #2:illegal volume name
+    002BEBD8  cvFsSetDefVol #3:device not found
+    002BEC08  cvFsGetNumTr64 #1:handle error
+    002BEC28  cvFsGetFsys64Info #1:handle error
+    002BEE48   srd_debug_geterror = %d
+    002BEF20  SRD: sceLseek64 error = %d
+    002BEF40  SRD: sceLseek error = %d
+    002BEF60  SRD: sceIoctl error = %d
+    002BEF80  SRD: sceOpen error = %d
+    002BEFA0  SRD: sceClose error = %d
+    002BEFC0  SRD: sceRead error = %d
+    002BF2D8  DVCI: sceCdSearchFile failed. "%s"
+    002BF6E8  HTCI: sceOpen failed. "%s"
+    002BF730  HTCI: sceOpen failed. IOP Module version is invalid.
+    002BF790  HTCI: sceOpen failed. file desc is insufficient.
+    002BFD88  E01100309:illegal file name format '%s'(mfci_get_adr_size)
+    002C0468  E03090307 : Illegal parameter is specified.
+    002C04C0  E03091602 : Illegal parameter is specified.
+    002C0718  E0110101: ps2rna_init_psj wk size error
+    002C0780  E0110103: ps2rna_init_psj: wk size error
+    002C0D18  1051002:SVM_DelCbSvr:illegal id
+    002C0D38  1071201:SVM_SetCbSvrId:illegal id
+    002C0D60  1071202:SVM_SetCbSvrId:illegal svtype
+    002C0DC0  1071301:SVM_ExecSvrFuncId:illegal id
+    002C0DE8  1071302:SVM_ExecSvrFuncId:illegal svtype
+    002C21E0  E20010703C mwPlyCreateSofdec: create error
+    002C2328  E0203261: MWSFCRE_ResetSfdHn: SFD_Stop() failed.
+    002C2360  E0203262: MWSFCRE_ResetSfdHn: SFD_SetErrFn() failed.
+    002C25E0  E204162: mwPlyGetHdrInf(): bufsize error
+    002C26D0  E201301: MWSFD: GetFps failed.
+    002C29B8  DATA ERROR(%08X)
+    002C29D0  DEC ERROR(%08X): 
+    002C29E8  SFD ERROR(%08X): width, height of cprm is short.
+    002C2A20  SFD ERROR(%08X): Picture data size is large. Please increase MAXBPS of creation parameter.
+    002C2A80  SFD ERROR(%08X)
+    002C2B00  E0203263: mw_sfd_start_ex: RESET failed.
+    002C2D20  E211151: ADXF_GetFnameRangeEx() faild.
+    002C34C8  E2011912: mwPlyFxCnvFrmZ16: getfrm is failed.
+    002C3528  E2011914: mwPlyFxCnvFrmZ32: getfrm is failed.
+    002C3870  E202284: MWSFD_MakeTblZ16: getfrm is failed.
+    002C38D0  E202286: MWSFD_MakeTblZ32: getfrm is failed.
+--- sdk (109)
+    00283C00  PsIIlibcdvd 3000
+    002857B8  PsIIlibdbc  3000
+    002857D0  PsIIlibdma  3000
+    00285F70  PsIIlibgraph3000
+    00285FB0  PsIIlibipu  3000
+    0028602F  9PsIIlibkernl3000
+    00287720  PsIIlibmc   3000
+    00287840  PsIIlibpad2 3000
+    002B7E00  sceCdCbfunc= %d sceCdCbfunc_num= %d
+    002B7E28  SceCdCallbackThread
+    002B7E40  SceCdNcmdSema
+    002B7E50  SceCdScmdSema
+    002B7E60  SceCdRcmdSema
+    002B7E70  SceCdCallbackSema
+    002B8068  sceCdChgSys: Illegal_function_call
+    002B8100  sceDbc_sema
+    002B8130  sceDbcSetWorkAddr: rpc error
+    002B8150  sceDbcCreateSocket: rpc error
+    002B8170  sceDbcDeleteSocket: rpc error
+    002B8190  sceDbcGetDepNumber: rpc error
+    002B81B0  sceDbcInitSocket: rpc error
+    002B81D0  sceDbcResetSocket: rpc error
+    002B81F0  sceDbcGetDeviceStatus: rpc error
+    002B8218  sceDbcSRData: rpc error
+    002B8238  sceDbcSendData: rpc error
+    002B82A8  sceDbcSendData2: rpc error
+    002B8318  sceDbcReceiveData: rpc error
+    002B8378  libdma: sync timeout
+    002B9268  rom0:ROMVER
+    002B9278  sceGsDefDispEnv:Not support displaymode for 0x%x!!
+    002B92B0  sceGsSyncPath: DMA Ch.1 does not terminate
+    002B9390  sceGsSyncPath: DMA Ch.2 does not terminate
+    002B93C0  sceGsSyncPath: VIF1 does not terminate
+    002B93F0  sceGsSyncPath: VU1 does not terminate
+    002B9418  sceGsSyncPath: GIF does not terminate
+    002B9440  sceGsSetDefLoadImage: too big size
+    002B9560  ## internel error in libkernl.a!
+    002B9588  SceKerneltopThread
+    002B95A0  SceKernelDelayThread
+    002B97F8  SceSifrpcGod
+    002B9808  SceSifrpcBind
+    002B9818  SceSifrpcCall
+    002B9830  SceStdioIobSema
+    002B9840  SceStdioQueSema
+    002B98B8  SceStdioFioSema
+    002B98D0  SceStdioOpenSema
+    002B98E8  SceStdioCloseSema
+    002B9900  SceStdioLseekSema
+    002B9918  SceStdioReadSema
+    002B9930  SceStdioWriteSema
+    002B9948  SceStdioIoctlSema
+    002B9960  SceStdioIoctl2Sema
+    002B9978  SceStdioCCodeSema
+    002B9990  SceStdioMkdirSema
+    002B99A8  SceStdioFormatSema
+    002B99C0  SceStdioAddDrvSema
+    002B99D8  SceStdioDcloseSema
+    002B99F0  SceStdioDreadSema
+    002B9A08  SceStdioGetstatSema
+    002B9A20  SceStdioChstatSema
+    002B9A38  SceStdioRenameSema
+    002B9A50  SceStdioSyncSema
+    002B9A68  SceStdioMountSema
+    002B9A80  SceStdioLseek64Sema
+    002B9A98  SceStdioDevctlSema
+    002B9AB0  SceStdioSymlinkSema
+    002B9AC8  SceStdioReadlinkSema
+    002B9AF0  rom0:UDNL 
+    002B9BA0  SceKernelLibc
+    002B9BB0  SceKernelLibcEh
+    002BA450  sceMc_sema_regs
+    002BA460  sceMc_sema_timer
+    002BA478  bind error libmc 
+    002BA490  libmc: too old release of mcserv.irx
+    002BA4B8  libmc: too old release of mcman.irx
+    002BA4E0  sceMcUdCheckNewCard RPC faild
+    002BA690  _sceMpegSliceA0(): error happens
+    002BA930  Need to re-setup libipu since sceMpegGetPicture was aborted
+    002BA970  sceMpegGetPicture is aborted
+    002BAAA0  libpad2: buffer addr is not 64 byte align. %08x
+    002BB300  cdrom0:\IRX\
+    002BED38  SRD: Drive Error (sceCdGetError = 0x%x)
+    002BED68  SRD: sceCdBreak is fail. %d
+    002BEF20  SRD: sceLseek64 error = %d
+    002BEF40  SRD: sceLseek error = %d
+    002BEF60  SRD: sceIoctl error = %d
+    002BEF80  SRD: sceOpen error = %d
+    002BEFA0  SRD: sceClose error = %d
+    002BEFC0  SRD: sceRead error = %d
+    002BF2D8  DVCI: sceCdSearchFile failed. "%s"
+    002BF3D8  E0092911:sceCdSearchFile fail.(dvCiOpen)
+    002BF6E8  HTCI: sceOpen failed. "%s"
+    002BF708  E0092705:sceOpen fail.(htCiGetFileSize)
+    002BF730  HTCI: sceOpen failed. IOP Module version is invalid.
+    002BF768  E0082101:sceOpen fail.(htCiGetFileSize)
+    002BF790  HTCI: sceOpen failed. file desc is insufficient.
+    002BF7C8  E0092706:sceLseek fail.(htCiGetFileSize)
+    002BF7F8  E0092707:sceClose fail.(htCiGetFileSize)
+    002BF8D0  E0092711:sceOpen fail.(htCiOpen)
+    002BF8F8  HTCI: Failed sceClose
+    002BF9B8  HTCI: "%s" can't Open.(sceOpen)
+    002BF9E0  HTCI: "%s" Opened.(sceOpen)
+    002BFA48  HTCI: "%s" can't Close.(sceClose)
+    002BFA70  HTCI: "%s" Closed.(sceClose)
+    002C06A0  PS2RNA: E01112903: Failed, sceSifAllocIopHeap(%d) in ps2rna_init_psj
+    002C06E8  PS2RNA: sceSifAllocIopHeap(%d) ret=0x%08x
+    002C0820  PS2RNA: E01112902: Failed, sceSifAllocIopHeap(%d) in PS2RNA_Init.
+    002C0890  E02041101: Failed, sceSifAllocIopHeap(%d) in PS2RNA_Init.
+    002C1788  cdrom0:\MBS\
+--- toolchain (7)
+    002C1C84  Append: GCC2096 SCE3010
+    002C1EED  Append: GCC2096 SCE3010
+    002C1F8D  Append: GCC2096 SCE3010
+    002C1FF5  Append: GCC2096 SCE3010
+    002C289A  Append: GCC2096 SCE3010
+    002C40A5  Append: GCC2096 SCE3010
+    002D58C0  MW MIPS C Compiler (2.4.1.01)
+--- save (4)
+    002C5E50  BISLPS-25533TOL-S
+    002C5EC8  icon.ico
+    002C5ED8  savedata.dat
+    002C5EE8  icon.sys
+--- section (3)
+    002D5881  .shstrtab
+    002D58A8  .comment
+    002D58B1  .reginfo
+--- other (626)
+    001EA542  E4ulc4fa
+    001EA622  E4ulc4fa
+    001F49DA  E4ulc4fa
+    001F4A26  E4ulc4fa
+    001F4B16  E4ulc4fa
+    001F4C8A  E4ulc4fa
+    001F4CD2  E4ulc4fa
+    001FB456  E4ulc4fa
+    0020981A  E4ulc4fa
+    0020D426  E4ulc4fa
+    0020D82A  E4ulc4fa
+    0020D88E  E4ulc4fa
+    0020F3B6  E4ulc4fa
+    0021126E  E4ulc4fa
+    00219842  E4ulc4fa
+    00219B4A  E4ulc4fa
+    0021B90A  E4ulc4fa
+    0026FFE2  E4ulc4fa
+    002706BE  E4ulc4fa
+    00270C3A  E4ulc4fa
+    00273472  E4ulc4fa
+    002734C2  E4ulc4fa
+    00287EB8  ent\CUST
+    0028D9E0  MARK:adxt_obj
+    002A2768  MARK:lsc_obj
+    002B7E88  Libcdvd bind err CdSearchFile
+    002B7EA8  ee call cmd search %s
+    002B7EC0  search name %s
+    002B7ED0  search size %d
+    002B7EE0  search loc lbn %d
+    002B7EF8  Ncmd fail sema cur_cmd:%d keep_cmd:%d
+    002B7F20  Libcdvd bind err N CMD
+    002B7F38  N cmd wait
+    002B7F48  S cmd wait
+    002B7F58  Scmd fail sema cur_cmd:%d keep_cmd:%d
+    002B7F80  Libcdvd bind err S cmd
+    002B7F98  Libcdvd bind err %d CD_Init %d
+    002B7FB8  Libcdvd Exit
+    002B7FC8  OLD DiskReady Call
+    002B7FE0  Libcdvd bind err CdDiskReady
+    002B8000  DiskReady ended
+    002B8018  NEW DiskReady Call
+    002B8030  call cdread cmd
+    002B8048  cdread end
+    002B8058  status called
+    002B80A8  libdbc: Module version mismatch 
+    002B8110  libdbc: SifDmaAddr %08x
+    002B8258  libdbc: SendData2 data length too long [%d]
+    002B8288  dbcman : SendData2 BUSY
+    002B82C8  libdbc: SendData3 data length too long [%d]
+    002B82F8  dbcman : SendData3 BUSY
+    002B84F0  Infinity
+    002B8838  bug in vfprintf: bad base
+    002B95B8  TTY: packet size larger than expect
+    002B95F8  TTY: send err %d
+    002B9B00  too long parameter '%s'
+    002B9B20  # TLB spad=0 kernel=1:%d default=%d:%d extended=%d:%d
+    002B9B58  # TLB over flow (1)
+    002B9B70  # TLB over flow (2)
+    002B9B88  # TLB over flow (3)
+    002BA500  (a) invalid motion_type(%d)-0
+    002BA520  (b) invalid motion_type(%d)-1
+    002BA540  (c) invalid motion_type(%d)-2
+    002BA560  Invalid modion type -- ignored(%d)
+    002BA588  intra && skip MB
+    002BA5A0  = Skip to the next picture =
+    002BA5C0  Too many macroblocks in picture
+    002BA5E0  skiped macroblock in I picure is not allowed
+    002BA610  Invalid macroblock_type code: 0
+    002BA630  Invalid macroblock_address_increment code(0x%08x)
+    002BA668  slice_start_code(0x%08x) out of range
+    002BA6D0  _chroma_format needs to be 1: 420
+    002BA6F8  Unsupported profile/level
+    002BA718  load_chroma_intra_quantizer_matrix == 1
+    002BA740  load_chroma_non_intra_quantizer_matrix == 1
+    002BA770  _sequenceScalableExtension() is not implemented
+    002BA7A0  Unknown Extension
+    002BA7B8  _pictureSpatialScalableExtension is not supported
+    002BA7F0  _pictureTemporalScalableExtension is not supported
+    002BA860  Unknown buff type.
+    002BA8C8  The size of work area is too small
+    002BA8F0  image buffer needs to be aligned to 64byte boundary(0x%08x)
+    002BA9A8  odd number of field pictures
+    002BA9C8  unknown picture sutructure
+    002BA9E8  work area size is too small
+    002BAA08  Too small buffer size for %dx%d picture
+    002BAA38  the second field is missing
+    002BAA70  Error code detected(BDEC)
+    002BAB70  rgb2hsv::How did I get here?
+    002BB0E0  #UNKNOWN
+    002BB1A0  AppCell deamon
+    002BB1B0  sio2man.irx
+    002BB1C0  sio2d.irx
+    002BB1D0  mcman.irx
+    002BB1E0  mcserv.irx
+    002BB1F0  dbcman.irx
+    002BB200  pad2\ds2u_d.irx
+    002BB210  libsd.irx
+    002BB220  korgivag.irx
+    002BB260  ixaudio.irx
+    002BB320  \AFS\FLIST.DIR
+    002BB380  CDV:\AFS\
+    002BB398  bEscaped
+    002BB3A8  event EB
+    002BB3B8  townName
+    002BB3C8  sleepApp
+    002BB408  town App
+    002BB418  mapTgtID
+    002BB428  town MCD
+    002BB438  townWait
+    002BB448  FLD MNGR
+    002BB458  fldInitMode
+    002BB498  mapTgtID
+    002BB4A8  mapGraph
+    002BB4B8  mapPicDB
+    002BB4C8  event EB
+    002BB4D8  map  NFB
+    002BB4E8  map  NFT
+    002BB4F8  mapEvent
+    002BB508  map cmmn
+    002BB5C8  map  NFT
+    002BB9DB  C%C'C3C7C9COCWCiC
+    002BBAEF  H1H=HGHUHYH[HkHmHyH
+    002BBB19  I+I7I=IEIUIcIiImIsI
+    002BBBAD  L!L-L3LKLULWLaLgLsLyL
+    002BBBDB  M'M)M/M3MAMQMYMeMkM
+    002BBC13  N+N5N7N=NONSN_NgNyN
+    002BBC7D  P)P5P?PEPGPSPqPwP
+    002BBCAD  Q#Q%Q5QGQIQqQyQ
+    002BBCE3  R'RCRERKRaRmRsR
+    002BBD13  S#SASESGSKS]ScS
+    002BBD7F  U'U+U9U=UOUQU[UcUgUoUyU
+    002BBDB3  V#V/V3V9V?VKVMV]V_VkVqVuV
+    002BBFE1  a-a9aKaUaWa[aoaya
+    002BC073  d!d'd+d9dCdIdOd]dgdud
+    002BC10F  g'g1g7g?gEgQg[gogyg
+    002BC13B  h-h9hCRI-MW
+    002BC148  E1060101 ADXB_DecodeHeaderAdx: 
+    002BC168  can't play AHX data by this handle
+    002BC248  E9040801:partition ID is range outside.(adxf_ChkPrmPt)
+    002BC280  E9040802:'ptinfo' is NULL.(adxf_ChkPrmPt)
+    002BC2B0  E1110701:'tmpbuf' is null.(load partition)
+    002BC308  E0042401:multi-load partition.(load partition)
+    002BC338  E9040804:can't open file.(load partition)
+    002BC368  E0041303:illigal parameter 'ptid'.(ADXF_GetPtStat)
+    002BC3A8  E0040701:Illigal format(not AFS).(ADXF_GetPtStat)
+    002BC3E0  E0040702:Illigal number of file.(ADXF_GetPtStat)
+    002BC418  E2122501:AFS file has 128MB or more of inside file.(ADXF_GetPtStat)
+    002BC460  E04041201:not enough ADXF handle (adxf_CreateAdxFs)
+    002BC498  E02111001:can't create stm handle (adxf_CreateAdxFs)
+    002BC4D0  E9081901:illigal parameter fname=null.(ADXF_Open)
+    002BC508  E9040811:'adxf' is NULL.(ADXF_ReadSj32)
+    002BC530  E9040812:'nsct'is negative.(ADXF_ReadSj32)
+    002BC560  E9040813:'sj'is NULL.(ADXF_ReadSj32)
+    002BC588  E9040816:'adxf' is NULL.(ADXF_ReadNw32)
+    002BC5B0  E9040817:'nsct' is negative.(ADXF_ReadNw32)
+    002BC5E0  E9040818:'buf' is NULL.(ADXF_ReadNw32)
+    002BC608  E9040821:'sj' must be NULL.(ADXF_ReadNw32)
+    002BC638  E0120401:'buf' isn't 64byte alignment.(ADXF_ReadNw)
+    002BC670  E9040822:'adxf' is NULL.(ADXF_Stop)
+    002BC6C8  E2092301:'adxf' is NULL.(ADXF_StopNw)
+    002BC720  E9040825:'adxf' is NULL.(ADXF_Seek)
+    002BC748  E9040826:'type' is illigal.(ADXF_Seek)
+    002BC770  E9040827:'adxf' is NULL.(ADXF_Tell)
+    002BC798  E9040828:'adxf' is NULL.(ADXF_GetFsizeSct)
+    002BC7C8  E9040830:'adxf' is NULL.(ADXF_GetNumReqSct)
+    002BC7F8  E9040831:'adxf' is NULL.(ADXF_GetNumReadSct)
+    002BC828  E9040832:'adxf' is NULL.(ADXF_GetStat)
+    002BC850  E9040828:'ptid' is range outside.
+    002BC878  E9040828:'flid' is range outside.
+    002BC8A0  E0041201:state is reading(ADXF_SetReqRdSct)
+    002BC8D8  E02041201: NULL pointer is specified.(ADXT_GetHdrInfo)
+    002BC910  E02041201: Can not get header information.(ADXT_GetHdrInfo)
+    002BC950  E02041201: Buffer size is too short.(ADXT_GetHdrInfo)
+    002BC9F0  E0010601:Can't entry file 
+    002BCA40  E0071301 ADXT_EntryAfs: can't entry 
+    002BCB88  1060102: Internal Error: adxm_goto_svr_border
+    002BCBB8  ADXM: UsrVsyncThread Stack pointer = 0x%08x, size = %d
+    002BCBF8  ADXM: UsrIdleThread Stack pointer = 0x%08x, size = %d
+    002BD470  ADXRNA_GetStat: not implemented
+    002BD498  E03010901 ADXB_DecodeHeader: 
+    002BD4B8  Can not decode this file format.
+    002BD558  E02110501 adxstmf_stat_exec: can't open 
+    002BD5E8  stat=%4d, ttl=%4d
+    002BD628  E03100801 ADXT_Create: Too many handles.
+    002BDD60  E8101202 ADXT_StartAfs: can't open 
+    002BDDE8  E8101207: can't create sj (ADXT_StartMem)
+    002BDE48  E8101207: can't create sj (ADXT_StartMemIdx)
+    002BDE80  E8101201 adxt_trap_entry: not enough data
+    002BDEB0  E9081001 adxt_stat_decinfo: can't play this number of channels
+    002BDF40  E1052501 ADXT_AttachAHX
+    002BDF58  can not attach AHX.
+    002BE0A0  cvFsSetDefDev #2:unknown device name
+    002BEC80  SRD: SRD_Destroy, invalidate srd handle. hn=%0x, srd_obj=%08x
+    002BECC0  SRD: invalid SRD_Destroy.
+    002BECE0  SRD: srd_wait_hst timeout.
+    002BED00  SRD: SRD_Break handle is NULL
+    002BED20  SRD: Already Break!
+    002BEDE8  SRD: SRD_WaitForExecServer timeout.(10sec)
+    002BEE18  SRD: SRD Info.
+    002BEE88   srd_obj.devtype    = DVD
+    002BEEA8   srd_obj.devtype    = HOST
+    002BEEC8   Read Status(DVD=2/HST=1) = %d
+    002BEEE8  SRD: 64bit Host filesystem.
+    002BEF08  SRD: Enable HostLock
+    002BF010  DTR_ExecHndl: Internal Error
+    002BF030  DTR_ExecHndl: Internal Error len
+    002BF058  cks.data=%08x, ckd.data=%08x, cks.len=%d
+    002BF088  DTR_ExecHndl: Internal Error cks.data
+    002BF0B0  DTR_ExecHndl: Internal Error ckd.data
+    002BF0D8  E0101701 DTR_ExecHndl: can't use DMA
+    002BF100  DTR_Init: in (%d)
+    002BF118  DTR_Init: out
+    002BF128  i:%d DTR_MAX_OBJ:%d
+    002BF170  Hello from EE (%d)
+    002BF188  eewk is not alignment 64 byte
+    002BF1A8  iopwk is not alignment 32 byte
+    002BF1C8  wklen=%d is not 64*N
+    002BF1E0  illeagal ID (%d) 
+    002BF1F8  DTX_Create: can't create DTX of server
+    002BF220  E0092101: DTX_Init bind errr
+    002BF2A8  E0092901:fname is null.(dvCiGetFileSize)
+    002BF300  E0092902:can't find file.(dvCiGetFileSize)
+    002BF330  E0092908:fname is null.(dvCiOpen)
+    002BF358  E0092909:rw is illigal.(dvCiOpen)
+    002BF380  E0092910:not enough handle resource.(dvCiOpen)
+    002BF3B0  DVCI: File cache was not hit. "%s"
+    002BF408  E0092912:handl is null.
+    002BF440  E0092914:buf is null.(dvCiReqRd)
+    002BF468  DVCI: dvCiStopTr timeout. (10sec)
+    002BF4A8  DVCI: "%s" found.
+    002BF4C0  DVCI: "%s" Not found.
+    002BF4D8  DVCI: Total %d files.
+    002BF4F0  DVCI: Warning, Can't load all cache file.%c
+    002BF520  DVCI: "%s" opened. 
+    002BF538  LSN=%d, 
+    002BF548  Size=%d[sector]
+    002BF568  DVCI: CD/DVD-ROM Image opened%c
+    002BF590  DVCI: Invalidate filelist buffer pointer.
+    002BF5C0  DVCI: Invalidate filelist buffer size.
+    002BF5F0  DVCI: Can't read filelist file.(%s)
+    002BF618  E0111501:can't read filelist.(dvCiLoadDirInfo)
+    002BF6B8  E0092704:fname is null.(htCiGetFileSize)
+    002BF828  E0092708:fname is null.(htCiOpen)
+    002BF850  E0092709:rw is illigal.(htCiOpen)
+    002BF878  E0092710:not enough handle resource.(htCiOpen)
+    002BF8A8  HTCI: File cache was not hit. "%s"
+    002BF910  E0092712:handl is null.
+    002BF948  E0092714:buf is null.(htCiReqRd)
+    002BF970  E0082401:handl is null.
+    002BF988  HTCI: htCiStopTr timeout.
+    002BFA00  HTCI: Total %d files.
+    002BFA18  HTCI: Error, Can't load all cache file.%c
+    002BFA90  HTCI: Total %d files
+    002BFAA8  HTCI: Invalidate filelist buffer pointer.
+    002BFAD8  HTCI: Invalidate filelist buffer size.
+    002BFB08  HTCI: Can't read filelist file.(%s)
+    002BFB30  E0111501:can't read filelist.(htCiLoadDirInfo)
+    002BFB68  E0001: Illigal parameter=sj (LSC_Create)
+    002BFB98  E0002: Not enough instance (LSC_Create)
+    002BFBC8  E0003: Illigal parameter lsc=NULL
+    002BFBF0  E0011: Illigal parameter fname=%s
+    002BFC18  E0009: Illigal parameter no=%d
+    002BFC38  E0012: Can not find stream ID =%d
+    002BFC60  E0010: Illigal parameter min=%d
+    002BFCB8  E0013: '%s' is different from entry file name.(LSC_ExecServer)
+    002BFD48  E01100308:length of '%s' is not 17 bytes.(mfci_get_adr_size)
+    002BFDC8  E01100301:fname is null.(mfCiOpen)
+    002BFDF0  E01100302:rw is illigal.(mfCiOpen)
+    002BFE18  E01100303:not enough handle resource.(mfCiOpen)
+    002BFE48  E01100305:handl is null.
+    002BFE68  E01100306:handl is null.
+    002BFE88  E01100307:handl is null.
+    002BFEC8  E01100309:buf is null.(mfCiReqRd)
+    002BFEF0  E0092912:handl is null.
+    002BFF08  E0040301:handl is null.
+    002BFF20  E0040302:handl is null.
+    002BFF38  E1041001:invalid entry number.(mfCiOpenEntry)
+    002BFF68  E1041002:rw is illigal.(mfCiOpenEntry)
+    002BFF90  E1041002:not enough handle resource.(mfCiOpenEntry)
+    002C03C8  E03090101 : NULL pointer is specified.
+    002C03F0  E03090102 : Work size is too short.
+    002C0418  E03091001 : Work size is too short.
+    002C0440  E03090306 : NULL pointer is specified.
+    002C0498  E03091601 : NULL pointer is specified.
+    002C04F0  E2003091101 : ADXT handle must be created for stereo output.
+    002C0530  E2003091002 : Fail to attach Dolby Pro Logic II.
+    002C0568  E2003091605 : NULL pointer is specified.
+    002C0598  E2003091606 : ADXT handle must be created for 3D sound.
+    002C0600  PS2RNA_SetupVoice:Illigal parameter(nste=%d).
+    002C0630  PS2RNA_SetupVoice:Illigal parameter(nmono=%d).
+    002C0660  PS2RNA_SetupVoice:The set-up value exceeded maximum(MAX=%d).
+    002C0748  E0110102: ps2rna_init_psj: can't creat SJUNI_CreaetRmt
+    002C07B0  E0110104: ps2rna_init_psj: can't creat SJUNI_Creaet
+    002C07E8  E0110105: ps2rna_init_psj: can't creat SJX_Create
+    002C0868  E0100302: PS2RNA_Init can't create DTX
+    002C08D0  E1072601: not enough PSJ handle
+    002C08F8  E0100401: can't create PS2RNA of IOP
+    002C0920  E1072602: can't create DTR handle
+    002C0948  PS2RNA_Start: not implemented
+    002C0968  PS2RNA_ClearBuf: not implemented
+    002C0990  PS2RNA_SetPcmType: not implemented
+    002C09B8  PS2RNA_SetStartSmpl: not implemented
+    002C09E0  sampling frequency=%d[Hz]
+    002C0A00  PS2RNA_SetBitPerSmpl: not support %d bps
+    002C0A30  PS2RNA_GetStartSmpl: not implemented
+    002C0A58  PS2RNA_IsOverflow: not implemented
+    002C0A80  PS2RNA_ClearOverflow: not implemented
+    002C0AA8  PS2RNA_DiscardData: not implemented
+    002C0AD0  PS2RNA_SetTotalNumSmpl: not implemented
+    002C0B00  PS2RNA_SetStmHdInfo: not implemented
+    002C0B38  SJMEM Error
+    002C0B58  SJRBF Error
+    002C0B78  SJUNI Error
+    002C0BE8  E0100301: SJX_Init can't allocate IOP Heap
+    002C0C18  E0100302: SJX_Init can't create DTX
+    002C0C40  E0100401: can't create SJX of IOP
+    002C0C98  2103102:SVM:svm_unlock:lock type miss match.(type org=%d, type now=%d)
+    002C0CE8  1051001:SVM_SetCbSvr:too many server function
+    002C0D88  2100801:SVM_SetCbSvrId:over write callback function.
+    002C12D0  sleepApp
+    002C12E0  townWait
+    002C12F0  mapPicDB
+    002C17A0  CCDVD_MCD_MANAGER::DeamonErrorThread
+    002C17D0  CCDVD_MCD_MANAGER::DeamonThread
+    002C17F0  TTL LOOP
+    002C1800  TTL LOOP
+    002C1840  fldInitMode
+    002C1850  Field: class fld_CPlayer
+    002C1870  Field: class fld_CNaviMap
+    002C1890  Field: class fld_CCamera
+    002C1980  Field: class fld_CExcelData
+    002C19A0  Field: class fld_CAreaAtrManager
+    002C1A40  [KORGEVAG] Failed to create EE-RPC server.
+    002C1C10  map_5bat_43kaij_00f_0hir
+    002C1C30  map_5bat_13retb_00f_0hir
+    002C20E8  E206011: MwsfdCrePrm: illigal buffmt.
+    002C2110  E301091: Internal Error: sfd_hnctrl_work is short.
+    002C2148  E1122613 mwPlyCalcWorkCprmSfd: cprm is NULL.
+    002C2178  E20010703B MWSFCRE_SetSupplySj: 
+    002C21A0  E2053002: not enough work
+    002C21C0  E4041301: not enough work
+    002C2210  E20010703D mwPlyCreateSofdec: set errcb
+    002C2258  E02120501: Internal Error: mwsfcre_AttachPicUsrBuf().
+    002C2290  E02120502: mwsfcre_AttachPicUsrBuf(): usrdatbuf is short.
+    002C22D0  E02120503: mwPlyAttachPicUsrBuf(): bufsize is short.
+    002C2308  E20010703E MWSFCRE_DestroySfd: 
+    002C2398  E1122612 mwPlyCreateSofdec : cprm is NULL.
+    002C23C8  W2000 mwPlyCreateSofdec:can't create handle
+    002C23F8  E2053006 mwPlyCreateSofdec: Didn't set malloc/free func.
+    002C2438  E2012 mwPlyCreate:can't create SFD
+    002C2460  E2013 mwPlyCreate:can't create SJ
+    002C2488  E2020 mwPlyCreate:can't create SJ
+    002C24B0  E201185: can't create SfxHn
+    002C24D0  E201212 mwPlyCreate: can't set AddInfSJ
+    002C24F8  E3012100: M1V Decode is not support yet.
+    002C2528  E3012101: Buffer format is invalid.
+    002C2550  E2053003: not enough work: sfx_wk
+    002C2578  E2053004: not enough work: ainfsj_buf
+    002C25A0  E2053005: forgot free.
+    002C25B8  E204161: mwPlyGetHdrInf(): NULL pointer
+    002C2610  E2053001 MWSFD_Malloc: cnt over.
+    002C2640  E1122629: mwPlySetFrmSync: handle is invalid.
+    002C2670  E2010801: mwPlyGetFrmSync: handle is invalid.
+    002C26A0  E1122614: mwPlyGetCurFrm: handle is invalid.
+    002C26F0  mwl_convPtypeFromSFD : Invalid Ptype
+    002C2718  E301271: mwsffrm_DecideFrmType() : Invalid Pstruct
+    002C2750  mwl_convPtypeToSFD : Invalid Ptype
+    002C2778  E1122615: mwPlyRelCurFrm: handle is invalid.
+    002C27A8  E1122618: mwPlyIsNextFrmReady: handle is invalid.
+    002C27E0  E3122201: mwPlyGetNextPicUsr: handle is invalid.
+    002C2818  E202231: mwPlyGetNumSkipDisp: handle is invalid.
+    002C2908  E1122611 mwPlyInitSfdFx: iprm is NULL.
+    002C2930  E2005 mwPlyInitSfdFx: can't init GSC
+    002C2958  ERR20010421A : mwPlyInitSfdFx
+    002C2980  E011081 mwPlySfdInit: Not compatible SFD Version.
+    002C2A90  E20010703F mwPlySfdStandby: 
+    002C2AB0  E20010703G mwPlySfdStart: 
+    002C2AD0  E10821A : Invalid value of SFD_GetPaStat : %d
+    002C2B30  E201213 mw_sfd_start_ex: can't set AddInfSJ
+    002C2B60  E1122601: mwPlyStartFname: handle is invalid.
+    002C2B90  E10915C: mwPlyStartFname: fname is NULL.
+    002C2BC0  E1122610 mwSfdStartMem: handle is invalid.
+    002C2BF0  E1122609 mwSfdStartSj: handle is invalid.
+    002C2C20  E2003 mwSfdStop:can't stop SFD
+    002C2C40  E1122602 mwSfdStop: handle is invalid.
+    002C2CC8  E1122638: mwPlyStartAfs: handle is invalid.
+    002C2CFF  ?E211121: filename is longer.
+    002C2D58  SUBTITLE
+    002C2DC0  E1122617 mwPlySetAudioSw: handle is invalid.
+    002C2DF0  E1122640: mwPlyGetSfdHn: handle is invalid.
+    002C2E20  E1122639: mwPlyGetAdxtHn: handle is invalid.
+    002C2E50  E202232: mwPlyGetNumDropFrm: handle is invalid.
+    002C2E80  E1122619: mwPlyGetNumSkipDec: handle is invalid.
+    002C2EB8  E1122628: mwPlySetBpicSkip mwPlySetPpicSkip: handle is invalid.
+    002C2EF8  E1122616 mwPlySetAudioCh: handle is invalid.
+    002C2F28  E10911A mwPlySetAudioCh: Invalid ch no.
+    002C2F50  E2080801 mwPlyGetNumAudioCh: handle is invalid.
+    002C2F80  E2080601 mwPlySetVideoCh: handle is invalid.
+    002C2FB0  E2080602 mwPlySetVideoCh: Invalid ch no.
+    002C2FE0  E2080802 mwPlyGetNumVideoCh: handle is invalid.
+    002C3010  E1122625: mwPlySetLimitTime: handle is invalid.
+    002C3040  W2004 mwSfdGetStat: handle is invalid
+    002C3068  E1122626: mwPlySetSyncMode: handle is invalid.
+    002C3098  E2010802: mwPlyGetSyncMode: handle is invalid.
+    002C30C8  E2010803: mwPlyGetSyncMode: mode is invalid.
+    002C30F8  E1122621: mwPlyGetNumDecPool: handle is invalid.
+    002C3130  E1121601 mwPlyGetNumDecPool
+    002C3150  E1122620: mwPlyGetNumTotalDec: handle is invalid.
+    002C31E0  E1122605 mwSfdSetOutVol: handle is invalid.
+    002C3210  E1122606 mwSfdGetOutVol: handle is invalid.
+    002C3240  E1122607 mwSfdSetOutPan: handle is invalid.
+    002C3270  E1122608 mwSfdGetOutPan: handle is invalid.
+    002C32A0  E1122623: mwPlyGetNumSkipEmptyB: handle is invalid.
+    002C32D8  E1122627: mwPlySetEmptyBpicSkip: handle is invalid.
+    002C3310  E1122624: mwPlyGetInputSj: handle is invalid.
+    002C3340  E202191: mwPlyGetPlyInf: handle is invalid.
+    002C3370  E302251: mwPlySetSpeed: handle is invalid.
+    002C33A0  E211051: mwPlySetFloatSpeed: handle is invalid.
+    002C3400  E201184 : MwsfdBufFmt value is invalid.
+    002C3428  E301272 : picture_structure is invalid.
+    002C3450  E301273 : chroma_format is invalid.
+    002C3478  E301274 : chromapos is invalid.
+    002C3498  E2011911: mwPlyFxCnvFrmZ16: handle is invalid.
+    002C34F8  E2011913: mwPlyFxCnvFrmZ32: handle is invalid.
+    002C3558  E201214: mwPlyFxSetCompoMode: handle is invalid.
+    002C3590  E204011: mwPlyFxSetCompoMode: COMPO_Z needs setting in MWPLY Creation.
+    002C35D8  E204012: mwPlyFxSetCompoMode: COMPO_AUTO needs setting in MWPLY Creation.
+    002C3628  E2011915: mwPlyFxGetCompoMode: handle is invalid.
+    002C3660  E307092: mwPlyFxGetOutBufPitchHeight: handle is invalid.
+    002C36A0  E306091: MWSFSFX_SetOutBufSize: handle is invalid.
+    002C36D8  E2011918: mwPlyFxSetOutZscale: handle is invalid.
+    002C3710  E2011919: mwPlyFxGetOutZscale: handle is invalid.
+    002C3748  E2011920: mwPlyFxSetOutZoffset: handle is invalid.
+    002C3780  E2011921: mwPlyFxGetOutZoffset: handle is invalid.
+    002C37B8  E201211 mwPlyCreate: can't create AddInfSJ
+    002C37F8  W2121001 : mwPlyAttachAddInfBuf(): bufsize is short.
+    002C3840  E202283: MWSFD_MakeTblZ16: handle is invalid.
+    002C38A0  E202285: MWSFD_MakeTblZ32: handle is invalid.
+    002C3900  E304162: MWSFD_GetMaxAlpha: handle is invalid.
+    002C3930  E304161: MWSFD_GetMaxAlpha: handle is invalid.
+    002C3960  E404010: mwPlySetCnvBottomUp: handle is invalid.
+    002C3998  E404011: mwPlyGetCnvBottomUp: handle is invalid.
+    002C39D0  E1122633: mwPlyEntryFname: handle is invalid.
+    002C3A00  E10915B: mwPlyEntryFname: fname is NULL.
+    002C3A30  E204021: mwPlyEntryFname: Can't entry file'%s'
+    002C3A60  E1122634: mwPlyStartSeamless: handle is invalid.
+    002C3A98  E1122641: mwPlySetLpFlg: handle is invalid.
+    002C3AC8  E1122630: mwPlyStartFnameLp: handle is invalid.
+    002C3AF8  E10915A: mwPlyStartFnameLp: fname is NULL.
+    002C3B28  E1122631: mwPlyReleaseLp: handle is invalid.
+    002C3B58  E1122635: mwPlyReleaseSeamless: handle is invalid.
+    002C3B90  E1122636: mwPlyEntryAfs: handle is invalid.
+    002C3BC0  E008311 mwPlyEntryAfs: can't entry pid=%d fid=%d
+    002C3BF8  E1122632: mwPlyStartAfsLp: handle is invalid.
+    002C3C28  E1122637: mwPlyGetSlFname: handle is invalid.
+    002C3C58  E10821B : Invalid value of stm_no : %d
+    002C3C80  E1122642: mwPlyLinkStm: handle is invalid.
+    002C3CB0  E99072101 mwPlyLinkStm: can't link stream
+    002C3CF0  E303111: MWSST_Create: worksize is short.
+    002C3D20  E303112: MWSST_Create: can't create SJ.
+    002C3D48  E303112: MWSST_Create: can't create corehn.
+    002C3D80  E99072103 mwPlyStartXX: can't link stream
+    002C3DB0  E211141 MWSTM_ReqStart: can't start '%s'
+    002C3DE0  E99072102 mwlSfdExecDecSvrPlaying: can't term
+    002C3E28  E1071901 mwPlyExecSvrHndl: NULL handle.
+    002C3E50  E2011101: MWSFSVR_IsSvrBdrHndl: handle is invalid.
+    002C4660   SFH Version 1.16SFH_VER_DATE
+    002C4680  Copyright (c) 1999-2003 CRI-MW
+    002C46D8  SofdecStream            
+    002C4720  E201312: sfxcnv_IsCnvUpHalf : compo is invalid.
+    002C4750  E201311: sfxcnv_MakeTable : compo is not support.
+    002C4928  E202282: SFX_MakeTblZ16 : zclip is not set.
+    002C4958  E202281: SFX_MakeTblZ32 : zclip is not set.
+    002C49C0  E201194: sfx_InitHn: work size is short.
+    002C49F0  E201281: SfxZHn: can't create.
+    002C4A10  E202011: SfxAHn: can't create.
+    002C4A70  %lx %lx %lx
+    002C4A8F  AE201314: SFXZ_SetZclip : zclip is invalid.
+    002C4AC8  E201315: sfxcnv_CnvFrmZcmn : zclip is not set.
+    002C4AF8  E201191: SFX_CnvFrmZcmn : frmfmt is not support.
+    002C4B30  E201313: sfxcnv_CnvZbitToCft : zbit is invalid.
+    002C54F0  MNOQRSTUVWX
+    002C5519  ILNMOJPHK
+    002C57D9  HIJKLMNOP
+    002C5F00  SRV_CMEMCARD::GetStatusThread
+    002C5F20  SRV_CMEMCARD::CheckLoadInfoThread
+    002C5F50  SRV_CMEMCARD::CreateFileThread
+    002C5F70  SRV_CMEMCARD::CheckFileBrakeThread
+    002C5FA0  SRV_CMEMCARD::LoadFileThread
+    002C5FC0  SRV_CMEMCARD::SaveFileThread
+    002C5FE0  SRV_CMEMCARD::FormatThread
+    002C6090  tlxTk_CCtl_CharacterPickUp
+    002C60B0  tlxTk_CCtl_IngredientList
+    002C6110  tlxTk_CFrm_Attract
+    002C6130  tlxTk_CFrm_GradeShop
+    002C6150  tlxTk_CCtl_MessageBox State
+    002C6170  tlxTk_CCtl_GradeShop GradeId
+    002C6190  tlxTk_CFrm_Composition
+    002C61B0  tlxTk_CCtl_MessageBox State
+    002C61D0  tlxTk_CFrm_Bakery
+    002C61F0  tlxTk_CCtl_MessageBox State
+    002C6210  tlxTk_CCtl_RecipeList
+    002C6230  tlxTk_CCtl_MessageBox State
+    002C6250  tlxTk_CFrm_ShopBuy
+    002C6270  tlxTk_CFrm_ShopSell
+    002C6290  tlxTk_CCtl_ShopItemLabel
+    002C62B0  tlxTk_CCtl_ShopItemList
+    002C62D0  tlxTk_CCtl_WMapInfomation
+    002C62F0  tlxTk_CCtl_WMapLocationList
+    002C6310  tlxTk_CCtl_WMapShopList
+    002C6330  tlxTk_CCtl_WorldMap
+    002C6350  tlxTk_CCtl_ShopNameLabel
+    002C6370  tlxTk_CCtl_LocationLabel
+    002C6390  tlxTk_CFrm_WorldMap
+    002C63B0  tlxTk_CFrm_Synopsis
+    002C63D0  tlxTk_CCtl_QuickEquipment
+    002C63F0  tlxTk_CCtl_AttackElement
+    002C6410  tlxTk_CCtl_DefenseElement
+    002C6430  tlxTk_CCtl_CharacterSelect
+    002C6450  tlxTk_CCtl_BGTexture
+    002C6470  tlxTk_CCtl_ChangeInfo
+    002C6520  tlxTk_CCtl_CharInfo
+    002C6560  tlxTk_CCtl_DetailInfo
+    002C6580  tlxTk_CCtl_HelpBar
+    002C65A0  tlxTk_CCtl_HpTpMeter
+    002C65E0  tlxTk_CCtl_InformationBar
+    002C6600  tlxTk_CCtl_TechniqueLabel
+    002C6660  tlxTk_CCtl_ListCtrl
+    002C6680  tlxTk_CCtl_MessageBox
+    002C66A0  tlxTk_CCtl_MessageBox State
+    002C66C0  tlxTk_CCtl_Meter
+    002C66E0  tlxTk_CCtl_StatusParam
+    002C6700  tlxTk_CCtl_TabCtrl
+    002C6720  tlxTk_CCtl_Animation
+    002C6740  tlxTk_CCtl_CheckBox
+    002C6760  tlxTk_CCon_AbHas1Control
+    002C6780  tlxTk_CCon_AbPopUpControl
+    002C67A0  tlxTk_CCon_MessageBox
+    002C67C0  tlxTk_CFrm_STDRT
+    002C67E0  tlxTk_CCtl_TabCtrl Index
+    002C6800  tlxTk_CCtl_BookLauncher select
+    002C6850  tlxTk_CCtl_SystemInfo
+    002C6870  tlxTk_CCtl_STDLauncher
+    002C68C0  tlxTk_CCtl_TabCtrl Index
+    002C68E0  tlxTk_CCtl_CharacterList
+    002C6900  tlxTk_CCtl_TabCtrl Index
+    002C6920  tlxTk_CCtl_BookLauncher
+    002C6940  tlxTk_CCtl_BookLauncher select
+    002C6960  tlxTk_CFrm_Screen
+    002C69A0  tlxTk_CBTLBridgeRT
+    002C6A60  tlxTk_CCtl_ScreenTarget
+    002C6AB0  tlxTk_CFrm_Tactics
+    002C6AD0  tlxTk_CCtl_Tactic
+    002C6AF0  tlxTk_CCtl_TacticsInfo
+    002C6B30  tlxTk_CCtl_TacticsPos
+    002C6B80  tlxTk_CCtl_Tactics
+    002C6BA0  tlxTk_CFrm_Equipment
+    002C6BE0  tlxTk_CCtl_EquipInfo
+    002C6C00  tlxTk_CCtl_EquipList
+    002C6C20  tlxTk_CCtl_Equipment
+    002C6C40  tlxTk_CCtl_EquipParam
+    002C6C60  tlxTk_CFrm_Technique
+    002C6CB0  tlxTk_CCtl_TechniqueAuto
+    002C6CD0  tlxTk_CCtl_TechniqueCreate
+    002C6CF0  tlxTk_CCtl_TechniqueEdit State
+    002C6D10  tlxTk_CCtl_TechniqueList State
+    002C6D30  tlxTk_CCtl_TechniqueInfo
+    002C6DB0  tlxTk_CCtl_TechniqueManual
+    002C6DD0  tlxTk_CCtl_TechniqueSet SetLR
+    002C6DF0  tlxTk_CCtl_TechniqueOwner
+    002C6E10  tlxTk_CCtl_TechniqueUse
+    002C6E30  tlxTk_CCtl_TecLauncher
+    002C6E50  tlxTk_CCtl_TechniqueList
+    002C6E70  tlxTk_CCtl_TechniqueList State
+    002C6E90  tlxTk_CCtl_TechniqueSet
+    002C6EB0  tlxTk_CCtl_TechniqueSet SetLR
+    002C6ED0  tlxTk_CCtl_TecUseCharList
+    002C6EF0  tlxTk_CCtl_TecSetCharList
+    002C6F10  tlxTk_CCtl_TechniqueOperation
+    002C6F30  tlxTk_CCtl_TecShortCutPlayer
+    002C6F50  tlxTk_CCtl_TecShortCutList
+    002C6F70  tlxTk_CFrm_Inventory
+    002C6F90  tlxTk_CCtl_InventoryList
+    002C7010  tlxTk_CCtl_InventoryLabel
+    002C7030  tlxTk_CCtl_InventoryUse
+    002C7050  tlxTk_CCtl_Status
+    002C7070  tlxTk_CCtl_StatusSub
+    002C7090  tlxTk_CFrm_Status
+    002C70B0  tlxTk_CFrm_Save
+    002C70F0  tlxTk_CCtl_MessageBox State
+    002C7110  tlxTk_CCtl_SaveInfo
+    002C7130  tlxTk_CCtl_SaveParty
+    002C7150  tlxTk_CCtl_SaveList
+    002C7170  tlxTk_CCtl_SaveDataLabel
+    002C7190  tlxTk_CFrm_Configure
+    002C71B0  tlxTk_CFrm_Basket
+    002C71D0  tlxTk_CFrm_Collection
+    002C71F0  tlxTk_CCtl_BasketList
+    002C7240  tlxTk_CCtl_CollectionList
+    002C72C0  tlxTk_CCtl_CollectionTopPage
+    002C72E0  tlxTk_CCtl_CollectionTPLabel
+    002C7300  tlxTk_CCtl_CompositeList
+    002C7320  tlxTk_CCtl_TargetReport
+    002C73A0  tlxTk_CCtl_ItemIcon
+    002C73D8  bEscaped
+    002C7AF1  fld_CDebugDispFlag()
+    002C7BB0  tlxTk_CFrm_BootCheck
+    002C7BD0  tlxTk_CCtl_MessageBox State
+    002C7DD0  tlxTk_CCtl_DesignationLabel
+    002C7DF0  tlxTk_CCtl_TechniqueEdit
+    002C7E10  tlxTk_CCtl_TechniqueEdit State
+    002C7E50  tlxTk_CCtl_SynopsisContents
+    002C7E70  tlxTk_CCtl_SynopsisLabel
+    002C7E90  tlxTk_CCtl_SynopsisList
+    002C7EB0  tlxTk_CCtl_AdjustScreen
+    002C7ED0  tlxTk_CCtl_Configure
+    002C7FB0  tlxTk_CCtl_GradeShop
+    002C7FD0  tlxTk_CCtl_GradeShop MsgId
+    002C7FF0  tlxTk_CCtl_GradeLabel
+    002C8010  tlxTk_CCtl_GradeShopInfo
+    002C8030  tlxTk_CCtl_AttractLauncher
+    002C8050  tlxTk_CCtl_StatusWindow
+    002C8070  tlxTk_CCon_StatusChar
+    002D5572  IA33kA@0
+    002D58DE  PlayStation2
+

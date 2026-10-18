@@ -1,0 +1,150 @@
+Ring-cursor constant scan -- tools/ring_sites.py --imm 4078,4079,4080
+
+Section 7 of tales-blockcodec-doc gives 4078/4079 as the shortcut.  From
+2004 the constant stopped being stable -- Symphonia's PlayStation 2 port
+clears the ring with 4080 and Tales of Rebirth with 4079 -- so all three
+are asked for at once here and the immediate is printed for every hit.
+
+==============================================================
+EMOTION ENGINE
+==============================================================
+_work/files/SLPS_255.33, mips, 742912 words scanned, looking for 4078/4079/4080
+
+ADDRESS      WORD       FORM        IMM  ROUTINE
+0x00107B90   0x66100FEF daddiu     4079  0x00107B34 (+23 words)
+0x001F6CE4   0x24030FEE addiu      4078  0x001F6C98 (+19 words)
+0x00267214   0x24B30FF0 addiu      4080  0x002671CC (+18 words)
+0x0026760C   0x26040FF0 addiu      4080  0x002675CC (+16 words)
+0x00267674   0x24A50FF0 addiu      4080  0x00267658 (+7 words)
+0x0026769C   0x24840FF0 addiu      4080  0x00267658 (+17 words)
+0x00267990   0x26440FF0 addiu      4080  0x002678EC (+41 words)
+
+7 sites
+
+  0x001F6CE4  4078  THE DECODER.  Inline zero loop unrolled by eight,
+                    bounded by 4078, ring base 0x004A0AE0, mask 4095.
+                    This is the 1997-2003 shape, not 2004's.
+  0x00107B90  4079  page rounding in an allocator -- the next instructions
+                    are daddiu -1 and slti 4096.  Not the decoder.
+  0x00267214  4080  five sites, all of the form addiu rX, rBASE, 4080
+  0x0026760C        with rBASE a live struct pointer.  These are field
+  0x00267674        offsets inside one object, not a length.  Two of them
+  0x0026769C        are arguments to the same memcpy of 72 bytes.
+  0x00267990        Not the decoder.
+
+==============================================================
+I/O PROCESSOR -- all eleven modules and the Sony bundle
+==============================================================
+_work/files/IRX_DBCMAN.IRX, mips, 3913 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_DEV9.IRX, mips, 3575 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_INET.IRX, mips, 35413 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_INETCTL.IRX, mips, 6191 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_IXAUDIO.IRX, mips, 18084 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_KORGIVAG.IRX, mips, 32097 words scanned, looking for 4078/4079/4080
+
+ADDRESS      WORD       FORM        IMM  ROUTINE
+0x00006C18   0x24100FF0 addiu      4080  0x00006A10 (+130 words)
+
+1 sites
+
+_work/files/IRX_KORGUMDI.IRX, mips, 7474 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_LIBSD.IRX, mips, 7165 words scanned, looking for 4078/4079/4080
+
+ADDRESS      WORD       FORM        IMM  ROUTINE
+0x0000182C   0x24020FF0 addiu      4080  0x000016E8 (+81 words)
+
+1 sites
+
+_work/files/IRX_MCMAN.IRX, mips, 23977 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_MCSERV.IRX, mips, 1854 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_NETCNF.IRX, mips, 16477 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_PAD2_DS2U_D.IRX, mips, 2931 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_SIO2D.IRX, mips, 2822 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_SIO2MAN.IRX, mips, 1660 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_SMAP.IRX, mips, 4254 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_USBD.IRX, mips, 8746 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+_work/files/IRX_IOPRP300.IMG, mips, 68980 words scanned, looking for 4078/4079/4080
+
+no 4078 or 4079 or 4080 immediate anywhere in this image.
+by section 7 of the codec specification that is evidence the
+decoder is not present, not merely that it was not found.
+
+==============================================================
+No 4078 and no 4079 anywhere on the I/O processor.  The two 4080
+hits are SPU register values: KORGIVAG.IRX pairs 4080 with 4092 and
+masks both with 0xFFCF, and LIBSD.IRX stores 4080 and 4092 as
+halfwords into the SPU register block at 0xBF90xxxx.  Neither is a
+length and neither is near a ring.  The decoder is on the Emotion
+Engine only -- as in Symphonia 2004, and unlike Rebirth 2004 and
+Destiny 2 2002, which both put a second copy on the IOP.
+==============================================================

@@ -1,0 +1,14 @@
+LBA 16     type 1    primary
+  system id      PLAYSTATION
+  volume id      
+  volume space   1992512 sectors (4080664576 bytes)
+  block size     2048
+  path table     58 bytes at LBA 257 (L) / 259 (M)
+  publisher      NAMCO LTD.
+  application    PLAYSTATION
+  created        2005072313381900$
+  modified       0000000000000000 
+  expires        0000000000000000 
+  effective      0000000000000000 
+LBA 17     type 255  terminator
+image           4080664576 bytes / 1992512 sectors

@@ -1,0 +1,206 @@
+The decoder in SLPS_255.33, disassembled.
+tools/dismips.py.  VA 0x001F6CA0 .. 0x001F7004, 872 bytes.
+
+Structure:
+  0x001F6CA0  ring_init   -- clears 4,078 bytes, sets cursor 4078, mask 4095
+  0x001F6D80  reset       -- clears the state word
+  0x001F6D90  wrapper
+  0x001F6DF0  the state machine -- (source, destination, length), no header
+
+State lives in five gp-relative globals rather than in registers, which is
+what lets the routine be re-entered on the next buffer:
+  gp-30844  ring cursor        gp-30840  mask, 4095
+  gp-30836  saved token byte   gp-30828  control register
+  gp-30824  state, 0..3
+
+================================ ring_init ================================
+0x001F6CA0  0x000F6D20  27bdfff0  addiu    sp, sp, -16
+0x001F6CA4  0x000F6D24  ffbf0000  sd       ra, 0(sp)
+0x001F6CA8  0x000F6D28  8f838780  lw       v1, -30848(gp)
+0x001F6CAC  0x000F6D2C  10600006  beq      v1, zero, 0x001F6CC8
+0x001F6CB0  0x000F6D30  00000000  nop
+0x001F6CB4  0x000F6D34  0c05477b  jal      0x00151DEC
+0x001F6CB8  0x000F6D38  00000000  nop
+0x001F6CBC  0x000F6D3C  1000fffb  beq      zero, zero, 0x001F6CAC
+0x001F6CC0  0x000F6D40  8f838780  lw       v1, -30848(gp)
+0x001F6CC4  0x000F6D44  00000000  nop
+0x001F6CC8  0x000F6D48  24030001  addiu    v1, zero, 1
+0x001F6CCC  0x000F6D4C  af838780  sw       v1, -30848(gp)
+0x001F6CD0  0x000F6D50  3c04004a  lui      a0, 0x004A
+0x001F6CD4  0x000F6D54  24030fff  addiu    v1, zero, 4095
+0x001F6CD8  0x000F6D58  af808798  sw       zero, -30824(gp)
+0x001F6CDC  0x000F6D5C  af838788  sw       v1, -30840(gp)
+0x001F6CE0  0x000F6D60  0000302d  daddu    a2, zero, zero
+0x001F6CE4  0x000F6D64  24030fee  addiu    v1, zero, 4078
+0x001F6CE8  0x000F6D68  af808794  sw       zero, -30828(gp)
+0x001F6CEC  0x000F6D6C  af838784  sw       v1, -30844(gp)
+0x001F6CF0  0x000F6D70  24840ae0  addiu    a0, a0, 2784
+0x001F6CF4  0x000F6D74  a0800000  sb       zero, 0(a0)
+0x001F6CF8  0x000F6D78  24c60008  addiu    a2, a2, 8
+0x001F6CFC  0x000F6D7C  a0800001  sb       zero, 1(a0)
+0x001F6D00  0x000F6D80  2cc30fe6  sltiu    v1, a2, 4070
+0x001F6D04  0x000F6D84  a0800002  sb       zero, 2(a0)
+0x001F6D08  0x000F6D88  a0800003  sb       zero, 3(a0)
+0x001F6D0C  0x000F6D8C  a0800004  sb       zero, 4(a0)
+0x001F6D10  0x000F6D90  a0800005  sb       zero, 5(a0)
+0x001F6D14  0x000F6D94  a0800006  sb       zero, 6(a0)
+0x001F6D18  0x000F6D98  a0800007  sb       zero, 7(a0)
+0x001F6D1C  0x000F6D9C  1460fff5  bne      v1, zero, 0x001F6CF4
+0x001F6D20  0x000F6DA0  24840008  addiu    a0, a0, 8
+0x001F6D24  0x000F6DA4  3c05004a  lui      a1, 0x004A
+0x001F6D28  0x000F6DA8  24c30001  addiu    v1, a2, 1
+0x001F6D2C  0x000F6DAC  24a50ae0  addiu    a1, a1, 2784
+0x001F6D30  0x000F6DB0  00a32021  addu     a0, a1, v1
+0x001F6D34  0x000F6DB4  00a61821  addu     v1, a1, a2
+0x001F6D38  0x000F6DB8  a0600000  sb       zero, 0(v1)
+0x001F6D3C  0x000F6DBC  24c30002  addiu    v1, a2, 2
+
+=========================== the state machine =============================
+0x001F6DF0  0x000F6E70  8f878798  lw       a3, -30824(gp)
+0x001F6DF4  0x000F6E74  00861021  addu     v0, a0, a2
+0x001F6DF8  0x000F6E78  24030001  addiu    v1, zero, 1
+0x001F6DFC  0x000F6E7C  10e30014  beq      a3, v1, 0x001F6E50
+0x001F6E00  0x000F6E80  00a0302d  daddu    a2, a1, zero
+0x001F6E04  0x000F6E84  24030002  addiu    v1, zero, 2
+0x001F6E08  0x000F6E88  10e30021  beq      a3, v1, 0x001F6E90
+0x001F6E0C  0x000F6E8C  00000000  nop
+0x001F6E10  0x000F6E90  24030003  addiu    v1, zero, 3
+0x001F6E14  0x000F6E94  10e30027  beq      a3, v1, 0x001F6EB4
+0x001F6E18  0x000F6E98  00000000  nop
+0x001F6E1C  0x000F6E9C  0082082b  sltu     at, a0, v0
+0x001F6E20  0x000F6EA0  10200067  beq      at, zero, 0x001F6FC0
+0x001F6E24  0x000F6EA4  00000000  nop
+0x001F6E28  0x000F6EA8  8f838794  lw       v1, -30828(gp)
+0x001F6E2C  0x000F6EAC  00033842  srl      a3, v1, 1
+0x001F6E30  0x000F6EB0  30e30100  andi     v1, a3, 0x0100
+0x001F6E34  0x000F6EB4  10600064  beq      v1, zero, 0x001F6FC8
+0x001F6E38  0x000F6EB8  af878794  sw       a3, -30828(gp)
+0x001F6E3C  0x000F6EBC  0007183c  .word 0x0007183C
+0x001F6E40  0x000F6EC0  0003183f  .word 0x0003183F
+0x001F6E44  0x000F6EC4  30630001  andi     v1, v1, 0x0001
+0x001F6E48  0x000F6EC8  10600011  beq      v1, zero, 0x001F6E90
+0x001F6E4C  0x000F6ECC  00000000  nop
+0x001F6E50  0x000F6ED0  8f878784  lw       a3, -30844(gp)
+0x001F6E54  0x000F6ED4  3c03004a  lui      v1, 0x004A
+0x001F6E58  0x000F6ED8  90880000  lbu      t0, 0(a0)
+0x001F6E5C  0x000F6EDC  24630ae0  addiu    v1, v1, 2784
+0x001F6E60  0x000F6EE0  00671821  addu     v1, v1, a3
+0x001F6E64  0x000F6EE4  a0680000  sb       t0, 0(v1)
+0x001F6E68  0x000F6EE8  24840001  addiu    a0, a0, 1
+0x001F6E6C  0x000F6EEC  a0a80000  sb       t0, 0(a1)
+0x001F6E70  0x000F6EF0  8f878784  lw       a3, -30844(gp)
+0x001F6E74  0x000F6EF4  24a50001  addiu    a1, a1, 1
+0x001F6E78  0x000F6EF8  8f838788  lw       v1, -30840(gp)
+0x001F6E7C  0x000F6EFC  af808798  sw       zero, -30824(gp)
+0x001F6E80  0x000F6F00  24e70001  addiu    a3, a3, 1
+0x001F6E84  0x000F6F04  00e31824  and      v1, a3, v1
+0x001F6E88  0x000F6F08  1000ffe4  beq      zero, zero, 0x001F6E1C
+0x001F6E8C  0x000F6F0C  af838784  sw       v1, -30844(gp)
+0x001F6E90  0x000F6F10  90830000  lbu      v1, 0(a0)
+0x001F6E94  0x000F6F14  af83878c  sw       v1, -30836(gp)
+0x001F6E98  0x000F6F18  24840001  addiu    a0, a0, 1
+0x001F6E9C  0x000F6F1C  0082182b  sltu     v1, a0, v0
+0x001F6EA0  0x000F6F20  14600004  bne      v1, zero, 0x001F6EB4
+0x001F6EA4  0x000F6F24  00000000  nop
+0x001F6EA8  0x000F6F28  24020003  addiu    v0, zero, 3
+0x001F6EAC  0x000F6F2C  10000044  beq      zero, zero, 0x001F6FC0
+0x001F6EB0  0x000F6F30  af828798  sw       v0, -30824(gp)
+0x001F6EB4  0x000F6F34  90880000  lbu      t0, 0(a0)
+0x001F6EB8  0x000F6F38  8f878784  lw       a3, -30844(gp)
+0x001F6EBC  0x000F6F3C  8f89878c  lw       t1, -30836(gp)
+0x001F6EC0  0x000F6F40  8f838788  lw       v1, -30840(gp)
+0x001F6EC4  0x000F6F44  310a00f0  andi     t2, t0, 0x00F0
+0x001F6EC8  0x000F6F48  af808798  sw       zero, -30824(gp)
+0x001F6ECC  0x000F6F4C  3108000f  andi     t0, t0, 0x000F
+0x001F6ED0  0x000F6F50  000a5100  sll      t2, t2, 4
+0x001F6ED4  0x000F6F54  25080003  addiu    t0, t0, 3
+0x001F6ED8  0x000F6F58  012a4825  or       t1, t1, t2
+0x001F6EDC  0x000F6F5C  00e83821  addu     a3, a3, t0
+0x001F6EE0  0x000F6F60  24840001  addiu    a0, a0, 1
+0x001F6EE4  0x000F6F64  00e3082b  sltu     at, a3, v1
+0x001F6EE8  0x000F6F68  af89878c  sw       t1, -30836(gp)
+0x001F6EEC  0x000F6F6C  1020001a  beq      at, zero, 0x001F6F58
+0x001F6EF0  0x000F6F70  af888790  sw       t0, -30832(gp)
+0x001F6EF4  0x000F6F74  0008082b  sltu     at, zero, t0
+0x001F6EF8  0x000F6F78  1020ffc8  beq      at, zero, 0x001F6E1C
+0x001F6EFC  0x000F6F7C  0000502d  daddu    t2, zero, zero
+0x001F6F00  0x000F6F80  3c08004a  lui      t0, 0x004A
+0x001F6F04  0x000F6F84  25080ae0  addiu    t0, t0, 2784
+
+============================== the match path =============================
+0x001F6EB4  0x000F6F34  90880000  lbu      t0, 0(a0)
+0x001F6EB8  0x000F6F38  8f878784  lw       a3, -30844(gp)
+0x001F6EBC  0x000F6F3C  8f89878c  lw       t1, -30836(gp)
+0x001F6EC0  0x000F6F40  8f838788  lw       v1, -30840(gp)
+0x001F6EC4  0x000F6F44  310a00f0  andi     t2, t0, 0x00F0
+0x001F6EC8  0x000F6F48  af808798  sw       zero, -30824(gp)
+0x001F6ECC  0x000F6F4C  3108000f  andi     t0, t0, 0x000F
+0x001F6ED0  0x000F6F50  000a5100  sll      t2, t2, 4
+0x001F6ED4  0x000F6F54  25080003  addiu    t0, t0, 3
+0x001F6ED8  0x000F6F58  012a4825  or       t1, t1, t2
+0x001F6EDC  0x000F6F5C  00e83821  addu     a3, a3, t0
+0x001F6EE0  0x000F6F60  24840001  addiu    a0, a0, 1
+0x001F6EE4  0x000F6F64  00e3082b  sltu     at, a3, v1
+0x001F6EE8  0x000F6F68  af89878c  sw       t1, -30836(gp)
+0x001F6EEC  0x000F6F6C  1020001a  beq      at, zero, 0x001F6F58
+0x001F6EF0  0x000F6F70  af888790  sw       t0, -30832(gp)
+0x001F6EF4  0x000F6F74  0008082b  sltu     at, zero, t0
+0x001F6EF8  0x000F6F78  1020ffc8  beq      at, zero, 0x001F6E1C
+0x001F6EFC  0x000F6F7C  0000502d  daddu    t2, zero, zero
+0x001F6F00  0x000F6F80  3c08004a  lui      t0, 0x004A
+0x001F6F04  0x000F6F84  25080ae0  addiu    t0, t0, 2784
+0x001F6F08  0x000F6F88  8f87878c  lw       a3, -30836(gp)
+0x001F6F0C  0x000F6F8C  8f898788  lw       t1, -30840(gp)
+0x001F6F10  0x000F6F90  8f838784  lw       v1, -30844(gp)
+0x001F6F14  0x000F6F94  00ea3821  addu     a3, a3, t2
+0x001F6F18  0x000F6F98  01273824  and      a3, t1, a3
+0x001F6F1C  0x000F6F9C  254a0001  addiu    t2, t2, 1
+0x001F6F20  0x000F6FA0  01073821  addu     a3, t0, a3
+0x001F6F24  0x000F6FA4  01031821  addu     v1, t0, v1
+0x001F6F28  0x000F6FA8  90e70000  lbu      a3, 0(a3)
+0x001F6F2C  0x000F6FAC  a0670000  sb       a3, 0(v1)
+0x001F6F30  0x000F6FB0  a0a70000  sb       a3, 0(a1)
+0x001F6F34  0x000F6FB4  8f878784  lw       a3, -30844(gp)
+0x001F6F38  0x000F6FB8  24a50001  addiu    a1, a1, 1
+0x001F6F3C  0x000F6FBC  8f838790  lw       v1, -30832(gp)
+0x001F6F40  0x000F6FC0  24e70001  addiu    a3, a3, 1
+0x001F6F44  0x000F6FC4  0143182b  sltu     v1, t2, v1
+0x001F6F48  0x000F6FC8  1460ffef  bne      v1, zero, 0x001F6F08
+0x001F6F4C  0x000F6FCC  af878784  sw       a3, -30844(gp)
+0x001F6F50  0x000F6FD0  1000ffb3  beq      zero, zero, 0x001F6E20
+
+========================= the control refill and end ======================
+0x001F6FC0  0x000F7040  1000000f  beq      zero, zero, 0x001F7000
+0x001F6FC4  0x000F7044  00a61023  subu     v0, a1, a2
+0x001F6FC8  0x000F7048  90830000  lbu      v1, 0(a0)
+0x001F6FCC  0x000F704C  3467ff00  ori      a3, v1, 0xFF00
+0x001F6FD0  0x000F7050  24840001  addiu    a0, a0, 1
+0x001F6FD4  0x000F7054  0082182b  sltu     v1, a0, v0
+0x001F6FD8  0x000F7058  1460ff98  bne      v1, zero, 0x001F6E3C
+0x001F6FDC  0x000F705C  af878794  sw       a3, -30828(gp)
+0x001F6FE0  0x000F7060  30e20001  andi     v0, a3, 0x0001
+0x001F6FE4  0x000F7064  50400004  beql     v0, zero, 0x001F6FF8
+0x001F6FE8  0x000F7068  24020002  addiu    v0, zero, 2
+0x001F6FEC  0x000F706C  24020001  addiu    v0, zero, 1
+0x001F6FF0  0x000F7070  1000fff3  beq      zero, zero, 0x001F6FC0
+0x001F6FF4  0x000F7074  af828798  sw       v0, -30824(gp)
+0x001F6FF8  0x000F7078  1000fff1  beq      zero, zero, 0x001F6FC0
+0x001F6FFC  0x000F707C  af828798  sw       v0, -30824(gp)
+0x001F7000  0x000F7080  03e00008  jr       ra
+0x001F7004  0x000F7084  00000000  nop
+
+The fingerprints section 3 of the specification lists, all present:
+  ori a3, v1, 0xFF00      at 0x001F6FCC   control register refill
+  andi t2, t0, 0x00F0     at 0x001F6EC4   reference's high nibble
+  sll  t2, t2, 4          at 0x001F6ED0   ...shifted into place
+  andi t0, t0, 0x000F     at 0x001F6ECC   length nibble
+  addiu t0, t0, 3         at 0x001F6ED4   the +3
+  and  a3, t1, a3         at 0x001F6F18   ring mask, 4095
+  addiu v1, zero, 4078    at 0x001F6CE4   RING - 18
+
+And two things that are absent:
+  no +19 anywhere in the routine -- there is no run escape, so the
+     corpus's method 3 has no counterpart on this disc
+  no 256-iteration pattern loops -- ring_init returns straight after
+     the zero loop, so the synthetic (i,0x00)/(i,0xFF) dictionary that
+     every PlayStation-family build since 1997 preloads is not written

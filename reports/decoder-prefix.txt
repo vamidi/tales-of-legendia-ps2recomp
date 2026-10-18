@@ -1,0 +1,57 @@
+Longest identical byte run, any alignment, whole-file search.
+Tool: tools/prefix_scan.py   Image: SLPS_255.33 (Tales of Legendia, 2005)
+
+================================================================
+A. THE DECODER  --  872 bytes at VA 0x001F6CA0 (ring init + state machine)
+================================================================
+needle  SLPS_255.33  va 0x001F6CA0  file 0xF6D20  872 bytes
+longest run of those bytes appearing anywhere in:
+  SLPS_254.50           20 bytes  (needle+208, SLPS_254.50+0xA5C8)
+  SLPS_254.00           21 bytes  (needle+208, SLPS_254.00+0xE2E70)
+  SLPS_251.72           16 bytes  (needle+208, SLPS_251.72+0x9658)
+  SLPS_030.50           11 bytes  (needle+325, SLPS_030.50+0x6783D)
+  SLPS_011.00           11 bytes  (needle+325, SLPS_011.00+0xB28ED)
+  VENUS.ELF             20 bytes  (needle+208, VENUS.ELF+0x14B80)
+
+  SLPS_254.50 = Tales of Rebirth,   PlayStation 2, 2004
+  SLPS_254.00 = Tales of Symphonia, PlayStation 2, 2004
+  SLPS_251.72 = Tales of Destiny 2, PlayStation 2, 2002
+  SLPS_030.50 = Tales of Eternia,   PlayStation,   2000
+  SLPS_011.00 = Tales of Destiny,   PlayStation,   1997
+  VENUS.ELF   = Venus & Braves promo -- the corpus's negative control,
+                an executable that provably contains no decoder at all.
+
+================================================================
+B. THE CONTROL  --  872 bytes of Legendia's OWN C runtime, VA 0x0010B6D0
+   Same needle length, same executable, same tool, same targets.
+================================================================
+needle  SLPS_255.33  va 0x0010B6D0  file 0xB750  872 bytes
+longest run of those bytes appearing anywhere in:
+  SLPS_254.50          276 bytes  (needle+0, SLPS_254.50+0xC0E54)
+  SLPS_254.00          872 bytes  (needle+0, SLPS_254.00+0x254C0)
+  SLPS_251.72          313 bytes  (needle+559, SLPS_251.72+0x91C2B)
+  SLPS_030.50           17 bytes  (needle+839, SLPS_030.50+0x33)
+  SLPS_011.00           17 bytes  (needle+839, SLPS_011.00+0x33)
+  VENUS.ELF            313 bytes  (needle+559, VENUS.ELF+0x2931CB)
+
+================================================================
+C. HOW FAR THE RUNTIME MATCH ACTUALLY RUNS
+   The 872-byte needle saturates against Symphonia, so widen it until
+   the answer stops growing.
+================================================================
+-- needle 4096 bytes vs Symphonia PlayStation 2 2004 --
+  SLPS_254.00         2420 bytes  (needle+0, SLPS_254.00+0x254C0)
+-- needle 16384 bytes vs Symphonia PlayStation 2 2004 --
+  SLPS_254.00         2420 bytes  (needle+0, SLPS_254.00+0x254C0)
+   (65536 also returns 2420; the run is 2,420 bytes and ends there.)
+
+================================================================
+D. TOOL VALIDATION -- the corpus's own published numbers, reproduced
+   Rebirth's 932-byte C-runtime needle. tales-blockcodec-doc reports
+   276 against Symphonia 2004 and 288 against Destiny 2 2002.
+================================================================
+needle  SLPS_254.50  va 0x001BFC34  file 0xC0C34  932 bytes
+longest run of those bytes appearing anywhere in:
+  SLPS_255.33          276 bytes  (needle+544, SLPS_255.33+0xB750)
+  SLPS_254.00          276 bytes  (needle+544, SLPS_254.00+0x254C0)
+  SLPS_251.72          288 bytes  (needle+544, SLPS_251.72+0x91A04)

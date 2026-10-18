@@ -1,0 +1,90 @@
+KIND                                MEMBERS          BYTES
+Sofdec (MPEG-2 program stream)           22      890421248
+CPS (not audio -- counted elsewhere)     3380      615235560
+ADX (CRI ADPCM)                       15643      552009757
+AHX (CRI voice, TLPS-wrapped)          2739       70160470
+
+SND.AFS        ADX=486398571  AHX=70160470  CPS=25948376
+BATTLE.AFS     CPS=589287184  ADX=65611186
+MOVIE.AFS      Sofdec=890421248
+
+ADX sample rates : 24000 Hz x15578, 48000 Hz x65
+ADX channels     : 1 ch x15531, 2 ch x112
+ADX playing time : 50289.0 seconds = 13.97 hours
+
+MOVIE.AFS sequence headers
+NAME                  BYTES       SIZE      FPS       BIT RATE
+mov_01.sfd         60411904    640x320    29.97  4111200 bit/s
+mov_02.sfd         50812928    640x320    29.97  4111200 bit/s
+mov_04.sfd         33441792    640x320    29.97  4111200 bit/s
+mov_05.sfd         13221888    640x320    29.97  4111200 bit/s
+mov_06.sfd         23191552    640x320    29.97  4111200 bit/s
+mov_07.sfd         23859200    640x320    29.97  4111200 bit/s
+mov_08.sfd          8138752    640x320    29.97  4111200 bit/s
+mov_09.sfd         14147584    640x320    29.97  4111200 bit/s
+mov_10.sfd         11212800    640x320    29.97  4111200 bit/s
+mov_11.sfd         10616832    640x320    29.97  4111200 bit/s
+mov_12.sfd         13129728    640x320    29.97  4111200 bit/s
+mov_13.sfd         28860416    640x320    29.97  4111200 bit/s
+mov_14.sfd         11206656    640x320    29.97  4111200 bit/s
+mov_15.sfd        235921408    640x320    29.97  4111200 bit/s
+mov_17.sfd         23205888    640x320    29.97  4111200 bit/s
+mov_18.sfd         19800064    640x320    29.97  4111200 bit/s
+mov_19.sfd         27510784    640x320    29.97  4111200 bit/s
+mov_20.sfd         23767040    640x320    29.97  4500000 bit/s
+mov_21.sfd         15364096    640x320    29.97  4500000 bit/s
+mov_22.sfd         13101056    640x320    29.97  4500000 bit/s
+mov_23.sfd         52099072    640x320    29.97  4500000 bit/s
+mov_24.sfd        177399808    640x320    29.97  3600000 bit/s
+
+Per name prefix.  ADX members carry a header and therefore a
+playing time; AHX members do not, so they count but do not time.
+
+PREFIX           ADX     AHX          BYTES     ADX SEC  READS AS
+VO              2192       0       51123134      3776.1  battle voice
+NOR             1834     348       50085744      5423.4  Norma
+SEN             2042     464       43419416      4468.6  Senel
+WIL             1307     206       34631328      3792.5  Will
+CHL             1156     333       33263622      3376.5  Chloe
+MOVIE             24       0       32645256      1441.3  movie audio
+JAY             1148     147       30763429      3761.9  Jay
+MOS             1181     171       27779690      3247.0  Moses
+SHI              910     369       25077272      2142.4  Shirley
+GUR              424     141       14126931      1448.0  Grune
+TITLE              1       0        9506816       176.0  
+HAR              362      83        8905404      1007.8  Harriet
+KAIJ               1       0        8294400       307.1  
+MAU              204      46        7773948       847.8  
+SOL              173      39        7579740       877.9  
+SCH              114      64        6906543       610.5  Schwartz
+TALK1              1       0        5709824       211.4  
+NAGA2              1       0        4689920       173.6  
+KINPAKU04          1       0        4556800       168.7  
+FEN              141      64        4515404       414.7  
+PHEROBOMB01        8       0        4491854       166.3  
+VAC              128      19        4300577       452.5  Vaclav
+WABIINST           1       0        4096000       151.6  
+MAN              178       0        3948534       564.6  
+TKDA               1       0        3911680       144.8  
+SE                81       0        3863836       285.5  sound effect
+WAL              156      18        3845951       457.9  
+KANK1              1       0        3786752       140.1  
+KYOD               1       0        3772416       139.6  
+FUAN               1       0        3760128       139.2  
+GENS               1       0        3512320       130.0  
+ELZ              131      32        3509248       394.4  
+SUIS               1       0        3500032       129.5  
+YOBI07             1       0        3491840       129.3  
+KOSE3              1       0        3442688       127.4  
+KANK2              1       0        3362816       124.4  
+STELDEATH          1       0        3218962       119.2  
+VACL               1       0        3129344       115.9  
+SAD                1       0        3041280       112.5  
+WABIPF             1       0        2938880       108.7  
+KOMO               1       0        2910208       107.7  
+KAID               1       0        2910208       107.7  
+FIELD              1       0        2910208       107.7  
+MATI               1       0        2869248       106.1  
+MAUR               1       0        2863104       106.0  
+GENS2              1       0        2859008       105.8  
+MIM              124      

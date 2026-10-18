@@ -1,0 +1,57 @@
+FIRST     LAST      SECTORS   WHAT
+0         15        16        <system area>
+16        16        1         <volume descriptor type 1>
+17        17        1         <volume descriptor type 255>
+257       257       1         <path table, L>
+259       259       1         <path table, M>
+262       262       1         IRX/
+263       263       1         MBS/
+264       264       1         AFS/
+265       265       1         IRX/PAD2/
+315       315       1         SYSTEM.CNF
+316       1767      1452      SLPS_255.33
+1768      1775      8         IRX/DBCMAN.IRX
+1776      1782      7         IRX/DEV9.IRX
+1783      1852      70        IRX/INET.IRX
+1853      1865      13        IRX/INETCTL.IRX
+1866      2000      135       IRX/IOPRP300.IMG
+2001      2036      36        IRX/IXAUDIO.IRX
+2037      2099      63        IRX/KORGIVAG.IRX
+2100      2114      15        IRX/KORGUMDI.IRX
+2115      2128      14        IRX/LIBSD.IRX
+2129      2175      47        IRX/MCMAN.IRX
+2176      2179      4         IRX/MCSERV.IRX
+2180      2212      33        IRX/NETCNF.IRX
+2213      2218      6         IRX/PAD2/DS2U_D.IRX
+2219      2224      6         IRX/SIO2D.IRX
+2225      2228      4         IRX/SIO2MAN.IRX
+2229      2237      9         IRX/SMAP.IRX
+2238      2255      18        IRX/USBD.IRX
+2256      2256      1         AFS/PTN_INFO.BIN
+2257      2257      1         AFS/PTN_INFO.NAM
+2258      2258      1         AFS/FLIST.DIR
+2259      2269      11        MBS/BATTLE.MBS
+2270      2273      4         MBS/FIELD.MBS
+2274      2275      2         MBS/MAP.MBS
+2276      2276      1         MBS/MOVIE.MBS
+2277      2308      32        MBS/SND.MBS
+2309      2309      1         MBS/SYS_REG.MBS
+2310      2310      1         MBS/DUMMY.MBS
+2311      526566    524256    CDVD.000
+526567    526567    1         AFS/DUMMY.AFS
+526568    961345    434778    AFS/MOVIE.AFS
+961346    1348177   386832    AFS/MAP.AFS
+1348178   1365381   17204     AFS/FIELD.AFS
+1365382   1688248   322867    AFS/BATTLE.AFS
+1688249   1981233   292985    AFS/SND.AFS
+1981234   1982265   1032      AFS/SYS_REG.AFS
+
+FIRST     LAST      SECTORS   CONTENT
+18        256       239       data: 00424541303101000000000000000000
+258       258       1         data: 01000501000001000000030006010000
+260       261       2         data: 01000000010500010000030000000106
+266       314       49        data: 00010200de000000964ef00700000000
+1982266   1992511   10246     all zero
+
+image      1992512 sectors (4080664576 bytes)
+slack      10537 sectors (0.5288% of the disc)

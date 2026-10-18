@@ -1,0 +1,29 @@
+tales_block.py -- the corpus reference decoder, copied without an edit
+md5 e2dcd6b8dc717b84f67bf8a46568298c, identical to tales-blockcodec-doc
+
+The question is not whether Tales of Legendia compresses its data.  It
+does, with the same engine.  The question is whether the nine-byte block
+this decoder reads is on the disc, and it is not: this disc's envelope is
+a sixteen-byte CPS header with no method byte for the scanner to anchor
+on.  So the expected answer below is zero, and a zero is only worth
+printing next to a control that is not zero.
+
+TARGET                                                      BYTES      psx     snes
+SYS_REG.AFS member 0, as shipped (CPS stream)              822424        0        0
+the same member, after CPS decompression                  1625216        0        0
+BATTLE.AFS from its first stored member, 2 MB             2097152        0        0
+MAP.AFS, first 2 MB                                       2097152        0        0
+SYS_REG.AFS, the whole archive                            2113536        0        0
+FIELD.AFS, first 2 MB                                     2097152        0        0
+SLPS_255.33, the whole executable                         2972228        0        0
+TOTAL                                                    13824860        0        0
+
+CONTROL -- the identical call, on discs where the format is known present
+
+TARGET                                                      BYTES      psx     snes
+Tales of Rebirth 2004, FLD.BIN first 1 MB                 1048576        0        0
+Tales of Rebirth 2004, DAT.BIN first 1 MB                 1048576       15        0
+Tales of Destiny 2 2002, FILE.FPB first 2 MB              2097152       30        0
+
+The tool works.  It finds nothing on this disc because there is nothing
+of its shape on this disc -- not because it failed to run.
