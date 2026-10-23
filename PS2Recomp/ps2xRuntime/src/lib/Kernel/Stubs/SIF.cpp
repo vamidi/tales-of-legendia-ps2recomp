@@ -298,10 +298,49 @@ namespace ps2_stubs
         // is treated as a failed transfer.
         constexpr uint32_t kSifCdvdStreamStatusAddr = 0x00385260u;
         constexpr uint32_t kSifCdvdStreamStatusEnd = 0xBu;
+        // The libcdvd command semaphore (DAT_00385228).  Every cdvd call takes
+        // it with PollSema and gives it back when the command finishes.  The
+        // asynchronous stream read takes it in FUN_00101d80 and expects the
+        // completion handler to release it, but FUN_001014c0 only signals on
+        // the non-0xB path, so a successful transfer would leave it held.
+        constexpr uint32_t kSifCdvdCommandSemaAddr = 0x00385228u;
         // The IOP replies to a stream read by filling this scatter descriptor
         // ({count1, count2, dest1, dest2, data1@+0x10, data2@+0x50}); the
         // request's "resp" field points at it and the end function walks it.
         constexpr uint32_t kSifCdvdStreamRespDesc = 0x00386300u;
+
+        // CRI server wiring.  ADXT_Init (FUN_001997a8) registers one server per
+        // dedicated channel when DAT_00393234 is set, and this build has it
+        // statically initialised to 1: channel 2 slot 1 = transfer server
+        // (FUN_00198260), channel 4 slot 0 = ADXF pump (FUN_00198280), channel 5
+        // slot 0 = SJ poll (FUN_00198210).  The library's own default wiring is
+        // the composite server FUN_00198230, which chains all three, and it is
+        // only installed when DAT_00393234 is zero.
+        //
+        // The game pumps channel 5 from its load loop (FUN_0019a080 ->
+        // FUN_001b7688(5)) and never dispatches channel 4, so under the
+        // dedicated-channel layout the ADXF state machine is never advanced:
+        // the pt-info handle is never released, the handle pool runs dry and
+        // every later partition open fails with "can't open file".  Selecting
+        // the composite server for that same slot restores the single-channel
+        // behaviour the library ships with.
+        constexpr uint32_t kCriServerChannel5Slot0 = 0x0049C790u; // 0x49C6A0 + 5 * 0x30
+        constexpr uint32_t kCriSjOnlyServer = 0x00198210u;
+        constexpr uint32_t kCriCompositeServer = 0x00198230u;
+
+        void ensureCriCompositeServer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            // The slot may still be free when the first CD RPCs are served
+            // (ADXT_Init runs later), in which case registering the composite
+            // server here simply makes ADXT_Init's own registration land in the
+            // next slot - both then run, which is harmless because the composite
+            // server is the one that also pumps the ADXF.
+            const uint32_t current = runtime->Load32(rdram, ctx, kCriServerChannel5Slot0);
+            if (current == 0u || current == kCriSjOnlyServer)
+            {
+                runtime->Store32(rdram, ctx, kCriServerChannel5Slot0, kCriCompositeServer);
+            }
+        }
 
         // The libcdvd RPC clients are ordinary EE functions; hand a scratch
         // context to the matching sceCd* stub so both paths share one CD model.
@@ -802,6 +841,8 @@ namespace ps2_stubs
                                   << " send_size=0x" << sendSize
                                   << " recv_size=0x" << recvSize << std::dec << std::endl;
 
+                        ensureCriCompositeServer(rdram, ctx, runtime);
+
                         if (callPayloadAddr != 0u)
                         {
                         if (boundSid == kSifSidCdvdMain && rpcNumber == kSifCdvdRpcSearchFile &&
@@ -813,11 +854,23 @@ namespace ps2_stubs
                             setScratchGpr(scratch, 5, callPayloadAddr + kSifCdvdSearchFilePathOffset);
                             ps2_stubs::sceCdSearchFile(rdram, &scratch, runtime);
                             const uint32_t found = getRegU32(&scratch, 2);
+                            std::string searchPath;
+                            for (uint32_t i = 0u; i < 0x100u; ++i)
+                            {
+                                const char c = static_cast<char>(
+                                    rdram[callPayloadAddr + kSifCdvdSearchFilePathOffset + i]);
+                                if (c == '\0')
+                                {
+                                    break;
+                                }
+                                searchPath.push_back(c);
+                            }
                             if (recvSize >= 4u)
                             {
                                 runtime->Store32(rdram, ctx, receiveAddr, found);
                             }
-                            std::cerr << "[SIF-iop] cdvd search -> " << found << std::endl;
+                            std::cerr << "[SIF-iop] cdvd search -> " << found
+                                      << " path=\"" << searchPath << "\"" << std::endl;
                         }
                         else if (boundSid == kSifSidCdvdStream &&
                                  rpcNumber == kSifCdvdRpcStreamRead && sendSize >= 0x18u)
@@ -852,6 +905,22 @@ namespace ps2_stubs
                             }
                             runtime->Store32(rdram, ctx, kSifCdvdStreamStatusAddr,
                                              kSifCdvdStreamStatusEnd);
+
+                            // Hand the command semaphore back.  FUN_001014c0 clears
+                            // the "command pending" word (0x385234) for 0xB but does
+                            // not call iSignalSema, and nothing else releases it, so
+                            // the next cdvd call fails its PollSema and returns 0
+                            // without issuing an RPC (logged by the library as
+                            // "Ncmd fail sema cur_cmd:%d keep_cmd:%d").  That made
+                            // every partition open after the pt-info transfer fail
+                            // with "can't open" and wedged the loader.
+                            const uint32_t cdvdCommandSema =
+                                runtime->Load32(rdram, ctx, kSifCdvdCommandSemaAddr);
+                            if (cdvdCommandSema > 0u && cdvdCommandSema < kSifMaxSemaphoreId)
+                            {
+                                runtime->eeScheduler().signalSemaphore(
+                                    static_cast<int>(cdvdCommandSema), true);
+                            }
                         }
                         }
                     }
@@ -873,6 +942,30 @@ namespace ps2_stubs
                         {
                             runtime->Store32(rdram, ctx, receiveAddr + offset, kDbcManReportedVersion);
                         }
+                    }
+                }
+
+                // TEMP DIAGNOSTIC: the CRI libraries report failures by formatting a
+                // message into 0x390630 and calling the registered log handler.  The
+                // ADXF poll loop spams that buffer with ADXF_GetStat errors, hiding the
+                // original failure, so log every distinct message at RPC boundaries.
+                {
+                    static char lastMsg[0x40] = {};
+                    char msg[0x40];
+                    for (uint32_t i = 0u; i < 0x40u; ++i)
+                    {
+                        msg[i] = static_cast<char>(rdram[0x00390630u + i]);
+                    }
+                    if (std::memcmp(lastMsg, msg, sizeof(msg)) != 0)
+                    {
+                        std::memcpy(lastMsg, msg, sizeof(msg));
+                        std::cerr << "[SIF-iop] cri-msg ";
+                        for (uint32_t i = 0u; i < 0x40u; ++i)
+                        {
+                            const char c = msg[i];
+                            std::cerr << ((c >= 0x20 && c < 0x7F) ? c : '.');
+                        }
+                        std::cerr << std::endl;
                     }
                 }
 
