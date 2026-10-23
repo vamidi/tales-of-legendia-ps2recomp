@@ -404,7 +404,35 @@ void EeScheduler::run()
                           << " cmd=" << formatHexWords(m_rdram, 0x3DED98u, 8u)
                           << " h=" << formatHexWords(m_rdram, 0x3DEF40u, 32u)
                           << " pkt=" << formatHexWords(m_rdram, 0x3E0000u, 4u)
+                          << " tick=" << std::dec << m_vsyncTick
+                          << " cyc=" << m_eeCycle
                           << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+                // TEMP DIAGNOSTIC (session 16, idle-thread triage): while the guest
+                // sits in its own idle loop (0x1B6B80), show what every other thread
+                // is blocked on and which semaphores are empty.
+                if (context.pc == 0x1B6B80u)
+                {
+                    for (const auto &[threadId, item] : m_threads)
+                    {
+                        const R5900Context &threadContext = item.activeContext();
+                        std::cerr << "[DIAG-thread] id=" << threadId
+                                  << " status=" << static_cast<int>(item.status)
+                                  << " wait=" << static_cast<int>(item.wait.reason)
+                                  << " waitId=" << waitObjectId(item.wait)
+                                  << " suspend=" << item.suspendCount
+                                  << " wake=" << item.wakeupCount
+                                  << " inv=" << item.invocations.size()
+                                  << " pc=0x" << std::hex << threadContext.pc
+                                  << " ra=0x" << getRegU32(&threadContext, 31)
+                                  << " entry=0x" << item.entry << std::dec << std::endl;
+                    }
+                    for (const auto &[semId, item] : m_semaphores)
+                    {
+                        std::cerr << "[DIAG-sem] id=" << semId << " count=" << item.count
+                                  << " max=" << item.maxCount
+                                  << " waiters=" << item.waiters.size() << std::endl;
+                    }
+                }
             }
         }
         if (m_debugPublishCountdown == 0u)

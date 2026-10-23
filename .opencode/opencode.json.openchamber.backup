@@ -1,0 +1,107 @@
+{
+  "$schema": "https://opencode.ai/config.schema.json",
+  "instructions": ["./AGENTS.md"],
+  "plugin": [
+    "opencode-plugin-openspec",
+    "@plannotator/opencode@latest",
+    "superpowers@git+https://github.com/obra/superpowers.git"
+  ],
+  "mcp": {
+    
+    "codegraph": {
+      "type": "local",
+      "command": [
+        "codegraph",
+        "serve",
+        "--mcp"
+      ],
+      "enabled": true
+    },
+    "servers": {
+      "github": {
+        "type": "remote",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {
+          "Authorization": "Bearer {GITHUB_PERSONAL_ACCESS_TOKEN}"
+        },
+        "oauth": false,
+        "disabled": false
+      }
+    }
+  },
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "git *": "ask",
+      "npm *": "allow",
+      "rm *": "ask",
+      "grep *": "ask",
+      "glob *": "ask",
+      "openspec *": "allow"
+    },
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow"
+    },
+    "edit": {
+      "*": "deny",
+      "*.html": "allow",
+      "*.ts": "allow",
+      "*.json": "ask",
+      "*.md": "ask",
+      "*.toml":"ask",
+      "*.txt": "allow",
+      "*.h": "allow",
+      "*.cpp": "allow",
+      "*.bat": "allow",
+      "*.ps1": "allow",
+      "*.cmd": "allow",
+      "*.py": "allow",
+      "*.pdf": "allow"
+    }
+  },
+  "agent": {
+    "build": {
+      "permission": {
+        "bash": {
+          "*": "allow",
+          "cmake *": "allow",
+          "openspec *": "allow",
+          "codegraph *": "allow",          
+          "ps2_analyzer *": "allow",
+          "ps2_recomp *": "allow",
+          "git *": "allow",
+          "git commit *": "ask",
+          "git push *": "ask",
+          "grep *": "deny",
+          "glob *": "deny"
+        },
+        "skill": {
+          "*": "deny",
+          "ps2-recomp": "allow"
+        }
+      }
+    },
+    "plan": {
+      "permission": {
+        "bash": {
+          "*": "ask",
+          "cmake *": "allow",
+          "openspec *": "allow",
+          "codegraph *": "allow",
+          "git *": "allow",
+          "git commit *": "ask",
+          "git push *": "ask",
+          "grep *": "deny",
+          "glob *": "deny"
+        },
+        "skill": {
+          "*": "deny",
+          "ps2-recomp": "allow"
+        }
+      }
+    }
+  }
+}
