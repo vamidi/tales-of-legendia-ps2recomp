@@ -76,7 +76,14 @@ namespace ps2recomp
             case COP1_S_CVT_W:
                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
+                // RSQRT.S fd, fs, ft computes fs / sqrt(ft) - the sign of ft is ignored - and not
+                // 1 / sqrt(fs). The EE has no Inf/NaN, so a zero radicand yields +-FLT_MAX whose
+                // sign comes from fs (the DZ flag is raised, as for DIV).
+                return fmt::format("{{ const float rsq_ft = std::fabs(ctx->f[{}]); "
+                                   "if (rsq_ft == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
+                                   "ctx->f[{}] = copysignf(3.402823466e+38f, ctx->f[{}]); }} "
+                                   "else ctx->f[{}] = ctx->f[{}] / sqrtf(rsq_ft); }}",
+                                   ft, fd, fs, fd, fs);
             case COP1_S_ADDA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
             case COP1_S_SUBA:
