@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "SIF.h"
+#include "CD.h"
 #include "../Syscalls/RPC.h"
 #include "../../ps2_iop_transport.h"
 #include "runtime/ps2_address.h"
@@ -244,6 +245,64 @@ namespace ps2_stubs
         // reports (ps2xIOP/src/modules/dbcman.cpp, kReportedVersion).
         constexpr uint32_t kDbcManRpcCheckVersion = 0x80001363u;
         constexpr uint32_t kDbcManReportedVersion = 0x00000310u; // BCD "3.10"
+
+        // SIF heap service (sid 0x80000003).
+        //
+        // libsif's sceSifAllocIopHeap()/sceSifFreeIopHeap() are not local: they
+        // are RPCs to the IOP heap manager.  rpc 1 sends a u32 size and expects
+        // the u32 IOP address back (0 = failure), rpc 2 sends the address to
+        // release.  No module in the emulated IOP claims this sid, so the
+        // generic reply path used to send back 0 for every allocation and
+        // SJX_Init treated it as fatal:
+        //     E0100301: SJX_Init can't allocate IOP Heap
+        // after which it falls into the nop sled at 0x1B6B80 and never returns,
+        // which from the outside looks exactly like an idle thread.
+        constexpr uint32_t kSifSidHeap = 0x80000003u;
+        constexpr uint32_t kSifHeapRpcAlloc = 1u;
+        constexpr uint32_t kSifHeapRpcFree = 2u;
+
+        // fileio/ioman service.  The guest's stdio layer (sceStdioInit at
+        // 0x119568) submits every file operation as an *asynchronous* request:
+        // the send header starts with the semaphore the completion notification
+        // signals (+0x00 sema, +0x04 result pointer, +0x08 result size,
+        // +0x0C flags, +0x10 argument, +0x14 path / data).  On hardware the IOP
+        // performs the I/O, writes the payload to the result pointer and then
+        // posts SIFCMD cid 0x80000011 with the slot index; the EE handler at
+        // 0x119030 copies the data and calls iSignalSema(slot->sema).  The HLE
+        // service does the I/O synchronously, so it answers here instead of
+        // posting that notification - without it sceOpen waits on a semaphore
+        // that nothing ever signals.
+        constexpr uint32_t kSifSidFileIo = 0x80000001u;
+        constexpr uint32_t kSifFileIoRpcInit = 0xFFu;
+        constexpr uint32_t kSifMaxSemaphoreId = 256u;
+
+        // libcdvd RPC services.  The game's CRI ADXF library (ADXF/PS2EE 7.14)
+        // links its own copy of libcdvd and talks to cdvd.irx through these
+        // sids instead of the imported sceCd* entry points, so the calls never
+        // reach the emulated IOP.  They are served from the same host-CD model
+        // the sceCd* stubs use, which keeps the pseudo-LBN assignment shared:
+        //   0x80000597 - main channel   (CdSearchFile: rpc 0)
+        //   0x80000595 - stream channel (stream start/read: rpc 1)
+        //   0x80000592 - "N cmd" channel (CdApplyNCmd)
+        //   0x80000593 - "S cmd" channel (CdApplySCmd)
+        constexpr uint32_t kSifSidCdvdMain = 0x80000597u;
+        constexpr uint32_t kSifSidCdvdStream = 0x80000595u;
+        constexpr uint32_t kSifSidCdvdNcmd = 0x80000592u;
+        constexpr uint32_t kSifSidCdvdScmd = 0x80000593u;
+        constexpr uint32_t kSifCdvdRpcSearchFile = 0u;
+        constexpr uint32_t kSifCdvdRpcStreamRead = 1u;
+        constexpr uint32_t kSifCdvdSearchFilePathOffset = 0x24u;
+
+        // The libcdvd RPC clients are ordinary EE functions; hand a scratch
+        // context to the matching sceCd* stub so both paths share one CD model.
+        void setScratchGpr(R5900Context &scratch, int reg, uint32_t value)
+        {
+            if (reg <= 0 || reg > 31)
+            {
+                return;
+            }
+            scratch.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(value)));
+        }
 
         // SIF_SMFLG (register 4) carries the boot progress handshake flags:
         //   0x10000 - SIF DMA/hardware initialized
@@ -511,6 +570,22 @@ namespace ps2_stubs
                 const uint32_t rmode = runtime->Load32(rdram, ctx, packet + 0x30u);
                 const uint32_t server = runtime->Load32(rdram, ctx, packet + 0x34u);
 
+                // The send payload travels as the DMA sibling whose recorded
+                // size matches the call's declared send size.  Both the routed
+                // path and the HLE services below need it.
+                uint32_t callPayloadAddr = 0u;
+                if (sendSize != 0u)
+                {
+                    if (g_sifRpcPayloadPrecedingSize == sendSize)
+                    {
+                        callPayloadAddr = g_sifRpcPayloadPrecedingEeAddr;
+                    }
+                    else if (g_sifRpcPayloadFollowingSize == sendSize)
+                    {
+                        callPayloadAddr = g_sifRpcPayloadFollowingEeAddr;
+                    }
+                }
+
                 uint32_t recvBefore[4] = {0u, 0u, 0u, 0u};
                 for (uint32_t i = 0u; i < 4u; ++i)
                 {
@@ -552,18 +627,7 @@ namespace ps2_stubs
                 {
                     // Locate the payload descriptor: prefer the sibling whose
                     // recorded size matches the call's declared send size.
-                    uint32_t sendEeAddr = 0u;
-                    if (sendSize != 0u)
-                    {
-                        if (g_sifRpcPayloadPrecedingSize == sendSize)
-                        {
-                            sendEeAddr = g_sifRpcPayloadPrecedingEeAddr;
-                        }
-                        else if (g_sifRpcPayloadFollowingSize == sendSize)
-                        {
-                            sendEeAddr = g_sifRpcPayloadFollowingEeAddr;
-                        }
-                    }
+                    const uint32_t sendEeAddr = callPayloadAddr;
 
                     if (sendSize == 0u || sendEeAddr != 0u)
                     {
@@ -592,6 +656,25 @@ namespace ps2_stubs
                                   << std::dec
                                   << " handled=" << (iopHandled ? 1 : 0)
                                   << std::endl;
+
+                        // fileio: complete the request the way the IOP would.
+                        // The stdio layer posts the operation, then waits on the
+                        // semaphore in the request header for the completion
+                        // notification (see kSifSidFileIo).
+                        if (iopHandled && boundSid == kSifSidFileIo &&
+                            rpcNumber != kSifFileIoRpcInit && sendSize >= 4u)
+                        {
+                            const uint32_t completionSema =
+                                runtime->Load32(rdram, ctx, sendEeAddr);
+                            if (completionSema > 0u && completionSema < kSifMaxSemaphoreId)
+                            {
+                                const int signalled = runtime->eeScheduler().signalSemaphore(
+                                    static_cast<int>(completionSema), true);
+                                std::cerr << "[SIF-iop] fileio completion sema=" << completionSema
+                                          << " rpc=0x" << std::hex << rpcNumber << std::dec
+                                          << " ret=" << signalled << std::endl;
+                            }
+                        }
                     }
                     else
                     {
@@ -606,6 +689,37 @@ namespace ps2_stubs
 
                 if (!iopHandled)
                 {
+                    // TEMP DIAGNOSTIC: an unrouted call still has a payload
+                    // descriptor in the SIF DMA chain.  Dump it so a custom
+                    // service (0x80000597, the CDV/AFS stream loader) can be
+                    // reconstructed from the request bytes alone.
+                    if (boundSid != 0u && sendSize != 0u && sendSize <= 0x400u)
+                    {
+                        uint32_t payloadAddr = 0u;
+                        if (g_sifRpcPayloadPrecedingSize == sendSize)
+                        {
+                            payloadAddr = g_sifRpcPayloadPrecedingEeAddr;
+                        }
+                        else if (g_sifRpcPayloadFollowingSize == sendSize)
+                        {
+                            payloadAddr = g_sifRpcPayloadFollowingEeAddr;
+                        }
+
+                        std::cerr << "[SIF-iop] UNROUTED sid=0x" << std::hex << boundSid
+                                  << " rpc=0x" << rpcNumber
+                                  << " client=0x" << clientPtr
+                                  << " payload=0x" << payloadAddr
+                                  << " size=0x" << sendSize << " words:";
+                        if (payloadAddr != 0u)
+                        {
+                            for (uint32_t offset = 0u; offset + 4u <= sendSize; offset += 4u)
+                            {
+                                std::cerr << " " << runtime->Load32(rdram, ctx, payloadAddr + offset);
+                            }
+                        }
+                        std::cerr << std::dec << std::endl;
+                    }
+
                     // The IOP answers a call by placing the service's response in the
                     // caller's receive buffer, then completing the call with an RPC
                     // END whose +0x20 names the request cid: _SifRpcEndHandler
@@ -614,6 +728,104 @@ namespace ps2_stubs
                     for (uint32_t offset = 0u; offset + 4u <= recvSize; offset += 4u)
                     {
                         runtime->Store32(rdram, ctx, receiveAddr + offset, 0u);
+                    }
+
+                    // SIF heap service: answer the guest's IOP-heap requests from
+                    // the emulated IOP allocator (the same one sceSifAllocIopHeap
+                    // uses).  The request payload is the DMA descriptor that the
+                    // guest posted right before the packet, which the SIF handler
+                    // already recorded as the payload sibling.
+                    if (boundSid == kSifSidHeap)
+                    {
+                        uint32_t heapRequest = 0u;
+                        if (sendSize == 4u)
+                        {
+                            if (g_sifRpcPayloadPrecedingSize == sendSize)
+                            {
+                                heapRequest = g_sifRpcPayloadPrecedingEeAddr;
+                            }
+                            else if (g_sifRpcPayloadFollowingSize == sendSize)
+                            {
+                                heapRequest = g_sifRpcPayloadFollowingEeAddr;
+                            }
+                        }
+
+                        if (heapRequest != 0u)
+                        {
+                            const uint32_t argument = runtime->Load32(rdram, ctx, heapRequest);
+                            if (rpcNumber == kSifHeapRpcAlloc && recvSize >= 4u)
+                            {
+                                const uint32_t address = runtime->allocateIopMemory(argument, 64u);
+                                runtime->Store32(rdram, ctx, receiveAddr, address);
+                                std::cerr << "[SIF-iop] IOP heap alloc 0x" << std::hex
+                                          << argument << " -> 0x" << address << std::dec
+                                          << std::endl;
+                            }
+                            else if (rpcNumber == kSifHeapRpcFree)
+                            {
+                                const bool released = runtime->freeIopMemory(argument);
+                                std::cerr << "[SIF-iop] IOP heap free 0x" << std::hex
+                                          << argument << (released ? " ok" : " unknown")
+                                          << std::dec << std::endl;
+                            }
+                            else
+                            {
+                                std::cerr << "[SIF-iop] IOP heap rpc 0x" << std::hex << rpcNumber
+                                          << " unhandled (send=0x" << argument << ")" << std::dec
+                                          << std::endl;
+                            }
+                        }
+                    }
+
+                    // libcdvd service.  The ADXF library's own libcdvd copy
+                    // issues raw RPCs (CdSearchFile, stream start) instead of
+                    // calling the imported sceCd* entries, so answer them from
+                    // the shared host-CD model.  CdSearchFile fills the request
+                    // buffer's leading sceCdlFILE (lsn/size/name/date) and
+                    // returns 1; the stream request is {lsn, sectors, dest}.
+                    if (boundSid == kSifSidCdvdMain || boundSid == kSifSidCdvdStream ||
+                        boundSid == kSifSidCdvdNcmd || boundSid == kSifSidCdvdScmd)
+                    {
+                        std::cerr << "[SIF-iop] cdvd sid=0x" << std::hex << boundSid
+                                  << " rpc=0x" << rpcNumber
+                                  << " payload=0x" << callPayloadAddr
+                                  << " send_size=0x" << sendSize
+                                  << " recv_size=0x" << recvSize << std::dec << std::endl;
+
+                        if (callPayloadAddr != 0u)
+                        {
+                        if (boundSid == kSifSidCdvdMain && rpcNumber == kSifCdvdRpcSearchFile &&
+                            sendSize >= kSifCdvdSearchFilePathOffset)
+                        {
+                            R5900Context scratch{};
+                            scratch.pc = 0x00101a60u;
+                            setScratchGpr(scratch, 4, callPayloadAddr);
+                            setScratchGpr(scratch, 5, callPayloadAddr + kSifCdvdSearchFilePathOffset);
+                            ps2_stubs::sceCdSearchFile(rdram, &scratch, runtime);
+                            const uint32_t found = getRegU32(&scratch, 2);
+                            if (recvSize >= 4u)
+                            {
+                                runtime->Store32(rdram, ctx, receiveAddr, found);
+                            }
+                            std::cerr << "[SIF-iop] cdvd search -> " << found << std::endl;
+                        }
+                        else if (boundSid == kSifSidCdvdStream &&
+                                 rpcNumber == kSifCdvdRpcStreamRead && sendSize >= 0x18u)
+                        {
+                            const uint32_t lsn = runtime->Load32(rdram, ctx, callPayloadAddr + 0x00u);
+                            const uint32_t sectors = runtime->Load32(rdram, ctx, callPayloadAddr + 0x04u);
+                            const uint32_t dest = runtime->Load32(rdram, ctx, callPayloadAddr + 0x08u);
+                            R5900Context scratch{};
+                            scratch.pc = 0x001029a8u;
+                            setScratchGpr(scratch, 4, lsn);
+                            setScratchGpr(scratch, 5, sectors);
+                            setScratchGpr(scratch, 6, dest);
+                            ps2_stubs::sceCdRead(rdram, &scratch, runtime);
+                            std::cerr << "[SIF-iop] cdvd stream read lsn=0x" << std::hex << lsn
+                                      << " sectors=" << std::dec << sectors
+                                      << " dest=0x" << std::hex << dest << std::dec << std::endl;
+                        }
+                        }
                     }
 
                     // Version query: answer with the emulated IOP module version so

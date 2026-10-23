@@ -1,3 +1,5 @@
+#include <iostream>
+
 #include "Common.h"
 #include "Sync.h"
 #include "runtime/ee_scheduler.h"
@@ -25,7 +27,15 @@ namespace ps2_syscalls
                                  bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
-            const int result = ee.deleteSemaphore(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+            const uint32_t id = getRegU32(ctx, 4);
+            const int result = ee.deleteSemaphore(static_cast<int>(id), interruptSafe);
+            // TEMP DIAGNOSTIC (session 17): semaphore lifetime audit.  The
+            // stdio open path creates a semaphore, then waits on it forever
+            // without anyone signalling it; trace every operation so the
+            // missing signal (or the wrong id) is visible in the log.
+            std::cerr << "[DIAG-del ] id=" << id << " ret=" << result
+                      << " pc=0x" << std::hex << ctx->pc << " ra=0x" << getRegU32(ctx, 31)
+                      << std::dec << std::endl;
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -38,6 +48,9 @@ namespace ps2_syscalls
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
             const uint32_t id = getRegU32(ctx, 4);
             const int result = ee.signalSemaphore(static_cast<int>(id), interruptSafe);
+            std::cerr << "[DIAG-sig ] id=" << id << " ret=" << result
+                      << " pc=0x" << std::hex << ctx->pc << " ra=0x" << getRegU32(ctx, 31)
+                      << std::dec << (interruptSafe ? " i" : "") << std::endl;
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -92,6 +105,10 @@ namespace ps2_syscalls
                                                param->max_count,
                                                param->attr,
                                                param->option);
+        std::cerr << "[DIAG-crt ] id=" << semId << " init=" << param->init_count
+                  << " max=" << param->max_count
+                  << " pc=0x" << std::hex << ctx->pc << " ra=0x" << getRegU32(ctx, 31)
+                  << std::dec << std::endl;
         setReturnS32(ctx, semId);
     }
 
@@ -118,6 +135,8 @@ namespace ps2_syscalls
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t id = getRegU32(ctx, 4);
+        std::cerr << "[DIAG-wait] id=" << id << " pc=0x" << std::hex << ctx->pc
+                  << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
         scheduler(rdram, ctx, runtime).waitSemaphore(static_cast<int>(id));
     }
 

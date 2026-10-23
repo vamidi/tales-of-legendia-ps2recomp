@@ -106,6 +106,19 @@ namespace
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
 
+    // The runtime's own HLE scratch arena.  guestMalloc() backs the memory the
+    // kernel shims have to hand to the guest (RPC server slots, SIF packet
+    // staging, thread stacks, GS/font packets) and it must never share bytes
+    // with the guest's own allocator: a game calls SetupHeap(base, size) and
+    // then manages that range itself, so the first guestMalloc() would clobber
+    // its heap control block (Tales of Legendia: SetupHeap(0x4E9B80, -1) and
+    // the runtime zeroed 0x4E9B80 with an RPC slot, leaving the game with an
+    // "empty" allocator).  The arena therefore lives in the free space below
+    // the first loaded module (retail PS2 ELFs load at 0x00100000) and is never
+    // reported back to the guest.
+    constexpr uint32_t kGuestHeapScratchBase = 0x00010000u;
+    constexpr uint32_t kGuestHeapScratchEnd = 0x00100000u;
+
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
     constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
@@ -933,11 +946,14 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::lock_guard<std::mutex> lock(m_guestHeapMutex);
         if (!m_guestHeapConfigured)
         {
+            // Remember where the guest's own heap starts (that is what
+            // SetupHeap reports back), but keep the HLE arena in private
+            // memory: see kGuestHeapScratchBase.
             const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
             m_guestHeapSuggestedBase = std::min(suggestedHeapBase, hardLimit);
-            m_guestHeapBase = m_guestHeapSuggestedBase;
-            m_guestHeapEnd = m_guestHeapSuggestedBase;
-            m_guestHeapLimit = hardLimit;
+            m_guestHeapBase = kGuestHeapScratchBase;
+            m_guestHeapEnd = kGuestHeapScratchBase;
+            m_guestHeapLimit = kGuestHeapScratchEnd;
         }
     }
     {
@@ -1885,8 +1901,9 @@ void PS2Runtime::ensureGuestHeapInitializedLocked()
         return;
     }
 
-    const uint32_t suggested = (m_guestHeapSuggestedBase == 0u) ? kGuestHeapDefaultBase : m_guestHeapSuggestedBase;
-    resetGuestHeapLocked(suggested, clampGuestHeapLimit(0u));
+    // Never fall back to the region after the loaded image: the guest builds
+    // its own allocator there (see kGuestHeapScratchBase).
+    resetGuestHeapLocked(kGuestHeapScratchBase, kGuestHeapScratchEnd);
 }
 
 int32_t PS2Runtime::findGuestHeapBlockIndexLocked(uint32_t guestAddr) const
@@ -1971,6 +1988,11 @@ uint32_t PS2Runtime::allocateGuestBlockLocked(uint32_t size, uint32_t alignment)
                                  replacement.end());
 
         m_guestHeapEnd = std::max(m_guestHeapEnd, static_cast<uint32_t>(allocEnd));
+        // TEMP DIAGNOSTIC: this arena is configured from the guest's SetupHeap
+        // call, so it starts exactly at the guest's own heap (0x4E9B80 here).
+        // Log each block so any overlap with guest-managed memory is visible.
+        std::cerr << "[guest-heap] alloc addr=0x" << std::hex << alignedAddr
+                  << " size=0x" << allocSize << std::dec << std::endl;
         return alignedAddr;
     }
 
@@ -2015,13 +2037,24 @@ void PS2Runtime::freeGuestBlockLocked(uint32_t guestAddr)
 void PS2Runtime::configureGuestHeap(uint32_t guestBase, uint32_t guestLimit)
 {
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
-    uint32_t normalizedBase = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
-    if (normalizedBase == 0u)
+
+    // SetupHeap() tells the kernel where the guest's own heap lives; that range
+    // belongs to the guest's allocator, so only remember it (guestHeapBase()
+    // reports it back) and keep the runtime arena in its private scratch region
+    // instead of allocating from memory the guest manages itself.
+    const uint32_t normalizedBase = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
+    if (normalizedBase != 0u)
     {
-        normalizedBase = (m_guestHeapSuggestedBase != 0u) ? m_guestHeapSuggestedBase : kGuestHeapDefaultBase;
+        m_guestHeapSuggestedBase = normalizedBase;
     }
-    m_guestHeapSuggestedBase = normalizedBase;
-    resetGuestHeapLocked(normalizedBase, guestLimit);
+    (void)guestLimit;
+
+    resetGuestHeapLocked(kGuestHeapScratchBase, kGuestHeapScratchEnd);
+    // TEMP DIAGNOSTIC: correlates with [guest-heap] alloc lines.
+    std::cerr << "[guest-heap] configure guestBase=0x" << std::hex << normalizedBase
+              << " guestLimit=0x" << guestLimit
+              << " arena=[0x" << m_guestHeapBase << ",0x" << m_guestHeapLimit << ")"
+              << std::dec << std::endl;
 }
 
 uint32_t PS2Runtime::guestMalloc(uint32_t size, uint32_t alignment)
@@ -2167,8 +2200,10 @@ void PS2Runtime::guestFree(uint32_t guestAddr)
 
 uint32_t PS2Runtime::guestHeapBase() const
 {
+    // This is the base the guest is told to build its heap on (SetupHeap's
+    // return value), not the runtime's private scratch arena.
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
-    return m_guestHeapConfigured ? m_guestHeapBase : m_guestHeapSuggestedBase;
+    return m_guestHeapSuggestedBase;
 }
 
 uint32_t PS2Runtime::guestHeapEnd() const
@@ -2677,6 +2712,114 @@ void PS2Runtime::run()
                                   << " v0=0x" << static_cast<uint32_t>(_mm_extract_epi32(watchdogLive->r[2], 0));
                     }
                     std::cerr << std::dec << std::endl;
+
+                    // TEMP DIAGNOSTIC: capture the full guest state once the
+                    // stall is confirmed, so the waiting thread, the ADXF handle
+                    // and the RPC client can be inspected without another run.
+                    if (s_watchdogReports == 1 || s_watchdogReports == 4)
+                    {
+                        const auto snap = m_eeScheduler->snapshot();
+                        for (const auto &thread : snap.threads)
+                        {
+                            std::cerr << "[EE-wd:thread] id=" << thread.id
+                                      << " status=" << static_cast<int>(thread.status)
+                                      << " wait=" << static_cast<int>(thread.waitReason)
+                                      << " waitId=" << thread.waitId
+                                      << " pc=0x" << std::hex << thread.pc
+                                      << " ra=0x" << thread.ra
+                                      << " sp=0x" << thread.sp
+                                      << " entry=0x" << thread.entry
+                                      << std::dec << std::endl;
+                        }
+                        for (const auto &sem : snap.semaphores)
+                        {
+                            std::cerr << "[EE-wd:sem] id=" << sem.id
+                                      << " count=" << sem.count
+                                      << " max=" << sem.maxCount
+                                      << " waiters=" << sem.waiters << std::endl;
+                        }
+
+                        uint8_t *wdRam = m_memory.getRDRAM();
+                        auto wdPeek = [wdRam](uint32_t addr) -> uint32_t {
+                            uint32_t value = 0u;
+                            std::memcpy(&value, wdRam + ((addr & PS2_RAM_MASK) & ~3u), sizeof(value));
+                            return value;
+                        };
+
+                        const uint32_t adxfHandle = wdPeek(0x003910A8u);
+                        std::cerr << "[EE-wd:adxf] handle=0x" << std::hex << adxfHandle << " words:";
+                        for (uint32_t i = 0u; i < 12u; ++i)
+                        {
+                            std::cerr << " " << wdPeek(adxfHandle + i * 4u);
+                        }
+                        std::cerr << std::dec << std::endl;
+
+                        std::cerr << "[EE-wd:client] words:";
+                        for (uint32_t i = 0u; i < 12u; ++i)
+                        {
+                            std::cerr << " " << std::hex << wdPeek(0x003DBA80u + i * 4u);
+                        }
+                        std::cerr << std::dec << std::endl;
+
+                        // TEMP DIAGNOSTIC: libcdvd stream client (0x3863D0) and
+                        // the request state the end handler is expected to clear.
+                        std::cerr << "[EE-wd:sclient] words:";
+                        for (uint32_t i = 0u; i < 12u; ++i)
+                        {
+                            std::cerr << " " << std::hex << wdPeek(0x003863D0u + i * 4u);
+                        }
+                        std::cerr << std::dec << std::endl;
+                        std::cerr << "[EE-wd:stream] busy=" << std::hex << wdPeek(0x00385234u)
+                                  << " state=" << wdPeek(0x00385260u)
+                                  << " sema=0x" << wdPeek(0x00385228u)
+                                  << " done=0x" << wdPeek(0x003863C0u)
+                                  << " resp:";
+                        for (uint32_t i = 0u; i < 8u; ++i)
+                        {
+                            std::cerr << " " << wdPeek(0x00386300u + i * 4u);
+                        }
+                        std::cerr << " dest:";
+                        for (uint32_t i = 0u; i < 4u; ++i)
+                        {
+                            std::cerr << " " << wdPeek(0x0049A440u + i * 4u);
+                        }
+                        std::cerr << std::dec << std::endl;
+
+                        // TEMP DIAGNOSTIC: CRI stream-engine slots polled by the
+                        // ADXF server callback (FUN_001b0d00, 32 slots of 0x238).
+                        for (uint32_t slot = 0u; slot < 32u; ++slot)
+                        {
+                            const uint32_t base = 0x003A7FB0u + slot * 0x238u;
+                            const uint32_t head = wdPeek(base);
+                            if (head == 0u && wdPeek(base + 4u) == 0u)
+                            {
+                                continue;
+                            }
+                            std::cerr << "[EE-wd:sj] slot=" << std::dec << slot
+                                      << " b0=0x" << std::hex << (head & 0xFFu)
+                                      << " b1=0x" << ((head >> 8) & 0xFFu)
+                                      << " b2=0x" << ((head >> 16) & 0xFFu)
+                                      << " b3=0x" << ((head >> 24) & 0xFFu)
+                                      << " w1=0x" << wdPeek(base + 4u)
+                                      << " w20=0x" << wdPeek(base + 0x20u)
+                                      << " w24=0x" << wdPeek(base + 0x24u)
+                                      << " w28=0x" << wdPeek(base + 0x28u)
+                                      << std::dec << std::endl;
+                        }
+
+                        const uint32_t partTable = wdPeek(0x003DB368u);
+                        std::cerr << "[EE-wd:table] ptr=0x" << std::hex << partTable << std::dec
+                                  << std::endl;
+                        for (uint32_t i = 0u; i < 6u && partTable != 0u; ++i)
+                        {
+                            const uint32_t entry = partTable + i * 0x28u;
+                            std::cerr << "[EE-wd:part] i=" << std::dec << i
+                                      << " blocks=0x" << std::hex << wdPeek(entry + 0x20u)
+                                      << " handle=0x" << wdPeek(entry + 0x24u)
+                                      << " name0=0x" << wdPeek(entry)
+                                      << std::dec << std::endl;
+                        }
+                    }
                 }
             }
 

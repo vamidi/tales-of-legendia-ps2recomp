@@ -16,6 +16,52 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 17 - libcdvd RPC served: ADXF open succeeds, the CRI stream engine is the new wall
+
+**What changed.** The game's CRI ADXF library (`ADXF/PS2EE Ver.7.14`) links its *own* copy of
+libcdvd ("PsIIlibcdvd 3000" = `cdvdfsv`) and talks to `cdvd.irx` with raw SIF RPCs, so none of the
+imported `sceCd*` HLE stubs were ever reached. `SIF.cpp` now answers those RPCs from the same
+host-CD model the stubs use, so the pseudo-LBN assignment stays shared (single registry, in
+`CD.cpp`'s translation unit).
+
+Protocol facts recovered from the guest's client code (all in `0x101xxx`-`0x103xxx`):
+
+| sid | rpc | request | reply | meaning |
+|---|---|---|---|---|
+| 0x80000597 | 0 | 0x12C: sceCdlFILE(0x24) then path(0x100) | 4 | CdSearchFile |
+| 0x80000595 | 0xE | none | 4 | stream probe |
+| 0x80000595 | 1 | 0x18: {lsn, sectors, dest, flags, resp=0x386300, status=0x3863C0} | none, endfn 0x1016D0 | stream read |
+| 0x80000592 / 0x80000593 | 0 / 0x22 | 4 | 0x10 / 4 | N-cmd / S-cmd channel |
+
+`CdSearchFile` writes the *SDK* `sceCdlFILE` layout (`u32 lsn; u32 size; char name[16]; u8 date[8]`) -
+which is exactly what this client consumes: `FUN_001029A8` uses `auStack[0]` as the LSN.
+
+**Result (run 83).**
+
+- 7/7 searches resolve through `data/CD/AFS` and assign LSNs from `0x100000`: FLIST.DIR->0x100000,
+  SYS_REG.AFS->0x100002, FIELD->0x100381, SND->0x1046B6, MAP->0x13ADF5, BATTLE->0x199555.
+- The stream read delivers real data: 2 sectors of FLIST.DIR land byte-exact at `0x49A440`
+  (`"\AFS\SYS_REG.AFS"`), which the ADXF then parses to search the six archives.
+- `DAT_003910A8` (ADXF handle) is now **0x390738** (was 0 when the open failed) and partition 0
+  (SYS_REG) gets its own handle `0x1AF9580`.
+- The EE RPC END path is verified correct: the blocking call completes, and the async stream call
+  really does invoke `client->end_function(0x386300)` (end parameter confirmed at `client+0x20`), and
+  that handler's epilogue clears `0x385234` / `0x385260`.
+
+**New blocker.** `FUN_001664D0`'s loop `while (FUN_00196460(h) != 3) FUN_0019A080();` never sees
+status 3. `FUN_0019A080` -> `FUN_001B7870` -> `FUN_001B7688(5)` (CRI callback pump) -> `FUN_00198210`
+-> `FUN_001B0D00`, which walks 32 stream slots at `0x003A7FB0` (stride 0x238) and calls
+`FUN_001B1690(slot)` for any with `slot[0] == 1`. **No slot is active**, so the ADXF server has
+nothing to do and the handle sits at status 2 forever. EE threads 3/4 are `ready`, thread 5 waits.
+
+What is missing is therefore not data but the *cdvd stream server state machine* (`cdvdstm`): the
+component that keeps the ADXF stream fed and reports completion (`0x385260 == 11`, tested in
+`FUN_001014C0`).
+
+**TEMP DIAGNOSTICS still in the tree (strip once triaged):** `[SIF-iop] cdvd ...` plus the
+`UNROUTED` payload dump in `Kernel/Stubs/SIF.cpp`; the `[EE-wd:*]` stall snapshot including
+`sclient` / `stream` / `sj` in `lib/ps2_runtime.cpp`.
+
 ## Session 16 - tree reconciled: master's runner regenerated from master's recompiler
 
 The session-15 restore left the source tree on `master` (04fbd8e) but the build artifacts on disk
