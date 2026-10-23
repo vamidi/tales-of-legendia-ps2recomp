@@ -274,7 +274,6 @@ namespace ps2_stubs
         // that nothing ever signals.
         constexpr uint32_t kSifSidFileIo = 0x80000001u;
         constexpr uint32_t kSifFileIoRpcInit = 0xFFu;
-        constexpr uint32_t kSifMaxSemaphoreId = 256u;
 
         // libcdvd RPC services.  The game's CRI ADXF library (ADXF/PS2EE 7.14)
         // links its own copy of libcdvd and talks to cdvd.irx through these
@@ -283,15 +282,42 @@ namespace ps2_stubs
         // the sceCd* stubs use, which keeps the pseudo-LBN assignment shared:
         //   0x80000597 - main channel   (CdSearchFile: rpc 0)
         //   0x80000595 - stream channel (stream start/read: rpc 1)
-        //   0x80000592 - "N cmd" channel (CdApplyNCmd)
-        //   0x80000593 - "S cmd" channel (CdApplySCmd)
+        //   0x80000592 - "N cmd" channel (CdInit: rpc 0)
+        //   0x80000593 - "S cmd" channel (CdApplySCmd + the disc-check S cmds)
+        //   0x8000059a - DiskReady channel (CdDiskReady: rpc 0)
         constexpr uint32_t kSifSidCdvdMain = 0x80000597u;
         constexpr uint32_t kSifSidCdvdStream = 0x80000595u;
         constexpr uint32_t kSifSidCdvdNcmd = 0x80000592u;
         constexpr uint32_t kSifSidCdvdScmd = 0x80000593u;
+        constexpr uint32_t kSifSidCdvdDiskReady = 0x8000059Au;
         constexpr uint32_t kSifCdvdRpcSearchFile = 0u;
         constexpr uint32_t kSifCdvdRpcStreamRead = 1u;
         constexpr uint32_t kSifCdvdSearchFilePathOffset = 0x24u;
+
+        // Disc-check surface.  The boot gate (FUN_00335490) and the per-frame
+        // disc watchdog (FUN_001f8000) both poll the same triple and only
+        // advance to stage init when all three hold at once:
+        //   CdGetDiskType (S rpc 3)        == 0x14 (SCECdPS2DVD)
+        //   CdStatus      (S rpc 0xc)      == 1    (disc present; 0x20 = error, retried)
+        //   CdDiskReady   (0x8000059a rpc 0) == 2  (SCECdComplete)
+        // ps2sdk's CD_SCMD_* enum gives the rpc function numbers on the S
+        // server (0x80000593) and the game's libcdvd copy uses the same
+        // numbering (rpc 3/4/0xc/0x16/0x22 = GetDiskType/GetError/Status/
+        // Break/Mmode).  With a PS2 DVD present and the drive ready the real
+        // cdvdfsv answers exactly these numerics, so reply from the host-CD
+        // model instead of zero-filling - run105 polled rpc 0xc 1218x and
+        // wedged in the "no disc" retry because every answer was 0.
+        constexpr uint32_t kSifCdvdRpcScmdGetDiskType = 0x03u;
+        constexpr uint32_t kSifCdvdRpcScmdGetError = 0x04u;
+        constexpr uint32_t kSifCdvdRpcScmdStatus = 0x0Cu;
+        constexpr uint32_t kSifCdvdRpcScmdBreak = 0x16u;
+        constexpr uint32_t kSifCdvdRpcScmdMmode = 0x22u;
+        constexpr uint32_t kSifCdvdDiscTypePs2Dvd = 0x14u;   // SCECdPS2DVD
+        constexpr uint32_t kSifCdvdStatusDiscPresent = 1u;   // disc present, drive ready
+        constexpr uint32_t kSifCdvdComplete = 2u;            // SCECdComplete
+        constexpr uint32_t kSifCdvdNoError = 0u;             // SCECdErNO
+        constexpr uint32_t kSifCdvdCmdSuccess = 1u;          // generic sceCd* success
+        constexpr uint32_t kSifCdvdLibVersion = 0x3000u;     // libcdvd "3000"
 
         // The stream library keeps its per-transfer completion word at 0x385260
         // and reads it back in FUN_001014c0: 0xB is "normal end", anything else
@@ -715,7 +741,11 @@ namespace ps2_stubs
                         {
                             const uint32_t completionSema =
                                 runtime->Load32(rdram, ctx, sendEeAddr);
-                            if (completionSema > 0u && completionSema < kSifMaxSemaphoreId)
+                            // Semaphore ids come from the scheduler's positive-id
+                            // allocator and are unbounded, so only the zero slot
+                            // (EE_SEMA_IDLE) is invalid here; the scheduler itself
+                            // rejects ids that no longer exist.
+                            if (completionSema > 0u)
                             {
                                 const int signalled = runtime->eeScheduler().signalSemaphore(
                                     static_cast<int>(completionSema), true);
@@ -833,7 +863,8 @@ namespace ps2_stubs
                     // buffer's leading sceCdlFILE (lsn/size/name/date) and
                     // returns 1; the stream request is {lsn, sectors, dest}.
                     if (boundSid == kSifSidCdvdMain || boundSid == kSifSidCdvdStream ||
-                        boundSid == kSifSidCdvdNcmd || boundSid == kSifSidCdvdScmd)
+                        boundSid == kSifSidCdvdNcmd || boundSid == kSifSidCdvdScmd ||
+                        boundSid == kSifSidCdvdDiskReady)
                     {
                         std::cerr << "[SIF-iop] cdvd sid=0x" << std::hex << boundSid
                                   << " rpc=0x" << rpcNumber
@@ -916,12 +947,70 @@ namespace ps2_stubs
                             // with "can't open" and wedged the loader.
                             const uint32_t cdvdCommandSema =
                                 runtime->Load32(rdram, ctx, kSifCdvdCommandSemaAddr);
-                            if (cdvdCommandSema > 0u && cdvdCommandSema < kSifMaxSemaphoreId)
+                            if (cdvdCommandSema > 0u)
                             {
                                 runtime->eeScheduler().signalSemaphore(
                                     static_cast<int>(cdvdCommandSema), true);
                             }
                         }
+                        }
+
+                        // Disc-check replies.  These carry no send payload
+                        // (Status/GetDiskType/GetError) or a small scalar
+                        // (Mmode/Break), so they never reach the payload-gated
+                        // block above; the generic path zero-filled their
+                        // receive buffer, which is what wedged the disc check.
+                        if (boundSid == kSifSidCdvdScmd && recvSize >= 4u)
+                        {
+                            uint32_t answer = 0u;
+                            bool answered = true;
+                            switch (rpcNumber)
+                            {
+                            case kSifCdvdRpcScmdGetDiskType:
+                                answer = kSifCdvdDiscTypePs2Dvd;
+                                break;
+                            case kSifCdvdRpcScmdStatus:
+                                answer = kSifCdvdStatusDiscPresent;
+                                break;
+                            case kSifCdvdRpcScmdGetError:
+                                answer = kSifCdvdNoError;
+                                break;
+                            case kSifCdvdRpcScmdBreak:
+                            case kSifCdvdRpcScmdMmode:
+                                answer = kSifCdvdCmdSuccess;
+                                break;
+                            default:
+                                answered = false;
+                                break;
+                            }
+                            if (answered)
+                            {
+                                runtime->Store32(rdram, ctx, receiveAddr, answer);
+                                std::cerr << "[SIF-iop] cdvd scmd rpc=0x" << std::hex
+                                          << rpcNumber << " -> 0x" << answer << std::dec
+                                          << std::endl;
+                            }
+                        }
+                        else if (boundSid == kSifSidCdvdDiskReady && rpcNumber == 0u &&
+                                 recvSize >= 4u)
+                        {
+                            runtime->Store32(rdram, ctx, receiveAddr, kSifCdvdComplete);
+                            std::cerr << "[SIF-iop] cdvd diskready -> 0x" << std::hex
+                                      << kSifCdvdComplete << std::dec << std::endl;
+                        }
+                        else if (boundSid == kSifSidCdvdNcmd && rpcNumber == 0u &&
+                                 sendSize == 4u && recvSize >= 0x10u)
+                        {
+                            // sceCdInit: CdInitPkt {result, cdvdfsv_ver,
+                            // cdvdman_ver, verbose}.  A non-negative cdvdman
+                            // version selects the NEW DiskReady path
+                            // (0x8000059a) in the game's libcdvd, which is the
+                            // channel answered above.
+                            runtime->Store32(rdram, ctx, receiveAddr + 0x00u, kSifCdvdCmdSuccess);
+                            runtime->Store32(rdram, ctx, receiveAddr + 0x04u, kSifCdvdLibVersion);
+                            runtime->Store32(rdram, ctx, receiveAddr + 0x08u, kSifCdvdLibVersion);
+                            runtime->Store32(rdram, ctx, receiveAddr + 0x0Cu, 0u);
+                            std::cerr << "[SIF-iop] cdvd init -> ok" << std::endl;
                         }
                     }
 
