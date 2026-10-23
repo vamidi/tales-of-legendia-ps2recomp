@@ -1432,6 +1432,13 @@ int EeScheduler::addIrqHandler(bool dmac,
                                   sp,
                                   true,
                                   append ? ++tail : --head});
+    // TEMP DIAGNOSTIC (session 16, idle-thread triage): who registers what, and
+    // whether the recompiled table can actually dispatch the handler.
+    std::cerr << "[DIAG-irq-reg] id=" << id << " dmac=" << (dmac ? 1 : 0)
+              << " cause=" << cause << " handler=0x" << std::hex << handler
+              << " arg=0x" << argument << std::dec
+              << " append=" << (append ? 1 : 0)
+              << " hasFn=" << (m_runtime.hasFunction(handler) ? 1 : 0) << std::endl;
     return id;
 }
 
@@ -1481,10 +1488,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
     assertExecutor();
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
-    if (cause < 32u && (mask & (1u << cause)) == 0u)
-    {
-        return;
-    }
+    const bool masked = cause < 32u && (mask & (1u << cause)) == 0u;
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
     std::vector<EeIrqHandler> matching;
     for (const auto &[id, handler] : handlers)
@@ -1498,6 +1502,37 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
+    // TEMP DIAGNOSTIC (session 16, idle-thread triage): does a VBLANK/VBLANK-END
+    // interrupt actually reach any guest handler? Print on change, the first few,
+    // and then sparsely.
+    if (cause == 2u || cause == 3u)
+    {
+        static uint64_t s_irqSeq = 0;
+        static size_t s_lastMatching = ~size_t{0};
+        static bool s_lastMasked = false;
+        const uint64_t seq = ++s_irqSeq;
+        const bool changed = matching.size() != s_lastMatching || masked != s_lastMasked;
+        s_lastMatching = matching.size();
+        s_lastMasked = masked;
+        if (changed || seq <= 4u || (seq % 240u) == 0u)
+        {
+            std::cerr << "[DIAG-irq] seq=" << seq << " cause=" << cause
+                      << " masked=" << (masked ? 1 : 0)
+                      << " enabledMask=0x" << std::hex << mask << std::dec
+                      << " handlers=" << handlers.size()
+                      << " matching=" << matching.size();
+            for (const EeIrqHandler &handler : matching)
+            {
+                std::cerr << " [pc=0x" << std::hex << handler.handler << std::dec
+                          << " arg=0x" << std::hex << handler.argument << std::dec << "]";
+            }
+            std::cerr << std::endl;
+        }
+    }
+    if (masked)
+    {
+        return;
+    }
     for (const EeIrqHandler &handler : matching)
     {
         GuestInvocation invocation{};
@@ -2094,6 +2129,15 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        // TEMP DIAGNOSTIC (session 16, idle-thread triage): is the VBLANK event
+        // actually firing while the EE thread sits in the idle loop?
+        if (m_vsyncTick <= 3u || (m_vsyncTick % 300u) == 0u)
+        {
+            std::cerr << "[DIAG-vb] tick=" << m_vsyncTick
+                      << " thread=" << m_currentThreadId
+                      << " threads=" << m_threads.size()
+                      << " pendingInv=" << m_pendingInvocations.size() << std::endl;
+        }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {
