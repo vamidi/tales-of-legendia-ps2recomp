@@ -15,6 +15,8 @@
 *.pdb
 *.ilk
 
+ps2_log.txt
+
 # Jetbrains
 .idea
 
