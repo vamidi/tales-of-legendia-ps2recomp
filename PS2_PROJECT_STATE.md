@@ -16,6 +16,55 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 18 - stream completion status decoded: the partition loop advances, ADXF handle goes NULL
+
+**What changed.** `SIF.cpp` now reports the CRI stream completion the way the library expects it.
+The stream read (`0x80000595` rpc 1) has `recv=0`: it is a fire-and-forget call whose reply is
+delivered through the request's `resp` field (`0x00386300`). The library's end function (`0x1016D0`)
+walks an IOP-built scatter descriptor there
+(`{count1, count2, dest1, dest2, data1@+0x10, data2@+0x50}`), then jumps to `FUN_001014C0(0x385260)`,
+which treats the word at `0x385260` as the transfer result: **`0xB` = normal end**, anything else is
+an error (it signals the error semaphore `0x385228` instead of releasing the loader). The handler now
+zeroes the descriptor and stores `0xB` (`kSifCdvdStreamStatusEnd`).
+
+**Decisive structural facts (these settle the "who should pump the ADXF" question).**
+
+- The ADXF pump is `FUN_00198280` -> `FUN_00197940` (6-stage state machine, reentrancy guard at
+  `0x393208`), registered on CRI **channel 4** (`DAT_00393238`, slot 0).
+- The game's wait loop calls `FUN_0019A080` = `FUN_001B7688(5)`, i.e. **channel 5**, whose callback
+  is `FUN_00198210` -> `FUN_001B0D00` (SJ slot poll only). Channel-4 pump count after 50 s: **1**
+  (the synchronous call inside the open); channel 5: **~24 000**.
+- The all-in-one server `FUN_00198230` (which chains `FUN_00198260` + `FUN_00198280` + `FUN_00198210`)
+  is *not* installed, because `ADXT_Init` (`FUN_001997A8`) only uses it when
+  `FUN_00199780()` (`DAT_003942C4 != 0`) or `DAT_00393234` is zero. Both are nonzero, and
+  `DAT_00393234` is **statically initialised to 1** in the ELF, so the dedicated-channel layout is
+  the shipped configuration.
+- Preemption is not the answer: the game supplies a priority config (`puVar1[4] = 1`) that puts the
+  spinning main thread at priority **1** and the ADXT worker threads at 8/16/18/25. A lower-priority
+  ready thread must not preempt, so the runtime's `hasReadyAtOrAbovePriority` behaviour is faithful.
+
+**Result (runs 87-88).** The `FUN_001664D0` partition loop advances: the first handle (`0x390738`)
+is consumed, the six-entry table is built, and the guest leaves the "status 2 forever" stall.
+
+**New blocker (run 89).** The ADXF's own message buffer (`0x390630`) reports
+
+    E9040832:'adxf' is NULL.(ADXF_GetStat)
+
+`DAT_003910A8` is back to 0 and `FUN_00196460(0)` therefore polls a NULL handle every iteration.
+Only **one** stream read (FLIST.DIR, the pt-info step) is ever issued; the partition read itself is
+never requested because nothing pumps channel 4. This is exactly the stream-server workstream:
+the component that keeps feeding the ADXF and drives `handle status 2 -> 3`.
+
+**Next step.** Make the stream server issue and complete the partition reads. The two candidate
+shapes: (a) dispatch channel 4 whenever the guest dispatches channel 5 (reproducing the all-in-one
+server the library would have installed in its default configuration), or (b) answer the remaining
+libcdvd RPC surface (`0xE` probe, `0x22` S-cmd, `0x92` N-cmd) from the host CD model so the
+library's own state machine is satisfied and it re-creates the handle.
+
+**TEMP DIAGNOSTICS still in the tree (strip once triaged):** `[SIF-iop] cdvd ...` plus the
+`UNROUTED` payload dump in `Kernel/Stubs/SIF.cpp`; the `[EE-wd:*]` stall snapshot including
+`sclient` / `stream` / `sj` / `adxfmsg` and the per-thread `prio` in `lib/ps2_runtime.cpp`.
+
 ## Session 17 - libcdvd RPC served: ADXF open succeeds, the CRI stream engine is the new wall
 
 **What changed.** The game's CRI ADXF library (`ADXF/PS2EE Ver.7.14`) links its *own* copy of

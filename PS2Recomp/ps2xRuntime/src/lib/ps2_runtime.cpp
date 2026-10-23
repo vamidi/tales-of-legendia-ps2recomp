@@ -2723,6 +2723,7 @@ void PS2Runtime::run()
                         {
                             std::cerr << "[EE-wd:thread] id=" << thread.id
                                       << " status=" << static_cast<int>(thread.status)
+                                      << " prio=" << thread.currentPriority
                                       << " wait=" << static_cast<int>(thread.waitReason)
                                       << " waitId=" << thread.waitId
                                       << " pc=0x" << std::hex << thread.pc
@@ -2753,6 +2754,17 @@ void PS2Runtime::run()
                             std::cerr << " " << wdPeek(adxfHandle + i * 4u);
                         }
                         std::cerr << std::dec << std::endl;
+
+                        // TEMP DIAGNOSTIC: the ADXF library formats status/error
+                        // messages into this buffer (0x390630) and hands them to the
+                        // callback registered at 0x390628.
+                        std::cerr << "[EE-wd:adxfmsg] ";
+                        for (uint32_t i = 0u; i < 0x40u; ++i)
+                        {
+                            const char c = static_cast<char>(wdRam[(0x00390630u + i) & PS2_RAM_MASK]);
+                            std::cerr << ((c >= 0x20 && c < 0x7F) ? c : '.');
+                        }
+                        std::cerr << std::endl;
 
                         std::cerr << "[EE-wd:client] words:";
                         for (uint32_t i = 0u; i < 12u; ++i)

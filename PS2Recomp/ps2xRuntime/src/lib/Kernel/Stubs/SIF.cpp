@@ -293,6 +293,16 @@ namespace ps2_stubs
         constexpr uint32_t kSifCdvdRpcStreamRead = 1u;
         constexpr uint32_t kSifCdvdSearchFilePathOffset = 0x24u;
 
+        // The stream library keeps its per-transfer completion word at 0x385260
+        // and reads it back in FUN_001014c0: 0xB is "normal end", anything else
+        // is treated as a failed transfer.
+        constexpr uint32_t kSifCdvdStreamStatusAddr = 0x00385260u;
+        constexpr uint32_t kSifCdvdStreamStatusEnd = 0xBu;
+        // The IOP replies to a stream read by filling this scatter descriptor
+        // ({count1, count2, dest1, dest2, data1@+0x10, data2@+0x50}); the
+        // request's "resp" field points at it and the end function walks it.
+        constexpr uint32_t kSifCdvdStreamRespDesc = 0x00386300u;
+
         // The libcdvd RPC clients are ordinary EE functions; hand a scratch
         // context to the matching sceCd* stub so both paths share one CD model.
         void setScratchGpr(R5900Context &scratch, int reg, uint32_t value)
@@ -824,6 +834,24 @@ namespace ps2_stubs
                             std::cerr << "[SIF-iop] cdvd stream read lsn=0x" << std::hex << lsn
                                       << " sectors=" << std::dec << sectors
                                       << " dest=0x" << std::hex << dest << std::dec << std::endl;
+
+                            // Report a normal transfer end.  The stream library calls
+                            // its end function (0x1016d0) with the request's "resp"
+                            // pointer (0x386300) once the IOP finishes; that function
+                            // walks an IOP-built scatter descriptor there
+                            // ({count1, count2, dest1, dest2, data1@+0x10, data2@+0x50})
+                            // and then hands 0x385260 to FUN_001014c0, which treats the
+                            // word as the transfer result: 0xB means "normal end",
+                            // anything else is an error (it signals the error semaphore
+                            // instead of releasing the loader).  Leaving the descriptor
+                            // empty and storing 0xB reproduces the completion the ADXF
+                            // loader waits for(handle status 2 -> 3).
+                            for (uint32_t off = 0u; off < 0x60u; off += 4u)
+                            {
+                                runtime->Store32(rdram, ctx, kSifCdvdStreamRespDesc + off, 0u);
+                            }
+                            runtime->Store32(rdram, ctx, kSifCdvdStreamStatusAddr,
+                                             kSifCdvdStreamStatusEnd);
                         }
                         }
                     }
