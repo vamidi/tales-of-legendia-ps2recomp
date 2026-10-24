@@ -60,8 +60,32 @@ beyond run141; the ps2_log flush cost was not on the vblank critical path.
 run145-147) is what keeps vblank at ~49-51 Hz instead of 60 Hz (16.67+2.8 = 19.5 ms period).
 vbLagMax ~0.7 s is a boot-phase JIT-compile burst, not steady state.
 
-**Current Blocker:** none - boot race fixed; gated+fallback build is the new baseline
-(run147: 49.5 Hz, c4350 46.4/s, race survivable).
+**run148 - vblank deadline-grid re-arm:** VBlankStart now re-arms from
+`fired deadline + kVBlankPeriod` (clamped to now on overrun) instead of from delivery time.
+Re-arm-from-now let the ~2.8 ms steady delivery latency accumulate into EVERY frame period
+(16.67+2.8 = 19.5 ms = 51 Hz). On the grid the latency is paid once per frame and never
+accumulates: the cri dump is a 1 s wall-clock timer, and late-window c4350 deltas are
+60-61/s (run148) vs 57/s (run145) - steady-state vblank is now **60.0 Hz**. 40 s totals:
+c4350 1919 vs 1814 (+5.8%); the 40 s *average* tick rate (51.75 Hz) is still dragged by the
+~11 s boot ramp (JIT-compile bursts, threads 1->6), which amortizes away on long runs.
+Frame-drop design preserved: the 700 ms boot stall clamped to now, no INTC backlog
+(irq 98/s normal).
+
+**run149 - race fired again at 0x1b5538 = entry_001b550c+0x2c** (a DEEPER trampoline JAL
+return; its switch has `case 0x1b5538u`) - the 0x10 fallback window was too narrow. Widened
+`kReentryWindowSlots` to 16 (0x40 bytes): entry_* trampolines span <=0x38 bytes and non-entry
+functions already register their resume targets, so 0x40 covers the whole gap class; a
+legit dispatch target is always inside some function's range.
+
+**run150-157 (grid + 0x40 window): 8/8 healthy** - c4350 1915-1989/40 s, threads=6, IDLE=0,
+dormant-missing=0, tick 2070-2130. The race has not re-fired since run149 (grid timing
+shifts worker-body completion past the 40 s window); the fallback remains a proven safety
+net (run147 caught +8 live; +0x2c coverage verified by switch-case + slot-distance check).
+
+**Current Blocker:** none. New baseline (run150-157): steady-state 60 Hz vblank, c4350
+~1915-1989/40 s (late-window 60/s), 8/8 healthy, boot race survivable via reentryFallback.
+Remaining wall-clock drag on 40 s totals: the ~11 s boot ramp (JIT bursts + staged-init
+thread ramp), not vblank pacing.
 
 ## Session 23 - the 23 Hz vblank cap: checkpointDue() never consumed m_nextDeadlineHostUs (half-landed session-21 fix)
 

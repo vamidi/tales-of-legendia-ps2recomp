@@ -2244,11 +2244,23 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
-                // Re-arm from *now* rather than from the deadline that just fired:
-                // a guest that cannot keep up with real time must simply miss
-                // frames instead of collecting a backlog of vblank interrupts and
+                // Session 24: re-arm VBlankStart on the DEADLINE GRID
+                // (fired deadline + period) instead of from *now*. Re-arming
+                // from now lets the steady-state delivery latency (~2.8 ms of
+                // preemption + dispatch pipeline) accumulate into every frame
+                // period: 16.67+3.5 = 20.2 ms = 49.5 Hz. On the grid the
+                // latency is paid once per frame but never accumulates, so
+                // deliveries hold 60 Hz. The frame-drop design is preserved:
+                // if the grid point has already passed (guest overrun, boot
+                // stall), clamp to now so a guest that cannot keep up simply
+                // misses frames instead of collecting a vblank backlog and
                 // livelocking inside its own INTC handler.
                 const auto vblankBase = std::chrono::steady_clock::now();
+                auto nextVBlankStart = scheduled.hostDeadline + kVBlankPeriod;
+                if (nextVBlankStart < vblankBase)
+                {
+                    nextVBlankStart = vblankBase;
+                }
                 // TEMP DIAGNOSTIC (session 23): delivery lag against the event's
                 // own published host deadline - the number that says whether the
                 // gate never fires, or fires but delivery is still late.
@@ -2282,7 +2294,7 @@ void EeScheduler::processDueDeadlines()
                 }
                 scheduleEvent(0u, vblankBase + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(0u, vblankBase + kVBlankPeriod,
+                scheduleEvent(0u, nextVBlankStart,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

@@ -1116,13 +1116,18 @@ namespace
     // run137/run140/run144 staged-init boot race. Scan back a tight window
     // from the missed slot for the nearest registered entry: that is the
     // start of the containing function, and its switch validates ctx->pc
-    // before jumping to the re-entry label. The window covers only
-    // trampoline start+4..+0x10 re-entries, which the recompiler always
-    // emits a case for; anything further falls through to the unchanged
-    // missing-function path.
+    // before jumping to the re-entry label. The window covers whole
+    // entry_* trampolines (start+4..+0x40), whose JAL-return re-entries the
+    // recompiler always emits a case for; anything further falls through to
+    // the unchanged missing-function path.
     PS2Runtime::RecompiledFunction reentryFallback(uint32_t slot, uint32_t *entryAddress)
     {
-        constexpr uint32_t kReentryWindowSlots = 4u; // 0x10 bytes
+        // 0x40 bytes: entry_* trampolines are tiny (entry_001b550c spans
+        // 0x34, entry_001b68f8 0x38) and their JAL-return re-entries sit at
+        // start+8, +0x2c, ... - run149 missed at +0x2c with the 0x10 window.
+        // Non-entry functions already get their resume targets registered, so
+        // this fallback only ever needs to cover whole trampolines.
+        constexpr uint32_t kReentryWindowSlots = 16u; // 0x40 bytes
         for (uint32_t back = 1u; back <= kReentryWindowSlots && slot >= back; ++back)
         {
             const PS2Runtime::RecompiledFunction containing = g_ps2RecompiledFunctionTable[slot - back];
