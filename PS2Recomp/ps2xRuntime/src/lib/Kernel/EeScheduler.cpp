@@ -9,9 +9,11 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -116,8 +118,10 @@ namespace
         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
     }
 
-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
-    constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+    // VBlank is paced on wall-clock time (see the schedule sites below), so these
+    // cycle equivalents are kept only as documentation of the intended cadence.
+    [[maybe_unused]] constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
+    [[maybe_unused]] constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
 
     template <typename Map>
@@ -213,7 +217,16 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
+    // VBlank is a real-time source, not a guest-cycle source.  Tales of Legendia's
+    // vblank INTC handler (0x166490, registered by FUN_00113b50 via
+    // AddIntcHandler(2, ...)) is what wakes the CRI ADXF/Stm server *threads* that
+    // drive every stream read - see PS2_PROJECT_STATE.md session 20.  Gating it on
+    // elapsed guest cycles stalls boot completely, because the recompiled guest
+    // runs orders of magnitude slower than the 299 MHz it expects (~4.9M cycles
+    // per frame would be ~168 s of wall time at the observed throughput).
+    // deadlineCycle = 0 makes the cycle gate in processDueDeadlines() trivially
+    // satisfied so the host deadline alone paces the interrupt.
+    scheduleEvent(0u,
                   std::chrono::steady_clock::now() + kVBlankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     g_dispatchTrace = {};
@@ -235,10 +248,28 @@ void EeScheduler::run()
     assertExecutor();
     m_running.store(true, std::memory_order_release);
 
+    // TEMP PROFILER (session 20): the guest advances at only ~66k EE cyc/s
+    // (~4500x slower than real time) and each loop iteration stretches the guest
+    // by just ~180 cycles, so ~2.6 ms of host wall time is being spent somewhere
+    // other than executing recompiled code.  Attribute the wall clock between the
+    // guest call itself and event processing to find out where.
+    static const auto s_profStart = std::chrono::steady_clock::now();
+    static auto s_profLast = s_profStart;
+    static uint64_t s_profGuestUs = 0u;
+    static uint64_t s_profEventsUs = 0u;
+    static uint64_t s_profIters = 0u;
+    // Per-dispatch-PC host cost: which guest function eats the 2.2 ms average.
+    static std::map<uint32_t, std::pair<uint64_t, uint64_t>> s_profByPc;
+
     while (!m_stopRequested.load(std::memory_order_acquire))
     {
         m_transferPending = false;
+        ++s_profIters;
+        const auto s_eventsStart = std::chrono::steady_clock::now();
         processPendingEvents();
+        s_profEventsUs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - s_eventsStart).count());
         if (m_stopRequested.load(std::memory_order_acquire))
         {
             break;
@@ -407,6 +438,39 @@ void EeScheduler::run()
                           << " tick=" << std::dec << m_vsyncTick
                           << " cyc=" << m_eeCycle
                           << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+                {
+                    const auto profNow = std::chrono::steady_clock::now();
+                    const auto spanMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            profNow - s_profLast).count();
+                    std::cerr << "[EE-prof] span_ms=" << spanMs
+                              << " t_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                 profNow - s_profStart).count()
+                              << " guest_ms=" << (s_profGuestUs / 1000u)
+                              << " events_ms=" << (s_profEventsUs / 1000u)
+                              << " iters=" << s_profIters
+                              << " cyc=" << m_eeCycle << std::endl;
+                    std::vector<std::pair<uint32_t, std::pair<uint64_t, uint64_t>>> ranked(
+                        s_profByPc.begin(), s_profByPc.end());
+                    std::sort(ranked.begin(), ranked.end(),
+                              [](const auto &left, const auto &right)
+                              { return left.second.second > right.second.second; });
+                    std::cerr << "[EE-profp] top host cost:";
+                    for (size_t i = 0u; i < ranked.size() && i < 10u; ++i)
+                    {
+                        std::cerr << " 0x" << std::hex << ranked[i].first << std::dec
+                                  << " n=" << ranked[i].second.first
+                                  << " ms=" << (ranked[i].second.second / 1000u)
+                                  << " avg_us=" << (ranked[i].second.first
+                                                        ? ranked[i].second.second / ranked[i].second.first
+                                                        : 0u);
+                    }
+                    std::cerr << std::endl;
+                    s_profLast = profNow;
+                    s_profGuestUs = 0u;
+                    s_profEventsUs = 0u;
+                    s_profIters = 0u;
+                    s_profByPc.clear();
+                }
                 // TEMP DIAGNOSTIC (session 16, idle-thread triage): while the guest
                 // sits in its own idle loop (0x1B6B80), show what every other thread
                 // is blocked on and which semaphores are empty.
@@ -531,7 +595,16 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            const auto s_guestStart = std::chrono::steady_clock::now();
+            const uint32_t s_profPc = context.pc;
             function(m_rdram, &context, &m_runtime);
+            const uint64_t s_guestUs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - s_guestStart).count());
+            s_profGuestUs += s_guestUs;
+            auto &slot = s_profByPc[s_profPc];
+            slot.first += 1u;
+            slot.second += s_guestUs;
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
@@ -2081,22 +2154,18 @@ void EeScheduler::processDueDeadlines()
                 }
             }
 
-            if (pacingDeadline == std::chrono::steady_clock::time_point{})
+            if (pacingDeadline == std::chrono::steady_clock::time_point{} || now < pacingDeadline)
             {
+                // Never park the executor here.  VBlank is paced on wall-clock, so
+                // a future pacing deadline always exists now that the cycle gate is
+                // relaxed for it; blocking would throttle the guest to roughly one
+                // time slice per interrupt (measured ~6k EE cyc/s, versus ~59k when
+                // the cycle gate accidentally kept this wait short).  The guest runs
+                // flat out and the interrupt is taken at the next checkpoint once its
+                // deadline passes; blocking lives in waitForEvent(), which only runs
+                // when no guest thread is runnable.
                 updateNextDeadline();
                 return;
-            }
-
-            if (now < pacingDeadline)
-            {
-                m_eventCv.wait_until(lock, pacingDeadline, [this]()
-                                     { return !m_events.empty() ||
-                                              m_stopRequested.load(std::memory_order_acquire); });
-                if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
-                {
-                    updateNextDeadline();
-                    return;
-                }
             }
 
             const auto pacedNow = std::chrono::steady_clock::now();
@@ -2136,15 +2205,25 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
-                scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                // Re-arm from *now* rather than from the deadline that just fired:
+                // a guest that cannot keep up with real time must simply miss
+                // frames instead of collecting a backlog of vblank interrupts and
+                // livelocking inside its own INTC handler.
+                const auto vblankBase = std::chrono::steady_clock::now();
+                scheduleEvent(0u, vblankBase + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                scheduleEvent(0u, vblankBase + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
         }
+
+        // Hand control back to the guest after one batch.  VBlank is paced on
+        // wall-clock (deadlineCycle 0), so it is always "cycle-met" and
+        // pacingDeadline is therefore always set; looping here would wait for the
+        // next vblank forever and the guest would never execute a single
+        // instruction (observed as dbgPc stuck at the ELF entry point).
+        return;
     }
 }
 
@@ -2157,13 +2236,17 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
-        // TEMP DIAGNOSTIC (session 16, idle-thread triage): is the VBLANK event
-        // actually firing while the EE thread sits in the idle loop?
-        if (m_vsyncTick <= 3u || (m_vsyncTick % 300u) == 0u)
+        // TEMP DIAGNOSTIC (session 19, first-frame triage): is the VBLANK event
+        // advancing at all, and does the guest ever flip a display buffer?
+        if (m_vsyncTick <= 3u || (m_vsyncTick % 30u) == 0u)
         {
             std::cerr << "[DIAG-vb] tick=" << m_vsyncTick
                       << " thread=" << m_currentThreadId
                       << " threads=" << m_threads.size()
+                      << " flips=" << m_runtime.memory().gs().displayFlipCount[0].load(
+                                          std::memory_order_relaxed)
+                      << "," << m_runtime.memory().gs().displayFlipCount[1].load(
+                                     std::memory_order_relaxed)
                       << " pendingInv=" << m_pendingInvocations.size() << std::endl;
         }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
@@ -2308,38 +2391,83 @@ void EeScheduler::waitForEvent()
         return;
     }
 
-    uint64_t deadlineCycle = 0u;
+    // Wake on the nearest *host* deadline.  VBlank is paced purely on wall-clock
+    // (deadlineCycle 0), so ordering by cycle deadline alone is not usable here:
+    // the vblank entry always wins the cycle minimum, its host deadline is the
+    // only real bound, and the cycle-gap charge below collapses to zero - which
+    // turns this wait into a busy spin that never lets the guest run (verified:
+    // reverting to cycle-ordering pins two cores at 100% with no boot progress).
     auto hostDeadline = std::chrono::steady_clock::time_point::max();
+    uint64_t nextCycleDeadline = 0u;
     if (!m_deadlines.empty())
     {
         const auto next = std::min_element(m_deadlines.begin(), m_deadlines.end(),
                                            [](const ScheduledEvent &left, const ScheduledEvent &right)
                                            {
-                                               if (left.deadlineCycle != right.deadlineCycle)
+                                               if (left.hostDeadline != right.hostDeadline)
                                                {
-                                                   return left.deadlineCycle < right.deadlineCycle;
+                                                   return left.hostDeadline < right.hostDeadline;
                                                }
                                                return left.sequence < right.sequence;
                                            });
-        deadlineCycle = next->deadlineCycle;
         hostDeadline = next->hostDeadline;
+        const auto cycleOrMax = [](const ScheduledEvent &item)
+        { return item.deadlineCycle == 0u ? std::numeric_limits<uint64_t>::max() : item.deadlineCycle; };
+        const auto nextCycle = std::min_element(m_deadlines.begin(), m_deadlines.end(),
+                                                [&cycleOrMax](const ScheduledEvent &left,
+                                                              const ScheduledEvent &right)
+                                                {
+                                                    const uint64_t l = cycleOrMax(left);
+                                                    const uint64_t r = cycleOrMax(right);
+                                                    if (l != r)
+                                                    {
+                                                        return l < r;
+                                                    }
+                                                    return left.sequence < right.sequence;
+                                                });
+        if (nextCycle->deadlineCycle != 0u)
+        {
+            nextCycleDeadline = nextCycle->deadlineCycle;
+        }
     }
     if (hasTimerDeadline)
     {
         const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
         if (timerHostDeadline < hostDeadline)
         {
-            deadlineCycle = m_eeCycle + timerCycles;
             hostDeadline = timerHostDeadline;
+        }
+        if (nextCycleDeadline == 0u || m_eeCycle + timerCycles < nextCycleDeadline)
+        {
+            nextCycleDeadline = m_eeCycle + timerCycles;
         }
     }
 
+    const auto sleepStart = std::chrono::steady_clock::now();
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
     if (!signaled)
     {
-        const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
+        // Idle time is real time: charge the EE for the interval actually slept,
+        // capped at the nearest cycle-gated deadline so an idle wait for a
+        // wall-clock-paced event can never run the EE clock past an event that
+        // still has to be seen as cycle-due.  The cap matters: with no cap the
+        // charge inflated m_eeCycle to 1.35e9 while the guest executed nothing,
+        // racing the EE timers and regressing boot (session 20, run127).
+        const auto sleptUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - sleepStart).count();
+        uint64_t elapsed = sleptUs > 0
+                               ? microsecondsToEeCycles(static_cast<uint64_t>(sleptUs))
+                               : 0u;
+        if (nextCycleDeadline != 0u && nextCycleDeadline > m_eeCycle)
+        {
+            const uint64_t gap = nextCycleDeadline - m_eeCycle;
+            if (elapsed > gap)
+            {
+                elapsed = gap;
+            }
+        }
         lock.unlock();
         uint64_t remaining = elapsed;
         while (remaining > 0u)
@@ -2369,14 +2497,48 @@ void EeScheduler::updateNextDeadline()
     if (m_deadlines.empty())
     {
         m_nextDeadlineCycle.store(0u, std::memory_order_release);
+        m_nextDeadlineHostUs.store(0u, std::memory_order_release);
         return;
     }
+
+    // Nearest host (wall-clock) deadline, published separately so checkpointDue()
+    // can preempt on it: a wall-clock-paced event such as VBlank is never
+    // cycle-due, and without this the interrupt is only noticed when the current
+    // time slice expires, collapsing the vblank rate to the guest's throughput.
+    const auto hostUs = [](const ScheduledEvent &item)
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         item.hostDeadline.time_since_epoch())
+                                         .count());
+    };
+    const auto nextHost = std::min_element(m_deadlines.begin(), m_deadlines.end(),
+                                           [&hostUs](const ScheduledEvent &left,
+                                                     const ScheduledEvent &right)
+                                           {
+                                               const uint64_t l = hostUs(left);
+                                               const uint64_t r = hostUs(right);
+                                               if (l != r)
+                                               {
+                                                   return l < r;
+                                               }
+                                               return left.sequence < right.sequence;
+                                           });
+    m_nextDeadlineHostUs.store(hostUs(*nextHost), std::memory_order_release);
+
+    // Ignore wall-clock-only events (deadlineCycle 0, e.g. VBlank) when publishing
+    // the next *cycle* deadline: they are never cycle-due, and letting them win the
+    // min would store 0 and disable the cycle-due preemption hint for every other
+    // event (EE timer, alarms) while a vblank is pending.
+    const auto cycleOrMax = [](const ScheduledEvent &item)
+    { return item.deadlineCycle == 0u ? std::numeric_limits<uint64_t>::max() : item.deadlineCycle; };
     const auto it = std::min_element(m_deadlines.begin(), m_deadlines.end(),
-                                     [](const ScheduledEvent &left, const ScheduledEvent &right)
+                                     [&cycleOrMax](const ScheduledEvent &left, const ScheduledEvent &right)
                                      {
-                                         if (left.deadlineCycle != right.deadlineCycle)
+                                         const uint64_t l = cycleOrMax(left);
+                                         const uint64_t r = cycleOrMax(right);
+                                         if (l != r)
                                          {
-                                             return left.deadlineCycle < right.deadlineCycle;
+                                             return l < r;
                                          }
                                          return left.sequence < right.sequence;
                                      });

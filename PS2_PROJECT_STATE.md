@@ -1,4 +1,4 @@
-﻿<!-- â›” RULES â€” Re-read this section EVERY TIME you open this file. -->
+<!-- â›” RULES â€” Re-read this section EVERY TIME you open this file. -->
 <!-- These rules also appear in the SKILL.md. Redundancy is intentional. -->
 
 # â›” QUICK RULES (mandatory re-read)
@@ -15,6 +15,410 @@
 
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
+
+## Session 22 - the "no-output regression" was environmental, not code; the tree is healthy at the run126 frontier
+
+**Disproved (do not chase again):** the session-21 suspected `assetInitEntryLabel` regression. The five
+new labels (`0x1F801C`, `0x1F8168`, `0x139AD0`, `0x113650`, `0x1173C8`) are innocent, and the watch
+mechanism provably cannot corrupt guest code: `watchAssetInitEntry` (hooked in `lookupFunction`) and
+`watchAssetInitBranch` (hooked in `dispatchGuestBranch`) only count hits in `g_watchHits` and emit capped
+`[WATCH-ENTRY]`/`[WATCH]` logs - no patching, no trampolines. The labels stay in the tree.
+
+**Real cause of run128/129/130's zero-output spin:** an environment-level hang during GPU/window init,
+*before* the EE scheduler runs anything. All three broken runs stop at the identical point: stdout ends at
+raylib `raudio:.... loaded (optional)` (never reaches `DISPLAY: Device initialized successfully`), stderr
+ends at the `[GS] BIOS-like CRT seed` line (Vulkan/Granite `[INFO]` layer enumeration never starts). Two
+cores pinned at 100% = GLFW/driver spin. The same unchanged 03:08 exe produced full diagnostics on the
+next attempt (run131, 25 s, `%TEMP%\ps2_run131.err` 1.69 MB). If a future run shows err=103 B / out=507 B
+again, suspect the GPU/session/display environment first - do not bisect code.
+
+**run131 health check (unchanged 03:08 exe):** vblank INTC dispatched (`cause=2 matching=1 pc=0x166490`)
+367x in 25 s; `[DIAG-vb]` ticks advancing; IOP `modules=9 rpcServers=9`; request queue entry `[0] b2=1
++18=0x63d600` - the same frontier as run124/126. The disc-monitor `rpc=0xc -> 0` polling is the healthy
+`kSifCdvdStatusIdle=0` path, not the old retry trap.
+
+**Current blocker (unchanged, needs a user decision):** the whole tree is an MSVC **Debug** build
+(`/Zi /Ob0 /Od /RTC1 -MDd` on all ~53k runner TUs) - EE throughput ~23k cyc/s vs 299M real. Options
+(session 21): (a) per-target `/O2 /Ob2` override for the runner TUs in the existing `out/build`
+(CMakeLists edit, one ~1-3 h rebuild, incremental builds preserved, no clean); (b) full Release
+reconfigure of `out/build` (recompiles `_deps` too); (c) a new clang-cl+Ninja+Release build dir
+(skill-optimal ~1 h full build, needs the CMakeLists SSE4.1/unity surgery, leaves `out/build` intact);
+(d) stay Debug, accept 1/1000 speed. The ADXF "never reaches state 3" stall must be re-examined *after*
+throughput is fixed.
+
+## Session 21 - wall-clock vblank lands and moves boot a long way; the throughput root cause is a **Debug build**
+
+**Uncommitted so far:** `SIF.cpp` (`kSifCdvdStatusIdle = 0u`), `EeScheduler.cpp` (wall-clock vblank +
+the `[EE-prof]`/`[EE-profp]` host-time profiler), `ee_scheduler.h` (added
+`m_nextDeadlineHostUs` - **header change, mass rebuild, needs user sign-off per rule 3**),
+`ps2_runtime.cpp` (samplers + `assetInitEntryLabel` entries), this file.
+
+### The vblank fix, as landed and verified
+`VBlankStart`/`VBlankEnd` are now scheduled with `deadlineCycle = 0` and a **host** deadline, so the
+cycle gate in `processDueDeadlines()` is trivially satisfied and only the wall clock paces them;
+re-arming is from `now` (not from the fired deadline) so a slow guest misses frames instead of
+livelocking in its INTC handler. `processDueDeadlines()` **returns** instead of parking - blocking
+there throttled the guest to ~6.4k cyc/s (run123) and starved it completely before that (run121).
+Blocking belongs only in `waitForEvent()`, which runs when no guest thread is runnable.
+`updateNextDeadline()` ignores `deadlineCycle == 0` entries when publishing `m_nextDeadlineCycle`,
+otherwise the cycle-due preemption hint is disabled for EE timer/alarm events.
+
+Measured: vblank went from **tick=3 / ~0.3 Hz** (session 20) to **tick=2070 in 90 s = ~23 Hz**
+(run124), and the game's INTC handler at `0x166490` was dispatched **2027 times**
+(`[DIAG-irq] cause=2 ... matching=1 [pc=0x166490]`).
+
+### Boot progress this unlocked (run124, best run to date)
+`CriAdxt_Init` **completed** (`c3228=1`); the AFS loader `0x1664d0` ran; `sceStdIoOpen` `0x119a68`
+fired 8 times; the boot chain `0x166010` / `0x1660a0` / `0x1f84b0` / `0x1f8530` was reached; and the
+request-queue entry status advanced **2 -> 1** (it never moved in run120) with `+18 = 0x63d600`
+destination buffer set. `threads=6`. Still `flips=0`.
+
+Boot file-open path decoded: `FUN_001664d0` opens `cdrom0:\AFS\PTN_INFO.BIN;1` (`0x3c0a40`) and
+`cdrom0:\AFS\PTN_INFO.NAM;1` (`0x3c0a60`) via `FUN_00119a68` = `sceStdIoOpen` ->
+`FUN_00118ed0`/`FUN_00118628` (`sceSifCallRpc`, `0x8000000a`) -> IOP stdio; result read from IOP
+memory `0x203e1480`. **If either open returns < 0 the game spins in an empty infinite loop.**
+
+### The host-time profiler, and what it measured
+A temporary profiler in `EeScheduler::run()` attributes wall clock between the guest call, event
+processing and per-dispatch-PC cost (`[EE-prof]` / `[EE-profp]`, printed inside the 3 s heartbeat).
+Steady state (run126): `span_ms=3000`, `guest_ms=2565`, `events_ms=165`, `iters=1150`,
+`cyc=+68.5k` -> **~383 loop iterations/s, ~2.2 ms of host time per dispatched guest function,
+~180 EE cycles per dispatch, ~23k EE cyc/s**. Top cost was concentrated in two PCs:
+
+```
+0x1f801c n=38/3s avg_us=25203   0x1f8168 n=38/3s avg_us=25090   (the two loop back-edges of FUN_001f8000)
+0x117aa8 n=76 avg_us=2402   0x1187ec n=76 avg_us=2233   0x114720 n=76 avg_us=1798 (= WaitSema stub)
+```
+
+`FUN_001f8000`'s loop body is `FUN_00139ad0()` -> `FUN_00139300()` -> `FUN_00113650(0,0)`, the
+`sceGsSyncPath` DMA/VIF/GIF drain, which busy-waits on DMAC VIF1 CHCR `0x100`, GIF CHCR `0x100`,
+`VIF1_STAT & 0x1f000003`, VU0 `cfc2` status and `GIF_STAT`, each with a `0x1000000`-iteration
+timeout and reports through `FUN_001173c8` ("sceGsSyncPath: DMA Ch.1 / DMA Ch.2 / VIF1 / VU1 / GIF
+does not terminate", strings at `0x3be9b0`..).
+
+### ROOT CAUSE of the throughput wall: the whole tree is an MSVC **Debug** build
+`PS2Recomp\out\build\CMakeCache.txt`: `CMAKE_BUILD_TYPE:STRING=Debug`, and `build.ninja` gives for
+**every** TU, including all ~53,000 generated recompiled guest functions under
+`ps2xRuntime/src/runner/`:
+
+```
+FLAGS = /DWIN32 /D_WINDOWS /Zi /Ob0 /Od /RTC1 -MDd
+```
+
+No optimisation, no inlining, runtime checks on, debug CRT with checked iterators - and the
+generated code additionally emits `PS_LOG_ENTRY("...")` on every function entry under
+`#ifdef _DEBUG` (see `WaitSema_0x114720.cpp`; the two macro variants are at `ps2_log.h:187`/`:207`).
+The runner exe is 514 MB. That fully explains ~23k EE cyc/s against 299M real: **the EE throughput
+problem is a build-configuration problem, not an emulation-architecture one.** Every diagnostic
+iteration this project has run has been at roughly 1/1000th of achievable speed.
+
+`scripts\build-runtime.bat` is documented as an *incremental Debug build*, so this has been true for
+every session.
+
+### Failed experiments - do not repeat
+- **Gating `checkpointDue()` on the nearest host deadline** (to raise vblank from 23 Hz to 60 Hz):
+  regressed hard - `tick=810` (9 Hz), `threads` fell 6 -> 3, `guest_ms=3`/3000, and `m_eeCycle`
+  ballooned to **1.35e9** phantom cycles while the guest executed nothing (run127).
+- **Charging idle time as wall-clock EE cycles in `waitForEvent()`** (uncapped): same phantom-cycle
+  failure mode. The charge must stay capped at the nearest non-zero cycle-deadline gap.
+- **Reverting `waitForEvent()` to the original cycle-ordered selection/charge**: livelock. Two cores
+  pinned at 100% CPU, zero output (`err` 103 bytes, `out` 507 bytes) for the whole 60 s run
+  (run128/run129). With vblank carrying `deadlineCycle = 0` it always wins the cycle minimum, the
+  gap charge collapses to 0, and the wait returns immediately forever. The host-deadline wake
+  selection is **required** now; keep it.
+- **Why 23 Hz and not 60 Hz**: `processDueDeadlines()` runs once per loop iteration, and a *single*
+  dispatched guest call blocks ~25 ms internally, so the scheduler cannot interleave a 60 Hz
+  interrupt. Raising the vblank rate needs the per-call cost to drop, not a different gate.
+
+### Suspected regression currently in the tree - UNVERIFIED
+run128/129/130 all produce **no boot output at all** (err 103 B, out 507 B, ~2 cores burning CPU),
+whereas run126/127 produced full diagnostics. The only change between the good 02:02 build and the
+broken 02:22 build that survives in the 03:08 build is the batch of new `assetInitEntryLabel`
+entries added to `ps2_runtime.cpp`, and two of them are for addresses that are **loop back-edges,
+not function entries**: `0x1F801C` and `0x1F8168` (also added: `0x139AD0`, `0x113650`, `0x1173C8`).
+Hypothesis: the watch mechanism installs a patch/trampoline at the labelled address, so labelling a
+mid-function address corrupts guest code. **Next action: remove those five labels, rebuild, and
+confirm boot output returns.** The last known-good exe is the 02:02 build (run126); the exe on disk
+(03:08) is broken.
+
+### Ruled out this session (do not re-investigate)
+- **MMIO read cost is not the problem**: `PS2Memory::read32` -> `readIORegister`
+  (`ps2_memory.cpp:748`/`:2369`) is map lookups plus bit ops.
+- **VU flush/spin is not the problem**: `[VU-wait] vu1 returned after spins=1`, no `[VU-stall]`, no
+  `still transferring`, no `abandoning`; budgets `kTransferSpinBudget = 1<<12`, warn every `1<<10`
+  are never reached (`vu_runtime.cpp:30-33`).
+- **The `sceGsSyncPath` timeouts never fire**: zero matches for `does not terminate` / `D1_CHCR` /
+  `sceGsSyncPath` in any run log. The drain loops exit normally.
+- **No host sleep exists in any HLE/MMIO path**: `sleep_for|wait_for|wait_until|Sleep(|
+  WaitForSingleObject` matches only the two `m_eventCv` waits in `EeScheduler.cpp`. So the 25 ms per
+  dispatch is host *execution*, not blocking.
+- **Not a busy-wait spin**: total `m_eeCycle` (66.9M over 84 s, ~2100 such calls) is far too small
+  for a 16.7M-iteration loop to have run.
+- `DIAG-del` in `Sync.cpp:36` is **`DeleteSema`**, not `DelayThread`. The stdio RPC handshake is
+  CreateSema -> CallRpc -> WaitSema -> signal -> DeleteSema (run124: 1974 creates / 2049 waits /
+  3815 signals / 1958 deletes).
+- `catchUpIopForSid` (`SIF.cpp:578`) is guarded by `g_sifIopCatchUpTriedSids` - once per sid - so it
+  cannot be a repeated cost.
+
+### Current Blocker
+Two, in order:
+1. **Restore a working build** (remove the five new watch labels; confirm boot output returns).
+2. **Decide the build configuration.** Reconfiguring `out/build` to `Release` re-runs CMake and
+   recompiles everything including `_deps`; a cheaper option that respects the "never clean
+   `out/build`" rule is to override optimisation flags on the generated-code target only
+   (replace `/Od /Ob0 /RTC1` with `/O2 /Ob2` for the runner TUs, keeping `-MDd`). Either way it is
+   a large rebuild (~53k TUs) and a build-configuration change, so it needs a user decision.
+
+The ADXF stall itself is narrowed but not solved: `adxf[0]` state `2`, its STM state `2` (never
+reaches `3`), `adxf[0x1c] = 0x10a` (266 sectors requested) but the completed counter still `0`;
+`0x19f298` (per-stm exec) 264x, `0x19ef58` (transfer step) 66x vs `0x196db0` (kicks) 69x, CDV pump
+`0x1ad2e8` 322x. Handler `0x1f8530` polls `FUN_00197668`/`FUN_00197638` forever waiting for state 3.
+Given the Debug-build finding, re-examine this *after* throughput is fixed - the "never reached"
+conclusion was drawn at 1/1000th speed.
+
+### Evidence
+`%TEMP%\ps2_run126.err` (best diagnostics + full `[EE-prof]`/`[EE-profp]` profile),
+`%TEMP%\ps2_run124.err` (best boot progress: `cri:` gate values, `[EE-adxf]`/`stm=` dump, request
+status 2->1, heartbeat `cyc=` trace), `%TEMP%\ps2_run127.err` (checkpointDue host-gate regression),
+`%TEMP%\ps2_run128.err` / `ps2_run129.err` / `ps2_run130.err` (no-output spin regression),
+`%TEMP%\ps2_run123.err` / `122.err` / `121.err` (blocking-executor failures),
+`%TEMP%\ps2_run120.err` (pre-vblank-fix baseline).
+
+## Session 20 - `Status=0` un-traps the main loop; the wall is the CRI server pump never being driven
+
+**Uncommitted so far:** `SIF.cpp` `kSifCdvdStatusIdle = 0u` (the `Status=0` directive), plus the
+session's temporary diagnostics (`[EE-seq]`, `[EE-req]`, `[EE-job]`, `[EE-cdv]`, `[EE-adxf]`,
+`[EE-tasks]`, `[EE-hits]`, `[DIAG-vb]`) and the added `assetInitEntryLabel` entries.
+
+### The `Status=0` change and what it proved
+`Status` must return **0**, not 1 (confirmed against `FUN_001f8000`: with `Status==1` it enters a
+do-loop; with 0 it branches straight to `0x1f8060 -> 0x1f8130` and returns). run111 confirmed the
+main thread is no longer trapped there - the main loop now cycles through the game's cooperative
+task pumps normally. "Disc present and ready" is carried by `DiskReady=2` + `GetDiskType=0x14`,
+not by `Status`. With `Status=0` the game never calls `GetDiskType` (S rpc 3) or `DiskReady`
+(`0x8000059a`) at all, and the boot gate `FUN_00335490` is never reached - the real boot path is
+the game's request-queue / ADXF pipeline. run108's heavy drawing (72k VIF1 ops) was the game's
+"insert disc" error screen, a red herring.
+
+### The stalled request, fully decoded
+The boot launcher `FUN_00166010` creates task entry `0x1660a0` and spins
+`do { FUN_00151ff0(0); FUN_00151ff0(1); FUN_001392d0(); } while (flag == 0)`. The request table is
+`0x4A72C0` (64 x 0x2c), queue head/tail/count at `0x3DB390`/`0x3DB394`/`0x3DB3A0`
+(gp = `0x3e2bf0`, gp-0x7860/-0x785c/-0x7850). The consumer task `FUN_001f84b0` dispatched the
+type-0 handler `FUN_001f8530`, which set `entry+2 = 1` and is parked in a poll loop.
+
+The stalled object is CRI **ADXF handle slot 0** (`0x390738`, 16 slots x 0x44, found via
+`FUN_00196870`), state byte `+1 = 2`:
+
+```
+adxf[0] st=2  +4 stm=0x39EE48  +8 sj=0x3B1E98  +c size=0x10a  +14 pos=0
+          +1c len=0x10a  +24 buf=0x63D600  +28 byteoff=0x85000  +38 path=0x1AF9590
+```
+Path `CDV:\AFS\SYS_REG.AFS`, 266 (0x10a) sectors = 0x85000 bytes into host buffer `0x63D600`.
+Its **stm handle** is pool slot 16 (`0x39E848 + 16*0x60 = 0x39EE48`, 40 slots x 0x60) with
+`stm[0]=1, stm[1]=2 (state), stm[2]=0, stm[8]=0x499DC0 (VFS file handle), stm[0x14]=0x10a,
+stm[0x1c]=0x85000, stm[0x30]=0x10a, stm[0x40]=0x85000 (file size), stm[0x47]=1, stm[0x49]=1,
+stm[0x50]=0x1AF9590`. Its **stream job** is `0x3B1E98` with vtable `0x3B1960` (statically
+initialised in the ELF: `+0x18=0x1b52f8, +0x1c=0x1b55c0, +0x20=0x1b5468, +0x24=0x1b52a8`).
+
+The gate bytes matter: `FUN_0019f298` (per-stm exec) reaches
+`if (stm[1] == 2 && stm[0x49] == 1) FUN_0019ef58(stm)` - **both conditions hold**, so the transfer
+step *would* run. And inside `FUN_0019ef58` the real branch (checked in the disassembly at
+`0x19f144`-`0x19f164`, the decompiler's C is inverted) is
+`if ((stm[0x40] - sj->vtable[0x24](sj,0)) < stm[0x1c]) -> issue the read`. With
+`sj->vtable[0x24]` = `FUN_001b52a8(sj,0)` = `sj[0x10]` = `0x85000`, that is
+`0 < 0x85000` = true, so it **would** call `FUN_001a9878` (VFS seek) + `FUN_001a98e0` (VFS read).
+Nothing is wrong with the request or the guards - the code is simply never reached.
+
+### The decisive measurement: the CRI chain stops dead while the scheduler stays healthy
+`[EE-hits]` (uncapped per-address hit counts, sampled every 2s) traced across run119:
+
+```
+sample   0x19f468  0x197940  0x196db0  0x19ef58  0x1973a8  0x197668  0x1ad2e8  0x151e90  0x15231c  0x151ff0
+3             120       77       35       34       77       37      155        -        -        -
+6             250      158       68       66      160       74      320        -        -        -
+9             252      159       69       66      161      140      322       68      201      135
+15            252      159       69       66      161      320      322      248      741      495
+30            252      159       69       66      161      767      322      695     2082     1389
+LAST          252      159       69       66      161     1002      322      930     2787     1859
+```
+The game's own task scheduler is **healthy and running continuously** (task pump `0x151ff0`
+135->1859, dispatch loop `0x151e90` 68->930, yield `0x15231c` 201->2787) and the handler's poll
+loop keeps polling (`0x197668` 140->1002). But the whole CRI server chain - pump `0x197940`,
+Stm exec `0x19f468`, ADXF exec `0x1973a8`, transfer step `0x19ef58`, CDV device pump `0x1ad2e8` -
+**freezes permanently at ~18s and never runs again.** This is *not* slowness: the scheduler
+counters climb steadily in the same samples.
+
+### Why: nothing in the live task set can pump the CRI server
+`[EE-tasks]` (pool = 64 slots x 0x210 at `0x407160`, list head `gp-0x7a5c = 0x3DA194`, next at
+`+0x1fc`, state `+0x1f0`, group `+0x1f1`, entry fn `+0x1b0`, resume target `+0x1b4`) shows exactly
+**three** live tasks, all group 0, 61 slots free:
+
+```
+t[0] rsm=0x1f8168  disc-monitor task (sceCdStatus spin)
+t[1] rsm=0x1f86b8  cdvd request handler poll loop (FUN_001f8530)
+t[2] rsm=0x1660ec  boot task (waits for request entry+2 to clear)
+```
+There is **no CRI-pumping task**. And the CRI server pump `FUN_00197940` (which runs Stm exec ->
+VFS exec -> dvCi exec -> VFS exec -> Stm exec -> ADXF exec, under the `DAT_00393208` phase guard)
+has exactly **five call sites, all CRI-internal API entry points**: `0x19ec90` (create),
+`0x19ed08` (destroy), `0x19eec8` (service), `0x198280`, `0x1979e0`. The public wrapper
+`FUN_001979e0` has **zero xrefs** and neither it nor `0x197940` appears as a scalar constant
+anywhere, so the game never calls a periodic `CriAdxf_Exec` by address.
+
+The handler's poll loop pumps nothing: `FUN_00197638` and `FUN_00197668` are pure getters
+(`return *(u32*)(adxf+0x20)` and `return *(u8*)(adxf+1)`). The kick `FUN_00196db0` calls the only
+servicing call `FUN_0019eec8` **only when `stm[1] != 1`**, and `FUN_0019eec8` is a *blocking* loop
+`do { do { FUN_00197940(); } while (stm[1] != 1); } while (stm[0x24] != 0)` that drains the
+**previous** transfer - it never pumps the one just started. The boot launcher's third call
+`FUN_001392d0()` is just `FUN_001135b8(0)`, a non-blocking poll of GS `CSR` bit 13
+(`(REG_GS_CSR >> 13) & 1`) - not a pump.
+
+So: the 69 earlier stream reads completed because they were driven *synchronously inside* the CRI
+open/close API calls made during the seven AFS opens (`FUN_001a9448` VFS open = 7 hits), where the
+pump runs inline. Job 16 is the first ADXF **stream** read whose completion must arrive later, and
+in the executed control flow nothing ever calls a CRI API again - so `stm[1]` never reaches 3,
+`adxf[1]` never reaches 3 (only `FUN_001972e0` copies it), `FUN_001f8da0` (complete + dequeue)
+never fires, the boot flag never sets, and the launcher spins forever.
+
+### Ruled out this session
+- CDV device pump is healthy: `0x3A6A90` is a **re-entrancy guard** (`FUN_001b79f8` = test-and-set
+  returning `*p != 1` then setting `*p = 1`), not a "work pending" flag; `FUN_001ad2e8` iterates
+  the 40-slot x 0x48 request array at `0x3A6B00` and `FUN_001ad220` polls the request handle at
+  `slot+0x1c`. `[EE-cdv]` shows the header flag 0 and no slot holding a request - the read simply
+  never reached the device.
+- `FUN_001ad780` is a seek/position setter (whence in `param_3`, clamps to `+8`), not a read.
+- `FUN_001ad478` (dvCiGetFile) = 0 hits, never called.
+- The CRI error buffer `0x390630` is empty - no ADXF argument errors.
+- Not EE throughput: the scheduler counters climb steadily while the CRI counters are frozen.
+
+### RESOLVED - what drives the CRI server: the **vblank interrupt**, waking CRI server *threads*
+The CRI ADXF/Stm server is not driven by a cooperative task at all. It runs as **guest EE kernel
+threads** (`CreateThread`/`SleepThread`/`WakeupThread`), which is why `[EE-tasks]` (the game's own
+cooperative task pool) showed only three tasks and no CRI task. The driver chain is:
+
+```
+vblank INTC (cause 2)
+  -> FUN_00113b50 registered it:  AddIntcHandler(2, 0x166490, -1) + EnableIntc(2)
+  -> handler 0x166490 = FUN_0019a068 -> FUN_00199f40
+       DAT_0039323c++                                  (vblank counter)
+       if (0 < DAT_003942c4)                           (CRI subsystems registered for vblank)
+           FUN_00199148(DAT_00394360)                  (up to three CRI worker TIDs)
+           FUN_00199148(DAT_00394364)
+           if (FUN_001996a0() == 1 && DAT_0039430c != 1) FUN_00199148(DAT_0039435c)
+       FUN_001b77f8()                                  (service CRI group 0 - empty here)
+       (*DAT_003943e0)(arg)                            (game's per-vblank callback)
+  -> FUN_00199148(tid): iReferThreadStatus(tid,st); if (st==4 || st==0xc) FUN_001155a8(tid)
+  -> FUN_001155a8(tid): if tid == self -> sema-signal ring, else _iWakeupThread()
+```
+
+So **each vblank wakes the sleeping CRI server threads**, and those threads run the ADXF/Stm/VFS/dvCi
+servers (which is where the 68 group-5 services and the 159 pump calls came from). `0x166490` was
+mislabelled in our watch list as "thread entry -> FUN_0019a068(0)" - it is the **vblank handler**.
+`[DIAG-irq]` proves the registration and dispatch work:
+`seq=26 cause=2 handlers=3 matching=1 [pc=0x166490 arg=0x77]`.
+
+### THE ACTUAL BLOCKER: vblank is delivered ~200x too rarely
+`[DIAG-irq]` reached only **seq=29 in a 90-second run** and `[DIAG-vb]` shows **tick=3** - vblank is
+firing at roughly **0.3 Hz instead of 60 Hz**, because `VBlankStart` is rescheduled on an
+**EE-cycle deadline** (~4.9M EE cycles per tick) while EE throughput has collapsed to ~29k EE-cyc/s
+(vs ~220k early in boot, vs 299M real). One frame therefore costs ~168 s of wall time.
+
+Consequence: the CRI server threads are woken ~0.3 times/s, so the ADXF state byte advances almost
+not at all, the boot request never completes, `FUN_00166010` never returns, and there is no flip and
+no first frame. The earlier "the CRI chain froze" observation is a *symptom* of this, not a separate
+defect - the counters are frozen because the interrupt that drives them is nearly never delivered.
+
+This **inverts the session's earlier priority**: the cdvd/ADXF/`Status` work is finished and correct
+(the stalled request's guards all pass and its read would be issued the moment the transfer step
+runs). The remaining blocker is the vsync cadence / EE throughput.
+
+### Current Blocker
+`EeScheduler` gates `VBlankStart` on elapsed **guest EE cycles** rather than wall-clock, so at the
+current ~29k EE-cyc/s throughput the game's vblank-driven CRI driver runs at ~0.3 Hz. Two coupled
+fixes, in order of value:
+1. Deliver vblank on a **wall-clock** cadence (60 Hz) so the INTC handler runs and wakes the CRI
+   server threads at the rate the game's design assumes.
+2. Recover EE throughput (it fell from ~220k to ~29k cyc/s during boot) so the woken CRI threads can
+   actually finish a transfer inside one frame budget.
+
+### Ruled out (do not re-investigate)
+- `0x1664c0` (registered via `FUN_00199790` -> `FUN_001b7618`, slot `0x49C870/0x49C874`) is CRI's
+  **error/assert handler**, invoked only by `FUN_001b7160` with a formatted message. It never ran
+  because no CRI error occurred - benign, not a missing driver.
+- CRI service-group registry (`0x49C6A0`, 8 groups x 6 x {fnptr,arg}, dispatcher `FUN_001b7688`,
+  per-group counters at `0x3B7330`, busy flags at `0x3B7350`): `CriAdxt_Init` (`FUN_001982a0`,
+  `"ADXT PS2EE Ver 9.19 Build Apr 12"`) registers the pump into **group 4** (`g4: 198280/0`),
+  begin into group 2, and `0x198210` into group 5. Observed `svc: 2 0 1 0 1 68 1 0` - group 4
+  serviced once (init), group 5 68 times. Group 0 (the vblank-serviced group) is empty in this
+  title, so `FUN_001b77f8()` in the vblank handler is a no-op; the real work is the thread wakeups.
+- The game's own periodic CRI service `FUN_0019a080` (-> `FUN_001b7870` -> group 5) is called only
+  from explicit blocking load loops (`FUN_001664d0`, `FUN_00195f68`:
+  `while (FUN_00196460(job) != 3) FUN_0019a080();`) and from the main thread's **post-boot** frame
+  loop in `FUN_00165ad0`. It is *not* called during the `FUN_00166010()` boot window, and the boot
+  request handler `FUN_001f8530` has no service loop (only `FUN_0015231c()` yields) - by design,
+  because the CRI threads are meant to be woken by vblank.
+- `FUN_001660a0` (the boot task) is `enqueue request; while (pending) FUN_0015231c(); *flag = 1;`.
+
+### Evidence
+`%TEMP%\ps2_run119.err` (task pool + pump/yield counters + the frozen-CRI table above),
+`%TEMP%\ps2_run118.err` (full 0x60-byte stm handle + exec-chain counts),
+`%TEMP%\ps2_run117.err` (ADXF handle pool decode), `%TEMP%\ps2_run116.err` (CDV device slot dump +
+kick-chain counts), `%TEMP%\ps2_run115.err` (first uncapped `[EE-hits]`),
+`%TEMP%\ps2_run114.err`, `%TEMP%\ps2_run113.err`, `%TEMP%\ps2_run111.err`.
+
+## Session 19 - disc-check RPCs answered: boot gate passes, all seven AFS archives open and stream
+
+**Commit `df8334b`** (`runtime(sif): answer the libcdvd disc-check RPCs so the boot gate passes`).
+
+**The blocker that run105 ended on, solved.** run105 polled `sid=0x80000593 rpc=0xc` 1218x and got a
+zero-filled reply -> endless "no disc" retry. Root cause: the game's *own* libcdvd copy (Sony 3.0,
+"PsIIlibcdvd 3000") gates boot on a three-value disc check, sampled over raw RPCs, and our generic
+SIF path zero-filled every cdvd reply except SearchFile/stream-read.
+
+**The gate (decoded from disassembly, two independent call sites).** The boot gate `FUN_00335490`
+and the per-frame disc-change watchdog `FUN_001f8000` both require, *simultaneously*:
+
+| value | rpc | server | wrapper | ps2sdk name |
+|---|---|---|---|---|
+| `0x14` | 3 | `0x80000593` | `FUN_00102c58` | `CD_SCMD_GETDISKTYPE` -> `SCECdPS2DVD` |
+| `1` | 0xc | `0x80000593` | `FUN_00102db0` | `CD_SCMD_STATUS` (retry while `0x20`=`SCECdStatEmg`) |
+| `2` | 0 | `0x8000059a` | `FUN_00102570` | `sceCdDiskReady` -> `SCECdComplete` |
+
+ps2sdk's `CD_SCMD_*` enum (`ee/rpc/cdvd/src/scmd.c`) confirms the rpc numbers on the S server
+(`3/4/0xc/0x16/0x22` = GetDiskType/GetError/Status/Break/Mmode) and the game uses the *same*
+numbering. ps2tek's SID table (`09-ps2tek.md` L4610+) gives `0x8000059A = CDVD Disk Ready`,
+`0x80000592 = CDVD Init`, `0x80000003 = IOP heap (FILEIO)`. The game's libcdvd error strings at
+`0x3BD658+` ("OLD/NEW DiskReady Call", "status called", "Libcdvd bind err S cmd") confirm the
+wrappers. `FUN_00102db0`'s decompiler output was misleading (`return 0`); the disassembly at
+`0x102e20-0x102e54` shows it really returns `*(0x20386400)` (the result buffer, uncached alias).
+
+**What `SIF.cpp` now answers** (cdvd branch, outside the payload-gated block since these carry
+`send_size==0`): S rpc 3 -> `0x14`, rpc 0xc -> `1`, rpc 4 -> `0`, rpc 0x16/0x22 -> `1`;
+`0x8000059a` rpc 0 -> `2`; `0x80000592` rpc 0 -> `CdInitPkt{1, 0x3000, 0x3000, 0}` (a non-negative
+cdvdman version selects the NEW DiskReady path `0x8000059a`, which is the one answered).
+
+**Result (run107, 110s direct run, `%TEMP%\ps2_run107.err`).** rpc-0xc polling gone (0 vs 1218).
+The game now opens **all seven AFS archives** (`\AFS\FLIST.DIR, SYS_REG, FIELD, SND, MAP, BATTLE,
+MOVIE` - all `found=1`) and issues **69 stream reads, all distinct LSNs** spanning `0x100000..0x1E83F7`
+(monotonic-ish, no re-read loop), plus 25 `0x80000595 rpc=0xe` N-commands (1:1 with each stream read,
+zero-reply is fine). **Zero CRI errors** (`cri-msg=0`, `can't open=0`). The ADXF pipeline is fully
+unblocked.
+
+**New frontier = EE throughput, not correctness.** `flips=0,0` (no frame yet); the vsync tick creeps
+`11->12->13` over 110s because the guest burns only ~600k EE-cycles/s wall (66.8M cyc in 110s). The
+game is loading data, not wedged. Reaching the first frame needs either a much longer run (many
+minutes) or a throughput pass. The `[DIAG-vb]` (EeScheduler.cpp) and `[EE-seq]` ADXF-sampler
+(ps2_runtime.cpp) diagnostics are still uncommitted and still in use for that triage.
+
+**Build gotcha (re-learned the hard way).** A bare `cmake --build PS2Recomp\out\build` from a plain
+shell fails with `Cannot open include file: 'functional'/'string'/'cstdint'` - the MSVC env
+(`INCLUDE`/`LIB`) isn't set. Use **`scripts\build-runtime.bat`** (calls `VsDevCmd.bat`, kills the
+runner, builds only `ps2EntryRunner`). And `run_game_agent.bat`'s `start /B` redirect doesn't flush
+on kill - run the exe directly with `Start-Process -RedirectStandardError` for reliable logs.
+
+**Still unrouted (non-blocking):** `0x80000003 rpc=0x1` (IOP heap alloc/free - handler exists,
+`kSifSidHeap`), `0x80000592 rpc=0` Init (now answered).
 
 ## Session 18 - stream completion status decoded: the partition loop advances, ADXF handle goes NULL
 

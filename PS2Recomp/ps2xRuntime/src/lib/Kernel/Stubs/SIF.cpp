@@ -313,7 +313,18 @@ namespace ps2_stubs
         constexpr uint32_t kSifCdvdRpcScmdBreak = 0x16u;
         constexpr uint32_t kSifCdvdRpcScmdMmode = 0x22u;
         constexpr uint32_t kSifCdvdDiscTypePs2Dvd = 0x14u;   // SCECdPS2DVD
-        constexpr uint32_t kSifCdvdStatusDiscPresent = 1u;   // disc present, drive ready
+        // CdStatus: the drive state.  The game's load-stage loop FUN_001f8000
+        // enters its pump loop only while Status==1 (0x1f8058 bnel) and only
+        // reaches its success chain (DiskReady -> GetDiskType -> stage-init ->
+        // exit) when Status != 1 (0x1f807c beq v0,zero,0x1f80b0).  A constant
+        // 1 therefore traps the main thread in that loop forever (run108: it
+        // spun, drawing via the pump, and never even evaluated DiskReady -
+        // short-circuit && - so diskready=0).  The real cdvdfsv reports the
+        // drive as idle/stopped (0) once a synchronous read has completed, so
+        // report 0: FUN_001f8000 then returns immediately and the main loop
+        // proceeds.  "disc present and ready" is carried by DiskReady=2 and
+        // GetDiskType=0x14, not by Status.
+        constexpr uint32_t kSifCdvdStatusIdle = 0u;          // drive idle, disc present
         constexpr uint32_t kSifCdvdComplete = 2u;            // SCECdComplete
         constexpr uint32_t kSifCdvdNoError = 0u;             // SCECdErNO
         constexpr uint32_t kSifCdvdCmdSuccess = 1u;          // generic sceCd* success
@@ -970,7 +981,7 @@ namespace ps2_stubs
                                 answer = kSifCdvdDiscTypePs2Dvd;
                                 break;
                             case kSifCdvdRpcScmdStatus:
-                                answer = kSifCdvdStatusDiscPresent;
+                                answer = kSifCdvdStatusIdle;
                                 break;
                             case kSifCdvdRpcScmdGetError:
                                 answer = kSifCdvdNoError;

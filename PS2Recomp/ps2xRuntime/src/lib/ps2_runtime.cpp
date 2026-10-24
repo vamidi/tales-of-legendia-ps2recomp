@@ -1402,7 +1402,7 @@ namespace
         switch (address)
         {
         case 0x166464u: return "thread entry (spawner)";
-        case 0x166490u: return "thread entry -> FUN_0019a068(0)";
+        case 0x166490u: return "vblank INTC handler (AddIntcHandler cause 2)";
         case 0x1664C0u: return "thread entry (second spawn)";
         case 0x199F40u: return "FUN_00199f40 (init body)";
         case 0x19A068u: return "FUN_0019a068 (thunk -> FUN_00199f40)";
@@ -1424,13 +1424,110 @@ namespace
         case 0x198C88u: return "entry_00198c88 (ready-flag spin)";
         case 0x1B75D8u: return "FUN_001b75d8 (invokes callback for event id)";
         case 0x113B50u: return "func_113B50 (thread/entry registration)";
+        // Session 20 profiler follow-up: the host-cost profile showed the two loop
+        // back-edges of FUN_001f8000 (0x1f801c / 0x1f8168) costing ~25 ms of host
+        // time each.  Their body is FUN_00139ad0 -> FUN_00113650(0), the
+        // sceGsSyncPath DMA/VIF/GIF drain, which busy-waits with a 0x1000000
+        // iteration timeout and reports through FUN_001173c8.  Watch all of them.
+        case 0x1F801Cu: return "FUN_001f8000 first while back-edge";
+        case 0x1F8168u: return "FUN_001f8000 do-while back-edge";
+        case 0x139AD0u: return "FUN_00139ad0 (gs sync x2 + mid)";
+        case 0x113650u: return "FUN_00113650 (sceGsSyncPath drain)";
+        case 0x1173C8u: return "FUN_001173c8 (sceGsSyncPath timeout report)";
+        // Session 20 follow-up: the CRI/AFS bootstrap thread and the stdio layer
+        // it uses to open PTN_INFO.BIN/NAM before the AFS loader can run.
+        case 0x1663A0u: return "CRI/AFS bootstrap thread body";
+        case 0x1664D0u: return "AFS 6-job loader (opens PTN_INFO, services CRI)";
+        case 0x165AD0u: return "main game thread body";
+        case 0x119A68u: return "sceStdIoOpen (IOP stdio RPC)";
+        case 0x118628u: return "sceSifCallRpc";
+        case 0x1997A8u: return "CriSrv init (sets DAT_003942c4 count)";
+        case 0x1982A0u: return "CriAdxt_Init";
+        case 0x1992C8u: return "CRI server thread spawn A";
+        case 0x199428u: return "CRI server thread spawn B";
+        case 0x1994B0u: return "CRI server thread spawn C";
+        case 0x199538u: return "CRI server thread spawn D";
+        case 0x1B5070u: return "FUN_001b5070 (post-ADXT init)";
+        case 0x1B4B38u: return "FUN_001b4b38 (post-ADXT init)";
+        case 0x1B5888u: return "FUN_001b5888 (post-ADXT init)";
         case 0x1ACD58u: return "the jalr that created the retired thread 3";
+        // Session 20: the cdvd request queue (head 0x3DB390, table 0x4A72C0).
+        case 0x1F8180u: return "cdvd subsystem init (spawns both tasks)";
+        case 0x1F8150u: return "disc-monitor task (sceCdStatus spin)";
+        case 0x1F84B0u: return "cdvd request-queue CONSUMER task";
+        case 0x1F8530u: return "request handler, type byte +1 == 0";
+        case 0x1F87C0u: return "request handler, type byte +1 == 1";
+        case 0x1F8BE0u: return "request enqueue (sets entry+0=1)";
+        case 0x1F8DA0u: return "request complete + dequeue";
+        case 0x1F8B60u: return "request unlink from queue";
+        case 0x1531A0u: return "consumer: acquire request lock";
+        case 0x153190u: return "consumer: release request lock";
+        case 0x166010u: return "boot launcher (pumps for completion flag)";
+        case 0x1660A0u: return "boot task: waits for request entry+2 to clear";
+        // Session 20: ADXF stream job + CDV device vtable (object at 0x3A6A98).
+        case 0x196F58u: return "ADXF_ReadNw32 (start stream read)";
+        case 0x196DB0u: return "ADXF job kick (vtable +0xc path)";
+        case 0x1B5118u: return "ADXF stream-job create";
+        case 0x197638u: return "ADXF completed-sector count";
+        case 0x197668u: return "ADXF stream state byte (waits for 3)";
+        case 0x1AD2E8u: return "CDV vtable +0x00";
+        case 0x1AD360u: return "CDV vtable +0x04";
+        case 0x1AD478u: return "CDV vtable +0x08";
+        case 0x1AD5A0u: return "CDV vtable +0x10 (open)";
+        case 0x1AD728u: return "CDV vtable +0x14";
+        case 0x1AD780u: return "CDV vtable +0x18";
+        case 0x1AD818u: return "CDV vtable +0x1c";
+        // Session 20: the kick chain (ADXF job -> CRI file layer) and the
+        // device-side request poll, to see how far job 16 gets.
+        case 0x19ED60u: return "CRI file: get access state";
+        case 0x19EEC8u: return "CRI file: force access state";
+        case 0x19ED68u: return "CRI file: set position";
+        case 0x19EE18u: return "CRI file: set read length";
+        case 0x19F548u: return "CRI file: set transfer size";
+        case 0x19F570u: return "CRI file: reset transfer";
+        case 0x19F648u: return "CRI file: attach stream job";
+        case 0x1AB120u: return "dvCi request state poll";
+        case 0x1AEEE0u: return "dvCi request release";
+        case 0x1B6F68u: return "dvCi lock";
+        case 0x1B6FE0u: return "dvCi unlock";
+        case 0x1B79F8u: return "dvCi flag test-and-clear";
+        // Session 20: the CRI Stm/ADXF server exec chain that must take a state-2
+        // stream handle to state 3.
+        case 0x1973A8u: return "ADXF server exec (iterate 16 handles)";
+        case 0x1972E0u: return "ADXF per-handle exec (adxf[1] <- stm state)";
+        case 0x19F468u: return "Stm server exec (iterate 40 handles)";
+        case 0x19F298u: return "Stm per-handle exec";
+        case 0x19EF58u: return "Stm transfer step (gated on stm[0x49]==1)";
+        case 0x197940u: return "CRI server pump (calls Stm exec)";
+        case 0x1A9448u: return "VFS open file";
+        case 0x1A9798u: return "VFS close file";
+        // Session 20: the game's own cooperative task scheduler plumbing, to see
+        // whether the pump is still dispatching at all.
+        case 0x151FF0u: return "task pump (run group N)";
+        case 0x151E90u: return "task dispatch loop";
+        case 0x15231Cu: return "task yield";
+        case 0x152200u: return "task resume";
+        // Session 20: the CRI service-group registry.  CriAdxt_Init (FUN_001982a0)
+        // registers the server pump as callback group 4 slot 0 via FUN_001b7378;
+        // FUN_001b7688(group) is the dispatcher that runs a group's six callbacks
+        // and bumps the per-group counter at 0x3B7330.  FUN_001b7858 services
+        // group 4.  The game's call site for it is the fragment chain
+        // 0x198eec -> 0x198eb8 -> 0x198ed8 (jump-table cases of FUN_001978f0).
+        case 0x1B7688u: return "CRI service group dispatcher";
+        case 0x1B7858u: return "CRI service group 4 (ADXT server pump)";
+        case 0x198EECu: return "game CRI service fragment 0x198eec";
+        case 0x198EB8u: return "game CRI service fragment 0x198eb8";
+        case 0x198ED8u: return "game CRI group-4 service call site";
+        case 0x1978F0u: return "CRI monolith hosting the service chain";
         default: return nullptr;
         }
     }
 
     // Entry watch: fires on every scheduler dispatch and every generated call,
     // i.e. also on fall-through entries into a neighbouring function.
+    std::mutex g_watchHitsMutex;
+    std::unordered_map<uint32_t, uint64_t> g_watchHits;
+
     void watchAssetInitEntry(uint32_t address)
     {
         const char *label = assetInitEntryLabel(address);
@@ -1439,9 +1536,16 @@ namespace
             return;
         }
 
+        // Session 20: uncapped hit counts, so a capped-out WATCH-ENTRY line does
+        // not hide whether a path runs at all.
+        {
+            std::lock_guard<std::mutex> hitLock(g_watchHitsMutex);
+            ++g_watchHits[address];
+        }
+
         static std::mutex s_entryMutex;
         static std::unordered_map<uint32_t, uint32_t> s_entryCounts;
-        static uint32_t s_entryBudget = 400u;
+        static uint32_t s_entryBudget = 2000u;
         std::lock_guard<std::mutex> lock(s_entryMutex);
         if (s_entryBudget == 0u)
         {
@@ -2675,6 +2779,506 @@ void PS2Runtime::run()
                                                    << std::endl);
                 }
             });
+            // TEMP DIAGNOSTIC: high-rate ADXF / stream-state sampler.  Prints only
+            // when the observed state changes, so the allocate/free sequence and the
+            // failure point are visible without flooding the log.
+            {
+                static auto s_next = std::chrono::steady_clock::now();
+                static std::string s_last;
+                static uint32_t s_prints = 0u;
+                const auto now = std::chrono::steady_clock::now();
+                if (s_prints < 80u && now >= s_next)
+                {
+                    s_next = now + std::chrono::milliseconds(100);
+                    if (const uint8_t *ram = m_eeScheduler->rdram())
+                    {
+                        auto peek = [ram](uint32_t addr) -> uint32_t {
+                            uint32_t value = 0u;
+                            std::memcpy(&value, ram + ((addr & PS2_RAM_MASK) & ~3u), sizeof(value));
+                            return value;
+                        };
+                        auto ascii = [ram](uint32_t addr, uint32_t len) -> std::string {
+                            std::string out;
+                            for (uint32_t i = 0u; i < len; ++i)
+                            {
+                                const char c = static_cast<char>(ram[addr + i]);
+                                out.push_back((c >= 0x20 && c < 0x7F) ? c : '.');
+                            }
+                            return out;
+                        };
+
+                        std::ostringstream os;
+                        os << "a8=0x" << std::hex << peek(0x003910A8u)
+                           << " ac=" << std::dec << static_cast<int32_t>(peek(0x003910ACu))
+                           << " b0=0x" << std::hex << peek(0x003910B0u)
+                           << " b4=" << std::dec << peek(0x003910B4u)
+                           << " adxf=";
+                        for (uint32_t i = 0u; i < 16u; ++i)
+                        {
+                            os << (ram[0x00390738u + i * 0x44u] ? '1' : '0');
+                        }
+                        os << " sj=";
+                        for (uint32_t i = 0u; i < 40u; ++i)
+                        {
+                            os << (ram[0x0039E848u + i * 0x60u] ? '1' : '0');
+                        }
+                        os << " paths=";
+                        for (uint32_t i = 0u; i < 40u; ++i)
+                        {
+                            const uint32_t base = 0x0039E848u + i * 0x60u;
+                            const uint32_t p = peek(base + 0x50u);
+                            if (p != 0u && p < 0x02000000u)
+                            {
+                                os << i << ":\"" << ascii(p, 0x30u) << "\" ";
+                            }
+                        }
+                        os << "cvfs=\"" << ascii(0x003A55C8u, 0x40u) << "\""
+                           << " msg=\"" << ascii(0x00390630u, 0x60u) << "\"";
+                        // CRI VFS device table: 0x20 entries of 0x10 at 0x499F00,
+                        // +0x00 object pointer, +0x04 inline 12-byte device name.
+                        os << " devs=";
+                        uint32_t devCount = 0u;
+                        for (uint32_t i = 0u; i < 0x20u; ++i)
+                        {
+                            const uint32_t objPtr = peek(0x00499F00u + i * 0x10u);
+                            if (objPtr == 0u)
+                            {
+                                continue;
+                            }
+                            ++devCount;
+                            os << "\"" << ascii(0x00499F04u + i * 0x10u, 0x0Cu) << "\"@0x"
+                               << std::hex << objPtr
+                               << "/open=0x"
+                               << (objPtr < 0x02000000u ? peek(objPtr + 0x10u) : 0u)
+                               << std::dec << " ";
+                        }
+                        os << " (" << devCount << ")";
+                        // Raw CDV vtable words, to compare against the ELF image.
+                        os << " cdvv=";
+                        for (uint32_t w = 0u; w < 8u; ++w)
+                        {
+                            os << std::hex << peek(0x003A6A98u + w * 4u) << ",";
+                        }
+                        os << std::dec;
+
+                        const std::string state = os.str();
+                        if (state != s_last)
+                        {
+                            s_last = state;
+                            ++s_prints;
+                            std::cerr << "[EE-seq] " << state << std::endl;
+                        }
+                    }
+                }
+            }
+
+            // TEMP DIAGNOSTIC (session 20): the boot task FUN_001660a0 waits for a
+            // request object's status byte (table entry +2) to fall from 2 to 0 and
+            // never sees it.  The table is 64 * 0x2c entries at 0x4A72C0 (built by
+            // FUN_001f8be0), linked into a priority list whose head/tail/count live
+            // gp-relative at gp-0x7860 / gp-0x785c / gp-0x7850.  Dump the queue and
+            // the live entries so the pending request is identifiable.
+            {
+                static auto s_reqNext = std::chrono::steady_clock::now();
+                static std::string s_reqLast;
+                static uint32_t s_reqPrints = 0u;
+                const auto reqNow = std::chrono::steady_clock::now();
+                if (s_reqPrints < 200u && reqNow >= s_reqNext)
+                {
+                    s_reqNext = reqNow + std::chrono::milliseconds(300);
+                    if (const uint8_t *ram = m_eeScheduler->rdram())
+                    {
+                        auto peekReq = [ram](uint32_t addr) -> uint32_t {
+                            uint32_t value = 0u;
+                            std::memcpy(&value, ram + ((addr & PS2_RAM_MASK) & ~3u), sizeof(value));
+                            return value;
+                        };
+                        const uint32_t gp = m_debugGp.load(std::memory_order_relaxed);
+                        const uint32_t head = gp != 0u ? peekReq(gp - 0x7860u) : 0u;
+                        const uint32_t tail = gp != 0u ? peekReq(gp - 0x785cu) : 0u;
+                        const uint32_t count = gp != 0u ? peekReq(gp - 0x7850u) : 0u;
+
+                        std::ostringstream ros;
+                        ros << std::hex << "gp=0x" << gp << " head=0x" << head << " tail=0x" << tail
+                            << std::dec << " count=" << count << " entries:";
+                        for (uint32_t i = 0u; i < 8u; ++i)
+                        {
+                            const uint32_t base = 0x004A72C0u + i * 0x2cu;
+                            const uint32_t w0 = peekReq(base + 0x00u);
+                            const uint32_t id = peekReq(base + 0x08u);
+                            const uint32_t prev = peekReq(base + 0x24u);
+                            const uint32_t next = peekReq(base + 0x28u);
+                            if (((w0 >> 24) & 0xFFu) == 0u && id == 0u && prev == 0u && next == 0u)
+                            {
+                                continue;
+                            }
+                            float f28 = 0.0f;
+                            const uint32_t w1c = peekReq(base + 0x1cu);
+                            std::memcpy(&f28, &w1c, sizeof(f28));
+                            ros << " [" << i << "] b0=" << ((w0 >> 0) & 0xFFu)
+                                << " b1=" << ((w0 >> 8) & 0xFFu)
+                                << " b2=" << ((w0 >> 16) & 0xFFu)
+                                << " b3=" << ((w0 >> 24) & 0xFFu)
+                                << " +4=0x" << std::hex << peekReq(base + 0x04u)
+                                << " id=0x" << id
+                                << " +10=0x" << peekReq(base + 0x10u)
+                                << " +14=0x" << peekReq(base + 0x14u)
+                                << " +18=0x" << peekReq(base + 0x18u)
+                                << " +1c=0x" << std::hex << w1c << std::dec << " f=" << f28
+                                << " +20=0x" << peekReq(base + 0x20u)
+                                << " prev=0x" << prev << " next=0x" << next << std::dec << "]";
+                        }
+
+                        const std::string reqState = ros.str();
+                        if (reqState != s_reqLast)
+                        {
+                            s_reqLast = reqState;
+                            ++s_reqPrints;
+                            std::cerr << "[EE-req] " << reqState << std::endl;
+                        }
+                    }
+                }
+            }
+
+            // TEMP DIAGNOSTIC (session 20): the ADXF stream-job array at 0x39E848
+            // (40 slots * 0x60).  Slot 16 goes active for CDV:\AFS\SYS_REG.AFS and
+            // never retires, and no CDVD stream read is ever issued for it.  Dump
+            // every active slot in full so the stall point is visible.
+            {
+                static auto s_jobNext = std::chrono::steady_clock::now();
+                static std::string s_jobLast;
+                static uint32_t s_jobPrints = 0u;
+                const auto jobNow = std::chrono::steady_clock::now();
+                if (s_jobPrints < 40u && jobNow >= s_jobNext)
+                {
+                    s_jobNext = jobNow + std::chrono::milliseconds(500);
+                    if (const uint8_t *ram = m_eeScheduler->rdram())
+                    {
+                        auto peekJob = [ram](uint32_t addr) -> uint32_t {
+                            uint32_t value = 0u;
+                            std::memcpy(&value, ram + ((addr & PS2_RAM_MASK) & ~3u), sizeof(value));
+                            return value;
+                        };
+                        std::ostringstream jos;
+                        bool any = false;
+                        for (uint32_t i = 0u; i < 40u; ++i)
+                        {
+                            const uint32_t base = 0x0039E848u + i * 0x60u;
+                            if (ram[base] == 0u)
+                            {
+                                continue;
+                            }
+                            any = true;
+                            jos << " job[" << i << "]=";
+                            for (uint32_t w = 0u; w < 0x60u; w += 4u)
+                            {
+                                jos << std::hex << peekJob(base + w) << " ";
+                            }
+                            jos << std::dec;
+                        }
+                        if (!any)
+                        {
+                            jos << "(none active)";
+                        }
+                        const std::string jobState = jos.str();
+                        if (jobState != s_jobLast)
+                        {
+                            s_jobLast = jobState;
+                            ++s_jobPrints;
+                            std::cerr << "[EE-job] " << jobState << std::endl;
+                        }
+                    }
+                }
+            }
+
+            // TEMP DIAGNOSTIC (session 20): the CDV VFS device keeps its own 40-slot
+            // request array at 0x3A6B00 (stride 0x48, object header at 0x3A6A90).
+            // FUN_001ad2e8 only pumps a slot when header word 0x3A6A90 is set and the
+            // slot's first byte is 1, and FUN_001ad220 then polls the request handle
+            // at slot+0x1c.  Dump the header, every live slot and the ADXF file object
+            // (0x499DC0) to see whether job 16 ever reaches the device at all.
+            {
+                static auto s_cdvNext = std::chrono::steady_clock::now();
+                static std::string s_cdvLast;
+                static uint32_t s_cdvPrints = 0u;
+                const auto cdvNow = std::chrono::steady_clock::now();
+                if (s_cdvPrints < 40u && cdvNow >= s_cdvNext)
+                {
+                    s_cdvNext = cdvNow + std::chrono::milliseconds(500);
+                    if (const uint8_t *ram = m_eeScheduler->rdram())
+                    {
+                        auto peekCdv = [ram](uint32_t addr) -> uint32_t {
+                            uint32_t value = 0u;
+                            std::memcpy(&value, ram + ((addr & PS2_RAM_MASK) & ~3u), sizeof(value));
+                            return value;
+                        };
+                        std::ostringstream cos;
+                        cos << std::hex << "hdr=";
+                        for (uint32_t w = 0x3A6A90u; w < 0x3A6A90u + 0x10u; w += 4u)
+                        {
+                            cos << peekCdv(w) << " ";
+                        }
+                        for (uint32_t i = 0u; i < 40u; ++i)
+                        {
+                            const uint32_t base = 0x003A6B00u + i * 0x48u;
+                            const uint32_t h = peekCdv(base + 0x1cu);
+                            if (ram[base] == 0u && h == 0u)
+                            {
+                                continue;
+                            }
+                            cos << " slot[" << std::dec << i << "]=";
+                            for (uint32_t w = 0u; w < 0x48u; w += 4u)
+                            {
+                                cos << std::hex << peekCdv(base + w) << " ";
+                            }
+                            cos << std::dec;
+                        }
+                        cos << " fileobj=";
+                        for (uint32_t w = 0u; w < 0x40u; w += 4u)
+                        {
+                            cos << std::hex << peekCdv(0x00499DC0u + w) << " ";
+                        }
+                        const std::string cdvState = cos.str();
+                        if (cdvState != s_cdvLast)
+                        {
+                            s_cdvLast = cdvState;
+                            ++s_cdvPrints;
+                            std::cerr << "[EE-cdv] " << cdvState << std::endl;
+                        }
+                    }
+                }
+            }
+
+            // TEMP DIAGNOSTIC (session 20): the CRI ADXF handle pool - 16 slots of
+            // 0x44 at 0x390738 (FUN_00196870).  Byte +1 is the state the request
+            // handler spins on (1 idle -> 2 read started -> 3 complete); +4 is the
+            // stm handle, +8 the stream job, +0xc size, +0x14 position, +0x1c
+            // length, +0x24 buffer, +0x30 base offset.  Dump every live handle and
+            // the head of its stm handle / stream job so the stalled read is visible.
+            {
+                static auto s_adxfNext = std::chrono::steady_clock::now();
+                static std::string s_adxfLast;
+                static uint32_t s_adxfPrints = 0u;
+                const auto adxfNow = std::chrono::steady_clock::now();
+                if (s_adxfPrints < 80u && adxfNow >= s_adxfNext)
+                {
+                    s_adxfNext = adxfNow + std::chrono::milliseconds(1000);
+                    if (const uint8_t *ram = m_eeScheduler->rdram())
+                    {
+                        auto peekAdxf = [ram](uint32_t addr) -> uint32_t {
+                            uint32_t value = 0u;
+                            std::memcpy(&value, ram + ((addr & PS2_RAM_MASK) & ~3u), sizeof(value));
+                            return value;
+                        };
+                        std::ostringstream aos;
+                        for (uint32_t i = 0u; i < 16u; ++i)
+                        {
+                            const uint32_t base = 0x00390738u + i * 0x44u;
+                            if (ram[base] == 0u)
+                            {
+                                continue;
+                            }
+                            aos << " adxf[" << i << "] st=" << ((int)ram[base + 1u] & 0xFF)
+                                << " b2=" << ((int)ram[base + 2u] & 0xFF)
+                                << " b3=" << ((int)ram[base + 3u] & 0xFF) << " " << std::hex;
+                            for (uint32_t w = 4u; w < 0x44u; w += 4u)
+                            {
+                                aos << peekAdxf(base + w) << " ";
+                            }
+                            const uint32_t stm = peekAdxf(base + 4u);
+                            const uint32_t sjh = peekAdxf(base + 8u);
+                            if (stm != 0u && stm < PS2_RAM_SIZE)
+                            {
+                                aos << "| stm=";
+                                for (uint32_t w = 0u; w < 0x60u; w += 4u)
+                                {
+                                    aos << peekAdxf(stm + w) << " ";
+                                }
+                            }
+                            if (sjh != 0u && sjh < PS2_RAM_SIZE)
+                            {
+                                aos << "| sj=";
+                                for (uint32_t w = 0u; w < 0x30u; w += 4u)
+                                {
+                                    aos << peekAdxf(sjh + w) << " ";
+                                }
+                            }
+                            aos << std::dec << "\n";
+                        }
+                        const std::string adxfState = aos.str();
+                        if (adxfState != s_adxfLast)
+                        {
+                            s_adxfLast = adxfState;
+                            ++s_adxfPrints;
+                            std::cerr << "[EE-adxf]\n" << adxfState << std::endl;
+                        }
+                    }
+                }
+            }
+
+            // TEMP DIAGNOSTIC (session 20): the game's cooperative task pool - 64
+            // slots of 0x210 at 0x407160 (FUN_00151c80).  Byte +0x1f0 is the task
+            // state (1 runnable, 3 retiring), +0x1f1 the group the pump matches,
+            // +0x1b0 the entry function, +0x1b4 the resume target the scheduler
+            // jumps back through after a yield (FUN_00152200).  Enumerating every
+            // live task with its entry and resume target shows which tasks exist
+            // and where each one is parked - the CRI server pump (FUN_00197940)
+            // has no call sites, so a task has to be driving it.
+            {
+                static auto s_taskNext = std::chrono::steady_clock::now();
+                static std::string s_taskLast;
+                static uint32_t s_taskPrints = 0u;
+                const auto taskNow = std::chrono::steady_clock::now();
+                if (s_taskPrints < 80u && taskNow >= s_taskNext)
+                {
+                    s_taskNext = taskNow + std::chrono::milliseconds(1000);
+                    if (const uint8_t *ram = m_eeScheduler->rdram())
+                    {
+                        auto peekTask = [ram](uint32_t addr) -> uint32_t {
+                            uint32_t value = 0u;
+                            std::memcpy(&value, ram + ((addr & PS2_RAM_MASK) & ~3u), sizeof(value));
+                            return value;
+                        };
+                        std::ostringstream tos;
+                        tos << std::hex << "head=" << peekTask(0x003DA194u) << "\n";
+                        for (uint32_t i = 0u; i < 64u; ++i)
+                        {
+                            const uint32_t base = 0x00407160u + i * 0x210u;
+                            const uint32_t state = ram[base + 0x1f0u];
+                            if (state == 0u)
+                            {
+                                continue;
+                            }
+                            tos << "  t[" << std::dec << i << "] st=" << (state & 0xFF)
+                                << " g=" << (ram[base + 0x1f1u] & 0xFF)
+                                << " f2=" << (ram[base + 0x1f2u] & 0xFF)
+                                << " f3=" << (ram[base + 0x1f3u] & 0xFF)
+                                << std::hex
+                                << " entry=" << peekTask(base + 0x1b0u)
+                                << " rsm=" << peekTask(base + 0x1b4u)
+                                << " ra=" << peekTask(base + 0x1a8u)
+                                << " ac=" << peekTask(base + 0x1acu)
+                                << " ctx=" << peekTask(base + 0x204u)
+                                << " cp=" << peekTask(base + 0x208u)
+                                << " stk=" << peekTask(base + 0x20cu)
+                                << " next=" << peekTask(base + 0x1fcu)
+                                << "\n";
+                        }
+                        const std::string taskState = tos.str();
+                        if (taskState != s_taskLast)
+                        {
+                            s_taskLast = taskState;
+                            ++s_taskPrints;
+                            std::cerr << "[EE-tasks]\n" << taskState << std::endl;
+                        }
+                    }
+                }
+            }
+
+            // TEMP DIAGNOSTIC (session 20): the CRI service-group registry that
+            // CriAdxt_Init registers the server pump into.  Registry = 8 groups at
+            // 0x49C6A0, stride 0x30, six {fnptr,arg} pairs each; the pump sits at
+            // group 4 slot 0.  FUN_001b7688 bumps a per-group call counter at
+            // 0x3B7330 and sets an in-progress flag at 0x3B7350.  Dumping both
+            // shows directly whether the game ever services group 4.
+            {
+                static auto s_srvNext = std::chrono::steady_clock::now();
+                static std::string s_srvLast;
+                static uint32_t s_srvPrints = 0u;
+                const auto srvNow = std::chrono::steady_clock::now();
+                if (s_srvPrints < 80u && srvNow >= s_srvNext)
+                {
+                    s_srvNext = srvNow + std::chrono::milliseconds(1000);
+                    if (const uint8_t *ram = m_eeScheduler->rdram())
+                    {
+                        auto peekSrv = [ram](uint32_t addr) -> uint32_t {
+                            uint32_t value = 0u;
+                            std::memcpy(&value, ram + ((addr & PS2_RAM_MASK) & ~3u), sizeof(value));
+                            return value;
+                        };
+                        std::ostringstream sos;
+                        sos << std::hex;
+                        for (uint32_t k = 0u; k < 8u; ++k)
+                        {
+                            const uint32_t base = 0x0049C6A0u + k * 0x30u;
+                            sos << "g" << std::dec << k << ":";
+                            for (uint32_t e = 0u; e < 6u; ++e)
+                            {
+                                const uint32_t fn = peekSrv(base + e * 8u);
+                                if (fn == 0u)
+                                {
+                                    continue;
+                                }
+                                sos << " " << std::hex << fn << "/" << peekSrv(base + e * 8u + 4u);
+                            }
+                            sos << (k + 1u < 8u ? " | " : "\n");
+                        }
+                        sos << "svc:";
+                        for (uint32_t k = 0u; k < 8u; ++k)
+                        {
+                            sos << " " << std::dec << peekSrv(0x003B7330u + k * 4u);
+                        }
+                        sos << " busy:";
+                        for (uint32_t k = 0u; k < 8u; ++k)
+                        {
+                            sos << " " << std::dec << peekSrv(0x003B7350u + k * 4u);
+                        }
+                        // CRI ADXT init-gate state: DAT_003942c4 is the CriSrv
+                        // registration count that FUN_00199780() tests, DAT_00393228
+                        // gates CriAdxt_Init, and 0x393230/0x393238 hold the group-5
+                        // and group-4 registration handles it returns.
+                        sos << "\ncri: c42c4=" << std::dec << peekSrv(0x003942C4u)
+                            << " c3228=" << peekSrv(0x00393228u)
+                            << " c3230=0x" << std::hex << peekSrv(0x00393230u)
+                            << " c3238=0x" << std::hex << peekSrv(0x00393238u)
+                            << " c323c=" << std::dec << peekSrv(0x0039323Cu)
+                            << " c43dc=" << peekSrv(0x003943DCu)
+                            << " c4350=" << peekSrv(0x00394350u)
+                            << " tid:5c/60/64=" << peekSrv(0x0039435Cu) << ","
+                            << peekSrv(0x00394360u) << "," << peekSrv(0x00394364u)
+                            << " c4368=" << peekSrv(0x00394368u);
+                        const std::string srvState = sos.str();
+                        if (srvState != s_srvLast)
+                        {
+                            s_srvLast = srvState;
+                            ++s_srvPrints;
+                            std::cerr << "[EE-srv] " << srvState << std::endl;
+                        }
+                    }
+                }
+            }
+
+            // TEMP DIAGNOSTIC (session 20): uncapped entry-hit counts for every
+            // labelled guest address, printed whenever the totals move.  WATCH-ENTRY
+            // caps at three lines per address, which hides whether a path keeps
+            // running (the CDV device read path for the stalled ADXF job).
+            {
+                static auto s_hitsNext = std::chrono::steady_clock::now();
+                static std::string s_hitsLast;
+                const auto hitsNow = std::chrono::steady_clock::now();
+                if (hitsNow >= s_hitsNext)
+                {
+                    s_hitsNext = hitsNow + std::chrono::milliseconds(2000);
+                    std::ostringstream hos;
+                    bool first = true;
+                    {
+                        std::lock_guard<std::mutex> hitLock(g_watchHitsMutex);
+                        for (const auto &[addr, hits] : g_watchHits)
+                        {
+                            hos << (first ? "" : " ") << "0x" << std::hex << addr
+                                << std::dec << "=" << hits;
+                            first = false;
+                        }
+                    }
+                    const std::string hitsState = hos.str();
+                    if (!hitsState.empty() && hitsState != s_hitsLast)
+                    {
+                        s_hitsLast = hitsState;
+                        std::cerr << "[EE-hits] " << hitsState << std::endl;
+                    }
+                }
+            }
+
             // TEMP DIAGNOSTIC (boot-stall triage): when the EE scheduler thread
             // gets stuck inside a single recompiled invocation the scheduler-side
             // heartbeats stop entirely, because the loop never comes back around.
@@ -2765,6 +3369,23 @@ void PS2Runtime::run()
                             std::cerr << ((c >= 0x20 && c < 0x7F) ? c : '.');
                         }
                         std::cerr << std::endl;
+
+                        // TEMP DIAGNOSTIC: ADXF loader globals.  DAT_003910a8 is the
+                        // open handle, 0x3910ac the partition currently loading,
+                        // 0x3910b0 the tmpbuf handed to the async read and 0x3910b4
+                        // the sector count; FUN_001970e8 rejects a tmpbuf that is not
+                        // 64-byte aligned (and leaves 0x3910ac set, wedging the loop).
+                        std::cerr << "[EE-wd:adxfglob] a4=" << wdPeek(0x003910A4u)
+                                  << " a8=0x" << std::hex << wdPeek(0x003910A8u)
+                                  << " ac=" << std::dec << static_cast<int32_t>(wdPeek(0x003910ACu))
+                                  << " b0=0x" << std::hex << wdPeek(0x003910B0u)
+                                  << " b0mod64=" << std::dec << (wdPeek(0x003910B0u) & 0x3Fu)
+                                  << " b4=" << wdPeek(0x003910B4u)
+                                  << " part0=0x" << std::hex << wdPeek(0x00390B78u)
+                                  << " cb5slot0=0x" << wdPeek(0x0049C790u)
+                                  << " ch4=" << std::dec << wdPeek(0x003B7340u)
+                                  << " ch5=" << wdPeek(0x003B7344u)
+                                  << std::dec << std::endl;
 
                         std::cerr << "[EE-wd:client] words:";
                         for (uint32_t i = 0u; i < 12u; ++i)

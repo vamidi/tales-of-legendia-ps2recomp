@@ -445,6 +445,12 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+    // Nearest *host* (wall-clock) deadline across all scheduled events, as
+    // microseconds on the steady_clock epoch; 0 = none.  VBlank is paced purely on
+    // wall-clock (deadlineCycle 0), so the checkpoint gate has to watch this too or
+    // the interrupt rate collapses to the guest's time-slice rate (measured 23 Hz
+    // instead of 60 Hz, which starves the frame-paced boot loops).
+    std::atomic<uint64_t> m_nextDeadlineHostUs{0};
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
