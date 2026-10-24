@@ -39,6 +39,17 @@ namespace
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
     constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+    // TEMP DIAGNOSTIC (session 23): why is vblank still ~27 Hz after the
+    // checkpointDue host gate landed? Count which gate preempts, and measure
+    // VBlankStart delivery lag against its own published host deadline.
+    std::atomic<uint64_t> s_hostGateFires{0};
+    std::atomic<uint64_t> s_cycleGateFires{0};
+    uint64_t s_vbDelivered = 0u;
+    uint64_t s_vbLagSumUs = 0u;
+    int64_t s_vbLagMaxUs = 0;
+    uint32_t s_lastDispPc = 0u;
+    uint32_t s_lastDispThread = 0u;
+    std::chrono::steady_clock::time_point s_lastDispStart{};
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
 
@@ -597,6 +608,9 @@ void EeScheduler::run()
             m_guestExecuting.store(true, std::memory_order_release);
             const auto s_guestStart = std::chrono::steady_clock::now();
             const uint32_t s_profPc = context.pc;
+            s_lastDispPc = s_profPc;
+            s_lastDispThread = running->id;
+            s_lastDispStart = s_guestStart;
             function(m_rdram, &context, &m_runtime);
             const uint64_t s_guestUs = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(
@@ -672,6 +686,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
     {
+        s_cycleGateFires.fetch_add(1, std::memory_order_relaxed);
         m_checkpointPending.store(true, std::memory_order_release);
         m_transferPending = true;
         return true;
@@ -694,6 +709,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
                                                          .count());
         if (nowUs >= preemptHostUs)
         {
+            s_hostGateFires.fetch_add(1, std::memory_order_relaxed);
             m_checkpointPending.store(true, std::memory_order_release);
             m_transferPending = true;
             return true;
@@ -2233,6 +2249,37 @@ void EeScheduler::processDueDeadlines()
                 // frames instead of collecting a backlog of vblank interrupts and
                 // livelocking inside its own INTC handler.
                 const auto vblankBase = std::chrono::steady_clock::now();
+                // TEMP DIAGNOSTIC (session 23): delivery lag against the event's
+                // own published host deadline - the number that says whether the
+                // gate never fires, or fires but delivery is still late.
+                {
+                    const int64_t lagUs = static_cast<int64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            vblankBase - scheduled.hostDeadline)
+                            .count());
+                    ++s_vbDelivered;
+                    if (lagUs > 0)
+                    {
+                        s_vbLagSumUs += static_cast<uint64_t>(lagUs);
+                    }
+                    if (lagUs > s_vbLagMaxUs)
+                    {
+                        s_vbLagMaxUs = lagUs;
+                    }
+                    if (lagUs > 5000)
+                    {
+                        const uint64_t lastDispUs = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                vblankBase - s_lastDispStart)
+                                .count());
+                        std::cerr << "[DIAG-vblag] tick=" << (m_vsyncTick + 1u)
+                                  << " lag_us=" << lagUs
+                                  << " lastPc=0x" << std::hex << s_lastDispPc
+                                  << " thread=" << std::dec << s_lastDispThread
+                                  << " lastDispUs=" << lastDispUs
+                                  << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+                    }
+                }
                 scheduleEvent(0u, vblankBase + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(0u, vblankBase + kVBlankPeriod,
@@ -2270,7 +2317,11 @@ void EeScheduler::processEvent(const EeEvent &event)
                                           std::memory_order_relaxed)
                       << "," << m_runtime.memory().gs().displayFlipCount[1].load(
                                      std::memory_order_relaxed)
-                      << " pendingInv=" << m_pendingInvocations.size() << std::endl;
+                      << " pendingInv=" << m_pendingInvocations.size()
+                      << " gate=" << s_hostGateFires.load(std::memory_order_relaxed)
+                      << " cycGate=" << s_cycleGateFires.load(std::memory_order_relaxed)
+                      << " vbLagAvgUs=" << (s_vbDelivered != 0u ? s_vbLagSumUs / s_vbDelivered : 0u)
+                      << " vbLagMaxUs=" << s_vbLagMaxUs << std::endl;
         }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)

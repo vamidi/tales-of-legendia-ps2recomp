@@ -65,6 +65,48 @@ cannot deliver vblank while it sits in a host-side wait); 0x139888 n=1 290 ms; 0
 host-side wait in their syscall stubs (blocking SIF RPC / sleep not tied to scheduler deadlines),
 make those waits pump processDueDeadlines or park with the vblank deadline, rebuild (~4 min),
 retest for ~60 Hz.
+**run134-run138 (lap-hunt for the residual ~20 ms):** the culprit PC is the frame-end
+`sceSifSetDma` at 0x117a28 (DIAG-vblag lastPc, lastDispUs 16-26 ms). run138 (ps2xIOP /O2
+experiment): 34.8 Hz, c4350 31.8/s, vbLagAvg 12.9 ms - the /O2 floor did NOT drop, so IOP
+interpreter speed is not the bottleneck (that CMakeLists block is still uncommitted pending
+sign-off). Ruled out: DMA copy volume (~125 KB total; 690x size-0x64 RPC packets), CallScope
+mutex+swap, onSifTransfer, cdvd HLE cost.
+
+**Root cause #2 (run139 SifTimingGuard lap timers, 2 ms threshold):** the straddle cost is OUR
+OWN diagnostic stderr. std::cerr is unit-buffered: the unconditional [SIF-SetDma]/
+[SIF-SetDma:DESC]/RPC CALL prints cost ~100 flushes per sceSifSetDma call ~= 18 ms/call
+(19.65 s of the 40 s wall). The actual DMA work (notify/copy/cmdInit) is all < 2 ms.
+
+**Fix (SIF.cpp only):** runtime env gate g_sifVerboseLogs (PS2_SIF_VERBOSE, default OFF) around
+~15 hot print sites (RPC CALL/ROUTE/END, fileio completion, UNROUTED dump, cdvd sid/search/
+stream/scmd/diskready/init, GetReg/SetReg, SetDma pc-dump, AGRESSIVE CALL/DESC). Chosen over
+compile-time PS2_IF_AGRESSIVE_LOGS so triage logs stay re-enableable without a rebuild.
+run140: SetDma cost collapsed 19.65 s -> 450 ms.
+
+**run140 regression = pre-existing boot race, same failure as run137 (ungated), NOT gating:**
+the main thread (id=1) completed its staged-init worker loop (32-entry x 20-byte table scan at
+0x1b6868/0x1b68ec via entry_001b68f8 -> func_1B4AE8) and terminated (dormant at 0x1b6900) before
+poller gate 0x3943B8 was released (writer FUN_00199938 never ran); threads=3, executor parks
+between vblanks, 21.75 Hz, c4350=785. run137 hit the identical stall ungated; run138/139 got
+lucky. Frequency ~1-in-3 either way: a host-timing race in the staged-init completion
+handshake, tracked as the next investigation.
+
+**Verification (run141 gated-default / run142 gated PS2_SIF_VERBOSE=1):**
+- run141 HEALTHY: tick=2040/40 s = 51.0 Hz (baseline 34.8), c4350=1916 = 47.9/s (baseline 31.8),
+  vbLagAvg 2.32 ms (baseline 12.9), threads=6, guest_ms 2092/3000, iters 3040/3 s, gate=1071
+  cycGate=0, 56 late deliveries/2040 ticks. vbLagMax 360 ms is a boot-phase JIT-compile burst,
+  not steady-state.
+- run142: verbose=1 restores the flush storm and reproduces run139's old numbers (29.3 Hz,
+  c4350=1056, vbLagAvg 15.3 ms) - the gating is semantically inert, purely a wall-clock win.
+
+**Next lever (needs user sign-off):** ps2_log.txt flush storm - CMake cache
+PS2X_ENABLE_AGRESSIVE_LOGS=ON -> PS2_FUNCTION_LOG_TRACKER=1 -> PS_LOG_ENTRY in EVERY guest
+function writes+flushes ps2_log.txt (11 MB/40 s ~= 7k flushes/s). Either flip the cache option
+OFF or buffer ps2_log.h's log_stream; both touch approval-gated files.
+
+**Current Blocker:** the ~1-in-3 staged-init boot race (run137/run140 mode) must be understood
+before gated runs can be relied on; the ps2_log flush storm awaits sign-off.
+
 ## Session 22 - the "no-output regression" was environmental, not code; the tree is healthy at the run126 frontier
 
 **Disproved (do not chase again):** the session-21 suspected `assetInitEntryLabel` regression. The five

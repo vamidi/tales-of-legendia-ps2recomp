@@ -7,6 +7,8 @@
 #include "runtime/ee_scheduler.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -58,6 +60,18 @@ namespace ps2_stubs
 
     namespace
     {
+        // Runtime gate for the verbose per-call SIF diagnostics below.  They
+        // are unit-buffered std::cerr flushes: session-23 lap timing measured
+        // ~18 ms of host wall time per sceSifSetDma call spent purely on the
+        // logging itself (the "22 ms frame-end straddle" that delayed vblank
+        // delivery was largely this flush storm, not emulation work).
+        // Set PS2_SIF_VERBOSE=1 in the environment to restore them for triage.
+        const bool g_sifVerboseLogs = []
+        {
+            const char *e = std::getenv("PS2_SIF_VERBOSE");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+
         struct Ps2SifDmaTransfer
         {
             uint32_t src = 0;
@@ -607,9 +621,36 @@ namespace ps2_stubs
                       << " rpcServers=" << snapshot.emulatorRpcServers << std::endl;
         }
 
+        // TEMP DIAGNOSTIC (session 23): name slow host-side SIF handlers -
+        // the 22 ms frame-end straddles (DIAG-vblag lastPc=0x117a28) have no
+        // guest checkpoints, so the suspect is host work inside these stubs.
+        struct SifTimingGuard
+        {
+            const char *name;
+            long long thresholdUs = 2000;
+            std::chrono::steady_clock::time_point t0 =
+                std::chrono::steady_clock::now();
+            void lap(const char *stage)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const long long us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
+                        .count();
+                if (us > thresholdUs)
+                {
+                    std::cerr << "[SIF-timing] " << name << ":" << stage
+                              << " took_us=" << us << std::endl;
+                }
+                t0 = now;
+            }
+            ~SifTimingGuard() { lap("end"); }
+        };
+
         void emulateIopSifRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
                               const Ps2SifDmaTransfer &xfer)
         {
+            const SifTimingGuard g_rpcTiming{"emulateIopSifRpc"};
+            SifTimingGuard g_rpcStage{"rpc"};
             if (!runtime || xfer.src == 0u || xfer.size < 0x24)
             {
                 return;
@@ -681,6 +722,7 @@ namespace ps2_stubs
                 // TEMP DIAGNOSTIC: the per-service responses still have to be
                 // derived from each call site; echo the request shape so the next
                 // stall can be triaged from the log alone.
+                if (g_sifVerboseLogs)
                 std::cerr << "[SIF-iop] RPC CALL sid=- client=0x" << std::hex << clientPtr
                           << " rpc_number=0x" << rpcNumber
                           << " send_size=0x" << sendSize
@@ -689,7 +731,8 @@ namespace ps2_stubs
                           << " rmode=0x" << rmode
                           << " server=0x" << server
                           << " recv_before=" << recvBefore[0] << "," << recvBefore[1] << ","
-                          << recvBefore[2] << "," << recvBefore[3] << std::dec << std::endl;
+                           << recvBefore[2] << "," << recvBefore[3] << std::dec << std::endl;
+                g_rpcStage.lap("pre");
 
                 // IOP routing: when the service this client bound is owned by
                 // the emulated IOP (a loaded IRX) or by an HLE service, hand the
@@ -733,6 +776,7 @@ namespace ps2_stubs
                         iopHandled = routed.handled;
                         ++g_sifRpcRoutedCallCount;
 
+                        if (g_sifVerboseLogs)
                         std::cerr << "[SIF-iop] RPC ROUTE sid=0x" << std::hex << boundSid
                                   << " rpc=0x" << rpcNumber
                                   << " send=0x" << sendEeAddr
@@ -760,6 +804,7 @@ namespace ps2_stubs
                             {
                                 const int signalled = runtime->eeScheduler().signalSemaphore(
                                     static_cast<int>(completionSema), true);
+                                if (g_sifVerboseLogs)
                                 std::cerr << "[SIF-iop] fileio completion sema=" << completionSema
                                           << " rpc=0x" << std::hex << rpcNumber << std::dec
                                           << " ret=" << signalled << std::endl;
@@ -768,6 +813,7 @@ namespace ps2_stubs
                     }
                     else
                     {
+                        if (g_sifVerboseLogs)
                         std::cerr << "[SIF-iop] RPC ROUTE sid=0x" << std::hex << boundSid
                                   << " rpc=0x" << rpcNumber
                                   << " send_size=0x" << sendSize
@@ -776,6 +822,7 @@ namespace ps2_stubs
                                   << std::endl;
                     }
                 }
+                g_rpcStage.lap("route");
 
                 if (!iopHandled)
                 {
@@ -783,7 +830,7 @@ namespace ps2_stubs
                     // descriptor in the SIF DMA chain.  Dump it so a custom
                     // service (0x80000597, the CDV/AFS stream loader) can be
                     // reconstructed from the request bytes alone.
-                    if (boundSid != 0u && sendSize != 0u && sendSize <= 0x400u)
+                    if (g_sifVerboseLogs && boundSid != 0u && sendSize != 0u && sendSize <= 0x400u)
                     {
                         uint32_t payloadAddr = 0u;
                         if (g_sifRpcPayloadPrecedingSize == sendSize)
@@ -795,6 +842,7 @@ namespace ps2_stubs
                             payloadAddr = g_sifRpcPayloadFollowingEeAddr;
                         }
 
+                        if (g_sifVerboseLogs)
                         std::cerr << "[SIF-iop] UNROUTED sid=0x" << std::hex << boundSid
                                   << " rpc=0x" << rpcNumber
                                   << " client=0x" << clientPtr
@@ -877,6 +925,7 @@ namespace ps2_stubs
                         boundSid == kSifSidCdvdNcmd || boundSid == kSifSidCdvdScmd ||
                         boundSid == kSifSidCdvdDiskReady)
                     {
+                        if (g_sifVerboseLogs)
                         std::cerr << "[SIF-iop] cdvd sid=0x" << std::hex << boundSid
                                   << " rpc=0x" << rpcNumber
                                   << " payload=0x" << callPayloadAddr
@@ -911,6 +960,7 @@ namespace ps2_stubs
                             {
                                 runtime->Store32(rdram, ctx, receiveAddr, found);
                             }
+                            if (g_sifVerboseLogs)
                             std::cerr << "[SIF-iop] cdvd search -> " << found
                                       << " path=\"" << searchPath << "\"" << std::endl;
                         }
@@ -926,6 +976,7 @@ namespace ps2_stubs
                             setScratchGpr(scratch, 5, sectors);
                             setScratchGpr(scratch, 6, dest);
                             ps2_stubs::sceCdRead(rdram, &scratch, runtime);
+                            if (g_sifVerboseLogs)
                             std::cerr << "[SIF-iop] cdvd stream read lsn=0x" << std::hex << lsn
                                       << " sectors=" << std::dec << sectors
                                       << " dest=0x" << std::hex << dest << std::dec << std::endl;
@@ -997,6 +1048,7 @@ namespace ps2_stubs
                             if (answered)
                             {
                                 runtime->Store32(rdram, ctx, receiveAddr, answer);
+                                if (g_sifVerboseLogs)
                                 std::cerr << "[SIF-iop] cdvd scmd rpc=0x" << std::hex
                                           << rpcNumber << " -> 0x" << answer << std::dec
                                           << std::endl;
@@ -1006,6 +1058,7 @@ namespace ps2_stubs
                                  recvSize >= 4u)
                         {
                             runtime->Store32(rdram, ctx, receiveAddr, kSifCdvdComplete);
+                            if (g_sifVerboseLogs)
                             std::cerr << "[SIF-iop] cdvd diskready -> 0x" << std::hex
                                       << kSifCdvdComplete << std::dec << std::endl;
                         }
@@ -1021,6 +1074,7 @@ namespace ps2_stubs
                             runtime->Store32(rdram, ctx, receiveAddr + 0x04u, kSifCdvdLibVersion);
                             runtime->Store32(rdram, ctx, receiveAddr + 0x08u, kSifCdvdLibVersion);
                             runtime->Store32(rdram, ctx, receiveAddr + 0x0Cu, 0u);
+                            if (g_sifVerboseLogs)
                             std::cerr << "[SIF-iop] cdvd init -> ok" << std::endl;
                         }
                     }
@@ -1069,6 +1123,7 @@ namespace ps2_stubs
                     }
                 }
 
+                g_rpcStage.lap("hle");
                 uint32_t reply[12] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
                 reply[0] = 0x30u;          // psize = 0x30, dsize = 0
                 reply[2] = kSifCmdRpcEnd;  // cid   = 80000008h
@@ -1080,6 +1135,7 @@ namespace ps2_stubs
                 reply[9] = server;         // server
 
                 const bool posted = postIopSifCommand(rdram, ctx, runtime, reply, 12u);
+                if (g_sifVerboseLogs)
                 std::cerr << "[SIF-iop] RPC CALL client=0x" << std::hex << clientPtr
                           << (posted ? " -> RPC END posted" : " -> RPC END FAILED")
                           << std::dec << std::endl;
@@ -1539,6 +1595,7 @@ namespace ps2_stubs
         {
             PS2_IF_AGRESSIVE_LOGS({
                 auto flags = std::cerr.flags();
+                if (g_sifVerboseLogs)
                 std::cerr << "[sceSifGetReg] reg=0x" << std::hex << reg
                           << " value=0x" << value
                           << " pc=0x" << (ctx ? ctx->pc : 0u)
@@ -1684,10 +1741,15 @@ namespace ps2_stubs
 
     void sceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        const SifTimingGuard g_setDmaTiming{"sceSifSetDma"};
         const uint32_t dmatAddr = getRegU32(ctx, 4);
         const uint32_t count = getRegU32(ctx, 5);
 
-        // TEMP DIAGNOSTIC (black-content triage)
+        // TEMP DIAGNOSTIC (black-content triage).  Runtime-gated: lap timing
+        // (session 23) measured ~18 ms of unit-buffered cerr flushes per
+        // sceSifSetDma call in this block alone - PS2_SIF_VERBOSE=1 restores it.
+        if (g_sifVerboseLogs)
+        {
         std::cerr << "[SIF-SetDma] pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
                   << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
                   << " dmat=0x" << dmatAddr
@@ -1721,9 +1783,12 @@ namespace ps2_stubs
                 }
             }
         }
+        }
 
         const uint32_t listAddr = getRegU32(ctx, 4);
         PS2_IF_AGRESSIVE_LOGS({
+            if (g_sifVerboseLogs)
+            {
             std::cerr << "[sceSifSetDma:CALL] pc=0x" << std::hex << ctx->pc
                       << " ra=0x" << getRegU32(ctx, 31)
                       << " list=0x" << listAddr
@@ -1746,6 +1811,7 @@ namespace ps2_stubs
                           << " pc=0x" << ctx->pc
                           << " ra=0x" << getRegU32(ctx, 31)
                           << std::dec << std::endl;
+            }
             }
         });
 
@@ -1799,6 +1865,7 @@ namespace ps2_stubs
             for (uint32_t i = 0; i < pendingCount; ++i)
             {
                 const Ps2SifDmaTransfer &xfer = pending[i];
+                SifTimingGuard g_stage{"xfer"};
                 if (runtime)
                 {
                     PS2IopTransport::notifyTransfer(runtime, rdram, {
@@ -1809,6 +1876,7 @@ namespace ps2_stubs
                                                                         static_cast<uint32_t>(xfer.size),
                                                                     });
                 }
+                g_stage.lap("notifyB");
                 const uint32_t sizeBytes = static_cast<uint32_t>(xfer.size);
                 std::vector<uint8_t> payload(sizeBytes);
                 if (!readEeRange(rdram, xfer.src, payload.data(), sizeBytes) || !runtime->writeIopMemory(xfer.dest, payload.data(), payload.size()))
@@ -1816,6 +1884,7 @@ namespace ps2_stubs
                     ok = false;
                     break;
                 }
+                g_stage.lap("copy");
                 if (runtime)
                 {
                     PS2IopTransport::notifyTransfer(runtime, rdram, {
@@ -1826,6 +1895,7 @@ namespace ps2_stubs
                                                                         static_cast<uint32_t>(xfer.size),
                                                                     });
                 }
+                g_stage.lap("notifyA");
                 g_sifRpcPayloadPrecedingEeAddr = previousEntrySrc;
                 g_sifRpcPayloadPrecedingSize = previousEntrySize;
                 g_sifRpcPayloadFollowingEeAddr =
@@ -1837,6 +1907,7 @@ namespace ps2_stubs
                 // it just received (see emulateIopSifCmdInitHandshake).
                 emulateIopSifCmdInitHandshake(rdram, ctx, runtime, xfer);
                 dumpSifCmdHandlersOnce(rdram, ctx, runtime, xfer);
+                g_stage.lap("cmdInit");
                 emulateIopSifRpc(rdram, ctx, runtime, xfer);
 
                 previousEntrySrc = xfer.src;
@@ -1860,7 +1931,9 @@ namespace ps2_stubs
             return;
         }
 
+        if (g_sifVerboseLogs)
         std::cerr << "[SIF-SetDma] ok=1 pending=" << pendingCount << std::dec << std::endl;
+        SifTimingGuard g_dmac{"setDma:dmac"};
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
 
         // TEMP DIAGNOSTIC (raw-SIFRPC bridge): what the guest's own handlers
@@ -1914,6 +1987,7 @@ namespace ps2_stubs
         {
             PS2_IF_AGRESSIVE_LOGS({
                 auto flags = std::cerr.flags();
+                if (g_sifVerboseLogs)
                 std::cerr << "[sceSifSetReg] reg=0x" << std::hex << reg
                           << " prev=0x" << prev
                           << " value=0x" << value
