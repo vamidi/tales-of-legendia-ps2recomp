@@ -82,6 +82,12 @@ dormant-missing=0, tick 2070-2130. The race has not re-fired since run149 (grid 
 shifts worker-body completion past the 40 s window); the fallback remains a proven safety
 net (run147 caught +8 live; +0x2c coverage verified by switch-case + slot-distance check).
 
+**run158 (120 s stability):** HEALTHY - tick=6930/120 s = 57.75 Hz avg (steady 60 Hz; boot
+ramp amortizes), vbLagAvg decayed to 1597 us, threads=6, IDLE=0, dormant-missing=0, race
+never fired in 120 s. Frontier SUSTAINED 60.1/s: c4350 1084@20s -> 2292@40s -> 3494@60s ->
+4697@80s. CAVEAT for the next session: the cri dump is budgeted at 80 prints total
+(`s_srvPrints < 80u`, ps2_runtime.cpp ~L3239) - it goes silent after t~80 s; raise the
+budget or add a second frontier probe for multi-minute asset-loading runs.
 **Current Blocker:** none. New baseline (run150-157): steady-state 60 Hz vblank, c4350
 ~1915-1989/40 s (late-window 60/s), 8/8 healthy, boot race survivable via reentryFallback.
 Remaining wall-clock drag on 40 s totals: the ~11 s boot ramp (JIT bursts + staged-init
