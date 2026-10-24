@@ -2,6 +2,27 @@ cmake_minimum_required(VERSION 3.20)
 
 project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
 
+# --- Session 22 (user-approved 2026-10-24): MSVC Debug optimization override ---
+# out/build is configured with CMAKE_BUILD_TYPE=Debug, which puts
+# "/Zi /Ob0 /Od /RTC1 -MDd" on every TU in this subproject - including all ~53k
+# generated runner files - collapsing recompiled-guest throughput to ~23k EE
+# cycles/s against the 299 MHz the game expects (PS2_PROJECT_STATE.md, session
+# 21: every diagnostic run this project has done has been at ~1/1000 speed).
+# Rewrite the Debug flag set for THIS subproject only: same code, optimized.
+# The cache is untouched (no reconfigure, no clean), the debug CRT stays (-MDd
+# defines _DEBUG, so Granite's VK_ASSERT and in-tree asserts remain live), and
+# /RTC1 must go because it is incompatible with /O2.  Ninja recompiles every TU
+# in this directory once (its flags changed); later builds stay incremental.
+if(MSVC)
+    string(REPLACE "/Od" "/O2"   CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    string(REPLACE "/Ob0" "/Ob2" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    string(REPLACE "/RTC1" ""    CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    string(REPLACE "/Od" "/O2"   CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+    string(REPLACE "/Ob0" "/Ob2" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+    string(REPLACE "/RTC1" ""    CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+    message(STATUS "ps2xRuntime Debug override: CMAKE_CXX_FLAGS_DEBUG=${CMAKE_CXX_FLAGS_DEBUG}")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -519,7 +540,12 @@ if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
 endif()
 
 if(MSVC)
-    target_compile_options(ps2EntryRunner PRIVATE /FS)
+    # Session 22: /O2 (Debug-flags override above) implies /Gy, and the monolith
+    # generated functions (FUN_00256cc0 ~92k lines, FUN_002578b8 ~77k lines)
+    # exceed COFF's 65k-section object limit inside their unity batches
+    # (fatal C1128). /bigobj raises the limit; scoped to the runner target so
+    # the runtime lib and _deps (which compile fine) are not invalidated.
+    target_compile_options(ps2EntryRunner PRIVATE /FS /bigobj)
 endif()
 
 target_include_directories(ps2_runtime PUBLIC

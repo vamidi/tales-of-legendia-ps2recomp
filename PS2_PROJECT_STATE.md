@@ -37,14 +37,53 @@ again, suspect the GPU/session/display environment first - do not bisect code.
 +18=0x63d600` - the same frontier as run124/126. The disc-monitor `rpc=0xc -> 0` polling is the healthy
 `kSifCdvdStatusIdle=0` path, not the old retry trap.
 
-**Current blocker (unchanged, needs a user decision):** the whole tree is an MSVC **Debug** build
-(`/Zi /Ob0 /Od /RTC1 -MDd` on all ~53k runner TUs) - EE throughput ~23k cyc/s vs 299M real. Options
-(session 21): (a) per-target `/O2 /Ob2` override for the runner TUs in the existing `out/build`
-(CMakeLists edit, one ~1-3 h rebuild, incremental builds preserved, no clean); (b) full Release
-reconfigure of `out/build` (recompiles `_deps` too); (c) a new clang-cl+Ninja+Release build dir
-(skill-optimal ~1 h full build, needs the CMakeLists SSE4.1/unity surgery, leaves `out/build` intact);
-(d) stay Debug, accept 1/1000 speed. The ADXF "never reaches state 3" stall must be re-examined *after*
-throughput is fixed.
+**Build-config decision (user, 2026-10-24): option (a) approved and applied.** `ps2xRuntime/CMakeLists.txt`
+now rewrites `CMAKE_CXX/C_FLAGS_DEBUG` for the whole ps2xRuntime subproject (runtime lib + runner +
+raylib/imgui + parallel-gs/Granite, all added in that scope): `/Od -> /O2`, `/Ob0 -> /Ob2`, `/RTC1`
+dropped (incompatible with /O2). Cache untouched: `CMAKE_BUILD_TYPE=Debug` and `-MDd` stay, so `_DEBUG`
+keeps Granite's VK_ASSERT and in-tree asserts live. One full recompile of the subproject (~2066 ninja
+edges) started 13:51 via `scripts\build-runtime.bat`; log `logs\o2_rebuild_session22.log` (harness shell
+sh_16dbffbdd001kE965PodI0OfgA). After exit 0: 25-50 s run, compare `[EE-prof]` throughput vs the
+~23k cyc/s Debug baseline and vblank rate vs 23 Hz, then re-examine the ADXF "never reaches state 3"
+stall at real speed.
+
+**C1128 on the first /O2 pass (build 13:51 -> FAILED 14:55, 1695/1826 edges done):** `unity_180` and
+`unity_182` died with `fatal error C1128: number of sections exceeded object file format limit` at
+`FUN_00256cc0_0x256cc0.cpp(91947)` / `FUN_002578b8_0x2578b8.cpp(76744)`. Mechanism: /O2 implies /Gy
+(function-level COMDATs), and the monolith generated functions (92k/77k lines) blow past the COFF
+65k-section object limit inside their unity batches. Fix applied: `/bigobj` added to the
+`ps2EntryRunner` target only (same `if(MSVC)` block as `/FS`, ~line 542 of
+`ps2xRuntime/CMakeLists.txt`) - runtime lib and _deps keep their already-built objects. Timing data:
+1695 edges in 64 min, so /O2 compiles at Debug speed or better. Second pass started 15:0x via the
+same script (harness shell sh_16e0634f00011PjJEsT39XVO6w); /bigobj changes every runner TU command
+line so all ~1660 unity batches recompile once more (~1 h) then link. Fallback if cl chokes on the
+two monolith batches under /O2 (C1001/C1026): per-file /Od on those two runner sources.
+**Build pass 2 (started 15:0x, harness lost the shell ~16:0x BEFORE link):** /bigobj worked - all
+1674 unity batches recompiled by 15:58:44 (verified: every Unity/*.obj newer than the 15:11:21
+build.ninja regeneration). Monolith batch unity_187 alone took 34 min under /O2; the five monolith
+sources FUN_00256bc8/256d58/256cc0/257888/2578a0 are 8.3-8.6 MB each, register_functions.cpp 19 MB.
+The background shell output file vanished and ninja died with it (no completion notification); exe
+stayed the 03:08 Debug one, so the link never ran. Pass 3 started 16:38 (harness shell
+sh_16e5a4bdf001VTixg6wd8OfekX): every object is fresh so ninja goes straight to link (514 MB exe,
+~5-20 min). If pass 3 also dies mid-link, run scripts\build-runtime.bat in a normal console window
+(immune to harness shell loss) - it is incremental and will resume at the link step.
+**run132 (/O2 exe, 50 s, build 17:37, 291 MB vs 514 MB Debug):** full diagnostics, zero asserts/VK
+failures. Dispatch rate 4.4x Debug (iters=1175/3s vs 267/3s); early boot 58.8M cyc in 5 s. Steady
+EE throughput still ~23k cyc/s because the boot chain is vblank-locked: DIAG-vb 1110 ticks/47.6 s
+= 23.3 Hz; threads=6 from tick 330 (~14 s); cri c42c4=1 c3228=1 c3230=0x1, c4350 advancing ~21/s
+(run126 Debug: same state, ~21.6/s - frontier rate is vblank-paced, not compile-paced); [EE-adxf]
+adxf[0] st=2 with stm active (0x85000 buffers, dest 63d600) - deeper than session 21 st=1, not yet
+3. Request queue final state identical to run126 (count=1 b2=1 +18=0x63d600). flips=0,0.
+
+**NEW BOTTLENECK: vblank delivery is 23 Hz, not 60 Hz.** Period 43.5 ms = 16.7 ms re-arm + ~27 ms
+delivery lag. The frame-paced boot chain advances ~1 unit per vblank, so fixing this is worth ~2.6x
+wall-clock on boot. Session 21 checkpointDue host-gate attempt (run127) regressed badly - needs a
+different approach. Next session: instrument WHERE VBlankStart delivery lags its host deadline
+(processDueDeadlines entry vs waitForEvent wake vs checkpointDue gate) before changing anything.
+**Committed + pushed (user instruction):** `d9db358` "runtime(ee): pace vblank on wall-clock so CRI
+server threads wake at frame cadence" - 5 files (ee_scheduler.h, EeScheduler.cpp, SIF.cpp,
+ps2_runtime.cpp, this file); remote master tip verified `d9db358`. The CMakeLists flag change gets its
+own commit once the build verifies.
 
 ## Session 21 - wall-clock vblank lands and moves boot a long way; the throughput root cause is a **Debug build**
 
