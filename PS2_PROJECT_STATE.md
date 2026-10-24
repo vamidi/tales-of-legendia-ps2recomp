@@ -16,6 +16,55 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 23 - the 23 Hz vblank cap: checkpointDue() never consumed m_nextDeadlineHostUs (half-landed session-21 fix)
+
+**User-approved workstream:** chase the 23 Hz vblank delivery cap found in run132, "as long as
+this is a step closer to loading the assets". It is: the asset frontier (cri c4350, ADXF stream)
+advances ~1 unit per vblank, so 60 Hz is worth ~2.6x wall-clock on the frame-paced boot chain.
+
+**Root cause (found by reading, no instrumentation needed):** EeScheduler::checkpointDue() is the
+gate that preempts a RUNNING guest for pending events (called every 8-32 guest cycles from
+dispatchGuestBranch and generated-code backward edges). Session 21 added m_nextDeadlineHostUs and
+published it in updateNextDeadline() with the comment "published separately so checkpointDue() can
+preempt on it" - but the consumer was never written: checkpointDue() only checked the cycle gate
+(m_nextDeadlineCycle), which vblank (deadlineCycle=0) never satisfies. vblank was therefore only
+noticed at time-slice expiry: delivery lag = slice length ~27 ms -> period 16.7+27 = 43.5 ms =
+23.3 Hz. Exactly the run126/run132 signature.
+
+**Why run127 regressed (session 21 first attempt):** updateNextDeadline published the nearest host
+deadline across ALL events including cycle-gated ones (alarms/timers). A host gate firing for a
+not-yet-cycle-due event makes processDueDeadlines() decline to deliver, the gate re-fires at the
+very next checkpoint, and the loop thrashes without running the guest (guest_ms=3/3000, 9 Hz).
+
+**Fix (EeScheduler.cpp only, no header change - m_nextDeadlineHostUs already existed):**
+1. updateNextDeadline(): publish m_nextDeadlineHostUs for WALL-CLOCK-PACED events only
+   (deadlineCycle==0; hostOrMax lambda), storing 0 when none exist.
+2. checkpointDue(): new host gate between the cycle gate and the m_sliceEndCycle short-circuit:
+   m_nextDeadlineHostUs != 0 && steady_clock now >= it -> checkpointPending + transferPending.
+   Whenever it fires the event is cycle-met AND host-met, so processDueDeadlines() is guaranteed
+   to deliver and re-arm 16.7 ms out - the run127 thrash cannot recur.
+Cost: one steady_clock::now() per checkpoint while a wall-clock event is pending (always, vblank);
+~1.4M calls/s worst boot burst x ~25 ns = ~3 percent, acceptable.
+
+**Verification (pending at write time):** rebuild shell sh_16eb8ac85001JW6vs4PMA4AnV8 (one runtime
+TU + relink; no runner batches, no CMakeLists change). run133 acceptance: DIAG-vb ~60 Hz (was
+23.3), c4350 ~60/s (was ~21/s), no starvation (guest_ms high, iters healthy), ADXF st past 2.
+On pass: commit + push. On fail: fix forward from this exact diff.
+**run133 (gate exe, 50 s; incremental build only 4m10s - the 55-min pass-3 "link" was really the
+3 monolith compiles; a 1-TU rebuild+relink is ~4 min):** gate verified live: vblank 23.3 -> 26.8
+Hz (tick 1290/48.2 s), DIAG-irq 44.6 -> 54.1/s, early boot 58.7M cyc in 3.1 s (was 5.0 s), c4350
+1179@48 s (was 1044@50 s). No asserts, no starvation (guest_ms 2549/3000, iters 1184/3s). ADXF
+still st=2, req queue identical, flips 0,0.
+
+**Remaining ~20 ms lag is NOT the gate: it is host-blocking waits INSIDE single guest dispatches
+(no checkpoints run there, so the gate cannot fire).** [EE-profp] top host cost names the PCs:
+0x109144 n=59 avg 7.9 ms (matches cdvd rpc=0xc disc-monitor poll, 15/s); 0x166370 n=9 avg 49.3 ms
+(adjacent to INTC handler 0x166490 - likely the game vsync-wait: victim AND cause, the executor
+cannot deliver vblank while it sits in a host-side wait); 0x139888 n=1 290 ms; 0x139ae0 n=1 237 ms;
+0x10235c n=2 avg 44 ms. NEXT: identify those PCs via runner filenames/register_functions, find the
+host-side wait in their syscall stubs (blocking SIF RPC / sleep not tied to scheduler deadlines),
+make those waits pump processDueDeadlines or park with the vblank deadline, rebuild (~4 min),
+retest for ~60 Hz.
 ## Session 22 - the "no-output regression" was environmental, not code; the tree is healthy at the run126 frontier
 
 **Disproved (do not chase again):** the session-21 suspected `assetInitEntryLabel` regression. The five

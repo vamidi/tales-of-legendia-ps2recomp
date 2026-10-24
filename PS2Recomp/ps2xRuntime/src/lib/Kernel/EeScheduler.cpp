@@ -677,6 +677,29 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return true;
     }
 
+    // Session 23: wall-clock-paced events (deadlineCycle 0 - VBlankStart/VBlankEnd)
+    // are invisible to the cycle gate above, so without this preemption the
+    // interrupt is only noticed when the time slice expires: delivery lag equals
+    // the slice length, measured 23 Hz instead of 60 Hz (run132). This is the
+    // consumer session 21 promised when it added m_nextDeadlineHostUs.
+    // m_nextDeadlineHostUs is published for wall-clock-paced events ONLY (see
+    // updateNextDeadline), so whenever this fires processDueDeadlines() has
+    // something deliverable - the run127 thrash (gate firing on cycle-gated
+    // events' host estimates, guest starved to guest_ms=3/3000) cannot recur.
+    const uint64_t preemptHostUs = m_nextDeadlineHostUs.load(std::memory_order_acquire);
+    if (preemptHostUs != 0u)
+    {
+        const uint64_t nowUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                         std::chrono::steady_clock::now().time_since_epoch())
+                                                         .count());
+        if (nowUs >= preemptHostUs)
+        {
+            m_checkpointPending.store(true, std::memory_order_release);
+            m_transferPending = true;
+            return true;
+        }
+    }
+
     if (m_eeCycle < m_sliceEndCycle)
     {
         return false;
@@ -2511,19 +2534,29 @@ void EeScheduler::updateNextDeadline()
                                          item.hostDeadline.time_since_epoch())
                                          .count());
     };
+    // Session 23: publish the nearest host deadline for WALL-CLOCK-PACED events
+    // only (deadlineCycle 0: VBlankStart/VBlankEnd). Cycle-gated events already
+    // have m_nextDeadlineCycle below; including their host estimates here let
+    // checkpointDue() preempt for events processDueDeadlines() will not deliver
+    // (not cycle-due yet), re-arming the gate every checkpoint and starving the
+    // guest (session 21, run127: guest_ms=3/3000, tick collapsed to 9 Hz).
+    const auto hostOrMax = [&hostUs](const ScheduledEvent &item)
+    { return item.deadlineCycle == 0u ? hostUs(item) : std::numeric_limits<uint64_t>::max(); };
     const auto nextHost = std::min_element(m_deadlines.begin(), m_deadlines.end(),
-                                           [&hostUs](const ScheduledEvent &left,
-                                                     const ScheduledEvent &right)
+                                           [&hostOrMax](const ScheduledEvent &left,
+                                                        const ScheduledEvent &right)
                                            {
-                                               const uint64_t l = hostUs(left);
-                                               const uint64_t r = hostUs(right);
+                                               const uint64_t l = hostOrMax(left);
+                                               const uint64_t r = hostOrMax(right);
                                                if (l != r)
                                                {
                                                    return l < r;
                                                }
                                                return left.sequence < right.sequence;
                                            });
-    m_nextDeadlineHostUs.store(hostUs(*nextHost), std::memory_order_release);
+    const uint64_t wallHostUs = hostOrMax(*nextHost);
+    m_nextDeadlineHostUs.store(wallHostUs == std::numeric_limits<uint64_t>::max() ? 0u : wallHostUs,
+                               std::memory_order_release);
 
     // Ignore wall-clock-only events (deadlineCycle 0, e.g. VBlank) when publishing
     // the next *cycle* deadline: they are never cycle-due, and letting them win the
