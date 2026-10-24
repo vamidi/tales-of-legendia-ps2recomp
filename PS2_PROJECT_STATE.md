@@ -16,6 +16,53 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 24 - boot race root-caused and fixed: entry_* secondary re-entry slots missing from the function table
+
+**Root cause (the run137/run140/run144 signature):** the staged-init worker body (`func_1B4AE8`
+via `entry_001b68f8`) returns with `jr $ra` to a MID-FUNCTION slot - `0x1b6900` =
+`entry_001b68f8`+8 and `0x1b5514` = `entry_001b550c`+8, the return address after each
+trampoline's first JAL. The recompiler's `discoverAdditionalEntryPoints()`
+(ps2_recompiler.cpp L1973-2016) SKIPS `entry_*` functions from resume-target collection, so
+those slots stay null in the dense table even though the generated body's switch HAS the case
+(`case 0x1b6900u:`, `case 0x1b5514u:` verified in runner sources). The lookup miss ->
+missing-function policy -> main thread dormant -> threads=3, executor parks, ADXF never starts.
+The "~1-in-3 race" is just whether the worker body completes and returns inside the run
+window; a faster executor makes it MORE likely (run143/144 hit it right after the stderr
+gating landed).
+
+**Fix (ps2_runtime.cpp only, runtime side):** `reentryFallback()` - on a table miss, scan back
+at most 0x10 bytes for the nearest registered slot (the containing function's start) and
+return that function; its generated switch validates ctx->pc before jumping to the re-entry
+label. The window is tight so only trampoline start+4..+0x10 re-entries - which the
+recompiler always emits a case for - can match; everything else falls through to the
+unchanged missing-function path. It must apply to BOTH `hasFunction` and `lookupFunction`:
+the scheduler's strict pre-check (EeScheduler L570) and `dispatchGuestBranch` L1708/1717
+consult `hasFunction` and never reach `lookupFunction` on a miss - fallback v1 (lookupFunction
+only) printed nothing in run144. `[lookup-reentry]` diagnostic prints on every fallback fire.
+
+**Why not fix the recompiler:** the root fix is emitting table entries for entry_* resume
+targets, but `writeToFile` is unconditional - re-running the pipeline rewrites all ~30k
+runner files -> 30+ h rebuild, and byte-identical regeneration of the current runner config
+(renames, TOML options) is not guaranteed. Recorded for a future regeneration window.
+
+**Verification:** run147 caught the race LIVE: `[lookup-reentry] pc=0x1b5514 -> containing
+0x1b550c (+8)` and the run stayed healthy (threads=6, dormant-missing=0, IDLE=0, tick=1980 =
+49.5 Hz, c4350=1856). run145/146 healthy (48.8 Hz, c4350 ~1813, vbLagAvg ~2.75 ms) with the
+race not firing. Zero spurious fallback fires across all runs.
+
+**Flush-storm lever (user-approved cache flip):** PS2X_ENABLE_AGRESSIVE_LOGS=OFF in the
+out/build CMake cache (local build-dir change, NOT committed; CMakeLists default still ON).
+PS_LOG_ENTRY stripped from every runner TU (one 1756-target full rebuild), ps2_log.txt no
+longer written. Healthy-run result: run145-147 = 48.8-49.5 Hz vs run141's 51.0 Hz - NO gain
+beyond run141; the ps2_log flush cost was not on the vblank critical path.
+
+**Next lever:** the remaining ~2.8 ms/frame vblank delivery lag (vbLagAvg 2.74-2.84 ms,
+run145-147) is what keeps vblank at ~49-51 Hz instead of 60 Hz (16.67+2.8 = 19.5 ms period).
+vbLagMax ~0.7 s is a boot-phase JIT-compile burst, not steady state.
+
+**Current Blocker:** none - boot race fixed; gated+fallback build is the new baseline
+(run147: 49.5 Hz, c4350 46.4/s, race survivable).
+
 ## Session 23 - the 23 Hz vblank cap: checkpointDue() never consumed m_nextDeadlineHostUs (half-landed session-21 fix)
 
 **User-approved workstream:** chase the 23 Hz vblank delivery cap found in run132, "as long as

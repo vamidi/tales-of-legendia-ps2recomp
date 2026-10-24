@@ -1106,6 +1106,37 @@ namespace
         slot = offset >> 2;
         return slot < g_ps2RecompiledFunctionTableSlotCount;
     }
+
+    // Session 24: secondary-entry fallback. discoverAdditionalEntryPoints()
+    // skips entry_* functions, so their secondary re-entry slots stay null in
+    // the dense table even though the generated body's switch HAS the case:
+    // 0x1b6900 = entry_001b68f8+8 and 0x1b5514 = entry_001b550c+8 (the return
+    // address after the trampoline's first JAL) both missed, dormanting the
+    // main thread when func_1B4AE8's `jr $ra` returned there - the
+    // run137/run140/run144 staged-init boot race. Scan back a tight window
+    // from the missed slot for the nearest registered entry: that is the
+    // start of the containing function, and its switch validates ctx->pc
+    // before jumping to the re-entry label. The window covers only
+    // trampoline start+4..+0x10 re-entries, which the recompiler always
+    // emits a case for; anything further falls through to the unchanged
+    // missing-function path.
+    PS2Runtime::RecompiledFunction reentryFallback(uint32_t slot, uint32_t *entryAddress)
+    {
+        constexpr uint32_t kReentryWindowSlots = 4u; // 0x10 bytes
+        for (uint32_t back = 1u; back <= kReentryWindowSlots && slot >= back; ++back)
+        {
+            const PS2Runtime::RecompiledFunction containing = g_ps2RecompiledFunctionTable[slot - back];
+            if (containing != nullptr)
+            {
+                if (entryAddress != nullptr)
+                {
+                    *entryAddress = g_ps2RecompiledFunctionTableBase + (slot - back) * 4u;
+                }
+                return containing;
+            }
+        }
+        return nullptr;
+    }
 }
 
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
@@ -1132,7 +1163,11 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
     uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    if (!generatedFunctionTableSlot(address, slot))
+    {
+        return false;
+    }
+    return g_ps2RecompiledFunctionTable[slot] != nullptr || reentryFallback(slot, nullptr) != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1171,6 +1206,16 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         if (fn != nullptr)
         {
             return fn;
+        }
+
+        // Session 24: secondary-entry fallback (see reentryFallback() above).
+        uint32_t entryAddress = 0u;
+        if (const RecompiledFunction containing = reentryFallback(slot, &entryAddress))
+        {
+            std::cerr << "[lookup-reentry] pc=0x" << std::hex << address
+                      << " -> containing 0x" << entryAddress
+                      << " (+" << (address - entryAddress) << ")" << std::dec << std::endl;
+            return containing;
         }
     }
 
