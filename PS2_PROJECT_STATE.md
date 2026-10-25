@@ -16,6 +16,117 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 26 - ROOT CAUSE of the whole boot stall: `ChangeThreadPriority` must return the OLD priority (priority inversion)
+
+**Symptom being chased.** Vblank ticked at 60 Hz, `flips=0`, and every CRI counter
+(`0x197940` server pump, `0x1973a8` ADXF exec, `0x19f468` Stm exec, `0x1ad2e8` CDV pump) was
+frozen from ~t=15 s while main-thread counters advanced. Thread dump (`[EE-thr]`) showed the
+CRI server threads 3/4 `Ready` at priority 16/18 with a byte-identical PC for 60 s: **they were
+never dispatched even once**.
+
+**Why (Ghidra, `FUN_001997a8` = `ADXPS2_Init`, called with `a0 == 0`, the default config):**
+- It creates the CRI server threads from the default config (`1, 8, 16, 18, 25`) and then calls
+  `ChangeThreadPriority(GetThreadId(), 0x18)` - the caller is demoted to 24 so the servers can
+  preempt it.
+- It also installs enter/leave-critical callbacks `FUN_00198a28` / `FUN_00198ab0`
+  (`FUN_001b7658/001b7670`). Enter-critical does `old = ChangeThreadPriority(self, 1)` and
+  stores `old` at `0x39BBF0`; leave-critical re-applies it.
+- **The EE kernel returns the thread's PREVIOUS priority from `ChangeThreadPriority`.** Our
+  implementation returned `0`, so the library saved `0` and the matching restore became
+  `ChangeThreadPriority(tid, 0)` -> `KE_ILLEGAL_PRIORITY` -> the main thread stayed pinned at
+  priority 1 forever. Under a strict-priority scheduler that starves every server at 8/16/18.
+
+**Fix (`Kernel/Syscalls/Thread.cpp`, `changePriorityImpl`):** return `oldPriority` on success
+(`result == KE_OK ? oldPriority : result`). Applies to `ChangeThreadPriority` and
+`iChangeThreadPriority` (same impl). Verified with `[EE-prio-call]`: the sequence is now
+`prio=24 old=119` (init) then `prio=1 old=24` (enter-critical) / `prio=24 old=1`
+(leave-critical), instead of the restore failing with `-403` forever.
+
+**Second finding - the `releaseStagedInitGates` HLE is a SHUTDOWN, not a ready handshake.**
+`FUN_00199938` writes six u64 at `0x394378..0x3943C8` all = 1, and each CRI server thread treats
+its word as a stop flag (`0x198d7c: if (*(u64*)0x394398 != 0) goto exit;` around the serve loop;
+`0x198c60: while (*(u64*)0x394378 == 0) FUN_00198c48(); *(u64*)0x394380 = 1;
+ExitDeleteThread();`). Once the servers actually ran, the HLE terminated all of them (run169:
+threads 2/3/4 gone, boot back to the poll loop). The HLE only ever "worked" because the priority
+bug kept the servers from consuming their own stop flags. Now gated: `PS2X_NO_GATE_HLE=1`
+skips it, and with that the whole pipeline works.
+
+**Result (run170/172, `PS2X_NO_GATE_HLE=1`, 45-60 s):** the CRI/streaming stack is alive -
+`0x197940=2303`, `0x1973a8=2158`, `0x19f468=4229`, `0x1ad2e8=4316`, `0x19ed60=11784` (was
+156/161/245/322 frozen). Server threads 3/4 sit in their own `serve; SleepThread()` loops,
+woken by vblank. The first asset request **completes and is dequeued** (`[WATCH-ENTRY]
+request complete + dequeue`, `[EE-req] count=0`), and the game then streams further files
+through the full path: VFS open -> CDV open -> set position -> set read length -> Stm per-handle
+exec -> transfer step -> complete -> dequeue -> release lock, repeated for request entries
+`#1 #2 #3` across three consumer tasks (PTN_INFO, gs sync, disc monitor). `flips=0` still, but
+this is the first time the game has ever done real streaming I/O.
+
+**New frontier:** an **intermittent** crash 1-2 vblanks after a request completes - jump to
+`pc=0x1` with `ra=0x1`, `sp=0x1ffff60` (a saved return address in main's top stack frame
+becomes 1). run170 died in the CRI SJ helpers (`0x22d044` epilogue), run171 in the game's
+object-update loop (`0x12f800`), and run172 (45 s) did not crash at all, so it is
+timing/interleaving dependent, not a fixed code path. Diagnostics added: `[EE-win]` (dispatch
+window log for `0x22c000..0x22f000`), `stack=` dump in `reportMissingFunction`, and
+`PS2X_WATCH_STACK=1` -> `[EE-stkw]` store watch on main's top frame (`0x1ffff00..0x1ffffc0`)
+plus small sentinels written near the top of RAM.
+
+**Diagnostics still in the tree (all env-gated or capped, strip before commit):**
+`[EE-create]`, `[EE-prio]`, `[EE-prio-call]`, `[EE-thr]`, `[EE-win]`, `[EE-stkw]`,
+`[EE-invstk]`, `[EE-regring]`, `stack=`/`stack=` in the missing-function report,
+`PS2X_MAIN_PRIO`, `PS2X_WATCH_STACK`, `PS2X_GATE_HLE`.
+
+### Session 26 update - the pipeline now really streams (run173-176)
+
+The gate HLE is now **off by default** (`PS2X_GATE_HLE=1` opt-in) because it is a shutdown,
+so a plain run reproduces the good behaviour.
+
+Thread stacks, measured: main (id 1) runs on `stack=0x1F00000 sz=0x100000` - i.e. the whole
+`[0x1F00000, 0x2000000)` top-of-RAM region, exactly the region
+`reserveAsyncCallbackStack` hands the per-(tid,depth) 0x4000 invocation stacks out of
+(`[EE-invstk] tid=3 top=0x1f07ff0`, `tid=4 0x1f0bff0`, `tid=-1 0x1f0fff0`). Those overlap
+main's stack base, but only the bottom 64 KB, and main's deepest observed sp is 0x1fffa70,
+so this is a latent hazard, not the current fault.
+
+Run175 (130 s, gate HLE off): no crash. Counters went from frozen to
+`0x197940=46704`, `0x19f468=86791`, `0x1ad2e8=91250`, `0x1973a8=45624`, `0x1b79f8=228124`,
+`0x19a120=7119`; `vbLagAvgUs` dropped from ~17000 to 724 us; thread 6 exited (threads=5).
+`[EE-seq] paths=16:"CDV:\AFS\MAP.AFS..."` - the game opened and streamed **MAP.AFS**, the
+ADXF job reached `adxf[0] st=3` (completed) and `[EE-req]` is empty. That is the first real
+asset read in the project's history.
+
+Remaining stall: main (thread 1) now busy-polls the CRI callback dispatcher `0x1a9a28`
+(32 slots, `jalr v0` through `*(*slot)`), entered via the string/parse helper
+`0x10d928`/`FUN_00108da0`; trace repeats `0x1a9a48 -> 0x1a9a28 -> 0x1a9a44`. CRI also emits
+`E0041303:illigal parameter 'ptid'.(ADXF_GetPtStat)`, so a completion callback or ptid
+lookup is going wrong. `flips=0` still.
+
+Run176 (120 s, gate HLE off, the new default): no crash, and further than run175 - **8 files
+opened** and all six package files read cleanly:
+`PTN_INFO.BIN` (64), `PTN_INFO.NAM` (75), then `MBS\SYS_REG.MBS` (1720), `MAP.MBS` (3160),
+`SND.MBS` (31724), `FIELD.MBS` (7324), `BATTLE.MBS` (22004), `MOVIE.MBS` - every read
+`hostOk=1 guestOk=1 value=<full size>`. `DVCI: Total 6 files.` confirms all six AFS archives
+(`SND/MAP/SYS_REG/FIELD/BATTLE/MOVIE`) mounted, and 9 IOP modules loaded
+(SIO2MAN, SIO2D, MCMAN, MCSERV, DBCMAN, DS2U_D, LIBSD, KORGIVAG, IXAUDIO).
+
+**The remaining fault, precisely located:** thread 1 reaches the game framework's own main
+loop (`0x3661b0`: `lw t9,0x0(s1); lw t9,0x38(t9); jalr t9` per frame, `jal 0x15231c` = task
+manager tick) with `v0=0x3f800000`, then takes the *shutdown* arm at `0x3661f8`/`0x366208`
+(`vtbl+0x2c`, `vtbl+0x14`) and returns into `ra=0` -> `pc=0` -> thread 1 Dormant with
+`sp=0x423530`. Note `sp=0x423530` is *outside* main's declared stack (`0x1F00000..0x2000000`),
+i.e. the game switches to its own heap-allocated stacks, so the return that lands in
+`ra=0`/`ra=1` is the task/framework return path, not crt0. After that the whole system is
+idle (`guest_ms=72` per 3 s): threads 2-5 sleeping, thread 6 (`entry=0x218908`) asleep, and
+only the vblank invocation runs.
+
+Open question for the next session: whether the framework loop exits because
+`0x3661ec` (`andi v0,v0,0xff` from the frame-update vtable call) reports "quit" due to a
+failed sub-load, or because the task/thread return path is wrong (run175 stayed alive and
+polled `0x1a9a28` instead, so it is interleaving-dependent).
+
+**Correction to Session 25:** `DAT_00394350` is a vblank counter incremented inside the CRI
+vblank handler `FUN_00199f40`, so the "c4350 asset frontier 60/s" of Session 24/25 measured the
+vblank rate, not loading progress. Do not use it as a progress signal.
+
 ## Session 25 - first-presented-frame BMP dump instrumentation: game is pre-draw at t=120s (libgs init done, no swap yet)
 
 **Goal.** Answer "can we see something on screen?" with a real image: dump the GS framebuffer as a BMP the moment the guest first presents.

@@ -1390,6 +1390,21 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " vtbl[c]=0x" << vtableSlotC
             << " codeRegion=" << (m_memory.isCodeAddress(targetPc) ? "yes" : "no")
             << " policy=" << static_cast<uint32_t>(policy)
+            << " stack=" << [&]() {
+                   std::string out;
+                   char buf[16];
+                   for (uint32_t i = 0u; i < 20u; ++i)
+                   {
+                       uint32_t word = 0u;
+                       if (!readGuestU32Offset(sp, i * 4u, word))
+                       {
+                           break;
+                       }
+                       std::snprintf(buf, sizeof(buf), "%x ", word);
+                       out += buf;
+                   }
+                   return out;
+               }()
             << " trace=" << formatDispatchHistory()
             << std::dec;
 
@@ -1653,33 +1668,27 @@ namespace
     }
 }
 
-    // HLE staged-init release for Tales of Legendia (SLUS_212.01).
+    // HLE staged-init release for Tales of Legendia (SLUS_212.01) -- DISABLED by
+    // default since Session 26; PS2X_GATE_HLE=1 re-enables it for A/B testing.
     //
-    // The guest's boot parks in entry_00198c88 spinning on the u64 gate at
-    // 0x394378 forever. That gate block is the game's own staged-init
-    // handshake: FUN_00199938 writes six u64 gates (0x394378 .. 0x3943C8) all
-    // equal to 1, and its only two callers FUN_00199988 / FUN_0019a550 are
-    // counter gated on a countdown at 0x3942C4.
+    // History: the guest's boot appeared to park in entry_00198c88 spinning on
+    // the u64 word at 0x394378 forever, and this HLE was added to write the six
+    // u64 words 0x394378..0x3943C8 to 1 so boot could continue.  The reading was
+    // wrong: `FUN_00199938` is the CRI *shutdown* (counter gated on 0x3942C4),
+    // and every CRI server thread loops on its own word as a STOP flag, so
+    // writing them terminates the entire streaming stack.
     //
-    // In this image that whole handshake is unreachable: a full scan finds no
-    // transfer that targets FUN_00199938 or either driver, no lui/addiu
-    // materialisation of them, and the only reads/writes of the 0x3942C4
-    // counter are inside the two drivers themselves, so the countdown can
-    // never reach zero and nothing ever releases the stages. The IOP never
-    // writes the gate either (instrumented: 39 IOP->EE writes in a whole run,
-    // none inside [0x394300, 0x394400)).
+    // It looked like a fix only because a separate bug kept those servers from
+    // running at all: ChangeThreadPriority must return the *previous* priority,
+    // and ours returned 0, so ADXPS2_Init's critical-section handler could never
+    // restore the main thread's priority and main stayed pinned at priority 1,
+    // starving every server.  With that fixed (Kernel/Syscalls/Thread.cpp) the
+    // servers run, the real handshake completes, and forcing the stop flags is
+    // actively harmful.
     //
-    // The guest's own definition of "every stage is ready" is exactly those
-    // six u64 stores, so apply that once -- but at the moment the guest itself
-    // asks for the handshake, which is when it blocks on semaphore 65.
-    //
-    // Timing matters. Firing on first entry to the staged-init cluster
-    // (0x19A6F0) was tried and is too early: the stage-chain threads (3, 4, 5)
-    // were released and exited six log lines later, long before the sem-60/65
-    // handshake ran, so by the time thread 1 created semaphore 65 and waited on
-    // it there was nothing left that could signal it. Release only when thread 1
-    // reaches the sem-65 wait instead, so the stage chain is still parked and
-    // has a live semaphore to complete.
+    // (Unreachability note, still true: no transfer in this image targets
+    // FUN_00199938 or its two drivers, and the 0x3942C4 counter is only touched
+    // inside them - so the shutdown path never runs, which is exactly right.)
     void releaseStagedInitGates(uint8_t *rdram, uint32_t targetPc, uint32_t sourcePc)
     {
         static bool s_released = false;
@@ -1692,6 +1701,24 @@ namespace
         // JAL's source address, not the label: mid-function branches are inlined
         // gotos and never reach dispatchGuestBranch, but every JAL does.
         if (sourcePc != 0x119C64u)
+        {
+            return;
+        }
+        // Session 26: the six u64 words at 0x394378..0x3943C8 are the CRI server
+        // threads' STOP flags, not a "ready" handshake.  FUN_00199938 (reached
+        // from the ADXPS2 shutdown path) writes all six to 1, and each server
+        // loops on its own word: thread 3 is
+        //   `while (*(u64*)0x394398 == 0) { serve; SleepThread(); }`,
+        // thread 2 is `while (*(u64*)0x394378 == 0) FUN_00198c48();` followed by
+        // `*(u64*)0x394380 = 1; ExitDeleteThread();`.
+        // Forcing them at boot therefore *terminates* the whole CRI stack, which
+        // is what this HLE used to do.  It only ever looked like a fix because
+        // the ChangeThreadPriority return-value bug kept those threads from ever
+        // running far enough to consume their own stop flags.  With that fixed
+        // the servers reach the real handshake themselves, so the HLE stays off
+        // by default; PS2X_GATE_HLE=1 restores it for A/B testing.
+        static const bool s_gateHleEnabled = std::getenv("PS2X_GATE_HLE") != nullptr;
+        if (!s_gateHleEnabled)
         {
             return;
         }
@@ -2476,6 +2503,35 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
 }
 
+// TEMP DIAGNOSTIC (session 26): the boot now completes its first asset request
+// and then dies jumping to pc=0x1 with ra=0x1, twice at different code but
+// always with sp=0x1ffff60, i.e. a saved return address in the top stack frame
+// was overwritten.  PS2X_WATCH_STACK=1 logs stores that land in main's top frame
+// (0x1ffff00..0x1ffffc0) or that write a small sentinel anywhere near the top of
+// RAM, so the clobbering instruction is identifiable.
+static void ps2WatchStackWrite(const R5900Context *ctx, uint32_t vaddr, uint32_t size, uint64_t value, const char *op)
+{
+    static const bool s_enabled = std::getenv("PS2X_WATCH_STACK") != nullptr;
+    static uint32_t s_count = 0u;
+    if (!s_enabled || s_count >= 400u)
+    {
+        return;
+    }
+    const uint32_t phys = vaddr & 0x1FFFFFFFu;
+    const bool inTopFrame = phys >= 0x1FFFF00u && phys < 0x1FFFFC0u;
+    const bool sentinel = value <= 0x1001u && phys >= 0x1FF0000u && phys < 0x2000000u;
+    if (!inTopFrame && !sentinel)
+    {
+        return;
+    }
+    ++s_count;
+    std::cerr << "[EE-stkw] pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+              << " ra=0x" << (ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u)
+              << " addr=0x" << phys
+              << " val=0x" << value
+              << std::dec << " size=" << size << " op=" << op << std::endl;
+}
+
 void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
@@ -2505,6 +2561,7 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
+    ps2WatchStackWrite(ctx, vaddr, 4u, value, "WRITE32");
     try
     {
         m_memory.write32(vaddr, value);
@@ -2519,6 +2576,7 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
+    ps2WatchStackWrite(ctx, vaddr, 8u, value, "WRITE64");
     try
     {
         m_memory.write64(vaddr, value);

@@ -113,7 +113,29 @@ namespace ps2_syscalls
             const int priority = static_cast<int>(getRegU32(ctx, 5));
             int oldPriority = 0;
             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
-            setReturnS32(ctx, result);
+            // TEMP DIAGNOSTIC (session 26): who pins thread 1 to priority 1 on
+            // every frame?  The caller pc/ra identify the guest function.
+            {
+                static uint32_t s_prioCallLogs = 0u;
+                if (s_prioCallLogs < 30u)
+                {
+                    ++s_prioCallLogs;
+                    std::cerr << "[EE-prio-call] id=" << id << " prio=" << priority
+                              << " old=" << oldPriority << " ret=" << result
+                              << " pc=0x" << std::hex << ctx->pc
+                              << " ra=0x" << getRegU32(ctx, 31)
+                              << std::dec << std::endl;
+                }
+            }
+            // The EE kernel returns the thread's PREVIOUS priority on success,
+            // not 0.  The CRI library relies on that: its enter/leave-critical
+            // callbacks (FUN_00198a28 / FUN_00198ab0, installed by ADXPS2_Init)
+            // save the return value and restore it on exit.  Returning 0 made
+            // every restore call ChangeThreadPriority(tid, 0), which the kernel
+            // rejects as KE_ILLEGAL_PRIORITY, so the main thread stayed pinned at
+            // the enter-critical priority 1 and the CRI server threads at
+            // 8/16/18/25 never ran again.
+            setReturnS32(ctx, result == KE_OK ? oldPriority : result);
             ee.transferIfRequested(interruptSafe);
         }
 
