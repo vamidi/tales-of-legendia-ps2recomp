@@ -1,13 +1,262 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// TEMP diagnostic (session 25, first-frame triage): framebuffer BMP dump.
+// The entry runner window has no GS image path, so the frames the guest
+// presents are otherwise invisible. When the guest first presents (libgs swap
+// stubs in Kernel/Stubs/GS.cpp, a DISPFB flip through the GIF path below, or
+// a forced vblank tick in EeScheduler), snapshot the live VRAM through the
+// raster backend and write the framebuffer described by DISPFB as a 24-bit
+// BMP. Budget: 3 dumps per run; PS2_FB_DUMP=N overrides (0 disables).
+// ---------------------------------------------------------------------------
+namespace
+{
+    bool WriteBmp24(const std::filesystem::path &path, uint32_t w, uint32_t h, const std::vector<uint8_t> &bgrBottomUp)
+    {
+        const uint32_t rowBytes = (w * 3u + 3u) & ~3u;
+        const uint32_t pixelBytes = rowBytes * h;
+        std::vector<uint8_t> header(54u, 0u);
+        auto put32 = [](std::vector<uint8_t> &v, size_t at, uint32_t value) {
+            v[at] = static_cast<uint8_t>(value);
+            v[at + 1] = static_cast<uint8_t>(value >> 8);
+            v[at + 2] = static_cast<uint8_t>(value >> 16);
+            v[at + 3] = static_cast<uint8_t>(value >> 24);
+        };
+        auto put16 = [](std::vector<uint8_t> &v, size_t at, uint16_t value) {
+            v[at] = static_cast<uint8_t>(value);
+            v[at + 1] = static_cast<uint8_t>(value >> 8);
+        };
+        header[0] = 'B';
+        header[1] = 'M';
+        put32(header, 2, 14u + 40u + pixelBytes);
+        put32(header, 10, 54u);
+        put32(header, 14, 40u);
+        put32(header, 18, w);
+        put32(header, 22, h);
+        put16(header, 26, 1u);
+        put16(header, 28, 24u);
+        put32(header, 34, pixelBytes);
+        std::ofstream out(path, std::ios::binary);
+        if (!out)
+            return false;
+        out.write(reinterpret_cast<const char *>(header.data()), 54);
+        std::vector<uint8_t> padRow(rowBytes, 0u);
+        for (uint32_t y = 0u; y < h; ++y)
+        {
+            std::memcpy(padRow.data(), bgrBottomUp.data() + static_cast<size_t>(y) * w * 3u, static_cast<size_t>(w) * 3u);
+            out.write(reinterpret_cast<const char *>(padRow.data()), rowBytes);
+        }
+        return out.good();
+    }
+}
+
+bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *tag)
+{
+    static uint32_t s_budget = [] {
+        const char *env = std::getenv("PS2_FB_DUMP");
+        return env ? static_cast<uint32_t>(std::atoi(env)) : 3u;
+    }();
+    static uint32_t s_index = 0u;
+    if (s_budget == 0u)
+        return false;
+    --s_budget;
+    const uint32_t frameIndex = s_index++;
+
+    // A scanout pass records the true display geometry (hostPresentation*)
+    // even though the parallel backend's frame is GPU-only (no CPU pixels).
+    frontend.latchHostPresentationFrame();
+    const GSDebugSnapshot snap = frontend.getDebugSnapshot();
+
+    frontend.refreshDisplaySnapshot();
+    uint32_t vramSize = 0u;
+    const uint8_t *vram = frontend.lockDisplaySnapshot(vramSize);
+    if (!vram || vramSize < 0x40000u)
+    {
+        if (vram)
+            frontend.unlockDisplaySnapshot();
+        std::fprintf(stderr, "[FB-dump] %s: no VRAM snapshot (size=%u)\n", tag, vramSize);
+        return false;
+    }
+
+    // PMODE.ALPS selects the scanout circuit; DISPFB layout: FBP[0:20]
+    // (x in 64px blocks, then y), FBW[22:26] (64px units), PSM[32:36].
+    const unsigned circuit = ((regs.pmode >> 6) & 3u) <= 1u ? static_cast<unsigned>((regs.pmode >> 6) & 3u) : 0u;
+    const uint64_t dispfb = circuit != 0u ? regs.dispfb2 : regs.dispfb1;
+
+    // VRAM census: is anything actually drawn? Scan the snapshot for non-zero
+    // 32-bit words; extent + densest 64 KiB blocks tell whether the guest has
+    // written primitives and where, independent of the DISPFB guess.
+    uint64_t nzCount = 0u;
+    uint64_t nzFirst = ~0ull, nzLast = 0u;
+    uint32_t blockDense[64] = {};
+    for (uint32_t off = 0u; off + 4u <= vramSize; off += 4u)
+    {
+        if (reinterpret_cast<const uint32_t *>(vram)[off >> 2] != 0u)
+        {
+            ++nzCount;
+            if (nzFirst == ~0ull)
+                nzFirst = off;
+            nzLast = off;
+            ++blockDense[off >> 16];
+        }
+    }
+    uint32_t denseIdx[3] = {0u, 0u, 0u};
+    bool denseTaken[64] = {};
+    for (uint32_t k = 0u; k < 3u; ++k)
+    {
+        uint32_t best = 0xFFFFFFFFu;
+        for (uint32_t i = 0u; i < 64u; ++i)
+        {
+            if (!denseTaken[i] && (best == 0xFFFFFFFFu || blockDense[i] > blockDense[best]))
+                best = i;
+        }
+        if (best == 0xFFFFFFFFu)
+            break;
+        denseIdx[k] = best;
+        denseTaken[best] = true;
+    }
+    std::fprintf(stderr,
+                 "[FB-dump] %s census: nzWords=%llu range=0x%llX..0x%llX dense=0x%X:%u 0x%X:%u 0x%X:%u "
+                 "pmode=0x%llX dispfb1=0x%llX dispfb2=0x%llX "
+                 "ctx0frame=%u/%u/0x%02X ctx1frame=%u/%u/0x%02X\n",
+                 tag,
+                 static_cast<unsigned long long>(nzCount),
+                 nzCount != 0u ? static_cast<unsigned long long>(nzFirst) : 0ull,
+                 static_cast<unsigned long long>(nzLast),
+                 denseIdx[0] * 0x10000u, blockDense[denseIdx[0]],
+                 denseIdx[1] * 0x10000u, blockDense[denseIdx[1]],
+                 denseIdx[2] * 0x10000u, blockDense[denseIdx[2]],
+                 static_cast<unsigned long long>(regs.pmode),
+                 static_cast<unsigned long long>(regs.dispfb1),
+                 static_cast<unsigned long long>(regs.dispfb2),
+                 snap.ctx[0].frame.fbp, snap.ctx[0].frame.fbw, static_cast<unsigned>(snap.ctx[0].frame.psm),
+                 snap.ctx[1].frame.fbp, snap.ctx[1].frame.fbw, static_cast<unsigned>(snap.ctx[1].frame.psm));
+
+    const uint32_t bp = static_cast<uint32_t>(dispfb & 0x1FFFFFull);
+    uint32_t fbw = static_cast<uint32_t>((dispfb >> 22) & 0x1Fu);
+    const uint32_t psm = static_cast<uint32_t>((dispfb >> 32) & 0x3Fu);
+
+    uint32_t w = snap.hostPresentationWidth;
+    uint32_t h = snap.hostPresentationHeight;
+    if (w == 0u)
+        w = fbw != 0u ? fbw * 64u : 640u;
+    if (h == 0u)
+        h = 448u;
+    if (w > 1024u)
+        w = 1024u;
+    if (h > 1024u)
+        h = 1024u;
+    bool fbwGuessed = false;
+    if (fbw == 0u)
+    {
+        fbw = (w + 63u) / 64u;
+        fbwGuessed = true;
+    }
+
+    // GSMem readers take the raw packed register fields exactly as DISPFB
+    // stores them (bp = FBP, bw = FBW) and apply the GS VRAM block
+    // addressing. Pixel words are R[0:7] G[8:15] B[16:23] A[24:31]
+    // (same convention as gs_cpu_backend texel reads).
+    uint8_t *vramMut = const_cast<uint8_t *>(vram);
+    std::vector<uint8_t> bgr(static_cast<size_t>(w) * h * 3u, 0u);
+    for (uint32_t y = 0u; y < h; ++y)
+    {
+        // BMP rows are bottom-up.
+        uint8_t *row = bgr.data() + static_cast<size_t>(h - 1u - y) * w * 3u;
+        for (uint32_t x = 0u; x < w; ++x)
+        {
+            uint32_t c = 0u;
+            switch (psm & 0x3Fu)
+            {
+            case GS_PSM_CT24:
+                c = GSMem::ReadCT24(vramMut, bp, fbw, x, y);
+                break;
+            case GS_PSM_CT16:
+                c = GSMem::ReadCT16(vramMut, bp, fbw, x, y);
+                break;
+            case GS_PSM_CT16S:
+                c = GSMem::ReadCT16S(vramMut, bp, fbw, x, y);
+                break;
+            case GS_PSM_CT32:
+            default:
+                c = GSMem::ReadCT32(vramMut, bp, fbw, x, y);
+                break;
+            }
+            uint8_t r = 0u, g = 0u, b = 0u;
+            if ((psm & 0x3Fu) == GS_PSM_CT16 || (psm & 0x3Fu) == GS_PSM_CT16S)
+            {
+                r = static_cast<uint8_t>((c & 0x1Fu) << 3);
+                g = static_cast<uint8_t>(((c >> 5) & 0x1Fu) << 3);
+                b = static_cast<uint8_t>(((c >> 10) & 0x1Fu) << 3);
+            }
+            else
+            {
+                r = static_cast<uint8_t>(c & 0xFFu);
+                g = static_cast<uint8_t>((c >> 8) & 0xFFu);
+                b = static_cast<uint8_t>((c >> 16) & 0xFFu);
+            }
+            row[x * 3u + 0u] = b;
+            row[x * 3u + 1u] = g;
+            row[x * 3u + 2u] = r;
+        }
+    }
+    // Raw physical slab of the densest 3x64 KiB region, read as linear CT32
+    // words: shows what actually lives in VRAM (uploaded textures vs a drawn
+    // framebuffer) regardless of DISPFB/FRAME programming.
+    const uint32_t slabW = 640u;
+    const uint32_t slabWords = 3u * 0x4000u;
+    const uint32_t slabH = slabWords / slabW;
+    const uint64_t slabBaseWord = static_cast<uint64_t>(denseIdx[0]) * 0x4000u;
+    const uint64_t vramWords = vramSize / 4u;
+    const uint32_t *vram32 = reinterpret_cast<const uint32_t *>(vram);
+    std::vector<uint8_t> slab(static_cast<size_t>(slabW) * slabH * 3u, 0u);
+    for (uint32_t y = 0u; y < slabH; ++y)
+    {
+        uint8_t *row = slab.data() + static_cast<size_t>(slabH - 1u - y) * slabW * 3u;
+        for (uint32_t x = 0u; x < slabW; ++x)
+        {
+            const uint64_t word = slabBaseWord + static_cast<uint64_t>(y) * slabW + x;
+            const uint32_t c = word < vramWords ? vram32[word] : 0u;
+            row[x * 3u + 0u] = static_cast<uint8_t>(c >> 16);
+            row[x * 3u + 1u] = static_cast<uint8_t>(c >> 8);
+            row[x * 3u + 2u] = static_cast<uint8_t>(c);
+        }
+    }
+    frontend.unlockDisplaySnapshot();
+
+    std::error_code ec;
+    const auto dir = std::filesystem::current_path(ec);
+    const auto framePath = std::filesystem::weakly_canonical(dir / ("gs_frame" + std::to_string(frameIndex) + "_" + tag + ".bmp"), ec);
+    if (!WriteBmp24(framePath, w, h, bgr))
+    {
+        std::fprintf(stderr, "[FB-dump] %s: cannot write %s\n", tag, framePath.string().c_str());
+        return false;
+    }
+    const auto slabPath = std::filesystem::weakly_canonical(dir / ("gs_slab" + std::to_string(frameIndex) + "_" + tag + ".bmp"), ec);
+    if (!WriteBmp24(slabPath, slabW, slabH, slab))
+        std::fprintf(stderr, "[FB-dump] %s: cannot write %s\n", tag, slabPath.string().c_str());
+
+    std::fprintf(stderr,
+                 "[FB-dump] wrote %s + %s (%ux%u psm=%u fbw=%u%s bp=0x%X circuit=%u dispfb=0x%llX slab@0x%X tag=%s idx=%u)\n",
+                 framePath.string().c_str(), slabPath.string().c_str(), w, h, psm, fbw, fbwGuessed ? "(guessed)" : "", bp, circuit,
+                 static_cast<unsigned long long>(dispfb), denseIdx[0] * 0x10000u, tag, frameIndex);
+    return true;
+}
 
 namespace
 {
@@ -1528,7 +1777,13 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case 0x59:
         if (m_privRegs)
+        {
+            // TEMP diagnostic (session 25): first real buffer switch -> dump.
+            const uint64_t flipsBefore = m_privRegs->displayFlipCount[0].load(std::memory_order_relaxed);
             m_privRegs->writeDisplayFramebuffer(0, value);
+            if (flipsBefore == 0u && m_privRegs->displayFlipCount[0].load(std::memory_order_relaxed) != 0u)
+                Ps2DumpFramebufferBmp(*this, *m_privRegs, "flip");
+        }
         break;
     case 0x5a:
         if (m_privRegs)
@@ -1536,7 +1791,13 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     case 0x5b:
         if (m_privRegs)
+        {
+            // TEMP diagnostic (session 25): first real buffer switch -> dump.
+            const uint64_t flipsBefore = m_privRegs->displayFlipCount[1].load(std::memory_order_relaxed);
             m_privRegs->writeDisplayFramebuffer(1, value);
+            if (flipsBefore == 0u && m_privRegs->displayFlipCount[1].load(std::memory_order_relaxed) != 0u)
+                Ps2DumpFramebufferBmp(*this, *m_privRegs, "flip");
+        }
         break;
     case 0x5c:
         if (m_privRegs)

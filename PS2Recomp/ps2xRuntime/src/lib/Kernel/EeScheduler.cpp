@@ -2335,6 +2335,15 @@ void EeScheduler::processEvent(const EeEvent &event)
                       << " vbLagAvgUs=" << (s_vbDelivered != 0u ? s_vbLagSumUs / s_vbDelivered : 0u)
                       << " vbLagMaxUs=" << s_vbLagMaxUs << std::endl;
         }
+        // TEMP DIAGNOSTIC (session 25): force one framebuffer BMP dump at
+        // t~10s so the dump pipeline is validated even before the guest
+        // reaches its first libgs swap. Budgeted inside the dump helper
+        // (PS2_FB_DUMP=N overrides, 0 disables).
+        if (m_vsyncTick == 600u)
+        {
+            extern bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *tag);
+            Ps2DumpFramebufferBmp(m_runtime.gs(), m_runtime.memory().gs(), "forced");
+        }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {

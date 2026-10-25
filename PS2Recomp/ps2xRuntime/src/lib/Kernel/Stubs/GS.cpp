@@ -6,6 +6,10 @@
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
 
+// TEMP diagnostic (session 25): first-presented-frame BMP dump, defined in
+// gs_frontend.cpp. Budgeted (PS2_FB_DUMP=N overrides, 0 disables).
+extern bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *tag);
+
 namespace ps2_stubs
 {
     namespace
@@ -1127,6 +1131,9 @@ namespace ps2_stubs
         }
 
         runtime->memory().gs().sdkPresentCount.fetch_add(1, std::memory_order_relaxed);
+        // TEMP diagnostic (session 25): the libgs swap IS the guest's present
+        // call; dump the first presented frames as BMPs (budgeted).
+        Ps2DumpFramebufferBmp(runtime->gs(), runtime->memory().gs(), "swap");
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));
     }
 
@@ -1153,6 +1160,9 @@ namespace ps2_stubs
         }
 
         runtime->memory().gs().sdkPresentCount.fetch_add(1, std::memory_order_relaxed);
+        // TEMP diagnostic (session 25): the libgs swap IS the guest's present
+        // call; dump the first presented frames as BMPs (budgeted).
+        Ps2DumpFramebufferBmp(runtime->gs(), runtime->memory().gs(), "swap");
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));
     }
 
