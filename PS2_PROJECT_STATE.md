@@ -16,6 +16,119 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 27 part 4 - the game's main loop, its lazy singleton, and two death families
+
+`FUN_00366090` (`0x366090`) is **the game's main loop**, and it explains both
+symptoms seen so far:
+
+```c
+lVar3 = alloc(0x104) -> FUN_002eefe0()          // renderer-ish object
+lVar2 = alloc(0x50)  -> FUN_002ed210(..,1)      // sound/stream object
+FUN_001ea850(0,0);                              // 0x366104: lazy singleton
+FUN_00139910(2);
+lVar4 = alloc(0x220) -> FUN_003654b0()          // game object
+if (lVar4) {
+  while ( (*piVar6[+0xC])(lVar4) ) {            // per-frame update test
+    (**(code**)(*piRam003db31c + 8))();         // singleton vtable slot 2
+    ...
+    (**(code**)(*piRam003db31c + 0xC))();       // singleton vtable slot 3
+    FUN_0015231c();                             // <- fibre suspend AT DEPTH 0
+  }
+}
+```
+
+* `piRam003db31c` is `*(0x3DB31C)`, created by `FUN_001ea850`:
+  `p = malloc(0x2c); *(0x3DB31C) = p ? FUN_001ea8f0(p,a0,a1) : 0;`
+  So the global holds the *return of the constructor*, not `p`, and stays 0 if
+  either step fails.
+* The loop body ends with `FUN_0015231c()` (suspend). Because this loop is the
+  outermost frame and is **not** running inside the pump, that suspend executes
+  at depth 0 and dereferences the never-allocated node 0. This is the "suspend at
+  depth 0" family from part 3 - it is a *consequence* of the loop structure, not
+  a scheduler bug.
+* Writing the same global from four sites: `0x1ea804`, `0x1ea83c`, `0x1ea8d4`
+  store **zero** (clear/reset), `0x1ea88c` stores **`$a0`** (the factory's
+  result). In a full run the probe only ever saw `pc=0x1ea804 val=0` - i.e. the
+  clear from `FUN_001ea800`, reached via the singleton-reset batch
+  `FUN_00164c60` <- `FUN_00165e70`. The factory store (`0x1ea88c`) did **not**
+  run in those runs.
+* `FUN_00164c60` is a reset batch of ten `jr $ra; sw $zero, -0x78D4($gp)`
+  one-liners, called by `FUN_00165e70`, the game's main init:
+  `alloc(0x80) -> store gp-0x79E8; alloc(0x1320); FUN_00164c60();
+   FUN_001517e0(); FUN_001f7240(); FUN_002336e0(); ... FUN_0018da50();`
+  So the singletons are cleared *before* the subsystem inits that should
+  recreate them.
+
+**Two death families observed, both after the six MBS packages load:**
+
+| family | path | symptom |
+| --- | --- | --- |
+| A (dominant) | `FUN_001510f0` handle->slot lookup (`count=*(gp-0x7A78)`, `table=*(gp-0x7A70)`, stride `0x18`, key at `+0x10`) spins, returns `-1`; caller uses it as an index | `pc=0x1 ra=0x1`, trace alternating `0x151104`/`0x151118` |
+| B | reaches `FUN_00366090`; singleton `*(0x3DB31C)` still 0 | `jalr` through NULL at `0x3661cc`, `pc=0 ra=0` |
+
+Both are consistent with **an init step that did not run to completion**: the
+scheduler tables and the singleton are read before anything populated them. The
+fatal indirection is always the *first use* of an unpopulated structure, not the
+fibre machinery itself.
+
+**Next probe (planned).** Log entry to every call in `FUN_00165e70`'s init
+sequence (plus `FUN_00366090`) so the step that bails out early is identified
+directly, instead of inferring it from the tail crash. Implementation: a
+reusable `PS2X_WATCH_CALLS=<comma-separated hex>` list in
+`dispatchGuestBranch` (which every `jal` goes through), logging
+`target`/`sourcePc`. Two runs, with and without `PS2X_DET_TICK`, to separate an
+init failure from a timing-dependent one.
+
+## Session 27 part 3 - the death is a NULL virtual call at `0x3661cc`, not the fibre slot
+
+**`PS2X_WATCH_FIBER=1`** was added in `PS2Runtime::dispatchGuestBranch` (every `jal`
+goes through it) and logs each fibre switch with the depth counter and the call
+site:
+
+```
+[EE-fibx] suspend depth=1 src=0x1f8160 ret=0x1f8168 ctx=0x407160 resume=0x151f88
+[EE-fibx] resume  depth=1 src=0x151f80 ret=0x151f88 ctx=0x407370 resume=0x151f88
+```
+
+Result over a whole run: **32 suspends, 34 resumes, all `depth=1`, all with a
+valid context** (`0x407160`, `0x407370`, `0x407580`, `0x407790`, `0x4079a0`), and
+**zero `depth0` events**. The fibre machinery works. The previous "suspend at
+depth 0" reading described a *different* `pc=0` path that some runs hit first -
+the 3-shot `[EE-fiber]` dump is a symptom dump and can be spent on either path.
+
+**What actually ends the run.** After the last resume (`ctx=0x4079a0`,
+`ownRa=0x165220`) the dispatch trace ends:
+
+```
+... 0x3582a4 -> 0x3582ac -> 0x3076a8 -> 0x358338 -> 0x358330 -> 0x358354
+ -> 0x3076c4 -> 0x365ba8 -> 0x36567c -> 0x3661c0        then pc=0 ra=0
+```
+
+`FUN_00366090` at `0x3661b0` is a virtual-dispatch stub:
+
+```
+0x3661b0  lw   $t9, 0x0($s1)       # object
+0x3661b4  lw   $t9, 0x38($t9)      # method
+0x3661b8  jalr $t9
+0x3661bc  daddu $a0, $s1, $0
+0x3661c0  lw   $a0, -0x78D4($gp)   # a0 = *(0x3DB31C)   (gp = 0x3E2BF0)
+0x3661c4  lw   $t9, 0x0($a0)       # vtable
+0x3661c8  lw   $t9, 0xC($t9)       # slot 3
+0x3661cc  jalr $t9                 # <-- t9 == 0
+```
+
+With `*(0x3DB31C) == 0`, both loads read address 0 and the `jalr` targets `0`.
+`dispatchGuestBranch(rdram, ctx, 0, ...)` sets `ctx->pc = 0`, which is the
+`[EE-dormant] thread=1 pc=0x0 ra=0x0` we have been chasing. So the terminal
+event is a **NULL virtual call through the global at `0x3DB31C`**, i.e. some
+subsystem object was never created (or its vtable slot 3 was never filled).
+
+**Next probe.** Watch `0x3DB31C` (`PS2X_WATCH_LO=0x3DB31C PS2X_WATCH_HI=0x3DB320`)
+to see whether anything ever writes it; if nothing does, identify which
+initialiser the game expects (the object's vtable slot `+0xC`) and whether the
+failure is an earlier syscall/allocation that returned 0. This is a much smaller
+surface than the fibre scheduler.
+
 ## Session 27 part 2 - the fibre crash, correctly modelled: a suspend at depth 0
 
 **The earlier "NULL task slot" reading was wrong.** `0x48F590` is not a table of node
@@ -2071,8 +2184,11 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - (Earlier sessions, pushed: `81488a7` VU clock desync; `37cc40d` DBCMAN version; `4fc7fa7` module version; `95120b1` boot-stall A/B + SIFCMD; `ad27d73` CRT seed + interop; `33ccc7e` cleanup.)
 
 ### Active
-- **The blocker is a fibre *suspend at depth 0*, not a NULL task slot.** Boot reliably reaches the six MBS packages, then `FUN_0015231c` saves the running fibre into `*(0x48F590 + depth*0x1D0 + 0x1C0)` with `depth = *(0x3DB1A0)` equal to **0**. Node 0's ctxPtr (`0x48F750`) is never populated (only ever zeroed), so the load yields `0`, `*(0+0x1A8)` is `0`, and the guest executes `jr 0`: thread 1 ends at `pc=0 ra=0 sp=0x423530`. `0x3DB1A0` is a depth/refcount (`+1` at `0x151eb4`, `-1` at `0x151f04` in the pump), and `0x3DB1B0`/`0x3DB1C0` are the node stride (`0x1D0`) and ctxPtr offset (`0x1C0`).
-- **Next probe (needs approval)**: trace depth at every suspend/resume and identify the caller that decrements to 0 and still suspends.
+- **Root cause class: an init step does not complete, so the scheduler tables and a core singleton are read while still empty.** Two death families, both after the six MBS packages load:
+  - **A (dominant)**: `FUN_001510f0` (handle -> slot lookup over `*(gp-0x7A70)`, count `*(gp-0x7A78)`, stride `0x18`, key at `+0x10`) spins and returns `-1`; the caller uses `-1` as an index and jumps to garbage (`pc=0x1 ra=0x1`).
+  - **B**: reaches the game's main loop `FUN_00366090`, where the lazy singleton `*(0x3DB31C)` is still `0`; `jalr` through its NULL vtable at `0x3661cc` gives `pc=0 ra=0`. The same loop calls `FUN_0015231c()` (suspend) at the end of each iteration at depth 0, which is why the "depth-0 suspend" appeared in earlier runs.
+- `FUN_00164c60` (called from the main init `FUN_00165e70`) **clears** the singletons before the subsystem inits that should recreate them; the factory that fills `0x3DB31C` is `FUN_001ea850` (`malloc(0x2c)` + ctor, store at `0x1ea88c`) and it was never observed to run.
+- **Next probe (approved, not yet written)**: add a reusable `PS2X_WATCH_CALLS=<hex,...>` list to `dispatchGuestBranch` and log entry to every call in `FUN_00165e70`'s init sequence plus `FUN_00366090`, to find the step that bails out early.
 - **Deferred**: a real virtual clock (make `accountCycles` time-proportional) before any retry of deterministic pacing - measured accrual varies ~5000x between spin and idle sleep.
 
 ### Blocked

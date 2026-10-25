@@ -1743,6 +1743,38 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      const char *debugName)
 {
     ctx->pc = targetPc;
+    // PS2X_WATCH_FIBER=1 traces the game's fibre switch pair (0x15231c suspend,
+    // 0x152200 resume).  Both address their slot as
+    //   *(0x48F590 + depth*0x1D0 + 0x1C0) with depth = *(0x3DB1A0)
+    // and a suspend at depth 0 dereferences node 0 - which this game never
+    // allocates (0x48F750 is only ever written with zero) - so *(0+0x1A8) is 0
+    // and the guest runs `jr 0`.  Logging the depth together with the call site
+    // identifies the path that leaves the counter at zero.
+    static const bool s_fiberWatch = std::getenv("PS2X_WATCH_FIBER") != nullptr;
+    static uint32_t s_fiberLogs = 0u;
+    if (s_fiberWatch && s_fiberLogs < 5000u &&
+        (targetPc == 0x15231Cu || targetPc == 0x152200u))
+    {
+        ++s_fiberLogs;
+        uint32_t depth = 0u;
+        std::memcpy(&depth, rdram + 0x3DB1A0u, sizeof(depth));
+        const uint32_t ctxAddr = (0x48F590u + depth * 0x1D0u + 0x1C0u) & 0x01FFFFFFu;
+        uint32_t ctxPtr = 0u;
+        std::memcpy(&ctxPtr, rdram + ctxAddr, sizeof(ctxPtr));
+        uint32_t resume = 0u;
+        if (ctxPtr != 0u)
+        {
+            std::memcpy(&resume, rdram + ((ctxPtr + 0x1A8u) & 0x01FFFFFFu), sizeof(resume));
+        }
+        std::cerr << "[EE-fibx] " << (targetPc == 0x15231Cu ? "suspend" : "resume")
+                  << " depth=" << depth
+                  << (depth == 0u ? " !!depth0" : "")
+                  << " src=0x" << std::hex << sourcePc
+                  << " ret=0x" << fallthroughPc
+                  << " ctx=0x" << ctxPtr
+                  << " resume=0x" << resume
+                  << std::dec << std::endl;
+    }
     watchAssetInitBranch(targetPc, sourcePc, fallthroughPc, kind, debugName, ctx);
     releaseStagedInitGates(rdram, targetPc, sourcePc);
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
