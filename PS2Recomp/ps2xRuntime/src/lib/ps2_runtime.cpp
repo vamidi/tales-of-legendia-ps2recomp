@@ -1775,6 +1775,68 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " resume=0x" << resume
                   << std::dec << std::endl;
     }
+    // PS2X_WATCH_CALLS=0x153530,0x1517e0,... reports the first time each
+    // (target, call site) pair is entered.  Every jal goes through here, so this
+    // reveals the shape of the game's init sequence - in particular which
+    // subsystem init bails out early - without touching the machine code.
+    static std::vector<uint32_t> s_callTargets = [] {
+        std::vector<uint32_t> out;
+        const char *env = std::getenv("PS2X_WATCH_CALLS");
+        if (env == nullptr)
+        {
+            return out;
+        }
+        const char *p = env;
+        while (*p != '\0')
+        {
+            char *end = nullptr;
+            const unsigned long v = std::strtoul(p, &end, 16);
+            if (end == p)
+            {
+                break;
+            }
+            out.push_back(static_cast<uint32_t>(v));
+            p = end;
+            if (*p == ',')
+            {
+                ++p;
+            }
+        }
+        return out;
+    }();
+    static std::vector<std::pair<uint32_t, uint32_t>> s_callEdges;
+    if (!s_callTargets.empty())
+    {
+        bool wanted = false;
+        for (const uint32_t t : s_callTargets)
+        {
+            if (t == targetPc)
+            {
+                wanted = true;
+                break;
+            }
+        }
+        if (wanted)
+        {
+            bool seen = false;
+            for (const auto &edge : s_callEdges)
+            {
+                if (edge.first == targetPc && edge.second == sourcePc)
+                {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen && s_callEdges.size() < 256u)
+            {
+                s_callEdges.emplace_back(targetPc, sourcePc);
+                std::cerr << "[EE-call] target=0x" << std::hex << targetPc
+                          << " src=0x" << sourcePc
+                          << " ret=0x" << fallthroughPc
+                          << std::dec << std::endl;
+            }
+        }
+    }
     watchAssetInitBranch(targetPc, sourcePc, fallthroughPc, kind, debugName, ctx);
     releaseStagedInitGates(rdram, targetPc, sourcePc);
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);

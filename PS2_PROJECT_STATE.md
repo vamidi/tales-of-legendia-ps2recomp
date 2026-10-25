@@ -16,6 +16,77 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 27 part 5 - the init chain completes; the deaths are `-1` sentinels used as pointers
+
+`PS2X_WATCH_CALLS=<hex,...>` (added to `dispatchGuestBranch`, one line per
+distinct target/call-site pair) settled the init question: **the whole init
+chain runs, in order, to its last step.**
+
+```
+0x1edc20 <- 0x165e94      (alloc 0x80)
+0x131220 <- 0x165ea0      (alloc 0x1320)
+0x153530 <- 0x165ea8
+0x164c60 <- 0x165eb0      (singleton reset batch)
+0x1ea800 <- 0x164cb0        (clears 0x3DB31C)
+0x1517e0 <- 0x165eb8      (scheduler init)
+0x1f7240 <- 0x165ec4      0x2336e0 <- 0x165ecc    0x22e050 <- 0x165edc
+0x2ddd80 <- 0x165ee4      0x342cc0 <- 0x165eec    0x2eb320 <- 0x165ef4
+0x281690 <- 0x165f04      0x2817d0 <- 0x165f0c    0x2ed7c0 <- 0x165f14
+0x2ede10 <- 0x165f1c      0x1f9610 <- 0x165f24    0x27a720 <- 0x165f2c
+0x2deed0 <- 0x165f34      0x165a10 <- 0x165f3c    0x18da50 <- 0x165f44
+```
+
+Then the pump (`0x151e90 <- 0x152014`), then the main loop
+`0x366090 <- 0x165408` (tail call, `ret=0`), then the singleton factory
+`0x1ea850 <- 0x366104`. So **nothing is skipped**; `0x3DB31C` must be failing
+inside the factory or the crash is a different sentinel.
+
+`FUN_001ea8f0(p,a1,a2)` is the constructor: `*p = &DAT_003d4000` (the vtable),
+two sub-constructors, `p[9] = 0x3f800000`, `*(p+0x28) = 1`, `return p`. It always
+returns `p`, so `*(0x3DB31C) == 0` can only come from `FUN_00101420(0x2c)`
+returning 0. The other possibility for family B is that the *vtable slot* at
+`DAT_003d4000 + 0xC` is zero.
+
+**Family A is the dominant one, and it is a registry sentinel problem.**
+`FUN_00151300` is a name/thread registry:
+
+```c
+if (flag == 1 && count) { for (i=0;i<count;i++) if (FUN_00151300(FUN_00146880(0),arg2,0) == -1) return -1; }
+else {
+  idx = FUN_001510f0(name);            // linear lookup, stride 0x18, key at +0x10
+  if (idx == -1) {
+      slot = FUN_00151060();           // first free slot
+      if (slot != -1) { entry = table + slot*0x18; r = FUN_00150910(entry,name); ... return slot; }
+      return -1;
+  }
+  table[idx].refcount++;
+  return idx;
+}
+```
+
+The fatal runtime report is:
+
+```
+[guest-branch:missing-target] kind=DirectJump op=EE scheduler source=0x1 target=0x1
+  pc=0x1 ra=0x1 sp=0x1ffff60 gp=0x3e2bf0 a0=0xffffffff a1=0x1651bb0 v0=0x22 v1=0x1
+```
+
+with the dispatch ring ending `0x1510b8 -> 0x1510e8 -> 0x151430 -> 0x1513f4 x10`
+- all inside `FUN_00151300` - before the jump to `1`. `a0 = -1` is exactly the
+sentinel this function family returns, so a caller receives `-1` and uses it as
+a slot/pointer.
+
+Two details worth noting for the next probe: `sp = 0x1FFFF60`, the *very top of
+RAM* (a guest thread stack), and `ra = 1` - not a plausible return address. That
+suggests the registry failure happens on a guest-created thread whose return
+path is also suspect.
+
+**Next probe (planned).** Log the return values of `FUN_00151300` /
+`FUN_001510f0` / `FUN_00151060` / `FUN_00150910` together with the caller, and
+dump the registry globals (`*(0x3DB178)` count, `*(0x3DB180)` table) at entry -
+i.e. is the table empty, full, or holding a garbage count when the create path
+fails.
+
 ## Session 27 part 4 - the game's main loop, its lazy singleton, and two death families
 
 `FUN_00366090` (`0x366090`) is **the game's main loop**, and it explains both
