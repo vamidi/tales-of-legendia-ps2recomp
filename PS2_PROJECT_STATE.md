@@ -16,6 +16,74 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 27 part 2 - the fibre crash, correctly modelled: a suspend at depth 0
+
+**The earlier "NULL task slot" reading was wrong.** `0x48F590` is not a table of node
+pointers indexed by a task id. `FUN_0015231c` (suspend) computes:
+
+```
+t1 = *(0x3DB1A0)          # depth counter, -0x7A50($gp)
+t2 = *(0x3DB1B0)          # 0x1D0 node stride
+t1 = t1 * t2
+t0 = 0x48F590 + t1 + *(0x3DB1C0)   # + 0x1C0 = ctxPtr field
+t0 = *(t0)                # <-- ONE pointer load
+... save all regs into t0 ...
+ra = *(t0 + 0x1A8)        # resume address
+jr ra
+```
+
+So `*(0x3DB1B0)=0x1D0` and `*(0x3DB1C0)=0x1C0` are the **struct stride and field
+offset**, not selector components. The old dump multiplied the sum by 4 again and
+read the wrong word, which is why it "found" `table[912] == 0`.
+
+**What `0x3DB1A0` actually is.** `FUN_00151e90` incremented it at `0x151eb4`
+(delay slot `0x151ebc`) and decremented it at `0x151f04` (delay slot `0x151f0c`),
+both via `-0x7A50($gp)` = `0x3E2BF0 - 0x7A50` = `0x3DB1A0`. It is a **fibre
+depth / nesting counter**, and the node table is indexed by depth:
+`node[depth] = 0x48F590 + depth*0x1D0`, with the saved-context pointer at
+`node+0x1C0`.
+
+**Measured evidence** (probes added this session: `PS2X_WATCH_PC` pc-filtered RAM
+store watch, `PS2X_WATCH_ZERO` zero-value filter, `[EE-fiber-live]` census):
+
+* The pump's `sw $s0, 0x1C0($v0)` (`0x151f64`) always targets **node 1**
+  (`0x48F920`) and rotates three context pointers through it:
+  `0x407160`, `0x407370`, `0x407580` - spacing `0x210`, so three fibre contexts.
+* `0x3DB1A0` alternates `0x151ebc: 1` / `0x151f0c: 0` on every pump iteration.
+* The fatal run has `cnt=0` at suspend: `node 0` = `0x48F590 + 0x1C0` = `0x48F750`,
+  `ctxPtr = 0`, so `*(0 + 0x1A8)` = 0 and the guest executes `jr 0` → `pc=0 ra=0`.
+* `0x48F750` (node 0's ctxPtr) is written **only with zero**, twice in a whole run:
+  `pc=0x100160` (BSS init, `WRITE128`) and `pc=0x109144` (`WRITE128`). It is never
+  populated with a context, so a suspend at depth 0 can never work.
+* A non-fatal variant exists: `cnt=1, ctx=0x4079a0, resume=0x151f88` - a valid
+  suspend that returns into the pump. The dump budget (`s_fiberDumps = 3`) can be
+  consumed by these benign events, which is why `[EE-fiber]` sometimes looks healthy.
+
+**Therefore the bug to chase is not a missing task slot: it is a suspend
+(`FUN_0015231c`) executed while the depth counter is 0.** Depth 0 is the root
+level; it has no saved context by design (`node 0` is deliberately never
+allocated), so any fibre that suspends there corrupts the machine.
+
+**Instrumentation now in the tree** (all env-gated, default off, zero effect
+unless set):
+
+| variable | meaning |
+| --- | --- |
+| `PS2X_WATCH_LO` / `PS2X_WATCH_HI` / `PS2X_WATCH_N` | RAM store window, `[EE-store] pc= addr= val=` |
+| `PS2X_WATCH_ZERO=1` | restrict that window to stores whose value is 0 (finds clears) |
+| `PS2X_WATCH_PC=0x151f64` / `PS2X_WATCH_PC_N` / `PS2X_WATCH_PC_DEDUP` | log stores made by one guest instruction, any target |
+| `PS2X_DET_TICK=1` | report cycles/frame avg/min/max/spread (measurement only) |
+
+`[EE-fiber]` now prints `cnt= stride= off= field= ctx= resume= flag= ownRa= cb= live=`,
+`[EE-fiber-ctx]` dumps `+0x1A0..+0x1C0` of the context, and `[EE-fiber-live]`
+lists the nodes that do hold a context.
+
+**Next probe (not yet run).** Log the depth counter and the suspend/resume entry
+at *every* occurrence rather than at the first three `pc==0` events: which caller
+reaches the decrement path and then suspends. Candidate mechanism: the pump
+resumes a fibre on a path where the depth was already decremented, so the fibre's
+own suspend saves into node 0.
+
 ## Session 27 - the A/B race was my own instrumentation; cycle-paced vblank is not viable
 
 **What changed.** The two remaining dead probes were removed: `[EE-taskw]` (`ps2_runtime.cpp`,
@@ -2003,8 +2071,9 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - (Earlier sessions, pushed: `81488a7` VU clock desync; `37cc40d` DBCMAN version; `4fc7fa7` module version; `95120b1` boot-stall A/B + SIFCMD; `ad27d73` CRT seed + interop; `33ccc7e` cleanup.)
 
 ### Active
-- **The single remaining blocker is the fiber NULL slot.** Boot reliably reaches the six MBS packages, then the game's own task pump resumes fiber index `912` whose `task[idx].ctxPtr` (at `0x48F590 + idx*0x1D0 + 0x1C0`) is `0x0`; the context is saved to address `0`, `jr *(0x1A8)` reads `0`, and thread 1 ends at `pc=0 ra=0 sp=0x423530`. Because A no longer occurs, this is now reproducible and safe to instrument (one run per hypothesis).
-- **Recommended next step (needs approval)**: make `accountCycles` time-proportional (a real virtual clock) before retrying deterministic pacing. The measurement above shows the accountancy counter's accrual rate varies ~5000x between spin and sleep, so any cycle-based pacing built on it is unstable.
+- **The blocker is a fibre *suspend at depth 0*, not a NULL task slot.** Boot reliably reaches the six MBS packages, then `FUN_0015231c` saves the running fibre into `*(0x48F590 + depth*0x1D0 + 0x1C0)` with `depth = *(0x3DB1A0)` equal to **0**. Node 0's ctxPtr (`0x48F750`) is never populated (only ever zeroed), so the load yields `0`, `*(0+0x1A8)` is `0`, and the guest executes `jr 0`: thread 1 ends at `pc=0 ra=0 sp=0x423530`. `0x3DB1A0` is a depth/refcount (`+1` at `0x151eb4`, `-1` at `0x151f04` in the pump), and `0x3DB1B0`/`0x3DB1C0` are the node stride (`0x1D0`) and ctxPtr offset (`0x1C0`).
+- **Next probe (needs approval)**: trace depth at every suspend/resume and identify the caller that decrements to 0 and still suspends.
+- **Deferred**: a real virtual clock (make `accountCycles` time-proportional) before any retry of deterministic pacing - measured accrual varies ~5000x between spin and idle sleep.
 
 ### Blocked
 - (none hard - the CDV/streaming path is healthy; the fiber NULL slot is a guest-level task-table bug to be localised, not an emulator stall)

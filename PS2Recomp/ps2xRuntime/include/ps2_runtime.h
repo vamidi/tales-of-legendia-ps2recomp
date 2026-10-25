@@ -282,23 +282,72 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     static const uint32_t s_watchHi = ps2x_trace_detail::traceHexEnv("PS2X_WATCH_HI");
     static const uint32_t s_watchBudget = ps2x_trace_detail::traceDecEnv("PS2X_WATCH_N", 200u);
     static uint32_t s_watchCount = 0u;
-    if (s_watchHi > s_watchLo && s_watchCount < s_watchBudget)
+    // PS2X_WATCH_ZERO=1 narrows the watched window to stores whose value is 0,
+    // which is how a "cleared to NULL" slot distinguishes itself from the
+    // bulk initialisation of the same table.
+    static const uint32_t s_watchZeroOnly = ps2x_trace_detail::traceDecEnv("PS2X_WATCH_ZERO", 0u);
+    // PS2X_WATCH_PC=0x151f64 logs every RAM store performed by that exact guest
+    // instruction, whatever its target address.  The fibre task pump stores
+    // `sw $s0,0x1C0($v0)` there, so this shows both the node it is writing into
+    // and the pointer it writes -- without having to know the address in advance.
+    // PS2X_WATCH_PC_DEDUP=1 (default) reports each distinct target address once,
+    // so the output is a compact "which nodes were ever pumped" list instead of
+    // one line per pump iteration.
+    static const uint32_t s_watchPc = ps2x_trace_detail::traceHexEnv("PS2X_WATCH_PC");
+    static const uint32_t s_watchPcBudget = ps2x_trace_detail::traceDecEnv("PS2X_WATCH_PC_N", 1200u);
+    static const uint32_t s_watchPcDedup = ps2x_trace_detail::traceDecEnv("PS2X_WATCH_PC_DEDUP", 1u);
+    static uint32_t s_watchPcCount = 0u;
+    static std::vector<uint32_t> s_watchPcSeen;
+
+    const uint32_t phys = guestAddr & 0x01FFFFFFu;
+    if (s_watchPc != 0u && s_watchPcCount < s_watchPcBudget)
     {
-        const uint32_t phys = guestAddr & 0x01FFFFFFu;
-        if (phys >= s_watchLo && phys < s_watchHi)
+        const uint32_t pcNow = ctx ? ctx->pc : 0u;
+        if (pcNow >= s_watchPc && pcNow < s_watchPc + 8u)
         {
-            ++s_watchCount;
-            std::cerr << "[EE-store] pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
-                      << " addr=0x" << phys
-                      << " val=0x" << static_cast<uint32_t>(valueLo)
-                      << std::dec << " size=" << size
-                      << " " << (op ? op : "?") << std::endl;
+            bool fresh = true;
+            if (s_watchPcDedup != 0u)
+            {
+                for (const uint32_t seen : s_watchPcSeen)
+                {
+                    if (seen == phys)
+                    {
+                        fresh = false;
+                        break;
+                    }
+                }
+            }
+            if (fresh)
+            {
+                if (s_watchPcDedup != 0u)
+                {
+                    s_watchPcSeen.push_back(phys);
+                }
+                ++s_watchPcCount;
+                std::cerr << "[EE-storepc] pc=0x" << std::hex << pcNow
+                          << " addr=0x" << phys
+                          << " val=0x" << static_cast<uint32_t>(valueLo)
+                          << std::dec << " size=" << size
+                          << " " << (op ? op : "?") << std::endl;
+            }
         }
     }
-    (void)size;
-    (void)valueLo;
-    (void)op;
-    (void)ctx;
+    if (s_watchHi > s_watchLo && s_watchCount < s_watchBudget)
+    {
+        if (phys >= s_watchLo && phys < s_watchHi)
+        {
+            const bool zeroMatch = (static_cast<uint32_t>(valueLo) == 0u);
+            if (s_watchZeroOnly == 0u || zeroMatch)
+            {
+                ++s_watchCount;
+                std::cerr << "[EE-store] pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                          << " addr=0x" << phys
+                          << " val=0x" << static_cast<uint32_t>(valueLo)
+                          << std::dec << " size=" << size
+                          << " " << (op ? op : "?") << std::endl;
+            }
+        }
+    }
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,

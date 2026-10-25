@@ -716,14 +716,73 @@ void EeScheduler::run()
                     const uint32_t f1 = ram32(0x3DB1A0u);
                     const uint32_t f2 = ram32(0x3DB1B0u);
                     const uint32_t f3 = ram32(0x3DB1C0u);
-                    const uint32_t idx = f1 * f2 + f3;
-                    const uint32_t slot = ram32(0x48F590u + idx * 4u);
-                    std::cerr << "[EE-fiber] f1=" << f1 << " f2=" << f2
-                              << " f3=" << f3 << " idx=" << idx
-                              << " slot=0x" << std::hex << slot
+                    // FUN_0015231c computes the slot as
+                    //   t0 = *(0x48F590 + *(0x3DB1A0) * *(0x3DB1B0) + *(0x3DB1C0))
+                    // i.e. a *byte* offset into the node array (stride 0x1D0, the
+                    // ctxPtr field at +0x1C0) followed by a single pointer load.
+                    // f2/f3 are the struct stride and the field offset, NOT
+                    // selector components - the earlier "idx = f1*f2+f3, table[idx]"
+                    // reading multiplied by 4 again and looked at the wrong word.
+                    const uint32_t stride = (f2 >= 8u && f2 <= 0x4000u) ? f2 : 0x1D0u;
+                    const uint32_t fieldAddr = 0x48F590u + f1 * stride + f3;
+                    const uint32_t slot = ram32(fieldAddr);
+                    uint32_t liveNodes = 0u;
+                    uint32_t lastLive = 0xFFFFFFFFu;
+                    for (uint32_t i = 0u; i < 928u; ++i)
+                    {
+                        if (ram32(0x48F590u + i * stride + f3) != 0u)
+                        {
+                            ++liveNodes;
+                            lastLive = i;
+                        }
+                    }
+                    std::cerr << "[EE-fiber] cnt=" << f1
+                              << " stride=" << f2
+                              << " off=0x" << std::hex << f3
+                              << " field=0x" << fieldAddr
+                              << " ctx=0x" << slot
                               << " resume=0x" << ram32(slot + 0x1A8u)
                               << " flag=" << std::dec << ram32(slot + 0x1ACu)
-                              << std::endl;
+                              << " ownRa=0x" << std::hex << ram32(slot + 0x1B4u)
+                              << " cb=0x" << ram32(slot + 0x1B0u)
+                              << " live=" << std::dec << liveNodes
+                              << " lastLive=";
+                    if (lastLive == 0xFFFFFFFFu)
+                    {
+                        std::cerr << "none";
+                    }
+                    else
+                    {
+                        std::cerr << lastLive;
+                    }
+                    std::cerr << std::endl;
+                    if (slot != 0u)
+                    {
+                        std::cerr << "[EE-fiber-ctx]";
+                        for (uint32_t off = 0x1A0u; off <= 0x1C0u; off += 4u)
+                        {
+                            std::cerr << " +0x" << std::hex << off
+                                      << "=0x" << ram32(slot + off);
+                        }
+                        std::cerr << std::dec << std::endl;
+                    }
+                    else
+                    {
+                        // Which nodes actually have a context, and does node 0
+                        // (the one this suspend read) have one?
+                        std::cerr << "[EE-fiber-live]";
+                        uint32_t shown = 0u;
+                        for (uint32_t i = 0u; i < 928u && shown < 24u; ++i)
+                        {
+                            const uint32_t ctxPtr = ram32(0x48F590u + i * stride + f3);
+                            if (ctxPtr != 0u)
+                            {
+                                std::cerr << " [" << i << "]=0x" << std::hex << ctxPtr;
+                                ++shown;
+                            }
+                        }
+                        std::cerr << std::dec << std::endl;
+                    }
                 }
             }
             makeDormant(*running);
