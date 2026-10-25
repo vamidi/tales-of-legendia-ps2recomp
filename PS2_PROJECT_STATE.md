@@ -16,6 +16,23 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 25 - first-presented-frame BMP dump instrumentation: game is pre-draw at t=120s (libgs init done, no swap yet)
+
+**Goal.** Answer "can we see something on screen?" with a real image: dump the GS framebuffer as a BMP the moment the guest first presents.
+
+**Built (all .cpp, no header/CMake changes; commit f740f7c):**
+- `Ps2DumpFramebufferBmp(GS&, const GSRegisters&, tag)` in `gs_frontend.cpp` (global linkage): `latchHostPresentationFrame()` (records scanout geometry even for GPU-only parallel-gs frames) -> `refreshDisplaySnapshot()`/`lockDisplaySnapshot()` (VRAM via backend `SnapshotVram` = parallel-gs `map_vram_read` = LIVE vram) -> decode DISPFB (FBP[0:20], FBW[22:26], PSM[32:36], circuit from PMODE.ALPS) -> per-pixel `GSMem::ReadCT32/CT24/CT16(S)` -> 24-bit BMP (bottom-up BGR; VRAM word = R:0-7 G:8-15 B:16-23). Budget 3 dumps/run; `PS2_FB_DUMP=N` overrides (0 disables). Plus VRAM census (non-zero word count/range, top-3 densest 64KiB blocks, pmode/dispfb1/dispfb2/ctx FRAME) and a raw physical slab BMP (640x76 linear CT32) of the densest block.
+- Trigger sites: `GS.cpp` both `sceGsSwap*` stubs after `sdkPresentCount.fetch_add` (libgs swap = the guest's present call); `gs_frontend.cpp` `writeRegisterUnlocked` 0x59/0x5b on first flip-counter increment; `EeScheduler.cpp` VBlankStart tick 600 forced dump (pipeline validation).
+
+**Key findings (run159-161):**
+- The entry runner already runs the parallel-gs backend + Vulkan interop; `[GS] present mode` lines come from gs_parallel_backend `Present()`. `flips=0,0` is partly a heuristic artifact: the flip counter only counts DISPFB FBP.x (bits 0-8) changes; libgs double-buffer swaps change FBP.y.
+- run159 (40s): forced dump at tick 600 wrote `gs_frame0_forced.bmp` (640x448, geometry from latch) - fully black even at 16x contrast boost. circuit=1 (pmode=0x66 ALPS=1), dispfb2=0x1000 (FBP.y=8, FBW=0), dispfb1=0x1400 (FBP.y=2, FBW=0).
+- run160/161 (120s): census shows VRAM NOT empty (nzWords=98728, range 0x54008..0x3AB8B4, dense blocks 0x60000-0x8FFFF 50% filled) but the slab image shows sparse gray streaks = raw upload data, not a drawn image. ctx0 FRAME written (fbw=8 -> 512px, psm=0 CT32), ctx1 unwritten; DISPFB.FBW=0 on both circuits.
+- No swap/flip dump fired in 120s -> the game has NOT called `sceGsSwap*` nor flipped DISPFB within 2 minutes. Display bring-up is stalled at "libgs initialized, assets loading" - the boot chain (c4350 frontier 60/s) remains the gate to the first frame.
+
+**Answer to "can we see something":** not yet - no presented frame exists (no swap, no flip, FB not fully programmed) and the runner window has no GS image path (ImGui debug panel only). Instrumentation is armed: the first real present auto-produces `gs_frameN_swap.bmp` next to the exe.
+
+**Baselines:** run160/161 healthy 120s (tick 6900, threads=6, cycGate=0) - consistent with run158 (tick 6930).
 ## Session 24 - boot race root-caused and fixed: entry_* secondary re-entry slots missing from the function table
 
 **Root cause (the run137/run140/run144 signature):** the staged-init worker body (`func_1B4AE8`
