@@ -237,6 +237,29 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
+namespace ps2x_trace_detail
+{
+    inline uint32_t traceHexEnv(const char *name)
+    {
+        const char *value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0')
+        {
+            return 0u;
+        }
+        return static_cast<uint32_t>(std::strtoul(value, nullptr, 16));
+    }
+
+    inline uint32_t traceDecEnv(const char *name, uint32_t fallback)
+    {
+        const char *value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0')
+        {
+            return fallback;
+        }
+        return static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+    }
+}
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -246,13 +269,36 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
+    (void)valueHi;
+    // TEMP DIAGNOSTIC (session 26): ordinary guest RAM stores never pass through
+    // PS2Runtime::Store32 -- WRITE32/WRITE64 route only *special* addresses there
+    // and send plain RAM to FAST_WRITE32 plus this hook.  A RAM store watch
+    // therefore has to live here; the one in ps2WatchStackWrite can only ever see
+    // MMIO, which is why PS2X_WATCH_STACK produced no hits.  Set
+    // PS2X_WATCH_LO / PS2X_WATCH_HI to the watched window (hex, lo inclusive,
+    // hi exclusive) and PS2X_WATCH_N to the line budget.  Each line carries the
+    // guest pc of the storing instruction, which identifies the writer.
+    static const uint32_t s_watchLo = ps2x_trace_detail::traceHexEnv("PS2X_WATCH_LO");
+    static const uint32_t s_watchHi = ps2x_trace_detail::traceHexEnv("PS2X_WATCH_HI");
+    static const uint32_t s_watchBudget = ps2x_trace_detail::traceDecEnv("PS2X_WATCH_N", 200u);
+    static uint32_t s_watchCount = 0u;
+    if (s_watchHi > s_watchLo && s_watchCount < s_watchBudget)
+    {
+        const uint32_t phys = guestAddr & 0x01FFFFFFu;
+        if (phys >= s_watchLo && phys < s_watchHi)
+        {
+            ++s_watchCount;
+            std::cerr << "[EE-store] pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                      << " addr=0x" << phys
+                      << " val=0x" << static_cast<uint32_t>(valueLo)
+                      << std::dec << " size=" << size
+                      << " " << (op ? op : "?") << std::endl;
+        }
+    }
     (void)size;
     (void)valueLo;
-    (void)valueHi;
     (void)op;
     (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,

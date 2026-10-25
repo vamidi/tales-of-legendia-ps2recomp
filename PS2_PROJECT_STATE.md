@@ -16,6 +16,70 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 27 - the A/B race was my own instrumentation; cycle-paced vblank is not viable
+
+**What changed.** The two remaining dead probes were removed: `[EE-taskw]` (`ps2_runtime.cpp`,
+inside `ps2WatchStackWrite`, which can only ever see MMIO addresses - guest RAM stores go through
+`FAST_WRITE32`) and the `[EE-taskp]` poll in `EeScheduler.cpp`. Nothing else was deleted.
+
+**Outcome A stopped appearing.** Two consecutive runs after the removal - one 70 s default, one
+150 s with the new flag - both reached **all six MBS packages**:
+
+```
+[IOP:fileio] open ... path='cdrom0:\MBS\SYS_REG.MBS;1'  size=1720
+[IOP:fileio] open ... path='cdrom0:\MBS\MAP.MBS;1'      size=3160
+[IOP:fileio] open ... path='cdrom0:\MBS\SND.MBS;1'      size=31724
+[IOP:fileio] open ... path='cdrom0:\MBS\FIELD.MBS;1'    size=7324
+[IOP:fileio] open ... path='cdrom0:\MBS\BATTLE.MBS;1'   size=22004
+[IOP:fileio] open ... path='cdrom0:\MBS\MOVIE.MBS;1'    size=88
+```
+
+and then both died in the same place:
+
+```
+[EE-win] ... id=1
+[EE-dormant] thread=1 pc=0x0 ra=0x0 sp=0x423530 gp=0x3e2bf0 v0=0x3f800000 t9=0x232460
+[EE-fiber] f1=1 f2=464 f3=448 idx=912 slot=0x0 resume=0x0 flag=0
+```
+
+So the ~1-in-3 A/B flip that blocked all diagnostics was **caused by the probes themselves** - the
+`[EE-taskp]` poll in particular ran a `memcpy` of two guest words on **every** dispatch. With them
+gone the boot is stable, which is what makes the fiber slot debuggable.
+
+**`PS2X_DET_TICK` was implemented, measured, and narrowed to measurement-only.**
+
+Goal was determinism: vblank delivered from the guest cycle counter with the wall clock as a
+rate-limiter only. It was implemented end to end - calibration of a `cycles/frame` period, a
+cycle deadline on `VBlankStart`, and a due-filter/`pacingDeadline` bypass so the host clock could
+not hold a cycle-gated event back. The measurement killed the idea:
+
+* calibrated baseline: **478,542 cycles/frame** (120 frames)
+* but `m_eeCycle` is an *accountancy* counter, not a clock. `EeScheduler::accountCycles` is fed
+  per-dispatch estimates while the guest is busy (~60k cyc/s during the CDV poll spin at
+  `0x1ad0e0`/`0x1ad0f8`) and `microsecondsToEeCycles(sleptUs)` - wall-clock time - while it idles
+  (~295M cyc/s). The accrual rate therefore varies by ~5,000x depending on what the guest is doing.
+* result: vblank delivery collapsed from 60 Hz to **~3.5 Hz** (523 deliveries in 150 s) with
+  `lastDispUs=8384687` - one dispatch lasting 8.4 s - and the run still ended in the same fiber
+  death. A cycle period cannot reproduce a fixed cadence when the counter's rate is workload
+  dependent.
+
+The delivery bypass was therefore reverted. `PS2X_DET_TICK=1` now only samples the counter once
+per delivered frame and prints `[EE-dettick] baseline cycles/frame=<n>` plus, every 600 frames,
+`[EE-dettick] cycles/frame avg=<n> min=<n> max=<n> spread=<n>%`. `PS2X_DET_VBLANK_CYCLES` pins the
+baseline instead of calibrating it. Default (unset) behaviour is byte-identical to before: a 70 s
+control run logged no `dettick` line, `tick=3085`, `lag_us=6565`, six MBS opens, same fiber death.
+
+**Consequence for the port.** Since the target is a PC port rather than a cycle-accurate PS2, the
+wall-clock vblank stays the default. Real determinism would need a virtual clock first: make
+`accountCycles` time-proportional (or drive guest-visible time from a single cycle domain that
+advances at a fixed rate regardless of spin/idle), and only then pace interrupts from it.
+
+**Next.** Localise the writer that clears `task[912].ctxPtr`. The task table is `0x48F590`, stride
+`0x1D0`, context pointer at `+0x1C0`, current depth at `0x3DB1A0`; the pump stores the slot at
+`0x151f64` and resumes at `0x151f80` via the node callback at `*(node+0x1B0)`, which re-enters the
+pump and can change the index. Because A no longer occurs, each hypothesis can now be tested with a
+single run.
+
 ## Session 26 - ROOT CAUSE of the whole boot stall: `ChangeThreadPriority` must return the OLD priority (priority inversion)
 
 **Symptom being chased.** Vblank ticked at 60 Hz, `flips=0`, and every CRI counter
@@ -122,6 +186,148 @@ Open question for the next session: whether the framework loop exits because
 `0x3661ec` (`andi v0,v0,0xff` from the frame-update vtable call) reports "quit" due to a
 failed sub-load, or because the task/thread return path is wrong (run175 stayed alive and
 polled `0x1a9a28` instead, so it is interleaving-dependent).
+
+### Session 26 - the exit is a NULL task slot in the game's own fiber scheduler
+
+The game implements cooperative multitasking itself, on top of one EE thread. Each task
+owns a 0x1B8-byte context record:
+
+| offset | contents |
+|--------|----------|
+| 0x000..0x0F0 | `v0 v1 a0 a1 a2 a3 s0..s7 sp s8` as 128-bit `sq`/`lq` quads |
+| 0x100..0x17C | `f0..f31` as 4-byte `swc1`/`lwc1` |
+| 0x180 / 0x190 | `hi` / `lo` (`sd`, value in the low 8 bytes) |
+| 0x1A0 / 0x1AC | `sa` / "context saved" flag |
+| 0x1A8 | **resume address** - where the owner wants this task to return to |
+| 0x1B4 | the task's own suspended `ra` |
+
+- `FUN_00152200` (`0x152200`) = **resume**: `slot = *(0x48F590 + cnt*0x1D0 + 0x1C0)`,
+  `*(slot+0x1A8) = ra`, `*(slot+0x1AC) = 0`, restore every register from `slot`,
+  `jr *(slot+0x1B4)`.
+- `FUN_0015231c` (`0x15231c`) = **suspend**: save every register into `slot`,
+  `*(slot+0x1AC) = 1`, `*(slot+0x1B4) = ra`, then `jr *(slot+0x1A8)`.
+- `FUN_00151e90` (`0x151e90`) = **task pump**: walks a node list (`0x1517c0` = next),
+  bumps the depth counter at `0x3DB1A0` per node, and on a match stores
+  `node` into `task[cnt].ctxPtr` (`0x151f64`, address `0x48F590 + cnt*0x1D0 + 0x1C0`)
+  and resumes it (`0x151f80`). Stride derivation at `0x151f4c..0x151f60`:
+  `((cnt*8-cnt)*4+cnt)*16 = cnt*0x1D0`.
+
+The fatal exit is that protocol breaking. Instrumentation (`[EE-fiber]`, run177) prints
+`f1=1 f2=464 f3=448 idx=912 slot=0x0 resume=0x0 flag=0`: the depth counter is 1, so the
+suspend resolves `task[1].ctxPtr = *(0x48F920) = NULL`. With `t0 = NULL` it saves the whole
+context to address `0x0` (our flat RAM silently accepts that) and jumps to `*(0x1A8) = 0`,
+which is the observed `pc=0 ra=0 sp=0x423530`.
+
+So the slot store and the slot read disagree on the index. Between the store
+(`0x151f64`) and the resume (`0x151f80`) the guest calls the node's optional callback
+`*(node+0x1B0)` with `a0 = node+0x1C0`, and that callback can re-enter `FUN_00151e90`,
+which bumps `0x3DB1A0`. Next diagnostic: `PS2X_WATCH_TASK=1` -> `[EE-taskw]` logs every
+store into `0x48F590..0x48F990` with the storing pc, to identify the writer that clears
+the slot.
+
+Side note: a store to `0x0..0x1B8` is the signature of a guest NULL dereference and our
+memory model accepts it silently. A warning for that range would surface this class of
+failure immediately in future runs (not changed yet).
+
+### Session 26 - diagnostic infrastructure caveat + the two remaining outcomes
+
+**Important for future sessions:** `WRITE32`/`WRITE64` in `include/ps2_runtime_macros.h`
+route only *special* addresses through `PS2Runtime::Store32/Store64`; ordinary RAM stores go
+straight to `FAST_WRITE32` plus `ps2TraceGuestWrite`. Therefore any store watch placed in
+`ps2WatchStackWrite` (which is called from `Store32`/`Store64`) is blind to guest RAM writes -
+this is also why `PS2X_WATCH_STACK=1` produced zero `[EE-stkw]` lines in session 26. A real
+RAM store watch must hook `ps2TraceGuestWrite`, which lives in `include/ps2_runtime.h` (a
+header, so it needs sign-off before touching). Confirmed with `PS2X_WATCH_TASK=1` -> zero
+`[EE-taskw]` lines.
+
+The same image produces two different outcomes, so the remainder is interleaving-dependent:
+
+- **Outcome A** (run175, run179): only 2 files open (PTN_INFO.BIN/NAM); main (thread 1) stays
+  alive spinning in the CRI callback dispatcher `0x1a9a28` on its own stack
+  (`sp=0x1fffdc0`), `flips=0`, `vbLagAvgUs=615`. A streaming completion never arrives.
+- **Outcome B** (run176/177/178): all 8 files open, the framework loop runs, then the NULL
+  fiber slot exits the boot thread (`pc=0`) and the system idles.
+
+`[EE-taskp]` polling of `0x3DB1A0` and `task[1].ctxPtr` showed no change during a whole
+outcome-A run, i.e. the fiber machinery never starts there. So the next milestone is getting
+outcome A to always become outcome B (the streaming completion), after which the fiber-slot
+mismatch is the last thing between the boot thread and a rendered frame.
+
+### Session 26 - outcome A: the CDV read is never issued
+
+Run179 is a clean outcome-A capture. The decisive numbers:
+
+- `IOP:fileio read` = **2** (only `PTN_INFO.BIN` and `PTN_INFO.NAM`).
+- **Correction (runs cdv3/cdv4):** `IOP:fileio` only covers the *host-VFS* device (`MFS`).
+  The disc path (`CDV`) never appears there even when it works, so the earlier reading "the
+  MAP.AFS read never reaches the IOP at all" was wrong. In the run-4 outcome-A capture the CDV
+  layer was demonstrably *healthy*: handle written at `pc=0x1ad8e8` (`slot+0x1C = 0x3a55d0`),
+  serviced, cleared at `pc=0x1ad2c0`, and the stream position `slot+0x0C` advancing
+  `0x11 -> 0x12`. So outcome A is **not** a dead CDV driver; the game keeps performing small
+  disc transfers and simply never proceeds to the eight `MBS` loads.
+- `[EE-seq]` splits the device layers: `devs="MFS........."@0x3ac6c0/open=0x1b1a68`
+  (host VFS - this is how the two PTN_INFO files are read) and
+  `devs="CDV........."@0x3a6a98/open=0x1ad5a0` (the disc path `MAP.AFS` needs).
+- `[EE-cdv]` shows the slot queued: `slot[39]=10101 1bf000 37e 2 1 1 391140` - buffer
+  `0x1bf000`, `0x37e` bytes, state `2`.
+- The CDV pump `0x1ad2e8` ran **121306** times while the issue entry `0x1ad780` ran **4**
+  times, and `0x1ad5a0` (CDV open) once. All six CRI pumps keep running at full rate
+  (`0x197940=61731`, `0x19f468=116093`, `0x1973a8=60653`, `0x1b79f8=303266`, `0x19a120=9238`,
+  `0x1b7858=9232`).
+
+So the CDV layer is functional in outcome A; what differs is *how far the boot gets*. A stops
+after the `PTN_INFO` pair while the disc path idles on small transfers, B proceeds to the six
+`MBS` packages. `0x1ad780` is a stream-seek helper (`0x8`/`0xc`/`0x14` fields), and the enqueue
+that assigns the request handle is `FUN_001ad818` at `0x1ad8e8`.
+
+**A vs B is a host-interleaving race, not a logic difference.** run178 and run179 are the same
+image and differ only by an added diagnostic, yet one reached B and the other A. Any timing
+perturbation flips it, which also explains why B appears in roughly 3 of 5 runs.
+
+**Store watch now works** (session 26): `ps2TraceGuestWrite` in `include/ps2_runtime.h` was a
+no-op stub; it now implements `PS2X_WATCH_LO` / `PS2X_WATCH_HI` (hex window, lo inclusive, hi
+exclusive) and `PS2X_WATCH_N` (line budget), printing `[EE-store] pc=... addr=... val=...` with
+the pc of the storing instruction. This is the only usable hook for guest RAM stores; the
+`ps2WatchStackWrite` hook sees MMIO only. First target: the CDV slot words at/around
+`0x391140` and the state word of `slot[39]`, to see whether the guest ever writes the
+"issued" transition.
+
+**Explicitly rejected for now:** moving `dispatchDmacHandlersForCause(rdram, runtime, 5u)` out
+of `sceSifSetDma` (SIF.cpp L1937) into a deferred queue. The inline dispatch is load-bearing -
+the SIF RPC handshake finishes inside the same call and `[SIF-iop] post-bind` reads back what
+the guest's own handlers did to the client struct. Deferring it would break the handshake that
+currently works in both outcomes, so it must not be changed without direct evidence.
+
+### Session 26 - the CDV driver object, mapped
+
+The disc path that outcome A stalls in is now fully identified:
+
+| address | meaning |
+|---------|---------|
+| `0x3A6A90` | driver header word - a **work flag** the pump consumes each pass |
+| `0x3A6B00` | request slot array, stride `0x48`, 40 slots (slot 39 = `0x3A75F8`) |
+| slot `+0x00` | byte tag, must be `1` for the pump to service the slot |
+| slot `+0x04` / `+0x08` / `+0x0C` | buffer / size / state (state `2` = queued) |
+| slot `+0x10` / `+0x14` | stream position / committed position |
+| slot `+0x18` | owner context (`0x391140` for ADXF) |
+| slot `+0x1C` | **device request handle** - 0 means "nothing to do" |
+
+- `FUN_001ad2e8` = pump: `if (!FUN_001b79f8(&hdr)) return;` then for `i = 39..0`
+  `if (slot[0] == 1) FUN_001ad220(slot);` and finally `hdr = 0` at `0x1ad340`. The header
+  clear is unconditional, i.e. `hdr=0` in `[EE-cdv]` is normal and not a fault.
+- `FUN_001ad220` = slot service: **`if (*(slot+0x1c) == 0) return;`** at `0x1ad230`, then
+  `FUN_001ab120(handle)` -> state jump table at `0x3C4990`, then `FUN_001aaee0(handle)` and
+  `*(slot+0x1c) = 0` at `0x1ad2c0`.
+- `FUN_001ad818` = enqueue: assigns the handle with `*(slot+0x1c) = <id>` at **`0x1ad8e8`**.
+
+So a queued slot with a zero handle is invisible to the pump forever. Verified against the
+store watch (runs cdv1/cdv2, both reaching all 8 opens): the handle is written `0x3a55d0` at
+`pc=0x1ad8e8` and cleared at `pc=0x1ad2c0`, and `0x1ad818` was entered 7 and 12 times
+respectively - the enqueue path works when the CDV layer reaches it.
+
+Watch-window caveat: `0x3A6A90` itself is written twice per pump pass (`0x1b7a38` sets it,
+`0x1ad340` clears it), so a window that includes it burns any line budget within seconds and
+hides everything else. Watch `0x3A6B00..0x3A76C0` instead.
 
 **Correction to Session 25:** `DAT_00394350` is a vblank counter incremented inside the CRI
 vblank handler `FUN_00199f40`, so the "c4350 asset frontier 60/s" of Session 24/25 measured the
@@ -1780,6 +1986,12 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 
 ## Work State
 
+### Completed (session 27 - dead probes removed, A/B flip gone, deterministic tick disproved)
+- **Removed the two dead probes that were perturbing the race**: `[EE-taskw]` in `ps2_runtime.cpp` (guest RAM stores use `FAST_WRITE32`, so `ps2WatchStackWrite` can never observe them) and the `[EE-taskp]` poll in `EeScheduler.cpp`.
+- **The A/B flip is gone.** With those probes removed, two consecutive runs (70 s default, 150 s with the tick flag) both reached **all six MBS packages** (`SYS_REG`, `MAP`, `SND`, `FIELD`, `BATTLE`, `MOVIE`) and then died in the same place: `[EE-dormant] thread=1 pc=0x0` -> `[EE-fiber] f1=1 f2=464 f3=448 idx=912 slot=0x0 resume=0x0 flag=0`. Outcome A (CDV-only, no MBS) did not appear in either run.
+- **`PS2X_DET_TICK` implemented, then deliberately narrowed to measurement-only** (env-gated, default off, so the default PC-port pacing is untouched). Cycle-paced vblank was tried and measured: baseline **478,542 cycles/frame**, but `m_eeCycle` is an *accountancy* counter, not a clock - it is charged from per-dispatch estimates while the guest is busy (~60k cyc/s during a CDV poll spin) and from wall-clock sleep time while it is idle (~295M cyc/s). Pacing vblank on it collapsed delivery from 60 Hz to **~3.5 Hz** (one 8.4 s dispatch) while still ending in the same fiber death, so the delivery bypass was reverted. The flag now only reports `cycles/frame avg=/min=/max=/spread=`.
+- **Default path verified unchanged** (70 s, no env): `dettick` absent, `tick=3085`, `lag_us=6565`, six MBS opens, same fiber death.
+
 ### Completed (session 7 - discovery gap + stale runner)
 - **Root-caused the "idle" state**: not a blocked wait - thread 1 was **retired** by `reportMissingFunction` on an indirect call (`FUN_001a8f80` -> pointer `0x1b1948`, `ra=0x1a8f94`). `[EE-hb] IDLE` reported `id=1 status=5 wait=None` and **all semaphores `waiters=0`**.
 - **Scale measured**: function-pointer tables at `0x3A6A98...`/`0x3AC6C0...` (shape `p,p,p,0,...`, preceded by data pointers); whole-image scan found **530** distinct code-range targets living in data with no `map.csv` start and no runner file (461 gap targets + 69 mid-function).
@@ -1791,13 +2003,15 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - (Earlier sessions, pushed: `81488a7` VU clock desync; `37cc40d` DBCMAN version; `4fc7fa7` module version; `95120b1` boot-stall A/B + SIFCMD; `ad27d73` CRT seed + interop; `33ccc7e` cleanup.)
 
 ### Active
-- **Awaiting a priority decision**: (i) implement the IOP **heap-allocation RPC** answer (advances boot) vs (ii) implement the **analyzer discovery pass** (makes the session-7 fix durable/automatic). Recommendation: (i) first, then (ii).
+- **The single remaining blocker is the fiber NULL slot.** Boot reliably reaches the six MBS packages, then the game's own task pump resumes fiber index `912` whose `task[idx].ctxPtr` (at `0x48F590 + idx*0x1D0 + 0x1C0`) is `0x0`; the context is saved to address `0`, `jr *(0x1A8)` reads `0`, and thread 1 ends at `pc=0 ra=0 sp=0x423530`. Because A no longer occurs, this is now reproducible and safe to instrument (one run per hypothesis).
+- **Recommended next step (needs approval)**: make `accountCycles` time-proportional (a real virtual clock) before retrying deterministic pacing. The measurement above shows the accountancy counter's accrual rate varies ~5000x between spin and sleep, so any cycle-based pacing built on it is unstable.
 
 ### Blocked
-- (none hard - the `SJX_Init` heap and sound RPCs are now answered by the emulated IOP; the current gate is the file I/O service on SID `0x80000001` - see *Open Decision (session 9)*)
+- (none hard - the CDV/streaming path is healthy; the fiber NULL slot is a guest-level task-table bug to be localised, not an emulator stall)
 
 ### Working tree
-- Tracked changes: `M PS2Recomp/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp` (temp `[EE-thread]`/`[EE-sem]`/`[EE-evf]` dumps - strip before the final commit), `M PS2_PROJECT_STATE.md` (this update).
+- Tracked changes at commit time: `PS2Recomp/ps2xRuntime/include/ps2_runtime.h` (guest store watch `ps2TraceGuestWrite` + `PS2X_WATCH_LO/HI/N`), `PS2Recomp/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp` (`PS2X_DET_TICK` measurement, kept `[EE-thr]`/`[EE-dormant]`/`[EE-fiber]`/`[EE-regring]` diagnostics), `M PS2_PROJECT_STATE.md`.
+- Removed this session: `[EE-taskw]` (`ps2_runtime.cpp`) and `[EE-taskp]` (`EeScheduler.cpp`).
 - Gitignored/local (not committable): `data/config.toml` (411 `entry_points`), the regenerated `PS2Recomp/ps2xRuntime/src/runner/` + `include/ps2_recompiled_functions.h`, dry-run dirs `data/output` + `data/output_base`.
 - untracked, **not mine - leave alone**: `.opencode/opencode.json.openchamber.backup`, `PS2Recomp/run_build.bat`, `scripts/`.
 ## Next Move (ordered)

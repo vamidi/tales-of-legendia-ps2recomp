@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -17,6 +18,48 @@
 
 namespace
 {
+    // TEMP DIAGNOSTIC (session 26): the boot now streams assets correctly and then
+    // dies by jumping to pc=0x1 with ra=0x1 from the top of main's stack
+    // (sp=0x1ffff60, the frame below crt0's `move sp, v0`).  The recompiler's
+    // dispatch trace only stores pcs, so record the entry registers of the last
+    // 24 dispatches; the dump below shows the exact call/return that produced
+    // the bogus pc.
+    constexpr uint32_t kEeRegRingSize = 24u;
+    uint32_t g_eeRegRingPc[kEeRegRingSize] = {};
+    uint32_t g_eeRegRingRa[kEeRegRingSize] = {};
+    uint32_t g_eeRegRingSp[kEeRegRingSize] = {};
+    uint32_t g_eeRegRingA0[kEeRegRingSize] = {};
+    uint32_t g_eeRegRingV0[kEeRegRingSize] = {};
+    int32_t g_eeRegRingTid[kEeRegRingSize] = {};
+    uint32_t g_eeRegRingPos = 0u;
+
+    void recordEeRegRing(const R5900Context &ctx, int32_t tid)
+    {
+        const uint32_t idx = g_eeRegRingPos % kEeRegRingSize;
+        g_eeRegRingPc[idx] = ctx.pc;
+        g_eeRegRingRa[idx] = getRegU32(&ctx, 31);
+        g_eeRegRingSp[idx] = getRegU32(&ctx, 29);
+        g_eeRegRingA0[idx] = getRegU32(&ctx, 4);
+        g_eeRegRingV0[idx] = getRegU32(&ctx, 2);
+        g_eeRegRingTid[idx] = tid;
+        ++g_eeRegRingPos;
+    }
+
+    void dumpEeRegRing(std::ostream &os)
+    {
+        const uint32_t count = std::min<uint32_t>(g_eeRegRingPos, kEeRegRingSize);
+        for (uint32_t i = 0u; i < count; ++i)
+        {
+            const uint32_t idx = (g_eeRegRingPos - count + i) % kEeRegRingSize;
+            os << " [reg" << i << " tid=" << g_eeRegRingTid[idx]
+               << " pc=0x" << std::hex << g_eeRegRingPc[idx]
+               << " ra=0x" << g_eeRegRingRa[idx]
+               << " sp=0x" << g_eeRegRingSp[idx]
+               << " a0=0x" << g_eeRegRingA0[idx]
+               << " v0=0x" << g_eeRegRingV0[idx] << std::dec << "]";
+        }
+    }
+
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -134,6 +177,44 @@ namespace
     [[maybe_unused]] constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     [[maybe_unused]] constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+
+    // PS2X_DET_TICK=1: measure how much guest work one frame consumes, so the
+    // boot race can be quantified instead of guessed at.  It reports the
+    // cycles/frame average and its min/max spread.
+    //
+    // It deliberately does NOT pace VBlank on the cycle counter.  Tried in
+    // session 26: m_eeCycle is an *accountancy* counter, not a clock.  It is
+    // charged from per-dispatch estimates while the guest is busy and from
+    // wall-clock sleep time while the guest is idle, and the two run at rates
+    // that differ by an order of magnitude (a CDV poll spin accrues ~60k cyc/s,
+    // an idle sleep accrues ~295M cyc/s).  A cycle-paced VBlank therefore
+    // collapsed delivery from 60 Hz to ~3.5 Hz - one 8.4 s dispatch - while
+    // still ending in the same fiber death.  A virtual clock needs accountCycles
+    // to be time-proportional first; until then this stays a measurement.
+    const bool s_detTick = []()
+    {
+        const char *value = std::getenv("PS2X_DET_TICK");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    // 0 means "calibrate from the wall-clock cadence of the first frames, then
+    // freeze".  Pin it with PS2X_DET_VBLANK_CYCLES once a run has reported the
+    // calibrated value, so different sessions compare the same cadence.
+    uint64_t s_detVBlankCycles = []()
+    {
+        const char *value = std::getenv("PS2X_DET_VBLANK_CYCLES");
+        return (value != nullptr && value[0] != '\0')
+                   ? static_cast<uint64_t>(std::strtoull(value, nullptr, 0))
+                   : 0ull;
+    }();
+    uint64_t s_detCalSumCycles = 0u;
+    uint32_t s_detCalFrames = 0u;
+    uint64_t s_detCalLastCycle = 0u;
+    uint64_t s_detRepSumCycles = 0u;
+    uint64_t s_detRepMinCycles = 0u;
+    uint64_t s_detRepMaxCycles = 0u;
+    uint32_t s_detRepFrames = 0u;
+    constexpr uint32_t kDetCalibrationFrames = 120u;
+    constexpr uint32_t kDetReportFrames = 600u;
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -404,6 +485,25 @@ void EeScheduler::run()
 
         GuestThread *running = currentThread();
         assert(running != nullptr);
+        // TEMP DIAGNOSTIC (session 26): with the CRI pipeline finally running the
+        // boot completes its first asset request and then dies with ra==1 inside
+        // the 0x22d0xx CRI SJ helpers.  Log every dispatch into that window with
+        // ra/sp/a0 so the frame that clobbers the saved return address is visible.
+        {
+            static uint32_t s_winLogs = 0u;
+            R5900Context &winCtx = running->activeContext();
+            if (winCtx.pc >= 0x22c000u && winCtx.pc < 0x22f000u && s_winLogs < 400u)
+            {
+                ++s_winLogs;
+                std::cerr << "[EE-win] pc=0x" << std::hex << winCtx.pc
+                          << " ra=0x" << getRegU32(&winCtx, 31)
+                          << " sp=0x" << getRegU32(&winCtx, 29)
+                          << " a0=0x" << getRegU32(&winCtx, 4)
+                          << " a1=0x" << getRegU32(&winCtx, 5)
+                          << " v0=0x" << getRegU32(&winCtx, 2)
+                          << std::dec << " id=" << running->id << std::endl;
+            }
+        }
         if (running->resumeCompletion)
         {
             auto completion = std::move(running->resumeCompletion);
@@ -449,6 +549,55 @@ void EeScheduler::run()
                           << " tick=" << std::dec << m_vsyncTick
                           << " cyc=" << m_eeCycle
                           << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+                // TEMP DIAGNOSTIC (session 26): enumerate every live guest thread.
+                // The CRI servers are woken from vblank only when
+                // iReferThreadStatus reports THS_WAIT/THS_WAITSUSPEND (the guest
+                // handler 0x199148 tests `status == 4 || status == 0xc`), and the
+                // whole CRI chain (pump 0x197940, ADXF exec 0x1973a8, Stm exec
+                // 0x19f468) freezes after ~t=15s while thread 1 keeps cycling at
+                // 60 Hz.  Without a per-thread status a thread that was never
+                // woken is indistinguishable from one that was woken and
+                // re-blocked, and `wake` shows deferred wakeups accumulating.
+                for (const auto &[tid, item] : m_threads)
+                {
+                    const char *stName = "?";
+                    switch (item.status)
+                    {
+                    case EeThreadStatus::Running: stName = "Running"; break;
+                    case EeThreadStatus::Ready: stName = "Ready"; break;
+                    case EeThreadStatus::Waiting: stName = "Waiting"; break;
+                    case EeThreadStatus::WaitingSuspended: stName = "WaitSusp"; break;
+                    case EeThreadStatus::Suspended: stName = "Suspended"; break;
+                    case EeThreadStatus::Dormant: stName = "Dormant"; break;
+                    }
+                    const char *wName = "?";
+                    switch (item.wait.reason)
+                    {
+                    case EeWaitReason::None: wName = "none"; break;
+                    case EeWaitReason::Sleep: wName = "sleep"; break;
+                    case EeWaitReason::Semaphore: wName = "sema"; break;
+                    case EeWaitReason::EventFlag: wName = "evf"; break;
+                    case EeWaitReason::VSync: wName = "vsync"; break;
+                    case EeWaitReason::External: wName = "ext"; break;
+                    case EeWaitReason::Mpeg: wName = "mpeg"; break;
+                    }
+                    const R5900Context &thrCtx = item.activeContext();
+                    std::cerr << "[EE-thr] id=" << tid
+                              << " st=" << static_cast<int>(item.status) << "(" << stName << ")"
+                              << " wait=" << wName
+                              << " waitId=" << waitObjectId(item.wait)
+                              << " susp=" << item.suspendCount
+                              << " wake=" << item.wakeupCount
+                              << " inv=" << item.invocations.size()
+                              << " pc=0x" << std::hex << thrCtx.pc
+                              << " ra=0x" << getRegU32(&thrCtx, 31)
+                              << " sp=0x" << getRegU32(&thrCtx, 29)
+                              << " stack=0x" << item.stack
+                              << " sz=0x" << item.stackSize
+                              << " entry=0x" << item.entry
+                              << " prio=" << std::dec << item.currentPriority
+                              << std::endl;
+                }
                 {
                     const auto profNow = std::chrono::steady_clock::now();
                     const auto spanMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -547,6 +696,36 @@ void EeScheduler::run()
                           << " t9=0x" << getRegU32(&context, 25)
                           << " trace=" << formatDispatchTrace() << std::dec << std::endl;
             }
+            // TEMP DIAGNOSTIC (session 26): FUN_0015231c (0x15231c, 32 dispatches
+            // before the exit) is the game's own task/fiber switch: it saves the
+            // caller's context into the slot selected by
+            //   t0 = table[*(0x3DB1A0) * *(0x3DB1B0) + *(0x3DB1C0)]
+            // and then does `jr ra` with `ra = *(t0+0x1a8)`.  If t0 is NULL that
+            // reads address 0x1a8 (zeroed kernel RAM) -> 0, i.e. exactly the
+            // `pc=0 ra=0` we observe.  Dump the selector globals and the slot.
+            {
+                static int s_fiberDumps = 3;
+                if (s_fiberDumps > 0)
+                {
+                    --s_fiberDumps;
+                    auto ram32 = [this](uint32_t addr) -> uint32_t {
+                        uint32_t v = 0u;
+                        std::memcpy(&v, m_rdram + (addr & 0x01FFFFFFu), sizeof(v));
+                        return v;
+                    };
+                    const uint32_t f1 = ram32(0x3DB1A0u);
+                    const uint32_t f2 = ram32(0x3DB1B0u);
+                    const uint32_t f3 = ram32(0x3DB1C0u);
+                    const uint32_t idx = f1 * f2 + f3;
+                    const uint32_t slot = ram32(0x48F590u + idx * 4u);
+                    std::cerr << "[EE-fiber] f1=" << f1 << " f2=" << f2
+                              << " f3=" << f3 << " idx=" << idx
+                              << " slot=0x" << std::hex << slot
+                              << " resume=0x" << ram32(slot + 0x1A8u)
+                              << " flag=" << std::dec << ram32(slot + 0x1ACu)
+                              << std::endl;
+                }
+            }
             makeDormant(*running);
             m_currentThreadId = 0;
             copyMainContextToRuntime();
@@ -566,6 +745,9 @@ void EeScheduler::run()
             running->invocations.push_back(std::move(invocation));
             continue;
         }
+
+        recordEeRegRing(context, running->id);
+
 
         if (!m_runtime.hasFunction(context.pc))
         {
@@ -588,6 +770,9 @@ void EeScheduler::run()
                               << " pc=0x" << std::hex << context.pc
                               << " ra=0x" << getRegU32(&context, 31)
                               << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+                    std::cerr << "[EE-regring]";
+                    dumpEeRegRing(std::cerr);
+                    std::cerr << std::endl;
                 }
                 makeDormant(*running);
                 m_currentThreadId = 0;
@@ -791,6 +976,22 @@ int EeScheduler::createThread(const EeThreadCreateParams &params)
     thread.initialPriority = params.priority;
     thread.currentPriority = params.priority;
     thread.status = EeThreadStatus::Dormant;
+    // TEMP DIAGNOSTIC (session 26): the CRI servers must end up at priorities
+    // 1/8/16/18/25 with the caller demoted to 0x18 (ADXPS2_Init default config,
+    // FUN_001997a8 with a0 == 0).  Log every creation so a wrong priority is
+    // visible immediately instead of inferred from the run.
+    {
+        static uint32_t s_createLogs = 0u;
+        if (s_createLogs < 40u)
+        {
+            ++s_createLogs;
+            std::cerr << "[EE-create] id=" << id
+                      << " entry=0x" << std::hex << params.entry
+                      << std::dec << " prio=" << params.priority
+                      << " stack=0x" << std::hex << params.stack
+                      << std::dec << " size=" << params.stackSize << std::endl;
+        }
+    }
     m_threads.emplace(id, std::move(thread));
     publishSnapshot();
     return id;
@@ -1040,6 +1241,22 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
     else
     {
         ++target->wakeupCount;
+        // TEMP DIAGNOSTIC (session 26): a wake that only bumps the counter means
+        // the target is not sleep-waiting (or is inside a suspend), so it never
+        // becomes runnable.  The CRI servers are woken from vblank every frame;
+        // if their wakes land here the CRI chain can never advance no matter how
+        // fast vblank runs.  Capped: this is a per-frame path.
+        static uint32_t s_wakeDeferLogs = 0u;
+        if (s_wakeDeferLogs < 40u)
+        {
+            ++s_wakeDeferLogs;
+            std::cerr << "[EE-wake-defer] id=" << id
+                      << " st=" << static_cast<int>(target->status)
+                      << " wait=" << static_cast<int>(target->wait.reason)
+                      << " waitId=" << waitObjectId(target->wait)
+                      << " wake=" << target->wakeupCount
+                      << " from=" << m_currentThreadId << std::endl;
+        }
     }
     publishSnapshot();
     return KE_OK;
@@ -1066,13 +1283,36 @@ int EeScheduler::cancelWakeup(int id)
 int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
 {
     assertExecutor();
-    if (priority < 1 || priority >= kPriorityCount)
-    {
-        return KE_ILLEGAL_PRIORITY;
-    }
     if (id == 0)
     {
         id = m_currentThreadId;
+    }
+    // TEMP EXPERIMENT (session 26): the game's own task pump pins the main
+    // thread to priority 1 (see [EE-prio] id=1 new=1 old=24 right after
+    // ADXPS2_Init's ChangeThreadPriority(id, 0x18)) while the CRI servers it
+    // just created sit at 8/16/18/25.  Under a strict-priority EE scheduler a
+    // lower-priority thread only runs when the higher-priority one blocks, and
+    // thread 1 never blocks (sceSifSetDma completes the IOP reply and queues
+    // the DMAC-5 handler for the next dispatch boundary, so every WaitSema
+    // finds its semaphore already signalled).  PS2X_MAIN_PRIO=<n> remaps that
+    // pin so the servers can preempt, which measures whether the frozen CRI
+    // chain (pump 0x197940 / ADXF exec 0x1973a8 / Stm exec 0x19f468) and the
+    // asset load advance at all once the servers actually get CPU.
+    static const int s_mainPrioOverride = [] {
+        int value = 0;
+        if (const char *env = std::getenv("PS2X_MAIN_PRIO"))
+        {
+            value = static_cast<int>(std::strtol(env, nullptr, 10));
+        }
+        return value;
+    }();
+    if (s_mainPrioOverride > 0 && id == kMainThreadId && priority == 1)
+    {
+        priority = s_mainPrioOverride;
+    }
+    if (priority < 1 || priority >= kPriorityCount)
+    {
+        return KE_ILLEGAL_PRIORITY;
     }
     GuestThread *target = thread(id);
     if (!target)
@@ -1080,6 +1320,20 @@ int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &o
         return KE_UNKNOWN_THID;
     }
     oldPriority = target->currentPriority;
+    // TEMP DIAGNOSTIC (session 26): ADXPS2_Init ends with
+    // ChangeThreadPriority(GetThreadId(), 0x18); if the caller lands anywhere
+    // else the CRI servers never preempt it.
+    {
+        static uint32_t s_prioLogs = 0u;
+        if (s_prioLogs < 40u)
+        {
+            ++s_prioLogs;
+            std::cerr << "[EE-prio] id=" << id << " new=" << priority
+                      << " old=" << oldPriority
+                      << " st=" << static_cast<int>(target->status)
+                      << " cur=" << m_currentThreadId << std::endl;
+        }
+    }
     if (target->status == EeThreadStatus::Ready)
     {
         removeReady(*target);
@@ -1540,6 +1794,20 @@ uint32_t EeScheduler::invocationStackTop()
     if (top == 0u)
     {
         throw std::runtime_error("EE invocation stack space exhausted");
+    }
+    // TEMP DIAGNOSTIC (session 26): both crash runs died with sp=0x1ffff60, i.e.
+    // on a stack at the very END of the async-callback pool (region base
+    // 0x1F00000, top PS2_RAM_SIZE).  Log the pool hand-outs so exhaustion /
+    // leakage is visible instead of inferred.
+    {
+        static uint32_t s_stackLogs = 0u;
+        if (s_stackLogs < 96u)
+        {
+            ++s_stackLogs;
+            std::cerr << "[EE-invstk] tid=" << owner->id << " depth=" << depth
+                      << " top=0x" << std::hex << top << std::dec
+                      << " n=" << s_stackLogs << std::endl;
+        }
     }
     m_invocationStackTops.emplace(key, top);
     return top;
@@ -2290,6 +2558,54 @@ void EeScheduler::processDueDeadlines()
                                   << " thread=" << std::dec << s_lastDispThread
                                   << " lastDispUs=" << lastDispUs
                                   << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+                    }
+                }
+                // PS2X_DET_TICK: sample the accountancy counter once per frame so
+                // the per-frame guest work - and how far it varies - is visible.
+                if (s_detTick)
+                {
+                    const uint64_t deltaCycles = (s_detCalLastCycle != 0u)
+                                                     ? (m_eeCycle - s_detCalLastCycle)
+                                                     : 0u;
+                    s_detCalLastCycle = m_eeCycle;
+                    if (deltaCycles != 0u)
+                    {
+                        if (s_detVBlankCycles == 0u)
+                        {
+                            s_detCalSumCycles += deltaCycles;
+                            ++s_detCalFrames;
+                            if (s_detCalFrames >= kDetCalibrationFrames)
+                            {
+                                s_detVBlankCycles = std::max<uint64_t>(1u, s_detCalSumCycles / s_detCalFrames);
+                                s_detCalSumCycles = 0u;
+                                s_detCalFrames = 0u;
+                                std::cerr << "[EE-dettick] baseline cycles/frame=" << s_detVBlankCycles
+                                          << " (accountancy counter, not a clock)" << std::endl;
+                            }
+                        }
+                        else
+                        {
+                            s_detRepSumCycles += deltaCycles;
+                            ++s_detRepFrames;
+                            s_detRepMinCycles = (s_detRepMinCycles == 0u)
+                                                    ? deltaCycles
+                                                    : std::min(s_detRepMinCycles, deltaCycles);
+                            s_detRepMaxCycles = std::max(s_detRepMaxCycles, deltaCycles);
+                            if (s_detRepFrames >= kDetReportFrames)
+                            {
+                                const uint64_t avgCycles = s_detRepSumCycles / s_detRepFrames;
+                                const uint64_t minCycles = std::max<uint64_t>(1u, s_detRepMinCycles);
+                                std::cerr << "[EE-dettick] cycles/frame avg=" << avgCycles
+                                          << " min=" << s_detRepMinCycles
+                                          << " max=" << s_detRepMaxCycles
+                                          << " spread=" << ((s_detRepMaxCycles * 100u) / minCycles) << "%"
+                                          << std::endl;
+                                s_detRepSumCycles = 0u;
+                                s_detRepMinCycles = 0u;
+                                s_detRepMaxCycles = 0u;
+                                s_detRepFrames = 0u;
+                            }
+                        }
                     }
                 }
                 scheduleEvent(0u, vblankBase + kVBlankDuration,
