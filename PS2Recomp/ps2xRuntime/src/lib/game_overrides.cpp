@@ -214,8 +214,6 @@ static void talesOfLegendiaAssetPaths(PS2Runtime & /*runtime */)
     }
 }
 
-PS2_REGISTER_GAME_OVERRIDE("Tales of Legendia (USA)", "SLUS_212.01", 0, 0, talesOfLegendiaAssetPaths);
-
 // The generated function table has a hole at 0x1AD548: Ghidra never identified
 // it as a function (it sits in the 0x38-byte gap between the epilogue at
 // 0x1AD534 and FUN_001ad580), so every call to it is reported as a missing
@@ -259,6 +257,60 @@ static void ps2_1ad548_afsSlotFinder(uint8_t *rdram, R5900Context *ctx, PS2Runti
     ctx->pc = GPR_U32(ctx, 31); // jr $ra
 }
 
+// Second hole of the same kind, but this one is *called directly* and therefore
+// fatal.  The function at 0x232460 ends with `jal func_232310` at 0x2324B4
+// (emitted verbatim by entry_232460_0x2324d0.cpp), yet no body exists for
+// 0x232310: its 12 instructions sit in the 0x38-byte gap between FUN_00232210's
+// epilogue - which ends at 0x232308 followed by two alignment nops - and
+// FUN_00232340, and no data word anywhere in the ELF points at it either, so
+// nothing ever put an entry in the dense table.
+//
+// lookupFunction()'s secondary-entry fallback then resolved it to the
+// *neighbouring* resume entry 0x2322F4 (+0x1c): FUN_00232210's shared epilogue.
+// That body popped the wrong frame - sp grew by 0x90 instead of this leaf's 0,
+// s0 was reloaded from a foreign stack slot (0x621b80 -> 0x232900) - and then
+// returned to 0x2324BC, which has no table slot and lies 0x5C past its own
+// function start (outside the 0x40 fallback window), so thread 1 was retired.
+//
+//   0x232310  lui   $v1, 0x3F80
+//   0x232314  mtc1  $v1, $f0
+//   0x232318  nop
+//   0x23231C  c.eq.s $f0, $f14
+//   0x232320  bc1t  0x232338
+//   0x232324  swc1  $f13, 0($a0)      ; (delay) stores on *both* paths
+//   0x232328  sub.s $f0, $f0, $f14
+//   0x23232C  mula.s $f0, $f12        ; ACC = $f0 * $f12
+//   0x232330  msub.s $f0, $f14, $f13  ; $f0 = ACC - $f14 * $f13
+//   0x232334  swc1  $f0, 0($a0)
+//   0x232338  jr    $ra
+//   0x23233C  nop
+static void ps2_232310_interpolate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t a0 = GPR_U32(ctx, 4);
+
+    SET_GPR_S32(ctx, 3, static_cast<int32_t>(0x3F800000u)); // lui $v1, 0x3F80
+    ctx->f[0] = 1.0f;                                      // mtc1 $v1, $f0
+
+    const bool equal = (ctx->f[0] == ctx->f[14]); // c.eq.s $f0, $f14
+    ctx->fcr31 = equal ? (ctx->fcr31 | 0x00800000u) : (ctx->fcr31 & ~0x00800000u);
+
+    // bc1t delay slot: the store is unconditional.
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &ctx->f[13], sizeof(bits));
+    runtime->Store32(rdram, ctx, a0, bits);
+
+    if (!equal)
+    {
+        ctx->f[0] = FPU_SUB_S(ctx->f[0], ctx->f[14]);                        // sub.s
+        ctx->f_acc = FPU_MUL_S(ctx->f[0], ctx->f[12]);                       // mula.s
+        ctx->f[0] = FPU_SUB_S(ctx->f_acc, FPU_MUL_S(ctx->f[14], ctx->f[13])); // msub.s
+        std::memcpy(&bits, &ctx->f[0], sizeof(bits));
+        runtime->Store32(rdram, ctx, a0, bits);
+    }
+
+    ctx->pc = GPR_U32(ctx, 31); // jr $ra
+}
+
 static void talesOfLegendiaMissingFunctions(PS2Runtime &runtime)
 {
     if (!runtime.replaceFunction(0x001AD548u, &ps2_1ad548_afsSlotFinder))
@@ -266,10 +318,12 @@ static void talesOfLegendiaMissingFunctions(PS2Runtime &runtime)
         std::cerr << "[game_overrides] Tales of Legendia (USA): could not install the AFS slot "
                      "finder at 0x1AD548" << std::endl;
     }
+    if (!runtime.replaceFunction(0x00232310u, &ps2_232310_interpolate))
+    {
+        std::cerr << "[game_overrides] Tales of Legendia (USA): could not install the "
+                     "interpolate helper at 0x232310" << std::endl;
+    }
 }
-
-PS2_REGISTER_GAME_OVERRIDE("Tales of Legendia (USA) - AFS slot finder (0x1AD548)",
-                           "SLUS_212.01", 0, 0, talesOfLegendiaMissingFunctions);
 
 // The generated table registers function *starts* only.  A thread can also be
 // resumed at an internal label: when a callee returns while an EE transfer is
@@ -282,6 +336,16 @@ PS2_REGISTER_GAME_OVERRIDE("Tales of Legendia (USA) - AFS slot finder (0x1AD548)
 // 0x1AD5A0-0x1AD728 is the libc/AFS helper block the boot loader runs through;
 // its resume labels are the ones listed in that function's prologue.
 extern void entry_1ad5a0_0x1ad728(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+// Same class, and proven live twice.  entry_232460's prologue exposes exactly
+// two mid-function resume labels - one per JAL return address:
+//   0x2324A8 = return of `jal func_232210` at 0x2324A0
+//   0x2324BC = return of `jal 0x232310`      at 0x2324B4
+// Both sit outside reentryFallback()'s 0x40-byte window (+0x48 and +0x5C), so
+// when either callee's `jr $ra` hands control back to the scheduler with pc set
+// to its return address, hasFunction() misses and the thread dorms.  Session 33
+// fixed 0x232310 (the callee) and the death simply moved one call earlier to
+// 0x2324A8; register the complete set in one pass instead of one per run.
+extern void entry_232460_0x2324d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 
 static void talesOfLegendiaResumeLabels(PS2Runtime &runtime)
 {
@@ -303,7 +367,29 @@ static void talesOfLegendiaResumeLabels(PS2Runtime &runtime)
     {
         (void)runtime.registerFunction(address, &entry_1ad5a0_0x1ad728);
     }
+
+    static constexpr uint32_t kEntry232460ResumeLabels[] = {
+        0x002324A8u,
+        0x002324BCu,
+    };
+    for (const uint32_t address : kEntry232460ResumeLabels)
+    {
+        (void)runtime.registerFunction(address, &entry_232460_0x2324d0);
+    }
 }
 
-PS2_REGISTER_GAME_OVERRIDE("Tales of Legendia (USA) - AFS helper resume labels",
-                           "SLUS_212.01", 0, 0, talesOfLegendiaResumeLabels);
+// GOW-port style: ONE descriptor, ONE apply function. applyMatching() applies
+// every matching descriptor, so the split into three registrations for the same
+// game was redundant - this keeps the application order explicit and holds the
+// identity check (ELF name + entry 0x100008) in a single place.
+static void talesOfLegendiaOverrides(PS2Runtime &runtime)
+{
+    talesOfLegendiaAssetPaths(runtime);
+    talesOfLegendiaMissingFunctions(runtime);
+    talesOfLegendiaResumeLabels(runtime);
+    std::cerr << "[game_overrides] Tales of Legendia (USA): asset mount + AFS slot finder "
+                 "(0x1AD548) + interpolate helper (0x232310) + resume labels applied."
+              << std::endl;
+}
+
+PS2_REGISTER_GAME_OVERRIDE("Tales of Legendia (USA)", "SLUS_212.01", 0x00100008u, 0u, talesOfLegendiaOverrides);

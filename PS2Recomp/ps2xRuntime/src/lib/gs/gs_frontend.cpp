@@ -26,6 +26,30 @@
 // ---------------------------------------------------------------------------
 namespace
 {
+    // TEMP diagnostic (session 30): which GIF A+D register ids the guest really
+    // writes. Dumped alongside the framebuffer census.
+    uint32_t g_gsAdHistogram[256] = {};
+
+    void DumpGsAdHistogram(const char *tag)
+    {
+        uint32_t order[256];
+        for (uint32_t i = 0u; i < 256u; ++i)
+            order[i] = i;
+        auto greater = [](uint32_t a, uint32_t b) { return g_gsAdHistogram[a] > g_gsAdHistogram[b]; };
+        std::partial_sort(order, order + 16u, order + 256u, greater);
+        std::fprintf(stderr, "[GS-ad] %s top:", tag);
+        for (uint32_t i = 0u; i < 16u; ++i)
+        {
+            if (g_gsAdHistogram[order[i]] == 0u)
+                break;
+            std::fprintf(stderr, " 0x%02X=%u", order[i], g_gsAdHistogram[order[i]]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+}
+
+namespace
+{
     bool WriteBmp24(const std::filesystem::path &path, uint32_t w, uint32_t h, const std::vector<uint8_t> &bgrBottomUp)
     {
         const uint32_t rowBytes = (w * 3u + 3u) & ~3u;
@@ -93,9 +117,11 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
         return false;
     }
 
-    // PMODE.ALPS selects the scanout circuit; DISPFB layout: FBP[0:20]
-    // (x in 64px blocks, then y), FBW[22:26] (64px units), PSM[32:36].
-    const unsigned circuit = ((regs.pmode >> 6) & 3u) <= 1u ? static_cast<unsigned>((regs.pmode >> 6) & 3u) : 0u;
+    // PMODE.EN1 (bit 0) / EN2 (bit 1) enable read circuits 1 and 2. Prefer an
+    // enabled circuit; fall back to circuit 1 when neither is enabled.
+    const bool en1 = (regs.pmode & 0x1u) != 0u;
+    const bool en2 = (regs.pmode & 0x2u) != 0u;
+    const unsigned circuit = en1 ? 0u : (en2 ? 1u : 0u);
     const uint64_t dispfb = circuit != 0u ? regs.dispfb2 : regs.dispfb1;
 
     // VRAM census: is anything actually drawn? Scan the snapshot for non-zero
@@ -146,10 +172,13 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
                  static_cast<unsigned long long>(regs.dispfb2),
                  snap.ctx[0].frame.fbp, snap.ctx[0].frame.fbw, static_cast<unsigned>(snap.ctx[0].frame.psm),
                  snap.ctx[1].frame.fbp, snap.ctx[1].frame.fbw, static_cast<unsigned>(snap.ctx[1].frame.psm));
+    DumpGsAdHistogram(tag);
 
-    const uint32_t bp = static_cast<uint32_t>(dispfb & 0x1FFFFFull);
-    uint32_t fbw = static_cast<uint32_t>((dispfb >> 22) & 0x1Fu);
-    const uint32_t psm = static_cast<uint32_t>((dispfb >> 32) & 0x3Fu);
+    // DISPFB shares FRAME_1's packed layout: FBP[0:8] (2048-byte pages),
+    // FBW[9:14] (64-pixel units), PSM[15:19], DBX[32:42], DBY[43:53].
+    const uint32_t bp = static_cast<uint32_t>(dispfb & 0x1FFu);
+    uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
+    const uint32_t psm = static_cast<uint32_t>((dispfb >> 15) & 0x1Fu);
 
     uint32_t w = snap.hostPresentationWidth;
     uint32_t h = snap.hostPresentationHeight;
@@ -173,48 +202,53 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
     // addressing. Pixel words are R[0:7] G[8:15] B[16:23] A[24:31]
     // (same convention as gs_cpu_backend texel reads).
     uint8_t *vramMut = const_cast<uint8_t *>(vram);
-    std::vector<uint8_t> bgr(static_cast<size_t>(w) * h * 3u, 0u);
-    for (uint32_t y = 0u; y < h; ++y)
-    {
-        // BMP rows are bottom-up.
-        uint8_t *row = bgr.data() + static_cast<size_t>(h - 1u - y) * w * 3u;
-        for (uint32_t x = 0u; x < w; ++x)
+    auto renderRegion = [&](uint32_t regionBp, uint32_t regionFbw, uint32_t regionPsm,
+                            uint32_t regionW, uint32_t regionH) {
+        std::vector<uint8_t> pixels(static_cast<size_t>(regionW) * regionH * 3u, 0u);
+        for (uint32_t y = 0u; y < regionH; ++y)
         {
-            uint32_t c = 0u;
-            switch (psm & 0x3Fu)
+            // BMP rows are bottom-up.
+            uint8_t *row = pixels.data() + static_cast<size_t>(regionH - 1u - y) * regionW * 3u;
+            for (uint32_t x = 0u; x < regionW; ++x)
             {
-            case GS_PSM_CT24:
-                c = GSMem::ReadCT24(vramMut, bp, fbw, x, y);
-                break;
-            case GS_PSM_CT16:
-                c = GSMem::ReadCT16(vramMut, bp, fbw, x, y);
-                break;
-            case GS_PSM_CT16S:
-                c = GSMem::ReadCT16S(vramMut, bp, fbw, x, y);
-                break;
-            case GS_PSM_CT32:
-            default:
-                c = GSMem::ReadCT32(vramMut, bp, fbw, x, y);
-                break;
+                uint32_t c = 0u;
+                switch (regionPsm & 0x3Fu)
+                {
+                case GS_PSM_CT24:
+                    c = GSMem::ReadCT24(vramMut, regionBp, regionFbw, x, y);
+                    break;
+                case GS_PSM_CT16:
+                    c = GSMem::ReadCT16(vramMut, regionBp, regionFbw, x, y);
+                    break;
+                case GS_PSM_CT16S:
+                    c = GSMem::ReadCT16S(vramMut, regionBp, regionFbw, x, y);
+                    break;
+                case GS_PSM_CT32:
+                default:
+                    c = GSMem::ReadCT32(vramMut, regionBp, regionFbw, x, y);
+                    break;
+                }
+                uint8_t r = 0u, g = 0u, b = 0u;
+                if ((regionPsm & 0x3Fu) == GS_PSM_CT16 || (regionPsm & 0x3Fu) == GS_PSM_CT16S)
+                {
+                    r = static_cast<uint8_t>((c & 0x1Fu) << 3);
+                    g = static_cast<uint8_t>(((c >> 5) & 0x1Fu) << 3);
+                    b = static_cast<uint8_t>(((c >> 10) & 0x1Fu) << 3);
+                }
+                else
+                {
+                    r = static_cast<uint8_t>(c & 0xFFu);
+                    g = static_cast<uint8_t>((c >> 8) & 0xFFu);
+                    b = static_cast<uint8_t>((c >> 16) & 0xFFu);
+                }
+                row[x * 3u + 0u] = b;
+                row[x * 3u + 1u] = g;
+                row[x * 3u + 2u] = r;
             }
-            uint8_t r = 0u, g = 0u, b = 0u;
-            if ((psm & 0x3Fu) == GS_PSM_CT16 || (psm & 0x3Fu) == GS_PSM_CT16S)
-            {
-                r = static_cast<uint8_t>((c & 0x1Fu) << 3);
-                g = static_cast<uint8_t>(((c >> 5) & 0x1Fu) << 3);
-                b = static_cast<uint8_t>(((c >> 10) & 0x1Fu) << 3);
-            }
-            else
-            {
-                r = static_cast<uint8_t>(c & 0xFFu);
-                g = static_cast<uint8_t>((c >> 8) & 0xFFu);
-                b = static_cast<uint8_t>((c >> 16) & 0xFFu);
-            }
-            row[x * 3u + 0u] = b;
-            row[x * 3u + 1u] = g;
-            row[x * 3u + 2u] = r;
         }
-    }
+        return pixels;
+    };
+    const std::vector<uint8_t> bgr = renderRegion(bp, fbw, psm, w, h);
     // Raw physical slab of the densest 3x64 KiB region, read as linear CT32
     // words: shows what actually lives in VRAM (uploaded textures vs a drawn
     // framebuffer) regardless of DISPFB/FRAME programming.
@@ -240,14 +274,41 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
     frontend.unlockDisplaySnapshot();
 
     std::error_code ec;
-    const auto dir = std::filesystem::current_path(ec);
-    const auto framePath = std::filesystem::weakly_canonical(dir / ("gs_frame" + std::to_string(frameIndex) + "_" + tag + ".bmp"), ec);
+    std::filesystem::path outDir;
+    if (const char *dumpDir = std::getenv("PS2_DUMP_DIR"))
+        outDir = dumpDir;
+    else
+    {
+        std::error_code tempEc;
+        outDir = std::filesystem::temp_directory_path(tempEc);
+        if (tempEc)
+            outDir = std::filesystem::current_path(tempEc);
+        outDir /= "ps2_diag";
+    }
+    std::filesystem::create_directories(outDir, ec);
+    const auto framePath = outDir / ("gs_frame" + std::to_string(frameIndex) + "_" + tag + ".bmp");
     if (!WriteBmp24(framePath, w, h, bgr))
     {
         std::fprintf(stderr, "[FB-dump] %s: cannot write %s\n", tag, framePath.string().c_str());
         return false;
     }
-    const auto slabPath = std::filesystem::weakly_canonical(dir / ("gs_slab" + std::to_string(frameIndex) + "_" + tag + ".bmp"), ec);
+    // Also render the context-1 draw framebuffer (FRAME_1) so the displayed
+    // buffer and the buffer the guest actually renders into can be compared.
+    {
+        const auto &drawFrame = snap.ctx[0].frame;
+        if (drawFrame.fbw != 0u && drawFrame.fbp != bp)
+        {
+            const uint32_t drawW = std::min<uint32_t>(drawFrame.fbw * 64u, 1024u);
+            const std::vector<uint8_t> drawBgr =
+                renderRegion(drawFrame.fbp, drawFrame.fbw, drawFrame.psm, drawW, h);
+            const auto drawPath = outDir / ("gs_draw" + std::to_string(frameIndex) + "_" + tag + ".bmp");
+            if (WriteBmp24(drawPath, drawW, h, drawBgr))
+                std::fprintf(stderr, "[FB-dump] drew %s (ctx1 fbp=%u fbw=%u psm=%u)\n",
+                             drawPath.string().c_str(), drawFrame.fbp, drawFrame.fbw,
+                             static_cast<unsigned>(drawFrame.psm));
+        }
+    }
+    const auto slabPath = outDir / ("gs_slab" + std::to_string(frameIndex) + "_" + tag + ".bmp");
     if (!WriteBmp24(slabPath, slabW, slabH, slab))
         std::fprintf(stderr, "[FB-dump] %s: cannot write %s\n", tag, slabPath.string().c_str());
 
@@ -1340,6 +1401,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    ++g_gsAdHistogram[regAddr];
     if (m_backend && m_backend->UsesRawCommands())
     {
         m_backend->WriteRegisterRaw(regAddr, value);
@@ -1778,9 +1840,24 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case 0x59:
         if (m_privRegs)
         {
-            // TEMP diagnostic (session 25): first real buffer switch -> dump.
+            // TEMP diagnostic (session 30): who programs the display buffer?
+            static uint32_t s_dispfb1Writes = 0u;
             const uint64_t flipsBefore = m_privRegs->displayFlipCount[0].load(std::memory_order_relaxed);
             m_privRegs->writeDisplayFramebuffer(0, value);
+            if (s_dispfb1Writes < 12u)
+            {
+                ++s_dispfb1Writes;
+                std::fprintf(stderr,
+                             "[GS-w] DISPFB1 val=0x%llX fbp=%llu fbw=%llu psm=%llu pmode=0x%llX "
+                             "flips=%llu\n",
+                             static_cast<unsigned long long>(value),
+                             static_cast<unsigned long long>(value & 0x1FFu),
+                             static_cast<unsigned long long>((value >> 9) & 0x3Fu),
+                             static_cast<unsigned long long>((value >> 15) & 0x1Fu),
+                             static_cast<unsigned long long>(m_privRegs->pmode),
+                             static_cast<unsigned long long>(
+                                 m_privRegs->displayFlipCount[0].load(std::memory_order_relaxed)));
+            }
             if (flipsBefore == 0u && m_privRegs->displayFlipCount[0].load(std::memory_order_relaxed) != 0u)
                 Ps2DumpFramebufferBmp(*this, *m_privRegs, "flip");
         }
@@ -1792,9 +1869,24 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case 0x5b:
         if (m_privRegs)
         {
-            // TEMP diagnostic (session 25): first real buffer switch -> dump.
+            // TEMP diagnostic (session 30): who programs the display buffer?
+            static uint32_t s_dispfb2Writes = 0u;
             const uint64_t flipsBefore = m_privRegs->displayFlipCount[1].load(std::memory_order_relaxed);
             m_privRegs->writeDisplayFramebuffer(1, value);
+            if (s_dispfb2Writes < 12u)
+            {
+                ++s_dispfb2Writes;
+                std::fprintf(stderr,
+                             "[GS-w] DISPFB2 val=0x%llX fbp=%llu fbw=%llu psm=%llu pmode=0x%llX "
+                             "flips=%llu\n",
+                             static_cast<unsigned long long>(value),
+                             static_cast<unsigned long long>(value & 0x1FFu),
+                             static_cast<unsigned long long>((value >> 9) & 0x3Fu),
+                             static_cast<unsigned long long>((value >> 15) & 0x1Fu),
+                             static_cast<unsigned long long>(m_privRegs->pmode),
+                             static_cast<unsigned long long>(
+                                 m_privRegs->displayFlipCount[1].load(std::memory_order_relaxed)));
+            }
             if (flipsBefore == 0u && m_privRegs->displayFlipCount[1].load(std::memory_order_relaxed) != 0u)
                 Ps2DumpFramebufferBmp(*this, *m_privRegs, "flip");
         }

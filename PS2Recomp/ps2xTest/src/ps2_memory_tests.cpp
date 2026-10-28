@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ee_scheduler.h"
 #include "Stubs/DMA.h"
 #include "Stubs/GS.h"
 
@@ -2065,6 +2066,11 @@ void register_ps2_memory_tests()
                      "guest should be able to configure VIF1 CHCR.TTE before submission");
 
             R5900Context ctx{};
+            // sceDmaSend completes the chain synchronously and dispatches DMAC
+            // handlers through the EE scheduler (dispatchIrq asserts it runs on
+            // the executor thread). Direct syscall tests must bind the scheduler
+            // to this thread first, exactly as the kernel tests do.
+            runtime.eeScheduler().bindMainContextForSyscall(ctx, rdram);
             setRegU32(ctx, 4, 1u); // sceDmaGetChan(1) / VIF1
             setRegU32(ctx, 5, kTag);
             ps2_stubs::sceDmaSend(rdram, &ctx, &runtime);

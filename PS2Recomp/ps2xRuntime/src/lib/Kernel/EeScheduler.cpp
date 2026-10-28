@@ -695,6 +695,13 @@ void EeScheduler::run()
                           << " v0=0x" << getRegU32(&context, 2)
                           << " t9=0x" << getRegU32(&context, 25)
                           << " trace=" << formatDispatchTrace() << std::dec << std::endl;
+                // A dispatch that returns to pc=0 never reaches the missing-target
+                // branch, so this is the only place the last few dispatches can be
+                // reported. The ring's newest entry is the function whose return
+                // landed on 0.
+                std::cerr << "[EE-regring]";
+                dumpEeRegRing(std::cerr);
+                std::cerr << std::endl;
             }
             // TEMP DIAGNOSTIC (session 26): FUN_0015231c (0x15231c, 32 dispatches
             // before the exit) is the game's own task/fiber switch: it saves the
@@ -2705,19 +2712,22 @@ void EeScheduler::processEvent(const EeEvent &event)
                       << "," << m_runtime.memory().gs().displayFlipCount[1].load(
                                      std::memory_order_relaxed)
                       << " pendingInv=" << m_pendingInvocations.size()
+                      << " pc=0x" << std::hex << (currentContext() ? currentContext()->pc : 0u) << std::dec
+                      << " presents=" << m_runtime.memory().gs().sdkPresentCount.load(
+                                             std::memory_order_relaxed)
                       << " gate=" << s_hostGateFires.load(std::memory_order_relaxed)
                       << " cycGate=" << s_cycleGateFires.load(std::memory_order_relaxed)
                       << " vbLagAvgUs=" << (s_vbDelivered != 0u ? s_vbLagSumUs / s_vbDelivered : 0u)
                       << " vbLagMaxUs=" << s_vbLagMaxUs << std::endl;
         }
-        // TEMP DIAGNOSTIC (session 25): force one framebuffer BMP dump at
-        // t~10s so the dump pipeline is validated even before the guest
-        // reaches its first libgs swap. Budgeted inside the dump helper
-        // (PS2_FB_DUMP=N overrides, 0 disables).
-        if (m_vsyncTick == 600u)
+        // TEMP DIAGNOSTIC (session 30): sample the framebuffer census several
+        // times so an early (still loading) VRAM can be told apart from one that
+        // already holds a drawn frame. Budget: PS2_FB_DUMP defaults to 3.
+        if (m_vsyncTick == 600u || m_vsyncTick == 1200u || m_vsyncTick == 2400u)
         {
             extern bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *tag);
-            Ps2DumpFramebufferBmp(m_runtime.gs(), m_runtime.memory().gs(), "forced");
+            const std::string dumpTag = "forced" + std::to_string(m_vsyncTick);
+            Ps2DumpFramebufferBmp(m_runtime.gs(), m_runtime.memory().gs(), dumpTag.c_str());
         }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)

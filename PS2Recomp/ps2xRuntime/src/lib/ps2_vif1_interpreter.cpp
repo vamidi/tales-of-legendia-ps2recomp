@@ -1,7 +1,17 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+
+// TEMP DIAGNOSTIC gate: the per-command and per-DIRECT VIF1 traces produced
+// ~9 MB of stderr in four minutes and measurably slowed the boot, so they are
+// now opt-in via PS2X_WATCH_VIF=1.
+static bool ps2xWatchVif1()
+{
+    static const bool enabled = std::getenv("PS2X_WATCH_VIF") != nullptr;
+    return enabled;
+}
 
 enum VIFCmd : uint8_t
 {
@@ -370,7 +380,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
 
-        if (ops <= 64) // TEMP DIAGNOSTIC (boot-stall triage)
+        if (ps2xWatchVif1() && ops <= 64) // TEMP DIAGNOSTIC (boot-stall triage)
             std::cerr << "[VIF1-op] n=" << ops << " pos=" << pos << " cmd=0x" << std::hex << cmd
                       << " opcode=0x" << (int)opcode << " imm=0x" << imm << std::dec
                       << " num=" << (int)num << " irq=" << (irq ? 1 : 0) << std::endl;
@@ -556,11 +566,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
-                // TEMP DIAGNOSTIC (boot-stall triage).
-                std::cerr << "[VIF1-direct] qwCount=" << qwCount << " hl=" << (directHl ? 1 : 0)
-                          << " pos=" << pos << " size=" << sizeBytes << std::endl;
+                // TEMP DIAGNOSTIC (boot-stall triage); opt-in, see ps2xWatchVif1().
+                if (ps2xWatchVif1())
+                    std::cerr << "[VIF1-direct] qwCount=" << qwCount << " hl=" << (directHl ? 1 : 0)
+                              << " pos=" << pos << " size=" << sizeBytes << std::endl;
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
-                std::cerr << "[VIF1-direct] submitted qwCount=" << qwCount << std::endl;
+                if (ps2xWatchVif1())
+                    std::cerr << "[VIF1-direct] submitted qwCount=" << qwCount << std::endl;
 
                 const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
                 if (pendingImageQw != 0u)

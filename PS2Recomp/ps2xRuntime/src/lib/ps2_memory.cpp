@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -99,6 +100,28 @@ namespace
 
     inline void writeGsRegister(GSRegisters &gs, uint64_t *reg, uint64_t value)
     {
+        // TEMP diagnostic (session 30): the recompiled libgraph programs the
+        // display through the GS-priv MMIO window (0x12000000), so this is the
+        // path where a real buffer switch has to be seen. Bounded.
+        static uint32_t s_traced = 0u;
+        if (reg == &gs.dispfb1 || reg == &gs.dispfb2 || reg == &gs.pmode)
+        {
+            if (s_traced < 24u)
+            {
+                ++s_traced;
+                std::fprintf(stderr,
+                             "[GS-m] %s val=0x%llX fbp=%llu fbw=%llu psm=%llu pmode=0x%llX "
+                             "flips=%llu,%llu\n",
+                             reg == &gs.pmode ? "PMODE" : (reg == &gs.dispfb1 ? "DISPFB1" : "DISPFB2"),
+                             static_cast<unsigned long long>(value),
+                             static_cast<unsigned long long>(value & 0x1FFu),
+                             static_cast<unsigned long long>((value >> 9) & 0x3Fu),
+                             static_cast<unsigned long long>((value >> 15) & 0x1Fu),
+                             static_cast<unsigned long long>(gs.pmode),
+                             static_cast<unsigned long long>(gs.displayFlipCount[0].load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(gs.displayFlipCount[1].load(std::memory_order_relaxed)));
+            }
+        }
         if (reg == &gs.dispfb1)
             gs.writeDisplayFramebuffer(0, value);
         else if (reg == &gs.dispfb2)

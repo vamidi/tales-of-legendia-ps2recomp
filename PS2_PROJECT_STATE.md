@@ -16,6 +16,173 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 30 - FIRST RENDERED FRAME (verified): "NOW LOADING"; thread 1 dormancy moved to `0x2324A8` and is fixed
+
+**The frame exists and is correct.** `[FB-dump]` at vblank ticks 600/1200/2400
+writes both the display region and the FRAME_1 region; reading them back with
+an image model gives, in both, white-on-black **"NOW LOADING"**, centred, about
+180x16 px. Non-black bbox: display `(168,216)-(348,232)` in 640x448, FRAME_1
+`(232,184)-(412,200)` in 512x448 - the same glyph run read at two different
+strides. So the guest's draw path reaches parallel-gs, the GS register state we
+push in `Present()` is coherent, and the output is a plausible boot screen. This
+is the milestone the whole port was aiming at.
+
+**Why `flips=0, presents=0` is *not* a defect.** Both counters are blind by
+construction:
+- The guest runs its **own libgraph**; no `sceGs*` symbol is bound in
+  `data/config.toml`, so our swap/put-disp stubs (and `scedPresentCount`) are
+  never called. `presents` can only ever read 0 here.
+- The guest's `sceGsPutDispEnv` is `FUN_00113248` and writes the GS privileged
+  window **directly** (`lui 0x1200`): `PMODE`, then `DISPFB1/DISPLAY1/EXTDATA`
+  if `*(u16*)(gparam+6)==1`, else `SMODE2/DISPFB2/DISPLAY2/BGCOLOR`. It takes
+  the else branch, so only `DISPFB2` is ever written - and always with the same
+  value (`0x1000` = FBP 0, FBW 8). `[GS-m]` shows the identical
+  `PMODE 0x66 / DISPFB2 0x1000` pair on every frame, so `writeDisplayFramebuffer`
+  never sees a changed FBP and no flip is counted. A static loading screen from
+  a single buffer is exactly this.
+- The A+D histogram probe is empty for the same class of reason: drawing
+  registers arrive as GIF A+D packets and go straight to the backend
+  (`WriteRegisterRaw`) without passing `writeRegisterUnlocked`, so the
+  histogram increments are never reached. The dump + `[GS-m]` are the reliable
+  probes; the histogram should be moved into the packed/raw path or deleted.
+
+**Root cause fixed this session - the dormancy simply moved one JAL earlier.**
+With `0x232310` implemented (session 29) thread 1 no longer died there, but
+`[guest-branch:missing-target] kind=DirectJump op=EE scheduler source=0x2324a8
+target=0x2324a8` + `[EE-dormant-missing] thread=1 pc=0x2324a8` appeared instead.
+`entry_232460_0x2324d0` calls `jal func_232210` at `0x2324A0`; the callee's
+`jr $ra` hands back to the scheduler with `pc=0x2324A8`, which the runner's
+prologue already exposes as `case 0x2324a8u`, but `hasFunction()` missed it
+because `0x2324A8 - 0x232460 = 0x48` is outside `reentryFallback()`'s 0x40-byte
+window (same story as `0x2324BC` at +0x5C). **Fix:** register the complete set
+of `entry_232460` resume labels (`0x2324A8`, `0x2324BC`) in one pass in
+`talesOfLegendiaResumeLabels` instead of one per discovered death. Result over
+two 130 s runs: zero `dormant`/`missing-target`, thread 1 alive throughout, and
+s35a reached tick 7500 (was 3660 before the fix).
+
+**The remaining blocker is the load itself, not the display.** The engine is
+demonstrably ticking: `FUN_0019F468` is a 40-slot job dispatcher (stride 0x60,
+table `0x39E848`, each slot's byte +0 == 1 means pending) that runs ~12 jobs per
+vblank - `0x19F468=90100` and `0x19F298=89922` hits per run. What it never does
+is fetch data:
+- DVCI announces all six archives (`SYS_REG/FIELD/SND/MAP/BATTLE/MOVIE.AFS`).
+- Exactly **two** files are opened for the whole run: `PTN_INFO.BIN` (64 B) and
+  `PTN_INFO.NAM` (75 B), both read and closed. No large AFS read follows.
+- **No `cdvd` RPC at all**, so nothing is waiting on a disc command.
+- Thread 2 (`0x198C60`, the CRI ADX server `while (*0x394378 == 0) FUN_00198C48()`)
+  is `Suspended` with `pc == entry`, `ra == 0`: it has never executed, which is
+  expected for a server parked until ADX starts.
+The next load is therefore gated on an EE-side condition (a server/CRI
+handshake or a DVCI mount state) rather than on I/O. `[EE-srv]` reports five
+server slots with the 6th busy and `cri: c3238=0x0` - that zero is the most
+promising thing to chase, together with who is supposed to resume the suspended
+servers.
+
+## Session 29 - ROOT CAUSE of the dormant thread 1: `0x232310` was a *hole*, and the reentry fallback ran a neighbour's epilogue
+
+**The fatal call was real, not garbage.** Session 27/28 read
+`[lookup-reentry] pc=0x232310 -> containing 0x2322f4 (+1c)` as a corrupt
+pointer. It is not: the word at `0x2324B4` is `0x0C08C8C4` = `jal 0x232310`,
+emitted verbatim by `runner/entry_232460_0x2324d0.cpp` (line 101). The call is
+`jal func_232310` inside the function at `0x232460`, with a valid heap object
+(`a0=0x621b80`). `PS2X_WATCH_CALLS=0x232310,0x2322f4,…` proved it:
+`[EE-call] target=0x232310 src=0x2324b4 ret=0x2324bc sp=0x423480 ra=0x2324bc`.
+Because it is a *call*, `dispatchGuestBranch()` invokes `lookupFunction()`
+directly (L2146-2148) and returns on `ctx->pc == 0` - which is why the
+scheduler ring ends at `0x3661c0` and never shows `0x232310`.
+
+**Why it had no body.** `0x232310` is 12 real instructions (verified bytes:
+`lui $v1,0x3F80 / mtc1 / c.eq.s $f0,$f14 / bc1t / swc1 $f13,0($a0) / sub.s /
+mula.s / msub.s / swc1 / jr $ra`) that exactly fill the 0x38-byte gap between
+FUN_00232210's epilogue (ends `0x232308` + two alignment nops) and
+FUN_00232340. It sits inside no Ghidra function, and **no word in the ELF
+points at it** (byte-scan for `10 23 23 00` = 0 hits; no `jal` xref, no
+`lui/addiu` builder - the only two `addiu …,0x2310` in the image are
+`0x15E77C`/`0x15E7C4` and build `0x3D2310`, a *vtable pointer*, not this code
+address). So the analyzer named it (`jal func_232310`) but never emitted or
+registered it. NB the neighbouring function IS in a vtable: `0x3D4B58+0x24/+0x28/+0x2C`
+= `0x2323C0`/`0x232440`/`0x232460`, which is how the analyzer found those.
+
+**The damage path.** `reentryFallback()` scans back 16 slots (0x40 bytes) and
+returned `0x2322F4` - FUN_00232210's *shared epilogue* (`lwc1 $f20,0($sp) /
+lq $s1,0x20($sp) / lq $s0,0x10($sp) / jr $ra / addiu $sp,+0x90`) - which then
+popped a foreign frame: `sp 0x423480 -> 0x423510` (+0x90 exactly, reg22/reg23)
+and **`s0` was reloaded from a foreign slot (`0x621b80 -> 0x232900`)**. It
+returned to `0x2324BC`, which has no table slot and lies 0x5C past its own
+function start - outside the 0x40 window - so `hasFunction()` failed and thread
+1 went dormant (`[EE-dormant-missing] thread=1 pc=0x2324bc`).
+
+**Fix (`src/lib/game_overrides.cpp`, `talesOfLegendiaMissingFunctions`):**
+`replaceFunction(0x00232310, &ps2_232310_interpolate)`, a hand-written body
+reproducing all 12 instructions (including the `bc1t` delay-slot store that
+executes on *both* paths, `fcr31` bit 23, and `ACC = $f0*$f12;
+$f0 = ACC - $f14*$f13`). Also registered `0x2324BC -> entry_232460_0x2324d0`
+(the function's own `switch` already has `case 0x2324bcu`), with a link-only
+stub added to `ps2xTest/src/test_function_table.cpp` (unit tests link
+`ps2_runtime` without runner sources - same pattern as `0x1AD548`).
+
+**Verified (s32a/s32b, 2x100 s):** `[EE-call] target=0x232310` hits the real
+body 3x; **no `[lookup-reentry] pc=0x232310`, no `[EE-dormant]` in either run**;
+log volume 21-24 k -> **67 k lines**; iterations 292 k -> **4.2 M**.
+The run now ends *mid-geometry*: `[VIF1-direct] qwCount=… pos=373744 size=394848`,
+`[GS] present mode: pmode=0x66 smode1=0x4101 (LC=32 CMOD=2 INT=1)`, 0
+errors/asserts, and `[FB-dump] nzWords=98728` (dumped slab is black - the
+slab heuristic picks `slab@0x60000` while `dispfb=0x1000`, so it is reading the
+wrong region; framebuffer content elsewhere in GS memory is real).
+
+**Lesson:** `reentryFallback` will happily execute *any* function whose start
+is within 0x40 bytes, even when the target lies past that function's real end.
+A missing target therefore does not always surface as `[EE-dormant-missing]`;
+it can silently corrupt sp/s-registers first. The dense table's holes are worth
+auditing per cluster (`[EE-call]` + `PS2X_WATCH_CALLS`), not per crash.
+
+## Session 28 - overrides consolidated to GOW-style single descriptor; test-link break FIXED; new pre-existing ps2x_tests assert surfaced
+
+**Consolidation (`game_overrides.cpp`):** the three Legendia
+`PS2_REGISTER_GAME_OVERRIDE` descriptors (asset paths / AFS slot finder /
+resume labels) are now ONE descriptor + ONE apply function, mirroring the
+GOW port's `applyGowOverrides` (github.com/KIexster/god-of-war-recomp):
+`talesOfLegendiaOverrides(runtime)` calls the three helpers in order
+(mount -> finder -> resume labels) and prints one summary line.
+`applyMatching` had been applying all three descriptors per loadELF -
+complementary, not conflicting, but the single entry keeps order and the
+identity check in one place. Descriptor keeps the entry pin:
+`"SLUS_212.01", 0x00100008u, 0u` (Legendia's real entry is 0x100008;
+GOW pins the same value).
+
+**Verified (run181, 30 s):** stdout `[game_overrides] applying 'Tales of
+Legendia (USA)'` + `applied 1 matching override(s)`; stderr summary line
+`asset mount + AFS slot finder (0x1AD548) + AFS helper resume labels applied`;
+`cdrom0:\AFS\PTN_INFO.BIN/NAM` opens `handled=1` (proves mount + finder +
+resume-label path all still live); zero unresolved-LBN.
+
+**cdImage question (answered this session):** auto-detect
+(`configureIoPathsFromElf` L746, "CD: mounted disc image next to ELF") mounts
+`data\Tales of Legendia (USA).iso` first; the override (L993) then CLEARS it -
+order verified in run179 logs. At read time `readCdSectors` (Support.h L435)
+prefers registered pseudo-LBN file ranges; the cdImage fallback is never
+reached (zero `unresolved LBN` lines). GOW's `configureGowCdImage` only sets
+cdImage via `GOW_ISO=` env for A/B comparison - same end state (extracted
+files), inverted default.
+
+**Test-link break FIXED:** since 29e46b3 (2026-10-23) `ps2x_tests.exe` and
+`ps2_vu1_tests.exe` failed LNK2019 on `entry_1ad5a0_0x1ad728` (runner symbol
+referenced by `talesOfLegendiaResumeLabels` in ps2_runtime.lib; tests link the
+lib without runner objects). Fix: stub in
+`ps2xTest/src/test_function_table.cpp` (the file that exists exactly to let
+tests link ps2_runtime without the generated runner) - returns to $ra like the
+leaf it stands in. Build now exits 0, all 8 steps, both test exes link.
+
+**NEWLY SURFACED (pre-existing, unrelated):** `ps2_vu1_tests.exe` passes
+94/94. `ps2x_tests.exe` runs (VIF1/VU/DMA tests pass) then hits
+`assert(m_executorThread == std::this_thread::get_id())` at
+`EeScheduler.cpp:2279` (`assertExecutor()`) during test "sceDmaSend preserves
+guest-configured VIF1 TTE" - the test calls scheduler state from the test main
+thread, not the executor thread; Debug-build assert hangs the suite. Was
+masked by the link break since Oct 23. Open question for next session:
+whether the test should run on the executor thread or the assert is too
+strict for read-only paths.
+
 ## Session 27 part 5 - the init chain completes; the deaths are `-1` sentinels used as pointers
 
 `PS2X_WATCH_CALLS=<hex,...>` (added to `dispatchGuestBranch`, one line per
@@ -2170,6 +2337,7 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 | stall after `sid=0x80001300` call (cleared) | Deci2 / `dbcman.irx` service (`libdbc`) | guest binds `sid 0x80001300`, calls `rpc 0x80001363` (0x90/0x90, buf `0x3dbc40`); our zero reply â†’ guest logs `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 0.00]`; then no heartbeats (blocked) | Either wire the raw SIF path to the existing `ps2xIOP` HLE `dbcman` service (`0x0310`), or answer `0x0310` locally (see *Open Decision*) | â€” | **RESOLVED** (session 9: the raw SIF path routes to the emulated DBCMAN) |
 | guest **retired**, no idle thread | EE scheduler / recompiler output | `FUN_001a8f80` indirect call -> `0x1b1948` never emitted -> `reportMissingFunction` retires thread 1 (`status=5` Dormant, `wait=None`, all sems `waiters=0`) | Regenerate with `[general].entry_points` for the 411 discovered targets (+358 functions) | Verified (run38): missing-target 1->0, dormant 1->0 | **RESOLVED** (session 7, local regeneration) |
 | fatal `for(;;);` at `0x1b6b80` | game `SJX_Init` / IOP heap allocation RPC | `func_11CA18(0x8D0)` -> `func_118628` RPC returns 0 -> guest prints `E0100301: SJX_Init can't allocate IOP Heap.` then spins | Answer the IOP allocation RPC on the SIF RPC path (see *Open Decision (session 7)*) | â€” | **RESOLVED** (session 9: real module loads, working IOP heap) |
+| thread 1 dormant, `pc=0` / `pc=0x2324bc` after `jal func_232310` | game class method cluster `0x2323C0`/`0x232440`/`0x232460`/`0x232310` | `0x232310` had no emitted body (12-byte-instruction hole in the `0x232308`-`0x232340` gap, unreferenced as data); `reentryFallback` resolved it to FUN_00232210's shared epilogue `0x2322F4`, which popped a foreign frame (`sp +0x90`, `s0 0x621b80 -> 0x232900`) and returned to `0x2324BC` (0x5C past its function start, outside the 0x40 window) | Game override: `replaceFunction(0x232310, ps2_232310_interpolate)` + resume label `0x2324BC` | Verified s32a/s32b: 0 reentry, 0 dormant, 292 k -> 4.2 M iters, reaches VIF1 geometry + `pmode=0x66` | **RESOLVED** (session 29, uncommitted) |
 ## Resolved Stubs
 | Address | Handler | Binding Method | Status | Notes |
 | ------- | ------- | -------------- | ------ | ----- |
@@ -2255,12 +2423,31 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - (Earlier sessions, pushed: `81488a7` VU clock desync; `37cc40d` DBCMAN version; `4fc7fa7` module version; `95120b1` boot-stall A/B + SIFCMD; `ad27d73` CRT seed + interop; `33ccc7e` cleanup.)
 
 ### Active
-- **Root cause class: an init step does not complete, so the scheduler tables and a core singleton are read while still empty.** Two death families, both after the six MBS packages load:
-  - **A (dominant)**: `FUN_001510f0` (handle -> slot lookup over `*(gp-0x7A70)`, count `*(gp-0x7A78)`, stride `0x18`, key at `+0x10`) spins and returns `-1`; the caller uses `-1` as an index and jumps to garbage (`pc=0x1 ra=0x1`).
-  - **B**: reaches the game's main loop `FUN_00366090`, where the lazy singleton `*(0x3DB31C)` is still `0`; `jalr` through its NULL vtable at `0x3661cc` gives `pc=0 ra=0`. The same loop calls `FUN_0015231c()` (suspend) at the end of each iteration at depth 0, which is why the "depth-0 suspend" appeared in earlier runs.
-- `FUN_00164c60` (called from the main init `FUN_00165e70`) **clears** the singletons before the subsystem inits that should recreate them; the factory that fills `0x3DB31C` is `FUN_001ea850` (`malloc(0x2c)` + ctor, store at `0x1ea88c`) and it was never observed to run.
-- **Next probe (approved, not yet written)**: add a reusable `PS2X_WATCH_CALLS=<hex,...>` list to `dispatchGuestBranch` and log entry to every call in `FUN_00165e70`'s init sequence plus `FUN_00366090`, to find the step that bails out early.
-- **Deferred**: a real virtual clock (make `accountCycles` time-proportional) before any retry of deterministic pacing - measured accrual varies ~5000x between spin and idle sleep.
+- **`PS2X_WATCH_TASKSW=1` itself flips the A/B race (again).** With the probe: 2/2 runs stall
+  pre-launcher (outcome A: 6 AFS mounts, ADXF partition reads streaming, CDV slot `+0x1C` handle=0,
+  pump never runs). Without it (s28c): the FULL boot chain runs - launcher `0x166010` -> boot task
+  `0x1660a0` -> request `0x1f84b0/0x1f8530/0x1f8da0` -> pump `0x151e90` (3+ passes) -> **all six MBS
+  opens** -> fiber switch into boot-task node `0x4079a0` -> main loop `FUN_00366090` runs. Part 8's
+  "pump starvation (3 passes/105 s)" was measured under this probe - treat that number as suspect.
+- **New clean-run frontier (s28c)**: right after the first fiber switch, thread 1 ends
+  `st=5(Dormant) pc=0x0 sp=0x423530` (task heap stack, entry=0x100008) - a `pc=0` death (family B
+  shape); all CRI/RNA threads go `wait=sleep`; scheduler IDLE with only the synthetic vblank thread
+  (id=-1, `pc=0x166490`, sp=0x1f13ff0) running. `[EE-regring]` did NOT dump - the fatal `jr ra`
+  return bypasses `dispatchGuestBranch` (part 8 caveat). The fiber dump taken AFTER the death shows
+  node `0x4079a0` with a VALID `+0x1A8=0x151F88`, so the fatal read used a different node or the slot
+  was rewritten after the read.
+- **Pump gate mapped (Ghidra)**: `FUN_00151ff0(group)` calls pump `FUN_00151e90` only if
+  `*(u16*)(group*2+0x48F570)` (per-group task count) != 0. Main frame loop `FUN_00165ad0`: outer
+  `do{}while(true)`; inner loop calls `FUN_00151ff0(0/1/4)` + CRI service `FUN_0019a080` each
+  iteration until `FUN_00153180()!=0`. Pump walk: `+0x1F0` state (1=ready,3=dead), start cb
+  `+0x1B0`, resume slots `+0x1A8` (pump, 0x151F88) / `+0x1B4` (task) - confirms part 7 protocol.
+- **Registry is exonerated**; **the "NULL singleton at 0x3DB31C" model is also exonerated** - the
+  factory runs, the object is created at `0x63e290`, and the vtable bytes at `0x3D4000` are correct in
+  our runtime. Do not spend more time on either.
+- **Runs are not reproducible at the death point** (same env: full boot vs early registry death vs zero
+  MBS). Always run at least twice before concluding anything.
+- **Deferred**: a real virtual clock (make `accountCycles` time-proportional) before any retry of
+  deterministic pacing - measured accrual varies ~5000x between spin and idle sleep.
 
 ### Blocked
 - (none hard - the CDV/streaming path is healthy; the fiber NULL slot is a guest-level task-table bug to be localised, not an emulator stall)
@@ -2271,13 +2458,22 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - Gitignored/local (not committable): `data/config.toml` (411 `entry_points`), the regenerated `PS2Recomp/ps2xRuntime/src/runner/` + `include/ps2_recompiled_functions.h`, dry-run dirs `data/output` + `data/output_base`.
 - untracked, **not mine - leave alone**: `.opencode/opencode.json.openchamber.backup`, `PS2Recomp/run_build.bat`, `scripts/`.
 ## Next Move (ordered)
-1. **Decision needed (user):** priority - (i) answer the `SJX_Init` IOP-heap allocation RPC (advances boot toward drawing), or (ii) implement the analyzer discovery pass (makes the discovery durable). *Recommended: (i), then (ii).*
-2. **Implement the IOP heap-allocation RPC**: bind the client first (to learn the SID), then have the SIF responder (`SIF.cpp` `emulateIopSifRpc`) or the `ps2xIOP` HLE path return a **non-zero IOP address** in the 4-byte receive buffer (`0x3E2080`) for the allocation request whose arg word is `0x8D0`. Then watch the guest's next gate (`E0100302 ...can't create DTX.`, `0x3C6328`).
-3. Rebuild (taskkill first) and run 30s; confirm `E0100301` is gone and the thread keeps making progress (`[EE-hb]` heartbeats, pc moving past `0x1b6b80`).
-4. **Analyzer discovery pass** (durable fix): in `ps2xAnalyzer`/`ps2xRecomp`, scan the image's data words for pointers into the code range that are not `map.csv` starts, filter with the validated rule (skip-aware code bitmap; `[0x100000,0x3DAF80)`; exclude words *inside* `skip` regions; require a compiled-function pointer within +/-0x20 bytes **and** a `nop`/`j`/`jal`/`jr` boundary at `T-4`/`T-8`), and emit them as `entry_points` (or directly as synthesized functions). Target: the 411 verified targets minus the ~12 known data false positives.
-5. Strip the session-7 temp diagnostics (`EeScheduler.cpp` `[EE-thread]`/`[EE-sem]`/`[EE-evf]`) once the SJX blocker is cleared; keep `[EE-wd]`/`[EE-hb]`/`[VU-*]`/`[SIF-iop]` until drawing.
+1. **Reproduce the clean frontier twice** (no env probes, 100 s): confirm "MBS=6 -> 1 fiber switch ->
+   thread 1 Dormant pc=0" is the stable default outcome, not a one-off.
+2. **Catch the pc=0 death at the instruction.** `[EE-regring]` never fires because the fatal `jr ra`
+   is a return, not a dispatch. Options: (a) force the regring dump on the Dormant transition in
+   `EeScheduler.cpp`; (b) `PS2X_WATCH_POISON=0x407B48:8` (node `0x4079a0` + `0x1A8`) to watch the
+   resume slot itself; (c) `PS2X_WATCH_CALLS=0x165220,0x165210` to trace the boot task's first steps.
+3. **Make `PS2X_WATCH_TASKSW` cheap or remove it** - its per-dispatch check flips the boot race
+   (session 27 part 1 lesson repeated). Do not trust measurements taken with it on.
+4. Always run **twice** - the death point is not reproducible (same env gave a full boot, an early
+   registry death, and a zero-MBS run).
+5. Strip the session diagnostics (`[EE-reg*]`, `[EE-tsw]`, `[EE-call]`, `[EE-dump]`, `[EE-fiber*]`,
+   `[EE-regring]`, `[EE-dormant*]`, `[EE-thread]`, `[EE-invstk]`) once the first real frame is up;
+   keep `[EE-hb]`/`[EE-wd]`/`[VU-*]`/`[SIF-iop]` until drawing.
 6. Verify displayed content via inline PowerShell screen capture (`CopyFromScreen`) + vision analysis.
-7. Cleanup: delete the dry-run dirs `data/output` + `data/output_base` once the adopt is confirmed; keep the pristine config backup at `%TEMP%\opencode\config.toml.bak`.
+7. Cleanup: delete the dry-run dirs `data/output` + `data/output_base` once the adopt is confirmed;
+   keep the pristine config backup at `%TEMP%\opencode\config.toml.bak`.
 ## Relevant Files
 | File | Why it matters |
 | ---- | -------------- |
@@ -2388,6 +2584,8 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - `abort()`/VK_ASSERT death signature: stderr `[ERROR]: Vulkan error at <file>:<line>`, self-exit code `-2147483645` (`0x80000003`).
 - **Enabling a previously-broken feature exposes latent bugs downstream**: expect follow-on crashes after unblocking each milestone.
 - **`SetupThread` with `stack == 0xFFFFFFFF` means "default stack" â†’ must return the stack TOP (`PS2_RAM_SIZE`)**.
+- **A `[lookup-reentry]` hit is silent corruption if the target lies past the containing function's real end**: `reentryFallback()` only scans 0x40 bytes back for *any* registered start, so it will run a neighbour's epilogue, popping a foreign frame (`sp`/`s0` clobbered) before the failure surfaces somewhere else entirely. Verify the offset is inside the function's actual extent.
+- **A gap Ghidra never disassembled can still be directly-called code**: scan raw instruction words for `jal` (`0x0C000000 | target>>2`) instead of relying on code xrefs or data-pointer scans. `0x232310` had zero data references and zero xrefs, yet `jal 0x232310` existed at `0x2324B4`.
 - **Two stacks growing down from the same top collide**: grow the async pool UP from a fixed floor (`0x01F00000`) instead.
 - Checkpoint re-entry semantics: `entry_*.cpp` dispatches via `switch (ctx->pc)`; a spin loop shows in the trace as a repeating cycle.
 - Grep for a literal address misses computed-address accesses (`lui 0x3E; addiu -0x10C0` â†’ `0x3DEF40`); search the lui/addiu forms or resolve the struct/table base against the SDK layout instead.
@@ -2420,6 +2618,175 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - **Region-based filtering must treat `skip` regions as data**: a zero-filled data region reads as `nop` padding and passes both "near a pointer" and "boundary" rules -> 12 false-positive entries, one of which produced 1295 unhandled-instruction errors. Exclude targets inside `skip` regions before promoting discovery to a default.
 
 ## Session Log
+### 2026-10-25 (session 28 part 1 - the TASKSW probe flips the race; clean runs reach MBS then die pc=0)
+
+- **Measurement bug found first**: `Select-String -SimpleMatch '\[EE-tag'` searches for a literal
+  backslash, so every bracketed-tag count reported 0 spuriously. Count tags WITHOUT brackets.
+- **Static map (Ghidra :8192, SLUS_212.01 loaded)**: pump gate `FUN_00151ff0(g)` -> pump
+  `FUN_00151e90(g)` only when `*(u16*)(g*2+0x48F570)` != 0. Frame loop `FUN_00165ad0` inner loop
+  pumps groups 0/1/4 + `FUN_0019a080` until `FUN_00153180()!=0`. `0x1664c0` is a `jr ra` no-op
+  callback (9-10k hits, benign - NOT a CRI error). `FUN_001ad0b8` = CRI server slot walk
+  (16 x 0x44-byte slots from `0x3A5E70`, process flag==1 via `FUN_001acce8`).
+- **s28a/s28b (`PS2X_WATCH_TASKSW=1`, 100 s)**: outcome A both times - thread 1 entered
+  `FUN_00165ad0` but never reached launcher `0x166010`; ADXF stuck status 2 streaming
+  SND/FIELD/BATTLE partitions; CDV slot[39] `+0x1C` handle=0 (request never issued to host);
+  pump never ran; no CRI errors (all six AFS "found", RNA heaps allocated).
+- **s28c (no probes, 100 s)**: FULL boot chain verified by WATCH-ENTRY: `0x166010`->`0x1660a0`->
+  `0x1f84b0`->`0x1f8530`->`0x1f8da0`, pump quad `0x151ff0/0x151e90/0x152200/0x15231c` all hit
+  (3-cap), six MBS opens (SYS_REG/MAP/...), fiber switch into node `0x4079a0` (cb `0x165210`,
+  task resume `0x165220`, `+0x1A8=0x151F88` valid), main loop `FUN_00366090` ran (0x3661c0).
+- **The clean death**: thread 1 `st=5(Dormant) pc=0x0 sp=0x423530` (task heap stack); CRI workers
+  id=3/4 `wait=sleep`, id=5 `WaitSusp`, id=6 (RNA, entry 0x218908 prio=99) `wait=sleep`;
+  scheduler IDLE, synthetic id=-1 runs vblank `0x166490` on sp=0x1f13ff0. `[EE-regring]` silent
+  (return-path death). Post-death fiber dump shows the depth-1 node slot `0x48F920` -> `0x4079a0`
+  with valid `+0x1A8` - so the fatal `lw ra,0x1A8(t0)` read a DIFFERENT node or a since-restored slot.
+- **Conclusion**: part 8's "pump starvation" framing was probe-perturbed; the real default frontier
+  is the pc=0 death right after the first fiber switch. Next: catch it at the instruction (force
+  regring on Dormant, poison-watch `0x407B48:8`, trace `0x165220`).
+
+### 2026-10-25 (session 27 part 8 - preemption experiment is negative; the stack-clobber model is dead)
+
+- **User-approved experiment run**: `PS2X_NO_MIDFUNC_PREEMPT=1` gates `PS2Runtime::eeCheckpointDue()`
+  to return `false` (generated code calls it only on branch back-edges, so transfers between functions
+  stay preemptible). Result is **negative as a fix**: control run `preempt=off` gave `MBS=24`,
+  3 pump passes, 8 suspends, death family A; experiment run `preempt=on` gave **`MBS=0`, zero pump
+  passes, zero suspends** - the boot never reaches the task pump at all. The game's early init spins in
+  loops that need a mid-function safe point to let vblank/IRQ work in. **Mid-function preemption is
+  required; do not retry removing it.**
+- **New probe `PS2X_WATCH_POISON=<addr>:<len>`** (in `dispatchGuestBranch`): a software watchpoint that
+  shadows a small RAM range and reports the first changed word at every inter-function transfer,
+  *including* writes that never go through a traced store instruction. Note the second field is a
+  **length**, not an end address - passing an end address silently watches megabytes and stalls the run
+  (that mistake produced a bogus `MBS=0` run).
+- **The overlapping-stack-clobber model is dead.** With the poison watchpoint on `0x1FFFF50:0x10`
+  (`ps2_pois02`, death family A), `0x1ffff50` is written many times with legitimate heap pointers
+  (`0x4e9bd0`, `0x4a5a80`, ...) and once with `0x3f800000` (a float 1.0 quad-store from `FUN_001edb90`
+  via `0x1edb90`), but **never with `1`**. The `ra=1` at death does not come from that slot.
+  Caveat: the fatal `jr ra` is a *return*, and returns do not route through `dispatchGuestBranch`
+  (only under `PS2X_STRICT_RETURN_DIAGNOSTICS`), so the watchpoint cannot see the very last write.
+- **Corrected reading of the task-switch protocol** (the part-7 note had `+0x1B4` wrong):
+  - `node+0x1A8` = the **pump's** resume address (`0x151F88`), written by `FUN_0015243c`/`FUN_00152200`;
+    the suspend `FUN_0015231c` ends with `lw ra,0x1A8(t0); jr ra` to leave the task.
+  - `node+0x1B4` = the **task's** resume point - the suspend does `sw $ra,0x1B4(t0)`, so it holds the
+    address right after the task's own `jal 0x15231c` (e.g. `0x1660ec` for the suspend at `0x1660e4`),
+    and `FUN_00152200` *calls* `*(node+0x1B4)` to re-enter the task. For a never-suspended task it is
+    pre-seeded with the start trampoline. It is **not** a fixed trampoline field.
+  - Every logged value is correct and self-consistent across runs: `d` alternates 0/1, `s=0x1d0`,
+    `i=0x1c0`, `slot=0x48f920` publishes the current node, `+1ac` toggles 1 (switch) -> 0 (suspend),
+    `+1f0=0x1000001`.
+- **The real blocker is pump starvation, not the death.** In a 105 s run with ~2400 vblank ticks the
+  pump ran **3 passes** total (`pump=3 save=9 switch=9 suspend=8`, against a 600-log budget that was
+  never reached). Three tasks (`0x407160`, `0x407370`, `0x407580`) round-robin on their own heap stacks
+  (`0x421540`, `0x411530`, `0x423520`). Asset loading cannot progress at that rate whatever kills
+  thread 1.
+- **Where family A actually lands**: at death `sp=0x1ffff60` - the **main** stack (pump entry `0x1ffff80`,
+  save/switch `0x1ffff50`), while the last resumed task ran on `0x423520`. So the fatal `jr ra` happens
+  after control is back on the pump's stack, not inside a task. Pinning it needs per-transfer logging
+  over the pump's own code range `0x151E90..0x152030`, or a bigger `[EE-regring]` ring (it held only
+  8 entries in `ps2_pois02`).
+
+### 2026-10-25 (session 27 part 7 - the task-switch protocol is mapped; the death is its resume slot)
+
+- **Actions**: (1) Extended `[EE-call]` in `dispatchGuestBranch` to log **entry `sp`/`ra`/`a0`** and to
+  repeat per edge via `PS2X_WATCH_CALLS_N=<count>` (was: first-time-only, no sp). (2) Added
+  `PS2X_DUMP_MEM=<addr>:<len>` - a one-shot hex dump of guest RAM at the first transfer, which
+  separates "the loader put the wrong bytes there" from "the guest overwrote it later". (3) Ran five
+  instrumented runs (`ps2_sp01`, `ps2_sing01`, `ps2_sing02a/b`, `ps2_vtab01`).
+- **Discovered - the game's real task architecture** (from entry-`sp` data):
+  - Tasks run on **heap-allocated stacks** in `0x411000..0x424000` (`0x411480`, `0x411530`,
+    `0x4134c0`, `0x413530`, `0x4154a0`, `0x4154f0`, `0x421540`, `0x423450`, `0x423520`, `0x423540`).
+    The main thread's own stack is only ~0xA0-0x100 deep (`0x1ffff80` -> `0x1ffff60`), and the pump
+    runs there.
+  - The pump is `FUN_00151e90` (called from `0x152014`). Protocol:
+    `node = 0x48F590 + *(0x3DB1A0) * *(0x3DB1B0) + *(0x3DB1C0)` where `*(0x3DB1A0)` = depth,
+    `*(0x3DB1B0)` = stride **0x1D0** (464), `*(0x3DB1C0)` = index. Depth is incremented on entry and
+    decremented on exit. A second table at `0x48F750` (same stride) publishes "current node per depth".
+  - Node fields: `+0x1A8` **resume address** (written by `FUN_0015243c` = `0x151F88`, then overwritten
+    by `FUN_00152200` = `0x151FC8`), `+0x1AC` suspend-pending flag, `+0x1B0` start callback
+    (`0x165210`), `+0x1B4` **trampoline** (`0x165220`), `+0x1B8` retire callback (`0x165250`),
+    `+0x1C0` arg block, `+0x1F0` state (0 free / 1 ready / 3 dead), `+0x1F1` kind tag,
+    `+0x1F3` started flag, `+0x200`/`+0x20C` id and bit index (bitmap at `0x48F560`, counts at `0x48F570`).
+  - `FUN_00152200` is the switch: it stores its own return address into `node+0x1A8`, clears
+    `+0x1AC`, restores HI/LO from `node+0x180`/`+0x190` (`pmthi`/`pmtlo`), then calls
+    `*(node+0x1B4)`. The trampoline `0x165220` is `addiu sp,-0x10; sd ra,0(sp); jal 0x165400;
+    jal 0x15231c; ld ra,0(sp); li v0,1; jr ra`. `0x165400` is a pure thunk
+    (`lw t9,0x10(a0); lw t9,0xc(t9); jr t9`) - the task entry is a **vtable slot +0xC**.
+  - The suspend `FUN_0015231c` saves the whole register file (`sq $sp,0xE0(t0)` -> sp at `+0xE8`,
+    `sw $ra,0x1B4(t0)`) and then `lw ra,0x1A8(t0); jr ra` - **it never restores `sp`**, so the pump
+    continues on the resuming task's stack and each task's own saved `sp` is what puts it back on its
+    own heap stack.
+- **Discovered - the death is that final `jr ra`.** `pc=0 ra=0` is exactly `lw ra,0x1A8(t0)` reading 0
+  and jumping to it (a `jalr` would leave a non-zero `ra`). The `[EE-fiber]` dump at death shows the
+  depth/index pair selecting a node whose `+0x1A8` is stale (`0x151f88`, the `FUN_0015243c` value, not
+  the `FUN_00152200` value `0x151fc8`) - i.e. the suspend is picking a **different node than the switch
+  wrote**, or a node at a depth that was never switched into.
+- **Corrected - the earlier "NULL singleton" model for death family B is wrong.** In `ps2_sing02a` and
+  `ps2_vtab01` the factory `FUN_001ea850` **does** run (`src=0x366104 sp=0x423500`) and the store watch
+  caught `pc=0x1ea88c addr=0x3db31c val=0x63e290` - the object is created. Its vtable is
+  `DAT_003d4000`, and `PS2X_DUMP_MEM=0x3D4000:0x40` confirms our runtime holds the correct bytes
+  (`0x3d400c=0x1eaa70`), so the `lw a0,-0x78d4(gp)` / `jalr` chain at `0x3661c0`-`0x3661cc` succeeds.
+  `0x3661c0` in the `trace=` ring is only the last pc *sample*, not the fault site.
+- **Corrected - the "overlapping stack clobber" is run-dependent, not the invariant fault.** In
+  `ps2_sp01` the `sq s3,0x30(sp)` at `0x152038` wrote `0` (harmless) into `0x1ffff50`; in
+  `ps2_topstack02` it wrote `1` (fatal). Both runs end in the same place: the suspend's `jr ra` to a
+  bad `+0x1A8`.
+- **The boot is timing-sensitive (a real race).** Same binary, same env, different runs: `ps2_vtab01`
+  and `ps2_sing02a` reached the main task loop and vblanked ~2400 ticks; `ps2_sing01` died earlier in
+  the registry lookup loop; `ps2_sing02b` loaded **zero** MBS packages. Do not read a single run as a
+  regression signal - always run twice.
+- **Probe recipe**: `PS2X_WATCH_CALLS=<targets> PS2X_WATCH_CALLS_N=<repeats>` (entry sp/ra/a0 per call,
+  capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
+  `PS2X_WATCH_LO/HI/N` store watch.
+
+### 2026-10-25 (session 27 part 6 - registry exonerated; the death is an overlapping-stack clobber of the saved `ra`)
+
+- **Actions**: (1) Wired the `PS2X_WATCH_REG=1` registry probe into `dispatchGuestBranch`
+  (`ps2_runtime.cpp`) - `[EE-reg]` per entry to `0x151300/0x1510F0/0x151060/0x150910` with
+  base/used/capacity/free-slot census, `[EE-reg-desc]` at create, `[EE-reg-tmpl]` one-shot dump of
+  `0x38AF50`/`0x38AF90`. (2) Ran it twice plus two store-watch runs over the top of the main stack
+  (`PS2X_WATCH_LO/HI/N`, no rebuild needed). (3) Read the existing `[EE-regring]` dump, which already
+  records `pc/ra/sp/a0/v0/tid` for the last 24 dispatches and fires on the dormant path.
+- **Discovered - the registry is healthy, all earlier registry theories are dead**:
+  `used=35 cap=1024 free=0` at death (never near exhaustion, no `-1` from a full table); the static
+  template is intact in runtime memory (`0x38af50 = 54 4c 52 0 1 6 0 0`, `0x38af90 = 54 54 58 0 1 1 0 1`);
+  the 32-vs-64-bit key-width idea is wrong; and `FUN_00150910`'s convention is **`a0` = registry slot,
+  `a1` = descriptor** - the earlier `magic=ff ff...` readings were an artefact of dumping the slot table.
+- **Discovered - the actual death** (`[EE-regring]`, thread 1 = main, `entry=0x100008`):
+  ```
+  reg20 pc=0x150910(create) ra=0x151464 sp=0x1fffea0 a0=0x1afa2e0
+  reg21 pc=0x151464         ra=0x151464 sp=0x1fffea0 v0=0x82000002
+  reg22 pc=0x1513f4         ra=0x1513f4 sp=0x1ffff00 a0=0xffffffff v0=0x22
+  reg23 pc=0x1     ra=0x1   sp=0x1ffff60 a0=0xffffffff v0=0x22
+  ```
+  `FUN_00151300` allocates `0x60` and saves `ra` at `0x50(sp)`; with its frame at `0x1ffff00` that slot
+  is **`0x1ffff50`**. The store watch caught the clobber: `pc=0x152038 addr=0x1ffff50 val=0x1 size=16
+  WRITE128`. `0x152038` is `sq s3,0x30(sp)` inside `FUN_00152030`'s prologue
+  (`addiu sp,sp,-0x50; sd ra,0x40(sp); sq s3,0x30(sp); sq s2,0x20(sp); ... sq s0,0x0(sp)`), so that
+  frame spans `0x1ffff20..0x1ffff6f` - it was entered with **`sp=0x1ffff70`, above the live frame at
+  `0x1ffff00`**, and its `s3` save slot *is* `FUN_00151300`'s saved `ra`. The epilogue
+  (`0x15149c ld ra,0x50(sp)` -> `0x1514b4 jr ra` + `addiu sp,sp,0x60`) then jumps to `1`, and the
+  scheduler retires the main thread (`[EE-thread] id=1 status=5 pc=0x1 ra=0x1`). Kernel workers keep
+  vblanking, so the process looks alive while the game is dead.
+- **Discovered - stack layout at the top of RAM**: crt0 (`entry_0x100008`) calls `SetupThread`
+  (`0x3C`) with `a1=0xFFFFFFFF` (kernel-allocated), so the runtime returns `sp = PS2_RAM_SIZE`
+  (`System.cpp:502-517`) and crt0 does `move sp, v0` at `0x1001cc`. The guest then reserves the top
+  `0xA0` bytes (`0x1ffff60..0x2000000`) as its root context block - that is the `stack=25 0 0 0
+  163ade0 ... 166210 ... 3db704` block the dormant dump prints. `FUN_00152030`'s frame also writes
+  `ra` at `0x1ffff60`, i.e. into that reserved block.
+- **Eliminated this session** (do not re-test): registry exhaustion / `-1` sentinel; the fibre
+  node-depth model (at death `cnt=0`, `field=0x48f750`, `ctx=0x0`, `resume=0x0` - that path produces
+  the older `pc=0 ra=0` family, not this one); the async-invocation stack pool (only 5 hand-outs,
+  tops `0x1f03ff0..0x1f13ff0`, all far below); guest thread stacks (`0x394bf0`, `0x396bb0`, `0x397bb0`,
+  `0x399ba0`, `0x4b3760` - heap-based, no overlap); template/resource-descriptor corruption;
+  32-vs-64-bit registry key width.
+- **Probe recipe that worked** (no rebuild, ~110 s each): `PS2X_WATCH_REG=1` plus
+  `PS2X_WATCH_LO=0x1FFFF40 PS2X_WATCH_HI=0x1FFFF60 PS2X_WATCH_N=2000`. Note the window must be kept
+  narrow: `0x1FFFF00..0x1FFFF68` with `N=300` was saturated by a 247-byte `strcpy` of
+  `"cdrom0:\SLUS_212.01;1"` from `pc=0x10b8e0` and the decisive store fell past the budget.
+- **Current Blocker**: two stack domains overlap on the main thread - a suspended task's live frame at
+  `0x1ffff00` and the task/fibre machinery running at `sp=0x1ffff70`. Need to know what `sp` the guest
+  saves on suspend and what it restores on resume for thread 1.
+
 ### 2026-10-18 (session 15 - the local tree is branched; master restored, all gates back)
 
 - **Actions**: The local working tree (which turned out to be based on `6497b30`) was committed to branch

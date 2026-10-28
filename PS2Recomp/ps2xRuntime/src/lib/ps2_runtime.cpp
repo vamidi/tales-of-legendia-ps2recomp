@@ -1804,7 +1804,27 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
         return out;
     }();
-    static std::vector<std::pair<uint32_t, uint32_t>> s_callEdges;
+    struct WatchedCallEdge
+    {
+        uint32_t target;
+        uint32_t source;
+        uint32_t hits;
+    };
+    static std::vector<WatchedCallEdge> s_callEdges;
+    // PS2X_WATCH_CALLS_N=<count> repeats each edge that many times (default 1).
+    // Session 27 part 6 needs the *entry sp* of every hit, not just the first:
+    // the fatal clobber is one frame writing into another frame's saved `ra`,
+    // and the only way to tell a legitimate call chain from a stack-domain
+    // collision is to see the sp each callee is entered with.
+    static const uint32_t s_callLogCap = [] {
+        const char *env = std::getenv("PS2X_WATCH_CALLS_N");
+        if (env == nullptr)
+        {
+            return 1u;
+        }
+        const unsigned long v = std::strtoul(env, nullptr, 10);
+        return v == 0ul ? 1u : static_cast<uint32_t>(v);
+    }();
     if (!s_callTargets.empty())
     {
         bool wanted = false;
@@ -1818,23 +1838,264 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
         if (wanted)
         {
-            bool seen = false;
-            for (const auto &edge : s_callEdges)
+            WatchedCallEdge *edge = nullptr;
+            for (auto &candidate : s_callEdges)
             {
-                if (edge.first == targetPc && edge.second == sourcePc)
+                if (candidate.target == targetPc && candidate.source == sourcePc)
                 {
-                    seen = true;
+                    edge = &candidate;
                     break;
                 }
             }
-            if (!seen && s_callEdges.size() < 256u)
+            if (edge == nullptr && s_callEdges.size() < 256u)
             {
-                s_callEdges.emplace_back(targetPc, sourcePc);
+                s_callEdges.push_back({targetPc, sourcePc, 0u});
+                edge = &s_callEdges.back();
+            }
+            if (edge != nullptr && edge->hits < s_callLogCap)
+            {
+                ++edge->hits;
                 std::cerr << "[EE-call] target=0x" << std::hex << targetPc
                           << " src=0x" << sourcePc
                           << " ret=0x" << fallthroughPc
-                          << std::dec << std::endl;
+                          << " sp=0x" << GPR_U32(ctx, 29)
+                          << " ra=0x" << GPR_U32(ctx, 31)
+                          << " a0=0x" << GPR_U32(ctx, 4)
+                          << " n=" << std::dec << edge->hits
+                          << std::endl;
             }
+        }
+    }
+    // PS2X_WATCH_POISON=<lo>:<hi> installs a software watchpoint over a small guest
+    // RAM range (<= 0x40 bytes).  Every inter-function transfer compares the range
+    // against a shadow copy and reports the first word that changed.  Unlike the
+    // PS2X_WATCH_LO/HI store watch this catches *every* writer, including the bulk
+    // copies that never go through a traced store instruction: the scratchpad->RAM
+    // DMA memcpy, the CD-ROM stub's memset, and IOP->EE transfers.  Session 27 part
+    // 7 needs that: the fatal `ra` slot at 0x1ffff50 changes to 1 with no traced
+    // store anywhere near the death.
+    static const char *s_poisonSpec = std::getenv("PS2X_WATCH_POISON");
+    if (s_poisonSpec != nullptr)
+    {
+        static const uint32_t s_poisonLo = [] {
+            char *e = nullptr;
+            const unsigned long v = std::strtoul(s_poisonSpec, &e, 16);
+            return static_cast<uint32_t>(v);
+        }();
+        static const uint32_t s_poisonHi = [] {
+            char *e = nullptr;
+            std::strtoul(s_poisonSpec, &e, 16);
+            const unsigned long v = (e != nullptr && *e == ':') ? std::strtoul(e + 1, nullptr, 16) : 0x20ul;
+            return static_cast<uint32_t>(v);
+        }();
+        static std::vector<uint32_t> s_poisonShadow;
+        static uint32_t s_poisonLogs = 0u;
+        static uint32_t s_poisonPrevTarget = 0u;
+        static uint32_t s_poisonPrevSource = 0u;
+        const uint32_t poisonWords = (s_poisonHi + 3u) / 4u;
+        if (s_poisonShadow.empty())
+        {
+            s_poisonShadow.resize(poisonWords);
+            for (uint32_t i = 0; i < poisonWords; ++i)
+            {
+                std::memcpy(&s_poisonShadow[i], rdram + ((s_poisonLo + i * 4u) & 0x01FFFFFFu), sizeof(uint32_t));
+            }
+        }
+        else if (s_poisonLogs < 64u)
+        {
+            for (uint32_t i = 0; i < poisonWords; ++i)
+            {
+                uint32_t now = 0u;
+                std::memcpy(&now, rdram + ((s_poisonLo + i * 4u) & 0x01FFFFFFu), sizeof(uint32_t));
+                if (now == s_poisonShadow[i])
+                {
+                    continue;
+                }
+                ++s_poisonLogs;
+                const uint32_t changedAddr = s_poisonLo + i * 4u;
+                std::cerr << "[EE-poison] addr=0x" << std::hex << changedAddr
+                          << " old=0x" << s_poisonShadow[i]
+                          << " new=0x" << now
+                          << " wroteByFn=0x" << s_poisonPrevTarget
+                          << " lastSrc=0x" << s_poisonPrevSource
+                          << " nowAt src=0x" << sourcePc
+                          << " target=0x" << targetPc
+                          << " sp=0x" << GPR_U32(ctx, 29)
+                          << " ra=0x" << GPR_U32(ctx, 31)
+                          << std::dec << std::endl;
+                s_poisonShadow[i] = now;
+            }
+        }
+        else
+        {
+            for (uint32_t i = 0; i < poisonWords; ++i)
+            {
+                std::memcpy(&s_poisonShadow[i], rdram + ((s_poisonLo + i * 4u) & 0x01FFFFFFu), sizeof(uint32_t));
+            }
+        }
+        s_poisonPrevTarget = targetPc;
+        s_poisonPrevSource = sourcePc;
+    }
+    // PS2X_DUMP_MEM=<addr>:<len> prints one hex dump of guest RAM the first time
+    // any inter-function transfer happens.  Static .data (vtables, control blocks)
+    // is already resident by then, so this separates "the loader put the wrong
+    // bytes there" from "the guest overwrote it later".
+    static const char *s_dumpSpec = std::getenv("PS2X_DUMP_MEM");
+    if (s_dumpSpec != nullptr)
+    {
+        static bool s_dumped = false;
+        if (!s_dumped)
+        {
+            s_dumped = true;
+            char *end = nullptr;
+            const unsigned long dumpAddr = std::strtoul(s_dumpSpec, &end, 16);
+            const unsigned long dumpLen = (end != nullptr && *end == ':')
+                                              ? std::strtoul(end + 1, nullptr, 16)
+                                              : 0x40ul;
+            std::cerr << "[EE-dump] " << std::hex << dumpAddr << ":" << dumpLen << " ";
+            for (unsigned long i = 0; i < dumpLen; i += 4u)
+            {
+                uint32_t word = 0u;
+                std::memcpy(&word, rdram + ((dumpAddr + i) & 0x01FFFFFFu), sizeof(word));
+                std::cerr << "0x" << (dumpAddr + i) << "=0x" << word << " ";
+            }
+            std::cerr << std::dec << std::endl;
+        }
+    }
+    // PS2X_WATCH_TASKSW=1 logs the guest's cooperative task-switch bookkeeping at
+    // every entry to the pump (0x151e90), the save (0x15243c), the switch
+    // (0x152200) and the suspend (0x15231c).  All four compute the same node:
+    //   node = 0x48F590 + *(0x3DB1A0) * *(0x3DB1B0) + *(0x3DB1C0)
+    // (depth * stride + index).  The suspend ends with `lw ra,0x1A8(t0); jr ra`,
+    // so comparing the node and +0x1A8 the switch wrote against the node and
+    // +0x1A8 the suspend reads is what identifies the fault.
+    static const bool s_taskSwitchWatch = std::getenv("PS2X_WATCH_TASKSW") != nullptr;
+    static uint32_t s_taskSwitchLogs = 0u;
+    if (s_taskSwitchWatch && s_taskSwitchLogs < 600u &&
+        (targetPc == 0x151E90u || targetPc == 0x15243Cu ||
+         targetPc == 0x152200u || targetPc == 0x15231Cu))
+    {
+        ++s_taskSwitchLogs;
+        auto ram32 = [&rdram](uint32_t addr) -> uint32_t {
+            uint32_t v = 0u;
+            std::memcpy(&v, rdram + (addr & 0x01FFFFFFu), sizeof(v));
+            return v;
+        };
+        const uint32_t depth = ram32(0x3DB1A0u);
+        const uint32_t stride = ram32(0x3DB1B0u);
+        const uint32_t index = ram32(0x3DB1C0u);
+        const uint32_t slot = 0x48F590u + depth * stride + index;
+        const uint32_t node = ram32(slot);
+        std::cerr << "[EE-tsw] "
+                  << (targetPc == 0x151E90u ? "pump   " :
+                      targetPc == 0x15243Cu ? "save   " :
+                      targetPc == 0x152200u ? "switch " : "suspend")
+                  << " src=0x" << std::hex << sourcePc
+                  << " d=0x" << depth << " s=0x" << stride << " i=0x" << index
+                  << " slot=0x" << slot
+                  << " node=0x" << node
+                  << " +1a8=0x" << (node != 0u ? ram32(node + 0x1A8u) : 0u)
+                  << " +1ac=0x" << (node != 0u ? ram32(node + 0x1ACu) : 0u)
+                  << " +1b4=0x" << (node != 0u ? ram32(node + 0x1B4u) : 0u)
+                  << " +1f0=0x" << (node != 0u ? ram32(node + 0x1F0u) : 0u)
+                  << " sp=0x" << GPR_U32(ctx, 29)
+                  << " ra=0x" << GPR_U32(ctx, 31)
+                  << " a0=0x" << GPR_U32(ctx, 4)
+                  << " ctxp=0x" << reinterpret_cast<uintptr_t>(ctx)
+                  << std::dec << std::endl;
+    }
+    // PS2X_WATCH_REG=1 traces the game's name/thread registry:
+    //   FUN_00151300 (lookup-or-create), FUN_001510f0 (linear lookup),
+    //   FUN_00151060 (first free slot), FUN_00150910 (construct entry).
+    // Layout from FUN_001517e0 / FUN_00151060:
+    //   *(0x3DB180) table base, *(0x3DB178) used, *(0x3DB17C) capacity,
+    //   stride 0x18, 64-bit key at +0x10 with 0xFFFFFFFFFFFFFFFF meaning free.
+    // FUN_00151060 returns -1 when every slot is taken, and that -1 is the
+    // sentinel that reaches a0 at the fatal jump, so used/capacity at the
+    // moment of failure is the thing to watch.
+    static const bool s_regWatch = std::getenv("PS2X_WATCH_REG") != nullptr;
+    static uint32_t s_regLogs = 0u;
+    if (s_regWatch && s_regLogs < 400u &&
+        (targetPc == 0x151300u || targetPc == 0x1510F0u ||
+         targetPc == 0x151060u || targetPc == 0x150910u))
+    {
+        ++s_regLogs;
+        uint32_t base = 0u;
+        uint32_t used = 0u;
+        uint32_t cap = 0u;
+        std::memcpy(&base, rdram + 0x3DB180u, sizeof(base));
+        std::memcpy(&used, rdram + 0x3DB178u, sizeof(used));
+        std::memcpy(&cap, rdram + 0x3DB17Cu, sizeof(cap));
+        uint32_t freeSlots = 0u;
+        if (base != 0u && used <= 4096u)
+        {
+            for (uint32_t i = 0u; i < used; ++i)
+            {
+                uint64_t key = 0u;
+                std::memcpy(&key, rdram + ((base + i * 0x18u + 0x10u) & 0x01FFFFFFu), sizeof(key));
+                if (key == 0xFFFFFFFFFFFFFFFFull)
+                {
+                    ++freeSlots;
+                }
+            }
+        }
+        std::cerr << "[EE-reg] "
+                  << (targetPc == 0x151300u ? "registry" :
+                      targetPc == 0x1510F0u ? "lookup   " :
+                      targetPc == 0x151060u ? "freeslot " : "create   ")
+                  << " src=0x" << std::hex << sourcePc
+                  << " base=0x" << base
+                  << std::dec << " used=" << used
+                  << " cap=" << cap
+                  << " free=" << freeSlots
+                  << std::endl;
+        // FUN_00150910 rejects anything whose +0x40 is not "TTX\0" or whose
+        // +0x44/+0x45 are not 1.  The boot splash registers the static template
+        // at 0x38AF50, which does carry those bytes in the image, so print both
+        // the pointer the guest actually passed and this runtime's copy of the
+        // template to separate an argument problem from a memory problem.
+        if (targetPc == 0x150910u)
+        {
+            const uint32_t desc = GPR_U32(ctx, 4);
+            uint8_t probe[8] = {};
+            uint64_t id = 0u;
+            uint32_t head = 0u;
+            if (desc != 0u)
+            {
+                std::memcpy(probe, rdram + ((desc + 0x40u) & 0x01FFFFFFu), sizeof(probe));
+                std::memcpy(&id, rdram + ((desc + 8u) & 0x01FFFFFFu), sizeof(id));
+                std::memcpy(&head, rdram + (desc & 0x01FFFFFFu), sizeof(head));
+            }
+            std::cerr << "[EE-reg-desc] a0=0x" << std::hex << desc
+                      << " a1=0x" << GPR_U32(ctx, 5)
+                      << " head=0x" << head
+                      << " id=0x" << id
+                      << std::dec << " magic=";
+            for (int i = 0; i < 6; ++i)
+            {
+                std::cerr << std::hex << static_cast<int>(probe[i]) << " ";
+            }
+            std::cerr << std::dec << std::endl;
+        }
+        static bool s_regTemplateDumped = false;
+        if (!s_regTemplateDumped)
+        {
+            s_regTemplateDumped = true;
+            uint8_t tmpl[8] = {};
+            uint8_t magic[8] = {};
+            std::memcpy(tmpl, rdram + 0x38AF50u, sizeof(tmpl));
+            std::memcpy(magic, rdram + 0x38AF90u, sizeof(magic));
+            std::cerr << "[EE-reg-tmpl] 0x38af50=" << std::hex;
+            for (const uint8_t b : tmpl)
+            {
+                std::cerr << static_cast<int>(b) << " ";
+            }
+            std::cerr << " 0x38af90=";
+            for (const uint8_t b : magic)
+            {
+                std::cerr << static_cast<int>(b) << " ";
+            }
+            std::cerr << std::dec << std::endl;
         }
     }
     watchAssetInitBranch(targetPc, sourcePc, fallthroughPc, kind, debugName, ctx);
@@ -2761,6 +3022,17 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
+    // EXPERIMENT (session 27 part 7): PS2X_NO_MIDFUNC_PREEMPT=1 turns off the
+    // scheduler's mid-function safe points (generated code calls this on branch
+    // back-edges only).  Transfers between functions stay preemptible.  This is
+    // the test for whether two logical chains are being interleaved on the main
+    // thread's stack - the task pump's frame and FUN_00151300's frame are both
+    // entered at sp=0x1ffff60, so an interleaving clobbers one saved `ra`.
+    static const bool s_noMidFuncPreempt = std::getenv("PS2X_NO_MIDFUNC_PREEMPT") != nullptr;
+    if (s_noMidFuncPreempt)
+    {
+        return false;
+    }
     return m_eeScheduler->checkpointDue(cycles);
 }
 

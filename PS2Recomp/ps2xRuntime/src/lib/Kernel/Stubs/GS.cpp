@@ -760,6 +760,29 @@ namespace ps2_stubs
         setReturnU32(ctx, addr);
     }
 
+    namespace
+    {
+        // TEMP diagnostic (session 30): which stub programs the display buffer,
+        // and with what. Bounded so a per-frame swap stays cheap.
+        void traceGsDispEnv(const char *who, uint32_t which, const GsDispEnvMem &env)
+        {
+            static uint32_t s_calls = 0u;
+            if (s_calls >= 16u)
+                return;
+            ++s_calls;
+            std::fprintf(stderr,
+                         "[GS-env] #%u %s which=%u pmode=0x%llX dispfb=0x%llX display=0x%llX "
+                         "(fbp=%llu fbw=%llu psm=%llu)\n",
+                         s_calls, who, which,
+                         static_cast<unsigned long long>(env.pmode),
+                         static_cast<unsigned long long>(env.dispfb),
+                         static_cast<unsigned long long>(env.display),
+                         static_cast<unsigned long long>(env.dispfb & 0x1FFu),
+                         static_cast<unsigned long long>((env.dispfb >> 9) & 0x3Fu),
+                         static_cast<unsigned long long>((env.dispfb >> 15) & 0x1Fu));
+        }
+    }
+
     void sceGsPutDispEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t envAddr = getRegU32(ctx, 4);
@@ -769,6 +792,7 @@ namespace ps2_stubs
             setReturnS32(ctx, -1);
             return;
         }
+        traceGsDispEnv("PutDispEnv", 0u, env);
         applyGsDispEnv(runtime, env);
         setReturnS32(ctx, 0);
     }
@@ -1087,6 +1111,7 @@ namespace ps2_stubs
             return;
         }
 
+        traceGsDispEnv("SwapDBuffDc", which, db.disp[which]);
         applyGsDispEnv(runtime, db.disp[which]);
         static uint32_t s_swapDbuffLogCount = 0u;
         if (s_swapDbuffLogCount < 32u)
@@ -1149,6 +1174,7 @@ namespace ps2_stubs
             return;
         }
 
+        traceGsDispEnv("SwapDBuff", which, db.disp[which]);
         applyGsDispEnv(runtime, db.disp[which]);
         if (which == 0u)
         {
