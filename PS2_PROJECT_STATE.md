@@ -2738,6 +2738,59 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 39 - the guest DOES submit geometry; every bit of it is unrenderable
+
+Session 38 concluded "no scene geometry is submitted". That was wrong - the byte census could
+not distinguish the two cases. Counting the A+D writes that actually drive rasterisation
+(added to `[GS-census]` in `gs_parallel_backend.cpp`) shows the guest submitting steadily from
+boot to the end of the run:
+
+    prim=124    -> prim=11596      PRIM (0x00)      ~312 per 256 KiB, never stops
+    xyz=914     -> xyz=30018       XYZ2 (0x05)      ~742 per 256 KiB
+    tex=34      -> tex=403         TEX0_1 (0x06)
+    frame=48    -> frame=568       FRAME_1 (0x4C)   ~14 per 256 KiB
+    xyoff=33    -> xyoff=332       XYOFFSET_1 (0x18)
+
+So roughly 11.6 k primitives and 30 k vertices reach parallel-gs, which receives every byte
+(`[GIFrecv] p2` == `[GIFsub-p2]`). The renderer is not dropping them and the guest is not idle.
+
+**The problem is the GS state the primitives are drawn with.** Every value the census reports is
+unrenderable, and all of them are constant for the whole run:
+
+| register | value | meaning |
+|---|---|---|
+| `SCISSOR_1` (0x40) | `0x100000001` | SCAX0=1, SCAX1=0, SCAY0=1, SCAY1=0 - an **empty** rectangle, so every primitive is clipped |
+| `FRAME_1` (0x4C) | `0x800E0` | FBP=224 (matches `ctx0frame=224/8`), but FBW=0 and PSM bit 19 - no valid drawing area |
+| `XYOFFSET_1` (0x18) | `0x7000` | OFX = 0x700 = 1792.0, far outside a 512-wide buffer |
+| `XYZ2` span | X -2048..1984, Y -2048..2046 | `in=0 out=30018` - not one vertex lands in 0..512 x 0..448 |
+
+`in=0` / `out=30018` is the decisive number: with a degenerate scissor and every vertex outside
+the buffer, parallel-gs correctly rasterises nothing. The loading screen rendered fine earlier
+because that was before these values were written.
+
+Note the alignment of the walk is trustworthy: `prim`/`xyz` occur at ~3.4 %/~8.7 % of
+`drawTags`, far above the 1/128 you would get from a misaligned stream, and each A+D pair takes
+its register address from *its own* D field, so pairing cannot be off by one. The values above
+are what the guest really writes.
+
+Raw forwarding of continuation QWs cannot corrupt the stream (same bytes, same order, only split
+across calls, and parallel-gs keeps its parser state), so this is not a regression from
+Session 38 - it is a separate, pre-existing problem that was previously masked by the upload bug.
+
+**Next moves**
+1. Determine whether these writes are for context 1 or context 2. `SCISSOR_1`/`FRAME_1` are per
+   context (0x40/0x4C vs 0x41/0x4D) and the census currently records only "last write wins". A
+   per-context capture decides whether the game sets a real state on one context and a dummy on
+   the other, or whether both are broken.
+2. Dump the raw A+D QWs of the first few PRIM/XYZ2/SCISSOR writes (address + 64-bit value) to
+   see whether the vertex data looks like sane 12.4 coordinates. If the vertex stream is
+   plausible in isolation, the fault is in the state; if it is not, the guest is working from
+   corrupted input structures and the fault is upstream of the GS.
+3. Check where these specific constants come from in the guest: trace writes to 0x40/0x4C/0x18
+   (which guest function issues them, and whether it reads them back from a display-environment
+   structure we may have mangled). The degenerate `0x100000001` scissor in particular looks like
+   a structure whose fields were read as zero.
+
 ### Session 38 - the lost texture uploads were ours; the black screen is a missing draw
 
 **Fixed: the path2 continuation synthesizer was corrupting the GIF stream.**
@@ -2771,6 +2824,10 @@ The fix: forward the continuation as **raw QWs, no tag** -
 Do not resurrect the synthetic tag; it is what broke the stream.
 
 **The black screen is a different bug: no geometry is submitted at all.**
+*(Wrong - corrected in Session 39: geometry is submitted continuously, 11.6 k primitives and 30 k
+vertices; they are all clipped by a degenerate scissor and an invalid drawing area. The byte
+census below cannot distinguish "not submitted" from "submitted and dropped", so the conclusion
+drawn from it here does not follow.)*
 
 Same run, three dumps at tick 3450 (`%TEMP%\ps2_diag\`):
 

@@ -190,6 +190,21 @@ namespace
             static uint64_t s_gifDrawTags = 0u;
             static uint64_t s_gifTags = 0u;
             static uint32_t s_gifPrints = 0u;
+            // Session 39: the census tracks *bytes*, which cannot distinguish
+            // "the guest stopped submitting geometry" from "the guest submits
+            // geometry and we drop it" - both end with an empty draw buffer.
+            // Count the A+D writes that actually drive rasterisation instead.
+            static uint64_t s_adPrim = 0u;    // PRIM (0x00)     - one per primitive
+            static uint64_t s_adXyz = 0u;     // XYZ2 (0x05)     - one per vertex
+            static uint64_t s_adTex = 0u;     // TEX0_1 (0x40)   - one per textured prim
+            static uint64_t s_adFrame = 0u;   // FRAME_1 (0x4C)  - drawing area setup
+            static uint64_t s_adXyoff = 0u;   // XYOFFSET_1 (0x18)
+            static uint32_t s_lastFrame = 0u;
+            static uint32_t s_lastXyoff = 0u;
+            static uint64_t s_lastScissor = 0u;
+            static uint64_t s_xyzIn = 0u, s_xyzOut = 0u;
+            static int32_t s_minX = 0x7FFFFFFF, s_maxX = -0x7FFFFFFF;
+            static int32_t s_minY = 0x7FFFFFFF, s_maxY = -0x7FFFFFFF;
             s_gifBytes += size;
             auto state = gs.get_gif_path(path);
             for (size_t offset = 0; offset < size;)
@@ -214,6 +229,35 @@ namespace
                 else
                 {
                     ++s_gifDrawTags;
+                    if (state.tag.FLG == 0)
+                    {
+                        const uint64_t adValue = word(data + offset);
+                        switch (uint8_t(word(data + offset + 8) & 127))
+                        {
+                        case 0x00: ++s_adPrim; break;
+                        case 0x05:
+                        {
+                            ++s_adXyz;
+                            // XYZ2 is 12.4 fixed point, X in bits 0-15, Y in 16-31.
+                            const int32_t vx = (static_cast<int32_t>(adValue & 0xFFFFu) << 16) >> 20;
+                            const int32_t vy = (static_cast<int32_t>((adValue >> 16) & 0xFFFFu) << 16) >> 20;
+                            if (vx < s_minX) s_minX = vx;
+                            if (vx > s_maxX) s_maxX = vx;
+                            if (vy < s_minY) s_minY = vy;
+                            if (vy > s_maxY) s_maxY = vy;
+                            if (vx >= 0 && vx < 512 && vy >= 0 && vy < 448)
+                                ++s_xyzIn;
+                            else
+                                ++s_xyzOut;
+                            break;
+                        }
+                        case 0x06: ++s_adTex; break;
+                        case 0x40: s_lastScissor = adValue; break;
+                        case 0x4C: ++s_adFrame; s_lastFrame = uint32_t(adValue); break;
+                        case 0x18: ++s_adXyoff; s_lastXyoff = uint32_t(adValue); break;
+                        default: break;
+                        }
+                    }
                     // Only packed A+D can address the transfer registers (>= 0x50).
                     const uint64_t descriptors = word(reinterpret_cast<const uint8_t *>(&state.tag) + 8);
                     if (state.tag.FLG == 0 && ((descriptors >> (state.reg * 4)) & 15) == 14)
@@ -232,14 +276,19 @@ namespace
                     offset += 16;
                 }
             }
-            if (s_gifPrints < 24u && s_gifBytes >= (static_cast<uint64_t>(s_gifPrints + 1u) << 18))
+            if (s_gifPrints < 40u && s_gifBytes >= (static_cast<uint64_t>(s_gifPrints + 1u) << 18))
             {
                 ++s_gifPrints;
                 std::cerr << "[GS-census] bytes=" << s_gifBytes << " tags=" << s_gifTags
                           << " imageBytes=" << s_gifImageBytes << " drawTags=" << s_gifDrawTags
                           << " dir=" << unsigned(transfer.direction) << " need=" << transferBytes
                           << " up=" << uploadedBytes << " px=" << transfer.copiedPixels << "/"
-                          << transfer.totalPixels << std::endl;
+                          << transfer.totalPixels << " prim=" << s_adPrim << " xyz=" << s_adXyz
+                          << " in=" << s_xyzIn << " out=" << s_xyzOut << " X=" << s_minX << ".."
+                          << s_maxX << " Y=" << s_minY << ".." << s_maxY << " tex=" << s_adTex
+                          << " frame=" << s_adFrame << " xyoff=" << s_adXyoff << " lastFrame=0x"
+                          << std::hex << s_lastFrame << " lastXyoff=0x" << s_lastXyoff
+                          << " scissor=0x" << s_lastScissor << std::dec << std::endl;
             }
         }
 
