@@ -3711,6 +3711,34 @@ void PS2Runtime::run()
                             << " tid:5c/60/64=" << peekSrv(0x0039435Cu) << ","
                             << peekSrv(0x00394360u) << "," << peekSrv(0x00394364u)
                             << " c4368=" << peekSrv(0x00394368u);
+                        // ADXF partition state.  ADXF_GetPtStat(ptid) returns -3
+                        // ("E0041303:illigal parameter 'ptid'") whenever ptid !=
+                        // DAT_003910AC, so 0x3910AC is the single word that decides
+                        // whether the 6-job AFS loader can ever see state 3.
+                        // 0x3910A8 is the ADXF file handle, 0x3910A4 the flags,
+                        // 0x3910B0/0x3910B4 the current load buffer/length.
+                        // Initial value is -1 ("no partition"); it is only ever
+                        // set inside `if (DAT_003910AC < 0)` in FUN_001961a8 and is
+                        // reset by the close paths, so a -1 here means the loader
+                        // is querying a partition nothing has opened.
+                        sos << "\nadxf: ac=" << std::dec
+                            << static_cast<int32_t>(peekSrv(0x003910ACu))
+                            << " a8=0x" << std::hex << peekSrv(0x003910A8u)
+                            << " a4=" << std::dec
+                            << static_cast<int32_t>(peekSrv(0x003910A4u))
+                            << " b0=0x" << std::hex << peekSrv(0x003910B0u)
+                            << " b4=" << std::dec << peekSrv(0x003910B4u)
+                            << " msg=\"";
+                        for (uint32_t c = 0u; c < 0x60u; ++c)
+                        {
+                            const char ch = static_cast<char>(ram[(0x00390630u + c) & PS2_RAM_MASK]);
+                            if (ch == '\0')
+                            {
+                                break;
+                            }
+                            sos << (ch >= 0x20 && ch < 0x7F ? ch : '.');
+                        }
+                        sos << "\"";
                         const std::string srvState = sos.str();
                         if (srvState != s_srvLast)
                         {

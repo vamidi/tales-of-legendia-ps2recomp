@@ -7,8 +7,10 @@
 #include "gs_interface.hpp"
 #include "thread_id.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 
@@ -176,6 +178,19 @@ namespace
         // Start from upstream's saved PATH state, including packets split across DMA calls.
         void observeGIF(uint32_t path, const uint8_t *data, size_t size)
         {
+            // TEMP DIAGNOSTIC (session 37): bounded GIF traffic census.
+            // Guest A+D never reaches WriteRegisterRaw - it arrives inside whole
+            // GIF packets via gs.gif_transfer - so every frontend counter and
+            // the raw-register histogram are dead.  Counting tags, image bytes
+            // and draw tags here is the only way to decide whether the guest is
+            // submitting scene geometry or merely repeating image uploads while
+            // it waits for data.
+            static uint64_t s_gifBytes = 0u;
+            static uint64_t s_gifImageBytes = 0u;
+            static uint64_t s_gifDrawTags = 0u;
+            static uint64_t s_gifTags = 0u;
+            static uint32_t s_gifPrints = 0u;
+            s_gifBytes += size;
             auto state = gs.get_gif_path(path);
             for (size_t offset = 0; offset < size;)
             {
@@ -183,6 +198,7 @@ namespace
                 {
                     std::memcpy(&state.tag, data + offset, 16);
                     state.reg = state.loop = 0;
+                    ++s_gifTags;
                     offset += 16;
                     continue;
                 }
@@ -191,11 +207,13 @@ namespace
                 {
                     size_t count = std::min<size_t>(state.tag.NLOOP - state.loop, (size - offset) / 16);
                     observeImage(count * 16);
+                    s_gifImageBytes += count * 16u;
                     state.loop += uint32_t(count);
                     offset += count * 16;
                 }
                 else
                 {
+                    ++s_gifDrawTags;
                     // Only packed A+D can address the transfer registers (>= 0x50).
                     const uint64_t descriptors = word(reinterpret_cast<const uint8_t *>(&state.tag) + 8);
                     if (state.tag.FLG == 0 && ((descriptors >> (state.reg * 4)) & 15) == 14)
@@ -213,6 +231,15 @@ namespace
                         }
                     offset += 16;
                 }
+            }
+            if (s_gifPrints < 24u && s_gifBytes >= (static_cast<uint64_t>(s_gifPrints + 1u) << 18))
+            {
+                ++s_gifPrints;
+                std::cerr << "[GS-census] bytes=" << s_gifBytes << " tags=" << s_gifTags
+                          << " imageBytes=" << s_gifImageBytes << " drawTags=" << s_gifDrawTags
+                          << " dir=" << unsigned(transfer.direction) << " need=" << transferBytes
+                          << " up=" << uploadedBytes << " px=" << transfer.copiedPixels << "/"
+                          << transfer.totalPixels << std::endl;
             }
         }
 
@@ -294,6 +321,21 @@ namespace
                 throw std::invalid_argument("parallel-gs: invalid GIF path or size");
             if (!data || !size)
                 return;
+            // TEMP DIAGNOSTIC (session 37): what actually reaches parallel-gs,
+            // per path, to bisect the Path2 image loss.
+            {
+                static uint64_t s_inBytes[4] = {0u, 0u, 0u, 0u};
+                static uint64_t s_inTotal = 0u;
+                static uint32_t s_inPrints = 0u;
+                s_inBytes[path & 3u] += size;
+                s_inTotal += size;
+                if (s_inPrints < 16u && s_inTotal >= ((static_cast<uint64_t>(s_inPrints) + 1u) << 19))
+                {
+                    ++s_inPrints;
+                    std::cerr << "[GIFrecv] total=" << s_inTotal << " p1=" << s_inBytes[1]
+                              << " p2=" << s_inBytes[2] << " p3=" << s_inBytes[3] << std::endl;
+                }
+            }
             observeGIF(path, data, size);
             gs.gif_transfer(path, data, size);
         }
@@ -303,6 +345,31 @@ namespace
             Lock lock(mutex);
             if (addr >= 128)
                 return; // Reserved addresses never index upstream's 128-entry table.
+            // TEMP DIAGNOSTIC (session 37): bounded A+D histogram.  Guest GIF
+            // traffic bypasses the frontend switch entirely (UsesRawCommands),
+            // so every primitive/vertex counter there is dead; counting raw
+            // register writes here is the only way to tell "the guest is
+            // drawing" from "the guest is stuck waiting".
+            {
+                static std::array<uint32_t, 128> s_adCounts{};
+                static uint64_t s_adTotal = 0u;
+                static uint32_t s_adPrints = 0u;
+                ++s_adCounts[addr];
+                ++s_adTotal;
+                if ((s_adTotal & 0xFFFull) == 0u && s_adPrints < 12u)
+                {
+                    ++s_adPrints;
+                    std::cerr << "[GS-adhist] total=" << std::dec << s_adTotal << " :";
+                    for (uint32_t r = 0u; r < 128u; ++r)
+                    {
+                        if (s_adCounts[r] != 0u)
+                        {
+                            std::cerr << " 0x" << std::hex << r << std::dec << "=" << s_adCounts[r];
+                        }
+                    }
+                    std::cerr << std::endl;
+                }
+            }
             observeRegister(addr, value);
             // Compatibility aliases used by native stubs, not actual GIF registers.
             switch (addr)

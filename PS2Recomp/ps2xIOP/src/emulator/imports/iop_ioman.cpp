@@ -5,6 +5,8 @@
 #include "../services/iop_rpc.h"
 
 #include <algorithm>
+#include <iostream>
+#include <string>
 
 namespace ps2x::iop::detail
 {
@@ -85,6 +87,25 @@ namespace ps2x::iop::detail
             return true;
         }
         default:
+            // TEMP DIAGNOSTIC (session 37): which ioman entry points does IOP
+            // module code actually call?  Only AddDrv/DelDrv are implemented
+            // above, so an AFS/CVFS module that opens an archive needs these
+            // and currently gets nothing.  Bounded, print-once style.
+            {
+                static uint32_t s_logged = 0u;
+                if (s_logged < 40u)
+                {
+                    ++s_logged;
+                    std::string path;
+                    const uint32_t pathArg = m_memory.read32(a0);
+                    if (pathArg >= 0x1000u && pathArg < 0x200000u)
+                    {
+                        path = m_memory.readString(pathArg, 64u);
+                    }
+                    std::cerr << "[IOP:ioman] ordinal=" << ordinal << " a0=0x" << std::hex << a0
+                              << std::dec << " path=\"" << path << "\"" << std::endl;
+                }
+            }
             return false;
         }
     }

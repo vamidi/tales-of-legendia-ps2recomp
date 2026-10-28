@@ -2700,6 +2700,37 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        // TEMP DIAGNOSTIC (session 37): capture CRI's status buffer at vblank
+        // rate.  CRI's formatter (FUN_00195a18) rewrites this 256-byte buffer
+        // for every message, and it is normally overwritten long before the
+        // 1 Hz [EE-srv] probe ever samples it, so the single message that
+        // explains a stall is usually lost.  Comparing 16 dwords per vblank is
+        // nearly free and prints every distinct message once, in order.
+        if (m_rdram)
+        {
+            static char s_lastCriMsg[65] = {0};
+            char criNow[65] = {0};
+            uint32_t criLen = 0u;
+            for (; criLen < 64u; ++criLen)
+            {
+                const char ch = static_cast<char>(m_rdram[(0x00390630u + criLen) & 0x01FFFFFFu]);
+                if (ch == '\0')
+                {
+                    break;
+                }
+                criNow[criLen] = (ch >= 0x20 && ch < 0x7F) ? ch : '.';
+            }
+            criNow[criLen] = '\0';
+            if (std::strcmp(criNow, s_lastCriMsg) != 0)
+            {
+                std::strcpy(s_lastCriMsg, criNow);
+                if (criNow[0] != '\0')
+                {
+                    std::cerr << "[CRI-msg] tick=" << m_vsyncTick << " \"" << criNow << "\""
+                              << std::endl;
+                }
+            }
+        }
         // TEMP DIAGNOSTIC (session 19, first-frame triage): is the VBLANK event
         // advancing at all, and does the guest ever flip a display buffer?
         if (m_vsyncTick <= 3u || (m_vsyncTick % 30u) == 0u)
@@ -2723,7 +2754,11 @@ void EeScheduler::processEvent(const EeEvent &event)
         // TEMP DIAGNOSTIC (session 30): sample the framebuffer census several
         // times so an early (still loading) VRAM can be told apart from one that
         // already holds a drawn frame. Budget: PS2_FB_DUMP defaults to 3.
-        if (m_vsyncTick == 600u || m_vsyncTick == 1200u || m_vsyncTick == 2400u)
+        // Session 37: the six-MBS metadata load completes around tick ~1500 and
+        // the first VIF1 image streaming starts after tick 2400, so sample late
+        // ticks too — otherwise every dump predates the phase we are debugging.
+        if (m_vsyncTick == 600u || m_vsyncTick == 1200u || m_vsyncTick == 2400u ||
+            m_vsyncTick == 3000u || m_vsyncTick == 3300u || m_vsyncTick == 3450u)
         {
             extern bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *tag);
             const std::string dumpTag = "forced" + std::to_string(m_vsyncTick);

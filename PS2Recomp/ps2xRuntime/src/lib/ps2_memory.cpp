@@ -2051,6 +2051,22 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     if (!data || sizeBytes < 16)
         return;
 
+    // TEMP DIAGNOSTIC (session 37): Path2 image accounting at the entry of the
+    // submit funnel.  The VIF1 image path reports ~4.4 MB of submitted Path2
+    // data while the backend only ever receives ~82 KB, so measure here to
+    // bisect whether the loss happens before or after the arbiter.
+    if (pathId == GifPathId::Path2)
+    {
+        static uint64_t s_p2Bytes = 0u;
+        static uint32_t s_p2Prints = 0u;
+        s_p2Bytes += sizeBytes;
+        if (s_p2Prints < 16u && s_p2Bytes >= ((static_cast<uint64_t>(s_p2Prints) + 1u) << 19))
+        {
+            ++s_p2Prints;
+            std::cerr << "[GIFsub-p2] bytes=" << s_p2Bytes << std::endl;
+        }
+    }
+
     if (pathId == GifPathId::Path3)
     {
         if (m_path3Masked)

@@ -93,7 +93,7 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
 {
     static uint32_t s_budget = [] {
         const char *env = std::getenv("PS2_FB_DUMP");
-        return env ? static_cast<uint32_t>(std::atoi(env)) : 3u;
+        return env ? static_cast<uint32_t>(std::atoi(env)) : 8u;
     }();
     static uint32_t s_index = 0u;
     if (s_budget == 0u)
