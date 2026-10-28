@@ -213,6 +213,45 @@ namespace
             static uint64_t s_xyzIn = 0u, s_xyzOut = 0u;
             static int32_t s_minX = 0x7FFFFFFF, s_maxX = -0x7FFFFFFF;
             static int32_t s_minY = 0x7FFFFFFF, s_maxY = -0x7FFFFFFF;
+            // FLG=1 (packed-reglist) sends nreg A words then nreg D words per
+            // loop, so a loop can straddle a DMA call; park the A words here.
+            static uint64_t s_reglistA[4][16] = {};
+            auto applyAD = [&](uint8_t adReg, uint64_t adValue) {
+                switch (adReg)
+                {
+                case 0x00: ++s_adPrim; break;
+                case 0x05:
+                {
+                    ++s_adXyz;
+                    if (s_xyzSampleN < 3u)
+                    {
+                        s_xyzSample[s_xyzSampleN++] = adValue;
+                    }
+                    // XYZ2 is 12.4 fixed point, X in bits 0-15, Y in 16-31.
+                    const int32_t vx = (static_cast<int32_t>(adValue & 0xFFFFu) << 16) >> 20;
+                    const int32_t vy = (static_cast<int32_t>((adValue >> 16) & 0xFFFFu) << 16) >> 20;
+                    if (vx < s_minX) s_minX = vx;
+                    if (vx > s_maxX) s_maxX = vx;
+                    if (vy < s_minY) s_minY = vy;
+                    if (vy > s_maxY) s_maxY = vy;
+                    if (vx >= 0 && vx < 512 && vy >= 0 && vy < 448)
+                        ++s_xyzIn;
+                    else
+                        ++s_xyzOut;
+                    break;
+                }
+                case 0x06: ++s_adTex; break;                              // TEX0_1
+                case 0x09: s_xyoff1 = uint32_t(adValue); break;            // XYOFFSET_1 (32-bit)
+                case 0x12: s_scissor1 = adValue; break;                    // SCISSOR_1
+                case 0x13: s_alpha1 = uint32_t(adValue); break;            // ALPHA_1
+                case 0x17: s_test1 = uint32_t(adValue); break;             // TEST_1
+                case 0x1A: ++s_adFrame; s_frame1 = uint32_t(adValue); break; // FRAME_1
+                case 0x43: s_xyoff2 = uint32_t(adValue); break;            // XYOFFSET_2
+                case 0x4C: s_scissor2 = adValue; break;                    // SCISSOR_2
+                case 0x54: s_frame2 = uint32_t(adValue); break;            // FRAME_2
+                default: break;
+                }
+            };
             s_gifBytes += size;
             auto state = gs.get_gif_path(path);
             for (size_t offset = 0; offset < size;)
@@ -235,63 +274,50 @@ namespace
                     state.loop += uint32_t(count);
                     offset += count * 16;
                 }
-                else
+                else if (state.tag.FLG == 1)
                 {
+                    // Packed-reglist: a loop is nreg A words then nreg D words,
+                    // NOT interleaved.  state.reg counts 0..2*nreg-1 across both
+                    // phases so a loop straddling a DMA call stays correct.
                     ++s_gifDrawTags;
-                    if (state.tag.FLG == 0)
+                    while (offset < size && state.loop < state.tag.NLOOP)
                     {
-                        const uint64_t adValue = word(data + offset);
-                        switch (uint8_t(word(data + offset + 8) & 127))
+                        if (state.reg < nreg)
                         {
-                        case 0x00: ++s_adPrim; break;
-                        case 0x05:
+                            s_reglistA[path & 3u][state.reg] = word(data + offset);
+                            ++state.reg;
+                        }
+                        else
                         {
-                            ++s_adXyz;
-                            if (s_xyzSampleN < 3u)
-                            {
-                                s_xyzSample[s_xyzSampleN++] = adValue;
-                            }
-                            // XYZ2 is 12.4 fixed point, X in bits 0-15, Y in 16-31.
-                            const int32_t vx = (static_cast<int32_t>(adValue & 0xFFFFu) << 16) >> 20;
-                            const int32_t vy = (static_cast<int32_t>((adValue >> 16) & 0xFFFFu) << 16) >> 20;
-                            if (vx < s_minX) s_minX = vx;
-                            if (vx > s_maxX) s_maxX = vx;
-                            if (vy < s_minY) s_minY = vy;
-                            if (vy > s_maxY) s_maxY = vy;
-                            if (vx >= 0 && vx < 512 && vy >= 0 && vy < 448)
-                                ++s_xyzIn;
-                            else
-                                ++s_xyzOut;
-                            break;
+                            const uint32_t k = state.reg - nreg;
+                            applyAD(uint8_t(word(data + offset) & 127), s_reglistA[path & 3u][k]);
+                            ++state.reg;
                         }
-                        case 0x06: ++s_adTex; break;
-                        case 0x09: s_xyoff1 = uint32_t(adValue); break;         // XYOFFSET_1 (32-bit)
-                        case 0x13: s_alpha1 = uint32_t(adValue); break;         // ALPHA_1
-                        case 0x17: s_test1 = uint32_t(adValue); break;          // TEST_1
-                        case 0x1A: ++s_adFrame; s_frame1 = uint32_t(adValue); break; // FRAME_1
-                        case 0x12: s_scissor1 = adValue; break;                 // SCISSOR_1
-                        case 0x40: break;                                       // TEX0_2
-                        case 0x43: s_xyoff2 = uint32_t(adValue); break;         // XYOFFSET_2
-                        case 0x4C: s_scissor2 = adValue; break;                 // SCISSOR_2
-                        case 0x54: s_frame2 = uint32_t(adValue); break;          // FRAME_2
-                        default: break;
-                        }
-                    }
-                    // Only packed A+D can address the transfer registers (>= 0x50).
-                    const uint64_t descriptors = word(reinterpret_cast<const uint8_t *>(&state.tag) + 8);
-                    if (state.tag.FLG == 0 && ((descriptors >> (state.reg * 4)) & 15) == 14)
-                    {
-                        const uint8_t adAddr = uint8_t(word(data + offset + 8) & 127);
-                        const uint64_t adValue = word(data + offset);
-                        observeRegister(adAddr, adValue);
-                    }
-                    unsigned count = state.tag.FLG == 0 ? 1 : 2;
-                    while (count-- && state.loop < state.tag.NLOOP)
-                        if (++state.reg == nreg)
+                        offset += 16;
+                        if (state.reg >= nreg * 2u)
                         {
                             state.reg = 0;
                             ++state.loop;
                         }
+                    }
+                }
+                else
+                {
+                    ++s_gifDrawTags;
+                    const uint8_t adReg = uint8_t(word(data + offset + 8) & 127);
+                    const uint64_t adValue = word(data + offset);
+                    // Only packed A+D can address the transfer registers (>= 0x50).
+                    const uint64_t descriptors = word(reinterpret_cast<const uint8_t *>(&state.tag) + 8);
+                    if (((descriptors >> (state.reg * 4)) & 15) == 14)
+                    {
+                        observeRegister(adReg, adValue);
+                    }
+                    applyAD(adReg, adValue);
+                    if (++state.reg == nreg)
+                    {
+                        state.reg = 0;
+                        ++state.loop;
+                    }
                     offset += 16;
                 }
             }
@@ -414,6 +440,28 @@ namespace
             }
             observeGIF(path, data, size);
             gs.gif_transfer(path, data, size);
+            // Session 41: parallel-gs's own accounting.  Everything in the
+            // census above only proves what *we* parsed; this proves what it
+            // actually rasterised and copied.  consume_flush_stats() resets the
+            // counters, so accumulate.
+            {
+                static uint64_t s_psPrims = 0u, s_psPasses = 0u, s_psCopies = 0u;
+                static uint64_t s_psPalettes = 0u, s_psBytes = 0u;
+                static uint32_t s_psPrints = 0u;
+                const auto stats = gs.consume_flush_stats();
+                s_psPrims += stats.num_primitives;
+                s_psPasses += stats.num_render_passes;
+                s_psCopies += stats.num_copies;
+                s_psPalettes += stats.num_palette_updates;
+                s_psBytes += size;
+                if (s_psPrints < 40u && s_psBytes >= (static_cast<uint64_t>(s_psPrints + 1u) << 18))
+                {
+                    ++s_psPrints;
+                    std::cerr << "[GSpost] bytes=" << s_psBytes << " prims=" << s_psPrims
+                              << " passes=" << s_psPasses << " copies=" << s_psCopies
+                              << " palettes=" << s_psPalettes << std::endl;
+                }
+            }
         }
 
         void WriteRegisterRaw(uint8_t addr, uint64_t value) override

@@ -2757,8 +2757,9 @@ void EeScheduler::processEvent(const EeEvent &event)
         // Session 37: the six-MBS metadata load completes around tick ~1500 and
         // the first VIF1 image streaming starts after tick 2400, so sample late
         // ticks too — otherwise every dump predates the phase we are debugging.
-        if (m_vsyncTick == 600u || m_vsyncTick == 1200u || m_vsyncTick == 2400u ||
-            m_vsyncTick == 3000u || m_vsyncTick == 3300u || m_vsyncTick == 3450u)
+        if (m_vsyncTick == 600u || m_vsyncTick == 2400u ||
+            m_vsyncTick == 3000u || m_vsyncTick == 3450u || m_vsyncTick == 4200u ||
+            m_vsyncTick == 4800u || m_vsyncTick == 5400u || m_vsyncTick == 5700u)
         {
             extern bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *tag);
             const std::string dumpTag = "forced" + std::to_string(m_vsyncTick);

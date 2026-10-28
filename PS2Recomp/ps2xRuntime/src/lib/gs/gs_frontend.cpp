@@ -142,6 +142,23 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
         }
     }
     uint32_t denseIdx[3] = {0u, 0u, 0u};
+    // Session 41: the dense-block summary cannot answer the one question that
+    // matters once parallel-gs is known to rasterise (14k prims, 23k copies):
+    // is the *displayed* buffer non-empty, and is the *drawn* one?  Count each
+    // buffer window explicitly.  FBP is in 8192-byte pages.
+    auto nzWindow = [&](uint32_t fbp) -> uint64_t {
+        const uint64_t base = static_cast<uint64_t>(fbp) * 8192ull;
+        uint64_t n = 0u;
+        for (uint64_t off = base; off + 4u <= vramSize && off < base + 0xB8000ull; off += 4u)
+        {
+            if (reinterpret_cast<const uint32_t *>(vram)[off >> 2] != 0u)
+                ++n;
+        }
+        return n;
+    };
+    const uint64_t nzDisp2 = nzWindow(static_cast<uint32_t>(regs.dispfb2 & 0x1FFu));
+    const uint64_t nzCtx0 = nzWindow(snap.ctx[0].frame.fbp);
+    const uint64_t nzCtx1 = nzWindow(snap.ctx[1].frame.fbp);
     bool denseTaken[64] = {};
     for (uint32_t k = 0u; k < 3u; ++k)
     {
@@ -158,6 +175,7 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
     }
     std::fprintf(stderr,
                  "[FB-dump] %s census: nzWords=%llu range=0x%llX..0x%llX dense=0x%X:%u 0x%X:%u 0x%X:%u "
+                 "nzDisp2=%llu nzCtx0=%llu nzCtx1=%llu "
                  "pmode=0x%llX dispfb1=0x%llX dispfb2=0x%llX "
                  "ctx0frame=%u/%u/0x%02X ctx1frame=%u/%u/0x%02X\n",
                  tag,
@@ -167,6 +185,9 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
                  denseIdx[0] * 0x10000u, blockDense[denseIdx[0]],
                  denseIdx[1] * 0x10000u, blockDense[denseIdx[1]],
                  denseIdx[2] * 0x10000u, blockDense[denseIdx[2]],
+                 static_cast<unsigned long long>(nzDisp2),
+                 static_cast<unsigned long long>(nzCtx0),
+                 static_cast<unsigned long long>(nzCtx1),
                  static_cast<unsigned long long>(regs.pmode),
                  static_cast<unsigned long long>(regs.dispfb1),
                  static_cast<unsigned long long>(regs.dispfb2),

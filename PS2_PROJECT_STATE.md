@@ -2738,6 +2738,48 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 41 - parallel-gs does rasterise; after the transition nothing lands in any buffer
+
+Added `gs.consume_flush_stats()` after `gs.gif_transfer` (`[GSpost]`). parallel-gs's own
+accounting, at the same 256 KiB thresholds as our census:
+
+    [GSpost] bytes=10485760 prims=14446 passes=268 copies=23846 palettes=366
+
+Our own parse counted `prim=15852` at the same byte count, so the two track: **we are not
+dropping draws, and parallel-gs is not rejecting the stream.** `FlushStats.num_primitives` counts
+primitives *submitted to the rasteriser*, not pixels written - that distinction is the whole
+remaining problem.
+
+Added explicit per-buffer non-zero word counts to the VRAM census (`nzDisp2` = the buffer
+DISPFB2 points at, `nzCtx0`/`nzCtx1` = the two FRAME buffers), and moved the forced dumps later
+(600, 2400, 3000, 3450, 4200, 4800, 5400, 5700) to sample past the transition:
+
+| tick | nzWords | nzDisp2 | nzCtx0 | nzCtx1 |
+|---|---|---|---|---|
+| 600 | 98,728 | **32,768** | 32,768 | 32,768 |
+| 2400 | 98,728 | 32,768 | 32,768 | 32,768 |
+| 3000 | 593 | **0** | 0 | 0 |
+| 3450 | 593 | 0 | 0 | 0 |
+| 4200 | 593 | 0 | 0 | 0 |
+| 4800 | 593 | 0 | 0 | 0 |
+| 5400 | 593 | 0 | 0 | 0 |
+
+So drawing works during the loading phase and lands in the displayed buffer, and after the
+transition **no buffer anywhere in VRAM receives a single pixel** while the rasteriser still
+processes primitives. Degenerate or off-screen geometry is the shape of it.
+
+**But the "all 30,018 vertices are off-screen" reading is still not trustworthy, and there is now
+direct evidence of why.** The first `XYZ2` sample is `0x72007000`. That bit pattern is exactly a
+plausible `XYOFFSET`: OFX = bits 0-15 = 0x7000 = 1792.0, OFY = bits 16-31 = 0x7200 = 1824.0. With
+that offset, the "off-screen" samples (1792,1824) and (2432,2720) map to screen (0,0) and
+(640,896) - i.e. on-screen. The register attribution is still off somewhere, so the vertex
+statistics cannot be used to conclude anything yet.
+
+**Next move (cheap, no new plumbing):** the snapshot already carries `snap.ctx[n].xyoffset` -
+print it in the census line and recompute on-screen coverage *relative to the real offset*. If
+coverage becomes non-zero, the geometry is fine and the fault is in whatever state selects the
+target/clips (TEST/ALPHA/COLMASK or the FRAME the rasteriser actually uses), not in the vertices.
+
 ### Session 40 - the Session 39 register readings were the wrong registers
 
 Session 39 claimed the guest draws with an unrenderable state (`SCISSOR_1=0x100000001`,
