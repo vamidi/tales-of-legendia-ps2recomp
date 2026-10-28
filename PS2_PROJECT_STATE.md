@@ -2738,6 +2738,96 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 37 - past the 6-MBS gate, and the texture-upload black screen
+
+Runs: s36a/b, s37a, s38a/b, s39a/b, s40a/b, s41a/b, s42a/b, s43a/b, s44a/b (128-150 s
+each). All probes below are TEMP diagnostics inside .cpp files only.
+
+**1. The six-MBS metadata gate now completes (outcome B).** 41 IOP:fileio ops: PTN_INFO.BIN
+(64 B) + PTN_INFO.NAM (75 B) + the six cdrom0:\MBS\*.MBS;1 archives (SYS_REG 1720, MAP 3160,
+SND 31724, FIELD 7324, BATTLE 22004, MOVIE 88). E0041303 is gone in this outcome. This is
+past the session-36 state.
+
+**2. The screen really does change, then goes black.** Measured from the real readback (see
+#5): "NOW LOADING" at ticks 600/1200; at tick 2400 VRAM is nzWords=0 and the draw contexts
+swap (ctx0frame 224->0, ctx1frame 0->224); ticks 3000/3300 are 0 non-black pixels. The
+loading screen is finished and the new scene renders nothing. flips=0 presents=0 remain
+blind counters.
+
+**3. Outcome A root-caused exactly** (new vblank-rate CRI message watcher; the 1 Hz probe
+always lost this message):
+
+    tick ~244  "E0042401:multi-load partition.(load partition)"
+    tick ~245  "E0041303:illigal parameter 'ptid'.(ADXF_GetPtStat)"   <- forever
+
+DAT_003910AC (=2) still holds the first partition, DAT_003910A8=0x390738, and its table read
+had advanced DAT_003910A4 to ~4351 entries. A second partition open is refused by the guard
+`if (DAT_003910AC < 0)`, so the loader polls a partition it never opened and FUN_00196460
+returns -3 for ever. DAT_003910A4 is a progress counter, not a countdown (read+written inside
+GetPtStat). GetPtStat's own failure paths print E0040701:Illigal format(not AFS)
+(memcmp(hdr,"AFS",3), string 0x3C1AB8), E0040702:Illigal number of file (0x3C1AF0),
+E2122501:AFS file has 128MB or more (0x3C1B28), then call FUN_001963A8 (close) and return 4.
+None of those three appeared, so the AFS header parse is not failing in these runs. All six
+archives on disk are valid: magic AFS\0, file counts 430/1831/790/7931/5501/22.
+
+**4. Three outcomes, not two.** A: 11 fileio, ADXF multi-load deadlock, ~8790 ticks, quiet.
+B-streaming: 41 fileio + 74k [VIF1-path2] chunks, ~3510 ticks, black screen. B-idle: 41
+fileio, no VIF1 streaming, ~4650 ticks, ends thread=-1 pc=0x166490 (vblank handler, idle).
+The split is the same host-interleaving race as session 26; B-streaming is roughly 1 in 2.
+
+**5. Framebuffer dumps are trustworthy.** Ps2DumpFramebufferBmp reads lockDisplaySnapshot(),
+which is snapshotVRAM() -> backend->Sync(DebugReadback) + SnapshotVram(), a real parallel-gs
+readback. So both the BMPs and the nzWords census describe actual GPU VRAM - the black screen
+is real, not a shadow-VRAM artifact.
+
+**6. Where all the drawing actually goes.** WriteRegisterRaw is never called on a guest path:
+guest A+D arrives inside whole GIF packets through gs.gif_transfer, so every frontend
+counter (s_debugGsPackedVertexCount etc.) and any register histogram are dead by
+construction. Per-path census over a full run:
+
+    Path1 (VU1 xgkick)                  0 bytes
+    Path3 (DMA)                       640 bytes
+    Path2 (VIF1 DIRECT/DIRECTHL)  8,388,000 bytes
+
+Everything in this phase is VIF1 path2; VU1 xgkick contributes nothing.
+
+**7. TEXTURE UPLOADS ARE DISCARDED - the concrete bug.** Of the Path2 traffic, 8.2 MB is
+FLG=IMAGE image data. It does reach parallel-gs (verified at both ends of the funnel:
+[GIFsub-p2] bytes=8388624 submitted vs [GIFrecv] p2=8388000 received), yet real VRAM holds
+~600 nonzero words. parallel-gs only accepts image QWs while
+transfer_state.host_to_local_active, which is set only when TRXDIR == HOST_TO_LOCAL and
+required_qwords != 0 derived from TRXREG (gs_interface.cpp ~L3212, payload append ~L3960,
+flush ~L2982). Image QWs arriving while that state is inactive are dropped silently - exactly
+what the empty VRAM shows.
+
+Prime suspect: ps2_vif1_interpreter.cpp L336-365, the path2 continuation synthesizer. It
+emits standalone FLG=IMAGE packets with EOP set on the final chunk (1ull << 15) and no
+accompanying transfer-register state, and pendingGifImageQwc() (L577) decides how much
+trailing data to convert. If that detection is off by even one tag, the A+D that would set
+TRXDIR/TRXREG is swallowed into "image data" and never executed - after which every upload
+for the rest of the frame is discarded.
+
+**8. IOP-side file I/O is ruled out.** IopIoman implements only AddDrv/DelDrv; a bounded
+ordinal probe ([IOP:ioman]) logged zero calls, so the CVFS/AFS module never uses ioman
+imports. Do not implement IOP ioman next.
+
+**Correction for future sessions:** two intermediate "no traffic at all" readings were
+print-cap artifacts (first-print thresholds above actual traffic: 64 KiB and 4 MiB). Keep
+diagnostic thresholds below expected traffic, and treat "counter never printed" as
+unmeasured, not as zero.
+
+**Next moves**
+1. Get a B-streaming run with the widened [GS-census] line (dir=/need=/up=/px=, 256 KiB
+   steps) and check whether dir ever becomes 0 with need != 0 and up advancing. If it never
+   does, the suspect in #7 is confirmed.
+2. Read pendingGifImageQwc() and make it report only the trailing tag-less remainder; it
+   must never absorb preceding A+D.
+3. Do not set EOP on partial image chunks (or split exactly at tag boundaries) so
+   parallel-gs's required_qwords flush can complete.
+4. Once uploads land, re-check the black screen: display FB is dispfb2=0x1000 (VRAM 0) with
+   draw contexts at 224/0 - if VRAM 0 is never redrawn, the game is still waiting for a flip
+   it never issues.
+
 ### 2026-10-25 (session 27 part 6 - registry exonerated; the death is an overlapping-stack clobber of the saved `ra`)
 
 - **Actions**: (1) Wired the `PS2X_WATCH_REG=1` registry probe into `dispatchGuestBranch`
@@ -2855,92 +2945,3 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
 - **Discovered**: Extracted tree holds AFS archives matching ELF path strings; bsdtar strips `;1`.
 - **Current Blocker**: Black screen â€” SMODE1 combo unrecognized by parallel-gs decoder.
 
-### Session 37 - past the 6-MBS gate, and the texture-upload black screen
-
-Runs: s36a/b, s37a, s38a/b, s39a/b, s40a/b, s41a/b, s42a/b, s43a/b, s44a/b (128-150 s
-each). All probes below are TEMP diagnostics inside .cpp files only.
-
-**1. The six-MBS metadata gate now completes (outcome B).** 41 IOP:fileio ops: PTN_INFO.BIN
-(64 B) + PTN_INFO.NAM (75 B) + the six cdrom0:\MBS\*.MBS;1 archives (SYS_REG 1720, MAP 3160,
-SND 31724, FIELD 7324, BATTLE 22004, MOVIE 88). E0041303 is gone in this outcome. This is
-past the session-36 state.
-
-**2. The screen really does change, then goes black.** Measured from the real readback (see
-#5): "NOW LOADING" at ticks 600/1200; at tick 2400 VRAM is nzWords=0 and the draw contexts
-swap (ctx0frame 224->0, ctx1frame 0->224); ticks 3000/3300 are 0 non-black pixels. The
-loading screen is finished and the new scene renders nothing. flips=0 presents=0 remain
-blind counters.
-
-**3. Outcome A root-caused exactly** (new vblank-rate CRI message watcher; the 1 Hz probe
-always lost this message):
-
-    tick ~244  "E0042401:multi-load partition.(load partition)"
-    tick ~245  "E0041303:illigal parameter 'ptid'.(ADXF_GetPtStat)"   <- forever
-
-DAT_003910AC (=2) still holds the first partition, DAT_003910A8=0x390738, and its table read
-had advanced DAT_003910A4 to ~4351 entries. A second partition open is refused by the guard
-`if (DAT_003910AC < 0)`, so the loader polls a partition it never opened and FUN_00196460
-returns -3 for ever. DAT_003910A4 is a progress counter, not a countdown (read+written inside
-GetPtStat). GetPtStat's own failure paths print E0040701:Illigal format(not AFS)
-(memcmp(hdr,"AFS",3), string 0x3C1AB8), E0040702:Illigal number of file (0x3C1AF0),
-E2122501:AFS file has 128MB or more (0x3C1B28), then call FUN_001963A8 (close) and return 4.
-None of those three appeared, so the AFS header parse is not failing in these runs. All six
-archives on disk are valid: magic AFS\0, file counts 430/1831/790/7931/5501/22.
-
-**4. Three outcomes, not two.** A: 11 fileio, ADXF multi-load deadlock, ~8790 ticks, quiet.
-B-streaming: 41 fileio + 74k [VIF1-path2] chunks, ~3510 ticks, black screen. B-idle: 41
-fileio, no VIF1 streaming, ~4650 ticks, ends thread=-1 pc=0x166490 (vblank handler, idle).
-The split is the same host-interleaving race as session 26; B-streaming is roughly 1 in 2.
-
-**5. Framebuffer dumps are trustworthy.** Ps2DumpFramebufferBmp reads lockDisplaySnapshot(),
-which is snapshotVRAM() -> backend->Sync(DebugReadback) + SnapshotVram(), a real parallel-gs
-readback. So both the BMPs and the nzWords census describe actual GPU VRAM - the black screen
-is real, not a shadow-VRAM artifact.
-
-**6. Where all the drawing actually goes.** WriteRegisterRaw is never called on a guest path:
-guest A+D arrives inside whole GIF packets through gs.gif_transfer, so every frontend
-counter (s_debugGsPackedVertexCount etc.) and any register histogram are dead by
-construction. Per-path census over a full run:
-
-    Path1 (VU1 xgkick)                  0 bytes
-    Path3 (DMA)                       640 bytes
-    Path2 (VIF1 DIRECT/DIRECTHL)  8,388,000 bytes
-
-Everything in this phase is VIF1 path2; VU1 xgkick contributes nothing.
-
-**7. TEXTURE UPLOADS ARE DISCARDED - the concrete bug.** Of the Path2 traffic, 8.2 MB is
-FLG=IMAGE image data. It does reach parallel-gs (verified at both ends of the funnel:
-[GIFsub-p2] bytes=8388624 submitted vs [GIFrecv] p2=8388000 received), yet real VRAM holds
-~600 nonzero words. parallel-gs only accepts image QWs while
-transfer_state.host_to_local_active, which is set only when TRXDIR == HOST_TO_LOCAL and
-required_qwords != 0 derived from TRXREG (gs_interface.cpp ~L3212, payload append ~L3960,
-flush ~L2982). Image QWs arriving while that state is inactive are dropped silently - exactly
-what the empty VRAM shows.
-
-Prime suspect: ps2_vif1_interpreter.cpp L336-365, the path2 continuation synthesizer. It
-emits standalone FLG=IMAGE packets with EOP set on the final chunk (1ull << 15) and no
-accompanying transfer-register state, and pendingGifImageQwc() (L577) decides how much
-trailing data to convert. If that detection is off by even one tag, the A+D that would set
-TRXDIR/TRXREG is swallowed into "image data" and never executed - after which every upload
-for the rest of the frame is discarded.
-
-**8. IOP-side file I/O is ruled out.** IopIoman implements only AddDrv/DelDrv; a bounded
-ordinal probe ([IOP:ioman]) logged zero calls, so the CVFS/AFS module never uses ioman
-imports. Do not implement IOP ioman next.
-
-**Correction for future sessions:** two intermediate "no traffic at all" readings were
-print-cap artifacts (first-print thresholds above actual traffic: 64 KiB and 4 MiB). Keep
-diagnostic thresholds below expected traffic, and treat "counter never printed" as
-unmeasured, not as zero.
-
-**Next moves**
-1. Get a B-streaming run with the widened [GS-census] line (dir=/need=/up=/px=, 256 KiB
-   steps) and check whether dir ever becomes 0 with need != 0 and up advancing. If it never
-   does, the suspect in #7 is confirmed.
-2. Read pendingGifImageQwc() and make it report only the trailing tag-less remainder; it
-   must never absorb preceding A+D.
-3. Do not set EOP on partial image chunks (or split exactly at tag boundaries) so
-   parallel-gs's required_qwords flush can complete.
-4. Once uploads land, re-check the black screen: display FB is dispfb2=0x1000 (VRAM 0) with
-   draw contexts at 224/0 - if VRAM 0 is never redrawn, the game is still waiting for a flip
-   it never issues.
