@@ -2738,6 +2738,64 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 38 - the lost texture uploads were ours; the black screen is a missing draw
+
+**Fixed: the path2 continuation synthesizer was corrupting the GIF stream.**
+
+`ps2_vif1_interpreter.cpp` detected a pending image transfer (`pendingGifImageQwc()`) and then,
+for every subsequent `processVIF1Data` call, wrapped the QWs in a **fresh synthetic GIF tag**
+(`FLG=IMAGE`, `EOP` on the final chunk) before handing them to `submitGifPacket`. That is
+semantically wrong: a pending image transfer means the guest's original tag still has an
+unfulfilled `NLOOP`. The VIF1 DMA ended mid-tag, so the bytes are a *continuation of that same
+tag*, not a new packet. parallel-gs keeps its tag parser state across `gif_transfer` calls, so it
+was consuming our injected 16-byte tags as **texture payload**.
+
+Measured proof, one B-streaming run, `[GS-census]` at the 256 KiB steps:
+
+| metric | before | after |
+|---|---|---|
+| `tags` observed | 492 | 55,247 |
+| `imageBytes` | 1,133,664 | 2,079,728 |
+| `drawTags` (bytes parsed as packed) | 321,956 | 207,994 |
+| transfer progress | `up=0`, `px=0/288` forever | `up==need`, `px=384/384`, `288/288`, `16/16` |
+| `ctx1frame` @ tick 3000 | `0/0` | `224/8` |
+
+With 36 k injected tags only ~500 tag boundaries were ever observed, and 5.1 MB of a 6.3 MB
+stream was parsed as packed A+D instead of image data - the uploads never completed, so VRAM
+stayed empty. After the change the guest's 394,848-byte transfer (`size=394848`, 24 678 QW) drains
+correctly (`pending=15 -> 4`), each `TRXREG` transfer reaches `uploadedBytes == transferBytes`, and
+its pixels complete.
+
+The fix: forward the continuation as **raw QWs, no tag** -
+`submitGifPacket(GifPathId::Path2, data + pos, chunkQw * 16u, true, m_vif1PendingPath2DirectHl)`.
+Do not resurrect the synthetic tag; it is what broke the stream.
+
+**The black screen is a different bug: no geometry is submitted at all.**
+
+Same run, three dumps at tick 3450 (`%TEMP%\ps2_diag\`):
+
+- `gs_frame5_forced3450.bmp` (display buffer, `dispfb2=0x1000`, FBP=0, FBW=8) - **solid black**
+- `gs_draw5_forced3450.bmp` (draw context, `ctx0frame=224/8`) - **solid black**
+- `gs_slab5_forced3450.bmp` (texture region) - **has content**: thin white horizontal line,
+  cyan specks, an orange/white/yellow cluster, and a multicoloured glitch band near the top
+  edge - i.e. real uploaded texture data is now present.
+
+So uploads land, the clear happens (VRAM falls 98 728 -> 593 non-zero words between ticks 2400
+and 3000 - the `NOW LOADING` screen is wiped), and then nothing is rasterised into either buffer.
+The guest is healthy while it does this: tick 5790, `thread=1`, `threads=6`, `vbLagAvgUs=11165`,
+no `E0`/`E2` CRI errors, main loop `pc=0x165bd0`. It clears and flips black frames forever.
+
+**Next moves**
+1. Find why no scene geometry is submitted after the transition. The main loop is running, so
+   this is most likely another async load that never completes (scene-specific AFS content) and
+   the game sits in its "waiting" sub-state, clearing black each frame. Instrument the code path
+   after the 6-MBS gate: what does the game block on between tick 2400 and 3000?
+2. Re-read the AFS claim carefully - `IOP:fileio` only logs the host-VFS `MFS` device, so absence
+   of log lines does not mean absence of disc reads. Check the CDV path directly.
+3. Only after geometry appears: re-examine the `dispfb2=0x1000` (FBP=0) vs `ctx0frame=224/8`
+   mismatch. It may be benign (the game alternates 224 <-> 0) or the real reason the displayed
+   buffer stays stale; do not chase it while both buffers are black.
+
 ### Session 37 - past the 6-MBS gate, and the texture-upload black screen
 
 Runs: s36a/b, s37a, s38a/b, s39a/b, s40a/b, s41a/b, s42a/b, s43a/b, s44a/b (128-150 s

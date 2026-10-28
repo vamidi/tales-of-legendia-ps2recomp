@@ -342,18 +342,23 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             }
 
             const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            // TEMP DIAGNOSTIC (boot-stall triage).
-            std::cerr << "[VIF1-path2] pending=" << m_vif1PendingPath2ImageQwc << " chunkQw=" << chunkQw
-                      << " pos=" << pos << " size=" << sizeBytes << std::endl;
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-            std::cerr << "[VIF1-path2] submitted chunkQw=" << chunkQw << std::endl;
+            // Session 38: a pending image transfer means the guest's GIF tag is
+            // still unfulfilled - the VIF1 DMA ended mid-tag, so this data is a
+            // *continuation* of that tag, not a new packet.  Synthesizing a
+            // fresh FLG=IMAGE tag here injected 16 extra bytes per chunk that
+            // parallel-gs consumed as payload: measured 36k tags submitted but
+            // only ~500 tag boundaries ever observed, with 1.1 MB parsed as
+            // image and 5.1 MB parsed as packed data.  Forward the raw QWs so
+            // the outstanding tag's NLOOP can be satisfied and the TRXREG
+            // transfer can actually complete.
+            static uint64_t s_p2Chunks = 0u;
+            if ((++s_p2Chunks & 0xFFFu) == 0u)
+            {
+                std::cerr << "[VIF1-path2] chunks=" << s_p2Chunks
+                          << " pending=" << m_vif1PendingPath2ImageQwc << " chunkQw=" << chunkQw
+                          << " pos=" << pos << " size=" << sizeBytes << std::endl;
+            }
+            submitGifPacket(GifPathId::Path2, data + pos, chunkQw * 16u, true, m_vif1PendingPath2DirectHl);
 
             pos += chunkQw * 16u;
             m_vif1PendingPath2ImageQwc -= chunkQw;
