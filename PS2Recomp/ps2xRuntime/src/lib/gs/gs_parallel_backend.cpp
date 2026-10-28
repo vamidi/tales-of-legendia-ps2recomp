@@ -189,6 +189,7 @@ namespace
             static uint64_t s_gifImageBytes = 0u;
             static uint64_t s_gifDrawTags = 0u;
             static uint64_t s_gifTags = 0u;
+            static uint64_t s_flg[4] = {0u, 0u, 0u, 0u};
             static uint32_t s_gifPrints = 0u;
             // Session 39: the census tracks *bytes*, which cannot distinguish
             // "the guest stopped submitting geometry" from "the guest submits
@@ -196,12 +197,19 @@ namespace
             // Count the A+D writes that actually drive rasterisation instead.
             static uint64_t s_adPrim = 0u;    // PRIM (0x00)     - one per primitive
             static uint64_t s_adXyz = 0u;     // XYZ2 (0x05)     - one per vertex
-            static uint64_t s_adTex = 0u;     // TEX0_1 (0x40)   - one per textured prim
-            static uint64_t s_adFrame = 0u;   // FRAME_1 (0x4C)  - drawing area setup
-            static uint64_t s_adXyoff = 0u;   // XYOFFSET_1 (0x18)
-            static uint32_t s_lastFrame = 0u;
-            static uint32_t s_lastXyoff = 0u;
-            static uint64_t s_lastScissor = 0u;
+            static uint64_t s_adTex = 0u;     // TEX0_1 (0x06)
+            static uint64_t s_adFrame = 0u;   // FRAME_1 (0x1A)
+            // Session 40: per-context capture with the real GS register map.
+            // Session 39 read 0x40/0x4C/0x18 and called them TEX0_1/FRAME_1/
+            // XYOFFSET_1; they are in fact context-2 registers (context 2 =
+            // context 1 + 0x3A) and PABE.  A game is free to leave context 2
+            // unconfigured, so only the per-context split can say anything.
+            static uint32_t s_xyoff1 = 0u, s_xyoff2 = 0u;
+            static uint64_t s_scissor1 = 0u, s_scissor2 = 0u;
+            static uint32_t s_frame1 = 0u, s_frame2 = 0u;
+            static uint32_t s_test1 = 0u, s_alpha1 = 0u;
+            static uint64_t s_xyzSample[3] = {0u, 0u, 0u};
+            static uint32_t s_xyzSampleN = 0u;
             static uint64_t s_xyzIn = 0u, s_xyzOut = 0u;
             static int32_t s_minX = 0x7FFFFFFF, s_maxX = -0x7FFFFFFF;
             static int32_t s_minY = 0x7FFFFFFF, s_maxY = -0x7FFFFFFF;
@@ -214,6 +222,7 @@ namespace
                     std::memcpy(&state.tag, data + offset, 16);
                     state.reg = state.loop = 0;
                     ++s_gifTags;
+                    ++s_flg[state.tag.FLG & 3u];
                     offset += 16;
                     continue;
                 }
@@ -238,6 +247,10 @@ namespace
                         case 0x05:
                         {
                             ++s_adXyz;
+                            if (s_xyzSampleN < 3u)
+                            {
+                                s_xyzSample[s_xyzSampleN++] = adValue;
+                            }
                             // XYZ2 is 12.4 fixed point, X in bits 0-15, Y in 16-31.
                             const int32_t vx = (static_cast<int32_t>(adValue & 0xFFFFu) << 16) >> 20;
                             const int32_t vy = (static_cast<int32_t>((adValue >> 16) & 0xFFFFu) << 16) >> 20;
@@ -252,9 +265,15 @@ namespace
                             break;
                         }
                         case 0x06: ++s_adTex; break;
-                        case 0x40: s_lastScissor = adValue; break;
-                        case 0x4C: ++s_adFrame; s_lastFrame = uint32_t(adValue); break;
-                        case 0x18: ++s_adXyoff; s_lastXyoff = uint32_t(adValue); break;
+                        case 0x09: s_xyoff1 = uint32_t(adValue); break;         // XYOFFSET_1 (32-bit)
+                        case 0x13: s_alpha1 = uint32_t(adValue); break;         // ALPHA_1
+                        case 0x17: s_test1 = uint32_t(adValue); break;          // TEST_1
+                        case 0x1A: ++s_adFrame; s_frame1 = uint32_t(adValue); break; // FRAME_1
+                        case 0x12: s_scissor1 = adValue; break;                 // SCISSOR_1
+                        case 0x40: break;                                       // TEX0_2
+                        case 0x43: s_xyoff2 = uint32_t(adValue); break;         // XYOFFSET_2
+                        case 0x4C: s_scissor2 = adValue; break;                 // SCISSOR_2
+                        case 0x54: s_frame2 = uint32_t(adValue); break;          // FRAME_2
                         default: break;
                         }
                     }
@@ -286,9 +305,17 @@ namespace
                           << transfer.totalPixels << " prim=" << s_adPrim << " xyz=" << s_adXyz
                           << " in=" << s_xyzIn << " out=" << s_xyzOut << " X=" << s_minX << ".."
                           << s_maxX << " Y=" << s_minY << ".." << s_maxY << " tex=" << s_adTex
-                          << " frame=" << s_adFrame << " xyoff=" << s_adXyoff << " lastFrame=0x"
-                          << std::hex << s_lastFrame << " lastXyoff=0x" << s_lastXyoff
-                          << " scissor=0x" << s_lastScissor << std::dec << std::endl;
+                          << " frame=" << s_adFrame << std::hex << " F1=0x" << s_frame1
+                          << " S1=0x" << s_scissor1 << " XY1=0x" << s_xyoff1 << " T1=0x" << s_test1
+                          << " A1=0x" << s_alpha1 << " F2=0x" << s_frame2 << " S2=0x" << s_scissor2
+                          << " XY2=0x" << s_xyoff2 << " v0=0x" << s_xyzSample[0] << " v1=0x"
+                          << s_xyzSample[1] << " v2=0x" << s_xyzSample[2]
+                          << " flg=" << s_flg[0] << "/" << s_flg[1] << "/" << s_flg[2] << "/"
+                          << s_flg[3] << " ourFLG=" << unsigned(state.tag.FLG) << " ourNLOOP="
+                          << state.tag.NLOOP << " ourLoop=" << state.loop << " upFLG="
+                          << unsigned(gs.get_gif_path(path).tag.FLG) << " upNLOOP="
+                          << gs.get_gif_path(path).tag.NLOOP << " upLoop="
+                          << gs.get_gif_path(path).loop << std::dec << std::endl;
             }
         }
 

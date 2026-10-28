@@ -2738,6 +2738,52 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 40 - the Session 39 register readings were the wrong registers
+
+Session 39 claimed the guest draws with an unrenderable state (`SCISSOR_1=0x100000001`,
+`FRAME_1 FBW=0`, `XYOFFSET_1=0x7000`). **That claim is void: those reads used the wrong
+addresses.** The GS register map is `TEX0_1=0x06`, `XYOFFSET_1=0x09`, `SCISSOR_1=0x12`,
+`ALPHA_1=0x13`, `TEST_1=0x17`, `PABE=0x18`, `FRAME_1=0x1A`, and context 2 = context 1 + 0x3A
+(`TEX0_2=0x40`, `XYOFFSET_2=0x43`, `SCISSOR_2=0x4C`, `FRAME_2=0x54`). So `0x40`/`0x4C` were
+context-2 registers (`TEX0_2`, `SCISSOR_2`) and `0x18` is `PABE`. A game may legitimately leave
+context 2 unconfigured; reading it says nothing about what gets drawn.
+
+**Two good things came out of the re-measurement.**
+
+1. *The draw environment is fine, and it does not arrive through the GIF stream at all.* Our
+   MMIO-tracked state reports `ctx0frame=224/8` - FBP=224, FBW=8, i.e. a correct 512-wide buffer.
+   The guest sets it via `sceGsPutDrawEnv`-style direct GS writes (`FUN_00113248`), not via GIF
+   A+D, so environment sanity was never the question.
+2. *Our tag walk is in sync with parallel-gs.* The census now echoes both parsers' state:
+   `ourFLG=2 ourNLOOP=c` vs `upFLG=2 upNLOOP=c` at the same point (`upstream` comes from
+   `gs.get_gif_path(path)` in `observeGIF`, which runs one call behind `gs.gif_transfer`). The tag
+   structure is therefore trustworthy: **65,657 FLG=0 (packed) + 1,984 FLG=1 (reglist) + 25,383
+   FLG=2 (image)** tags, 11,596 `PRIM`, 30,018 `XYZ2`, 403 `TEX0_1`.
+
+**But the per-register readings are still untrustworthy, and now we know why.** 1,984 of the
+93,024 tags are **FLG=1 (packed-reglist)**, which packs all A words for a loop first and then all
+D words - `observeGIF` walks it as if it were interleaved A/D (`count = 2`, `offset += 16`), so
+every register written through a reglist packet is misattributed. That is why context 1 reads as
+`F1=0x1 S1=0x0 XY1=0x5` while the MMIO path says FBP=224/FBW=8. Games use reglist packets
+precisely for vertex data, so this is exactly the path that matters.
+
+**One real contradiction is left standing.** The image path reports 3.47 MB uploaded with
+`px=384/384` completions, yet the VRAM census at ticks 3000/3300/3450 counts only **593 non-zero
+words** (~2.4 KB) in the entire 4 MB. `observeRegister`/`observeImage` model the transfer from our
+own parse; they do not prove parallel-gs wrote anything.
+
+**Next moves**
+1. Fix the FLG=1 walk in `observeGIF` (per loop: `nreg` A QWs, then `nreg` D QWs; carry partial
+   groups across calls). Only then are `SCISSOR_1`/`FRAME_1`/`XYOFFSET_1`/`TEX0_1` readings real,
+   and only then can the "off-screen vertices" result be interpreted.
+2. Re-check `XYZ2`: all 30,018 are outside 512x448 (`in=0`), with samples `0x72007000` ->
+   (1792.0, 1824.0) and `0xaa009800` -> (2432.0, 2720.0). Those are clean 12.4 values, not noise,
+   so either the projection is producing screen coordinates for a larger/different target or the
+   guest is drawing off-screen deliberately.
+3. Resolve the upload contradiction: if 3.47 MB of image data really completes, ~870 k words
+   should be non-zero in VRAM, not 593. Either our transfer model is fiction or parallel-gs is
+   discarding. Querying parallel-gs's own state after `gs.gif_transfer` (not before) settles it.
+
 ### Session 39 - the guest DOES submit geometry; every bit of it is unrenderable
 
 Session 38 concluded "no scene geometry is submitted". That was wrong - the byte census could
@@ -2754,7 +2800,10 @@ boot to the end of the run:
 So roughly 11.6 k primitives and 30 k vertices reach parallel-gs, which receives every byte
 (`[GIFrecv] p2` == `[GIFsub-p2]`). The renderer is not dropping them and the guest is not idle.
 
-**The problem is the GS state the primitives are drawn with.** Every value the census reports is
+**The problem is the GS state the primitives are drawn with.**
+*(Void - corrected in Session 40: the addresses used here were context-2 registers and PABE, not
+context 1. The real draw environment is set through the MMIO path and is sane (`ctx0frame=224/8`).
+Keep the counters below, discard the table and its conclusion.)* Every value the census reports is
 unrenderable, and all of them are constant for the whole run:
 
 | register | value | meaning |
