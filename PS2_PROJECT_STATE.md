@@ -2738,6 +2738,38 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 42 - the register numbering is the GIF table, and it invalidates Session 40
+
+`ps2xRuntime/include/runtime/gs/gs_types.h` is authoritative for the A+D D-field numbering, and
+it is the **GIF REGS table**, where context 1 and context 2 registers are *interleaved*:
+`TEX1_1=0x14, TEX1_2=0x15, TEX2_1=0x16, TEX2_2=0x17, XYOFFSET_1=0x18, XYOFFSET_2=0x19,
+PRMODECONT=0x1A, PRMODE=0x1B, TEXCLUT=0x1C, SCANMSK=0x22`.
+
+Session 40 replaced those with the hardware MMIO index map (`XYOFFSET_1=0x09`, `SCISSOR_1=0x12`,
+`FRAME_1=0x1A`, context 2 = +0x3A) and declared Session 39 void. **That correction was the
+mistake** - `0x18` *is* `XYOFFSET_1` in the numbering the D-field actually uses, so Session 39's
+`lastXyoff=0x7000` was a real XYOFFSET_1 read all along.
+
+Which dissolves the "all 30,018 vertices are off-screen" result. `XYOFFSET_1 = 0x72007000` means
+OFX = 0x7000 = 1792.0 and OFY = 0x7200 = 1824.0, and the hardware subtracts that offset from the
+`XYZ2` coordinates. The samples that looked off-screen - (1792.0, 1824.0) and (2432.0, 2720.0) -
+map to screen **(0,0) and (640,896)**. The `in=0 / out=30018` counter never applied the offset, so
+it measured nothing. The geometry is probably fine.
+
+Note the same value appearing twice is not a coincidence or a misparse: a game that sets
+XYOFFSET to (1792,1824) and then draws its first vertex at (1792,1824) is drawing at screen (0,0).
+
+**Corrected next moves**
+1. Re-run the coverage test *with* XYOFFSET applied, and print `snap.ctx[n].xyoffset` (already in
+   the snapshot) so the offset comes from the frontend's own tracked state rather than from the
+   GIF walk. If coverage becomes non-zero, the vertices are exonerated.
+2. Then look at what can suppress pixels while primitives still reach the rasteriser: TEST_1
+   (alpha/depth test that always fails), FRAME's COLMASK/ALPHAMASK (all write masks off),
+   ZBUF/PSM mismatch, or a scissor set from the MMIO path. `nzDisp2/nzCtx0/nzCtx1` say no buffer
+   anywhere receives a pixel, so it is a write-enable/test state problem, not a target-selection
+   problem.
+3. Do not re-derive GS register numbers by hand again - read them from `gs_types.h`.
+
 ### Session 41 - parallel-gs does rasterise; after the transition nothing lands in any buffer
 
 Added `gs.consume_flush_stats()` after `gs.gif_transfer` (`[GSpost]`). parallel-gs's own
