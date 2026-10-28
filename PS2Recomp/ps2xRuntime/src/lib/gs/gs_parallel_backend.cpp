@@ -236,6 +236,50 @@ namespace
             // FLG=1 (packed-reglist) sends nreg A words then nreg D words per
             // loop, so a loop can straddle a DMA call; park the A words here.
             static uint64_t s_reglistA[4][16] = {};
+            // Session 46: record *where* each parked A word came from, so a PRIM
+            // value can be shown next to the raw bytes it was read out of.  The
+            // CTXT=3 anomaly lives in the upper bits of the A word, which is
+            // exactly where the reglist pairing error would show up, so it has to
+            // be confirmed from raw bytes rather than from this walk's decode.
+            static size_t s_reglistAOff[4][16] = {};
+            static uint32_t s_primRawGood = 2u, s_primRawBad = 6u;
+            auto wantPrimRaw = [&]() -> bool {
+                if (s_gifBytes >= (12u << 20))
+                    return s_primRawBad != 0u;
+                return s_gifBytes >= (2u << 20) && s_primRawGood != 0u;
+            };
+            auto takePrimRaw = [&]() {
+                if (s_gifBytes >= (12u << 20))
+                    --s_primRawBad;
+                else
+                    --s_primRawGood;
+            };
+            // Print the raw QWs around a PRIM write: two before, the pair itself,
+            // two after.  In FLG=0 the A and D halves share one QW; in FLG=1 they
+            // are nreg QWs apart, and aOff marks the one this walk paired with.
+            auto primRawDump = [&](const char *flgKind, size_t dOff, size_t aOff, uint64_t aVal) {
+                std::cerr << "[GS-prim] phase=" << (s_gifBytes >= (12u << 20) ? "black" : "loading")
+                          << " path=" << unsigned(path) << " flg=" << flgKind
+                          << " bytes=" << s_gifBytes << "\n";
+                const size_t first = dOff >= 32u ? (dOff - 32u) & ~size_t(15u) : 0u;
+                const size_t last = std::min(size, dOff + 48u);
+                for (size_t q = first; q + 16u <= last; q += 16u)
+                {
+                    std::cerr << "   " << (q == dOff ? "D>" : (q == aOff ? "A>" : " ."))
+                              << " qword@0x" << std::hex << q << " = 0x" << word(data + q + 8)
+                              << ":" << word(data + q) << std::dec << "\n";
+                }
+                std::cerr << "   paired A=0x" << std::hex << aVal << std::dec
+                          << "  PRIM=" << unsigned(aVal & 7u)
+                          << " iip=" << unsigned((aVal >> 3) & 1u)
+                          << " tme=" << unsigned((aVal >> 4) & 1u)
+                          << " fge=" << unsigned((aVal >> 5) & 1u)
+                          << " abe=" << unsigned((aVal >> 6) & 1u)
+                          << " aa1=" << unsigned((aVal >> 7) & 1u)
+                          << " fst=" << unsigned((aVal >> 8) & 1u)
+                          << " ctxt=" << unsigned((aVal >> 9) & 3u)
+                          << " fix=0x" << std::hex << ((aVal >> 11) & 0x1FFFu) << std::dec << "\n";
+            };
             auto applyAD = [&](uint8_t adReg, uint64_t adValue) {
                 switch (adReg)
                 {
@@ -384,12 +428,20 @@ namespace
                         if (state.reg < nreg)
                         {
                             s_reglistA[path & 3u][state.reg] = word(data + offset);
+                            s_reglistAOff[path & 3u][state.reg] = offset;
                             ++state.reg;
                         }
                         else
                         {
                             const uint32_t k = state.reg - nreg;
-                            applyAD(uint8_t(word(data + offset) & 127), s_reglistA[path & 3u][k]);
+                            const uint64_t dWord = word(data + offset);
+                            const uint64_t aWord = s_reglistA[path & 3u][k];
+                            applyAD(uint8_t(dWord & 127), aWord);
+                            if ((dWord & 0xFFu) == 0x00u && wantPrimRaw())
+                            {
+                                takePrimRaw();
+                                primRawDump("reglist", offset, s_reglistAOff[path & 3u][k], aWord);
+                            }
                             ++state.reg;
                         }
                         offset += 16;
@@ -412,6 +464,11 @@ namespace
                         observeRegister(adReg, adValue);
                     }
                     applyAD(adReg, adValue);
+                    if (adReg == 0x00u && wantPrimRaw())
+                    {
+                        takePrimRaw();
+                        primRawDump("packed", offset, offset, adValue);
+                    }
                     if (++state.reg == nreg)
                     {
                         state.reg = 0;

@@ -2738,6 +2738,67 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 46 - CTXT=3 was probe error again; the raw stream is an on-screen triangle strip
+
+Triggered the raw dump on the A+D write itself (`D & 0xFF == 0x00`) in both the packed and the
+reglist path, printing the QW plus two either side, and marking which QW this walk had parked as
+the paired A word. Result: **the CTXT=3 anomaly is an artifact of the broken reglist pairing, and
+the walk cannot be used to interpret the stream at all - not values, not counts.**
+
+Reglist packet, bytes=12,607,936 (the walk calls the QW at 0xa0 a D word with register 0):
+
+    A> qword@0x80 = 0x80007400:72007000
+     . qword@0x90 = 0x80007800:72007400
+    D> qword@0xa0 = 0x80007c00:72007800      <- "PRIM write", reg = 0x7800 & 0x7F = 0
+     . qword@0xb0 = 0x80008000:72007c00
+     . qword@0xc0 = 0x80008400:72008000
+    paired A=0x72007000  PRIM=0 ... ctxt=0
+
+That "D word" is `0x72007800` - **vertex data whose low 7 bits happen to be zero**, not a register
+descriptor. Reading the 8-byte stream straight across the QW boundaries gives XYZ2 values
+(X = bits 0-15, Y = bits 16-31, 12.4 fixed):
+
+| raw | X | Y |
+|---|---|---|
+| 0x72007000 | 1792.0 | 1824.0 |
+| 0x80007400 | 1856.0 | 2048.0 |
+| 0x72007400 | 1856.0 | 1824.0 |
+| 0x80007800 | 1920.0 | 2048.0 |
+| 0x72007800 | 1920.0 | 1824.0 |
+| 0x80007c00 | 1984.0 | 2048.0 |
+
+X steps by 64.0 while Y alternates 1824.0 / 2048.0 - a **triangle strip of quads**. With the
+frontend's XYOFFSET (1792, 1824) applied, the screen coordinates are (0,0), (64,224), (64,0),
+(128,224), (128,0), (192,224) ... i.e. a strip tiling the viewport. The geometry is unambiguously
+fine, and the same pattern is present in both the loading and the black phase.
+
+The packed-path trigger shows the same failure mode from the other side: the QW the walk read as
+`PRIM=0x7ff8` is `qword@0x30 = 0x800000000000:7ff8` - the walk took `0x7ff8` as the A word and
+`0x800000000000 & 0x7F == 0` as the register. So `0x7ff8`, `CTXT=3`, the `ptype` histogram
+(66,338 Point / 3,574 Sprite) and `prim=69,912` are all inflated or fabricated by false positives on
+vertex data. **Only parallel-gs's own accounting is trustworthy: `prims=58,273`, `passes=1,077`.**
+
+That closes out the last surviving lead from Session 45. What is left, stated only from instruments
+that have been verified:
+
+1. parallel-gs runs 1,077 render passes containing 58,273 primitives (`consume_flush_stats`).
+2. After `flush_submit` + `wait_timeline`, the host VRAM image contains 593 non-zero words in
+   4 MiB (census via `map_vram_read`).
+3. Its own `ContextState` is sane: scissor 0,0..511,447, CMASK 0, ZMSK 0, ATE=0, ZTST=GEQUAL against
+   a zeroed Z buffer, FRAME 224/8, XYOFFSET 1792/1824.
+4. The stream carries an on-screen triangle strip tiling the viewport, in both phases.
+5. Display reads FBP 0 (`DISPFB2=0x1000`) while FRAME says FBP 224 - real, but nothing is rendered
+   anywhere, so it cannot be the cause.
+
+**Next move:** the contradiction is now between (1) and (2), and the only place left for it is
+parallel-gs's page tracking - whether render-pass results are copied back into the image
+`begin_host_vram_access()` returns, or stay in per-page render targets. Read `page_tracker.cpp`
+for when a page's render target is written back (`commit_host_write` / `flush_render_pass` /
+`register_accessed_readback_page`) and check whether `map_vram_read`'s `get_host_read_timeline`
+path actually forces that copy for pages that were only ever *written* by the rasteriser. If it
+does not, the census has been reading a stale image all along and the scene may in fact be rendered
+- in which case the black screen really is the FBP 0 vs FBP 224 mismatch after all.
+
 ### Session 45 - raw PACKED packets decode cleanly and on-screen; geometry, colour and TEST are all exonerated
 
 Added a raw-packet capture at the tag boundary in `observeGIF` (one PACKED packet at >= 2 MiB,
