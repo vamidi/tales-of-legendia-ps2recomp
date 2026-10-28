@@ -177,7 +177,9 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
                  "[FB-dump] %s census: nzWords=%llu range=0x%llX..0x%llX dense=0x%X:%u 0x%X:%u 0x%X:%u "
                  "nzDisp2=%llu nzCtx0=%llu nzCtx1=%llu "
                  "pmode=0x%llX dispfb1=0x%llX dispfb2=0x%llX "
-                 "ctx0frame=%u/%u/0x%02X ctx1frame=%u/%u/0x%02X\n",
+                 "ctx0frame=%u/%u/0x%02X ctx1frame=%u/%u/0x%02X "
+                 "c0xy=0x%X/0x%X c0sc=%u,%u..%u,%u c0fbmsk=0x%X c0zmask=%d c0test=0x%llX "
+                 "c1xy=0x%X/0x%X c1sc=%u,%u..%u,%u c1fbmsk=0x%X c1zmask=%d c1test=0x%llX\n",
                  tag,
                  static_cast<unsigned long long>(nzCount),
                  nzCount != 0u ? static_cast<unsigned long long>(nzFirst) : 0ull,
@@ -192,7 +194,17 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
                  static_cast<unsigned long long>(regs.dispfb1),
                  static_cast<unsigned long long>(regs.dispfb2),
                  snap.ctx[0].frame.fbp, snap.ctx[0].frame.fbw, static_cast<unsigned>(snap.ctx[0].frame.psm),
-                 snap.ctx[1].frame.fbp, snap.ctx[1].frame.fbw, static_cast<unsigned>(snap.ctx[1].frame.psm));
+                 snap.ctx[1].frame.fbp, snap.ctx[1].frame.fbw, static_cast<unsigned>(snap.ctx[1].frame.psm),
+                 static_cast<unsigned>(snap.ctx[0].xyoffset.ofx), static_cast<unsigned>(snap.ctx[0].xyoffset.ofy),
+                 static_cast<unsigned>(snap.ctx[0].scissor.x0), static_cast<unsigned>(snap.ctx[0].scissor.y0),
+                 static_cast<unsigned>(snap.ctx[0].scissor.x1), static_cast<unsigned>(snap.ctx[0].scissor.y1),
+                 snap.ctx[0].frame.fbmsk, static_cast<int>(snap.ctx[0].zbuf.zmask),
+                 static_cast<unsigned long long>(snap.ctx[0].test),
+                 static_cast<unsigned>(snap.ctx[1].xyoffset.ofx), static_cast<unsigned>(snap.ctx[1].xyoffset.ofy),
+                 static_cast<unsigned>(snap.ctx[1].scissor.x0), static_cast<unsigned>(snap.ctx[1].scissor.y0),
+                 static_cast<unsigned>(snap.ctx[1].scissor.x1), static_cast<unsigned>(snap.ctx[1].scissor.y1),
+                 snap.ctx[1].frame.fbmsk, static_cast<int>(snap.ctx[1].zbuf.zmask),
+                 static_cast<unsigned long long>(snap.ctx[1].test));
     DumpGsAdHistogram(tag);
 
     // DISPFB shares FRAME_1's packed layout: FBP[0:8] (2048-byte pages),

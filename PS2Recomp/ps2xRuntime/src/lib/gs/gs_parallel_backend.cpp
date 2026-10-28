@@ -195,31 +195,68 @@ namespace
             // "the guest stopped submitting geometry" from "the guest submits
             // geometry and we drop it" - both end with an empty draw buffer.
             // Count the A+D writes that actually drive rasterisation instead.
+            // Register numbers for the A+D D-field come from gs_types.h, which is
+            // the GIF REGS table with the two contexts interleaved (XYOFFSET_1 =
+            // 0x18, SCISSOR_1 = 0x40, FRAME_1 = 0x4C, ...).  Session 40 swapped in
+            // the hardware MMIO index map and that is what made the echo read as
+            // garbage; the low registers (PRIM 0x00, RGBAQ 0x01, XYZ2 0x05,
+            // TEX0_1 0x06) are the same in both schemes.
             static uint64_t s_adPrim = 0u;    // PRIM (0x00)     - one per primitive
             static uint64_t s_adXyz = 0u;     // XYZ2 (0x05)     - one per vertex
             static uint64_t s_adTex = 0u;     // TEX0_1 (0x06)
-            static uint64_t s_adFrame = 0u;   // FRAME_1 (0x1A)
-            // Session 40: per-context capture with the real GS register map.
-            // Session 39 read 0x40/0x4C/0x18 and called them TEX0_1/FRAME_1/
-            // XYOFFSET_1; they are in fact context-2 registers (context 2 =
-            // context 1 + 0x3A) and PABE.  A game is free to leave context 2
-            // unconfigured, so only the per-context split can say anything.
+            static uint64_t s_adFrame = 0u;   // FRAME_1 (0x4C)
+            static uint64_t s_adRgba = 0u;    // RGBAQ (0x01)    - one per vertex/colour
             static uint32_t s_xyoff1 = 0u, s_xyoff2 = 0u;
             static uint64_t s_scissor1 = 0u, s_scissor2 = 0u;
             static uint32_t s_frame1 = 0u, s_frame2 = 0u;
             static uint32_t s_test1 = 0u, s_alpha1 = 0u;
+            static uint64_t s_zbuf1 = 0u;     // ZBUF_1 (0x4E)
             static uint64_t s_xyzSample[3] = {0u, 0u, 0u};
             static uint32_t s_xyzSampleN = 0u;
             static uint64_t s_xyzIn = 0u, s_xyzOut = 0u;
             static int32_t s_minX = 0x7FFFFFFF, s_maxX = -0x7FFFFFFF;
             static int32_t s_minY = 0x7FFFFFFF, s_maxY = -0x7FFFFFFF;
+            // Session 43: the VRAM census counts *non-zero* words, so it cannot
+            // tell "nothing was rasterised" from "everything was rasterised in
+            // black".  parallel-gs reports 49.5k primitives and 915 render passes
+            // after the transition, so colour is now a first-class suspect.  Count
+            // what RGBAQ actually carries: R/G/B are bits 0-23, A is bits 24-31.
+            static uint64_t s_rgbBlack = 0u;   // R=G=B=0
+            static uint64_t s_rgbOpaque = 0u;  // A == 0xFF
+            static uint64_t s_rgbZeroA = 0u;   // A == 0
+            static uint64_t s_rgbaSample[3] = {0u, 0u, 0u};
+            static uint32_t s_rgbaSampleN = 0u;
+            // PRIM flags: IIP bit 0, TME bit 1, FGE bit 2, ABE bit 3, FST bit 5.
+            static uint64_t s_primTme = 0u, s_primAbe = 0u, s_primFge = 0u, s_primIip = 0u;
+            static uint64_t s_primSample[3] = {0u, 0u, 0u};
+            static uint32_t s_primSampleN = 0u;
             // FLG=1 (packed-reglist) sends nreg A words then nreg D words per
             // loop, so a loop can straddle a DMA call; park the A words here.
             static uint64_t s_reglistA[4][16] = {};
             auto applyAD = [&](uint8_t adReg, uint64_t adValue) {
                 switch (adReg)
                 {
-                case 0x00: ++s_adPrim; break;
+                case 0x00:
+                    ++s_adPrim;
+                    if (adValue & 0x2u) ++s_primTme;
+                    if (adValue & 0x8u) ++s_primAbe;
+                    if (adValue & 0x4u) ++s_primFge;
+                    if (adValue & 0x1u) ++s_primIip;
+                    if (s_primSampleN < 3u)
+                    {
+                        s_primSample[s_primSampleN++] = adValue;
+                    }
+                    break;
+                case 0x01:
+                    ++s_adRgba;
+                    if ((adValue & 0x00FFFFFFull) == 0u) ++s_rgbBlack;
+                    if (((adValue >> 24) & 0xFFu) == 0xFFu) ++s_rgbOpaque;
+                    if (((adValue >> 24) & 0xFFu) == 0u) ++s_rgbZeroA;
+                    if (s_rgbaSampleN < 3u)
+                    {
+                        s_rgbaSample[s_rgbaSampleN++] = adValue;
+                    }
+                    break;
                 case 0x05:
                 {
                     ++s_adXyz;
@@ -227,28 +264,32 @@ namespace
                     {
                         s_xyzSample[s_xyzSampleN++] = adValue;
                     }
-                    // XYZ2 is 12.4 fixed point, X in bits 0-15, Y in 16-31.
+                    // XYZ2 is 12.4 fixed point, X in bits 0-15, Y in 16-31.  The
+                    // hardware subtracts XYOFFSET before clipping, so raw values
+                    // near the offset are on-screen; keep the raw extent only.
                     const int32_t vx = (static_cast<int32_t>(adValue & 0xFFFFu) << 16) >> 20;
                     const int32_t vy = (static_cast<int32_t>((adValue >> 16) & 0xFFFFu) << 16) >> 20;
                     if (vx < s_minX) s_minX = vx;
                     if (vx > s_maxX) s_maxX = vx;
                     if (vy < s_minY) s_minY = vy;
                     if (vy > s_maxY) s_maxY = vy;
-                    if (vx >= 0 && vx < 512 && vy >= 0 && vy < 448)
+                    const int32_t ox = static_cast<int32_t>(s_xyoff1 & 0xFFFFu) >> 4;
+                    const int32_t oy = static_cast<int32_t>(s_xyoff1 >> 16) >> 4;
+                    const int32_t sx = vx - ox, sy = vy - oy;
+                    if (sx >= 0 && sx < 512 && sy >= 0 && sy < 448)
                         ++s_xyzIn;
                     else
                         ++s_xyzOut;
                     break;
                 }
-                case 0x06: ++s_adTex; break;                              // TEX0_1
-                case 0x09: s_xyoff1 = uint32_t(adValue); break;            // XYOFFSET_1 (32-bit)
-                case 0x12: s_scissor1 = adValue; break;                    // SCISSOR_1
-                case 0x13: s_alpha1 = uint32_t(adValue); break;            // ALPHA_1
-                case 0x17: s_test1 = uint32_t(adValue); break;             // TEST_1
-                case 0x1A: ++s_adFrame; s_frame1 = uint32_t(adValue); break; // FRAME_1
-                case 0x43: s_xyoff2 = uint32_t(adValue); break;            // XYOFFSET_2
-                case 0x4C: s_scissor2 = adValue; break;                    // SCISSOR_2
-                case 0x54: s_frame2 = uint32_t(adValue); break;            // FRAME_2
+                case 0x06: ++s_adTex; break;                                // TEX0_1
+                case 0x18: s_xyoff1 = uint32_t(adValue); break;             // XYOFFSET_1
+                case 0x40: s_scissor1 = adValue; break;                     // SCISSOR_1
+                case 0x42: s_alpha1 = uint32_t(adValue); break;             // ALPHA_1
+                case 0x47: s_test1 = uint32_t(adValue); break;              // TEST_1
+                case 0x4C: ++s_adFrame; s_frame1 = uint32_t(adValue); break; // FRAME_1
+                case 0x4D: s_frame2 = uint32_t(adValue); break;             // FRAME_2
+                case 0x4E: s_zbuf1 = adValue; break;                        // ZBUF_1
                 default: break;
                 }
             };
@@ -321,7 +362,7 @@ namespace
                     offset += 16;
                 }
             }
-            if (s_gifPrints < 40u && s_gifBytes >= (static_cast<uint64_t>(s_gifPrints + 1u) << 18))
+            if (s_gifPrints < 200u && s_gifBytes >= (static_cast<uint64_t>(s_gifPrints + 1u) << 18))
             {
                 ++s_gifPrints;
                 std::cerr << "[GS-census] bytes=" << s_gifBytes << " tags=" << s_gifTags
@@ -331,7 +372,14 @@ namespace
                           << transfer.totalPixels << " prim=" << s_adPrim << " xyz=" << s_adXyz
                           << " in=" << s_xyzIn << " out=" << s_xyzOut << " X=" << s_minX << ".."
                           << s_maxX << " Y=" << s_minY << ".." << s_maxY << " tex=" << s_adTex
-                          << " frame=" << s_adFrame << std::hex << " F1=0x" << s_frame1
+                          << " frame=" << s_adFrame
+                           << " rgba=" << s_adRgba << " black=" << s_rgbBlack << " a0="
+                           << s_rgbZeroA << " a255=" << s_rgbOpaque << " tme=" << s_primTme
+                           << " abe=" << s_primAbe << " fge=" << s_primFge << " iip="
+                           << s_primIip
+                           << std::hex << " c0=0x" << s_rgbaSample[0] << " c1=0x"
+                           << s_rgbaSample[1] << " c2=0x" << s_rgbaSample[2] << " p0=0x"
+                           << s_primSample[0] << " Z1=0x" << s_zbuf1 << " F1=0x" << s_frame1
                           << " S1=0x" << s_scissor1 << " XY1=0x" << s_xyoff1 << " T1=0x" << s_test1
                           << " A1=0x" << s_alpha1 << " F2=0x" << s_frame2 << " S2=0x" << s_scissor2
                           << " XY2=0x" << s_xyoff2 << " v0=0x" << s_xyzSample[0] << " v1=0x"
@@ -454,7 +502,7 @@ namespace
                 s_psCopies += stats.num_copies;
                 s_psPalettes += stats.num_palette_updates;
                 s_psBytes += size;
-                if (s_psPrints < 40u && s_psBytes >= (static_cast<uint64_t>(s_psPrints + 1u) << 18))
+                if (s_psPrints < 200u && s_psBytes >= (static_cast<uint64_t>(s_psPrints + 1u) << 18))
                 {
                     ++s_psPrints;
                     std::cerr << "[GSpost] bytes=" << s_psBytes << " prims=" << s_psPrims

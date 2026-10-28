@@ -2738,6 +2738,105 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 44 - the census is authoritative; the primitives are clipped, and my GIF walk is not a usable instrument
+
+**The census can be trusted, and that is now proven rather than assumed.** `GS::snapshotVRAM()`
+ends in `GSInterface::map_vram_read` (`parallel_gs-src/gs/gs_interface.cpp:4240`), which calls
+`tracker.get_host_read_timeline` / `renderer.flush_submit` / `renderer.wait_timeline` before
+returning the host pointer. Reading VRAM *forces every pending render pass to complete into the
+returned memory*. The all-zero readings after the transition are genuinely absent pixels, not a
+stale-shadow artifact. This retroactively validates the Sessions 41/43 VRAM numbers.
+
+**And the display never reads emulated VRAM.** `GSParallelBackend::Present` ends in
+`interop.present(gs.vsync(info))` - parallel-gs composites from its own host pages. "The window is
+black" and "VRAM is zero" are two independent observations that agree.
+
+New A+D accounting (RGBAQ counts, PRIM flag decode, offset-corrected coverage) with the corrected
+register numbering. The reliable part is the counts:
+
+    prim=70728 xyz=133912 rgba=115466 black=1405 a0=1672 a255=0 tme=3614 abe=21458 fge=3614
+    [GSpost] bytes=47186000 prims=58273 passes=1077 copies=109405 palettes=1711
+
+"The game renders everything in black" is **out**: of 115,466 RGBAQ writes only 1,405 carry
+R=G=B=0 and only 1,672 carry A=0. Colours are being submitted.
+
+**The walk's per-register *values* are still wrong, and that is now proven, not suspected.** The
+walk reports `F1=0x80070` for FRAME_1 while parallel-gs's own `ContextState` says FRAME = FBP 224 /
+FBW 8 / PSM 0. `0x80070` decodes as FBP=112, FBW=0, PSM=8 - malformed. Its low 9 bits coincide with
+the *other* sample (`F2=0x800e0` = FBP 224), which is what made it look plausible for two sessions.
+Same for `XY1=0x7000` where parallel-gs holds OFX 0x7000 **and** OFY 0x7200. The FLG=1 A/D pairing
+is still off, so every conclusion resting on walk-read values - including `in=0/out=133912` even
+after applying the offset, and the whole "off-screen vertices" line of argument - is void. Counts are
+roughly right (70,728 vs parallel-gs's 58,273); values are not.
+
+**Where that leaves the diagnosis.** Every trustworthy source agrees: draw state is sane
+(parallel-gs's own `ContextState`: scissor 0,0..511,447, CMASK 0, ZMSK off, tests off, FRAME 224/8,
+XYOFFSET 1792/1824), colours are non-black, 58,273 primitives enter 1,077 real render passes, and
+the flushed result contains no colour *and no Z* anywhere in VRAM. parallel-gs has a path for
+exactly this shape - `gs_interface.cpp:2573`, *"Degenerate BB. Can happen if primitive is clipped
+away completely by scissor"* - and `draw_is_degenerate()` at 2046. The only unmeasured quantity is
+the vertex data itself.
+
+Supporting: the streaming run reports **no** missing functions at all, and VU1 microprograms do
+execute (`vu1 returned after spins=1 status=0`, x360). Tag mix is 65,657 FLG=0 (PACKED) vs 25,383
+FLG=2 (IMAGE) - the geometry arrives as packed packets, through the same VIF1 path2 code whose
+continuation was fixed in Session 38.
+
+**Next move - stop reading the GIF stream ourselves; sample it at the producer.** Add a bounded
+probe in `ps2_vif1_interpreter.cpp` where path2 forwards packed QWs: a per-path FLG histogram and
+the first ~8 raw QWs of the first PACKED packet after the transition, dumped verbatim. PRIM/XYZ2/
+RGBAQ layouts are documented, so a hand-decoded packet answers "is the geometry garbage" with no
+walk involved. Sane screen coordinates -> the fault is in what we hand parallel-gs; garbage -> the
+VIF1 unpack/continuation is corrupting vertices and that is the bug.
+
+### Session 43 - the rasteriser is very active after the transition; the census cannot see black
+
+The 40-print cap on `[GS-census]`/`[GSpost]` was exactly 10,485,760 bytes, which is where the
+series ended - the cap was hit, so most of the run had been silent. Raised to 200 prints
+(51 MiB). The real totals for a B-streaming run, correlated with `[DIAG-vb]` ticks in the
+interleaved log:
+
+    tick ~3210 : bytes 10.5 MB, prims 14,446, passes 268, copies 23,845
+    tick ~5220 : bytes 39.8 MB, prims 49,525, passes 915, copies 92,234
+
+So GIF traffic does **not** stop at the transition - it continues to ~40 MB, and parallel-gs keeps
+processing primitives throughout the black phase (49.5 k primitives, 915 render passes, 92 k
+copies). The game is not idle and the renderer is not stalled.
+
+The per-context state from parallel-gs's own snapshot is *sane* in both phases:
+
+| | loading (renders) | after transition (black) |
+|---|---|---|
+| `c0xy` | 0x7000/0x7200 (OFX 1792.0, OFY 1824.0) | same |
+| `c0sc` | 0,0..511,447 (full screen) | same |
+| `c0fbmsk` | 0x0 (all columns enabled) | same |
+| `c0zmask` | 0 | 0 |
+| `c0test` | 0x5000D (ATE=0, DATE=0 - tests off) | 0x50000 |
+| `c1test` | 0x0 (unconfigured) | 0x5000C |
+| `ctx0frame` | 224/8/0x00 | 224/8/0x00 |
+| `ctx1frame` | 0/0/0x00 | 224/8/0x00 |
+| `dispfb2` | 0x1000 (FBP 0, FBW 8) | same |
+
+Scissor covers the whole screen, write masks are open, alpha and depth tests are disabled, the
+frame target and offset are valid. Nothing in the state can explain zero output.
+
+**And the census has a blind spot that matters now:** it counts *non-zero words*. A scene rendered
+entirely in black (RGBA = 0, e.g. a missing CLUT/palette or A=0 blending) writes 0x00000000
+everywhere, which is indistinguishable from "nothing was written". With 49 k primitives and 915
+render passes actually being processed, "drawn black" is now at least as likely as "nothing
+drawn". The loading screen proves the pipeline can produce non-zero output (32,768 words), so
+what changed is what the game submits, not our ability to render it.
+
+**Next moves**
+1. Add a per-buffer *change* detector to the census (a checksum of the FBP window taken at each
+   dump). If the window changes between dumps while `nzWords` stays 0, writes of zero are
+   happening and the fault is in colour/alpha/CLUT, not in geometry or clipping.
+2. Print `RGBAQ`/`COLCLAMP`/`ALPHA_1`/`zbuf.psm` from the same snapshot - `zbuf.psm == 0` means
+   the Z buffer is disabled, which is why even Z writes cannot break the all-zero tie.
+3. The register numbering question is settled: use `gs_types.h` (`SCISSOR_1=0x40`, `FRAME_1=0x4C`,
+   `XYOFFSET_1=0x18`, `TEST_1=0x47`, `ZBUF_1=0x4E`). Session 40's MMIO-map "correction" was wrong
+   and Session 39's readings were right.
+
 ### Session 42 - the register numbering is the GIF table, and it invalidates Session 40
 
 `ps2xRuntime/include/runtime/gs/gs_types.h` is authoritative for the A+D D-field numbering, and
