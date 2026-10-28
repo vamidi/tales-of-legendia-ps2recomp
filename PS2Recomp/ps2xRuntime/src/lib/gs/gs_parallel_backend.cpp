@@ -230,6 +230,9 @@ namespace
             static uint64_t s_primTme = 0u, s_primAbe = 0u, s_primFge = 0u, s_primIip = 0u;
             static uint64_t s_primSample[3] = {0u, 0u, 0u};
             static uint32_t s_primSampleN = 0u;
+            static uint64_t s_primType[8] = {};   // 0 Point 1 Line 2 LineStrip 3 Tri
+                                                 // 4 TriStrip 5 TriFan 6 Sprite
+            static uint64_t s_lastPrimVal = 0u;   // PRIM in force when a packet is dumped
             // FLG=1 (packed-reglist) sends nreg A words then nreg D words per
             // loop, so a loop can straddle a DMA call; park the A words here.
             static uint64_t s_reglistA[4][16] = {};
@@ -237,11 +240,16 @@ namespace
                 switch (adReg)
                 {
                 case 0x00:
+                    // parallel-gs's PRIMBits: PRIM bits 0-2, IIP 3, TME 4, FGE 5,
+                    // ABE 6, AA1 7, FST 8, CTXT 9-10.  The earlier flag decode
+                    // used bits 1/2/3 and so mislabelled every tme/fge/abe count.
                     ++s_adPrim;
-                    if (adValue & 0x2u) ++s_primTme;
-                    if (adValue & 0x8u) ++s_primAbe;
-                    if (adValue & 0x4u) ++s_primFge;
-                    if (adValue & 0x1u) ++s_primIip;
+                    s_lastPrimVal = adValue;
+                    ++s_primType[adValue & 7u];
+                    if (adValue & 0x8u) ++s_primIip;
+                    if (adValue & 0x10u) ++s_primTme;
+                    if (adValue & 0x20u) ++s_primFge;
+                    if (adValue & 0x40u) ++s_primAbe;
                     if (s_primSampleN < 3u)
                     {
                         s_primSample[s_primSampleN++] = adValue;
@@ -303,6 +311,56 @@ namespace
                     state.reg = state.loop = 0;
                     ++s_gifTags;
                     ++s_flg[state.tag.FLG & 3u];
+                    // Session 45: every conclusion about *why* nothing rasterises
+                    // has rested on this walk's decoded register values, and those
+                    // are now known to be mis-paired (FRAME_1 read as 0x80070 while
+                    // parallel-gs holds FBP 224 / FBW 8 / PSM 0).  So stop decoding:
+                    // dump the raw QWs of a few PACKED packets and hand-decode them.
+                    // Tag boundaries themselves are not in doubt - they mirror the
+                    // upstream state machine - and in FLG=0 each 16-byte group is
+                    // one A+D pair: low 8 bytes = A (the register's data), high 8
+                    // bytes = D (low 8 bits = GS register number).  One sample while
+                    // the loading screen still draws (>= 2 MiB) and five after the
+                    // transition (>= 12 MiB; the clear lands near 10 MiB).
+                    static uint32_t s_packGood = 1u, s_packBad = 5u;
+                    const uint32_t want = s_gifBytes >= (12u << 20) ? s_packBad
+                                      : (s_gifBytes >= (2u << 20) ? s_packGood : 0u);
+                    if (state.tag.FLG == 0u && want != 0u)
+                    {
+                        if (s_gifBytes >= (12u << 20))
+                            --s_packBad;
+                        else
+                            --s_packGood;
+                        std::cerr << "[GS-pack] phase=" << (s_gifBytes >= (12u << 20) ? "black" : "loading")
+                                  << " path=" << unsigned(path) << " bytes=" << s_gifBytes
+                                  << " NLOOP=" << state.tag.NLOOP << " NREG=" << state.tag.NREG
+                                  << " EOP=" << state.tag.EOP << " tag=0x" << std::hex
+                                  << word(data + offset + 8) << ":" << word(data + offset)
+                                  << " lastPRIM=0x" << s_lastPrimVal << std::dec
+                                  << " type=" << unsigned(s_lastPrimVal & 7u)
+                                  << " iip=" << unsigned((s_lastPrimVal >> 3) & 1u)
+                                  << " tme=" << unsigned((s_lastPrimVal >> 4) & 1u)
+                                  << " abe=" << unsigned((s_lastPrimVal >> 6) & 1u)
+                                  << " fst=" << unsigned((s_lastPrimVal >> 8) & 1u)
+                                  << " ctxt=" << unsigned((s_lastPrimVal >> 9) & 3u) << "\n";
+                        const size_t n = std::min<size_t>(12u, (size - offset - 16) / 16);
+                        uint32_t nXyz = 0u, nVtx = 0u;
+                        for (size_t k = 0; k < n; ++k)
+                        {
+                            const size_t q = offset + 16 + k * 16;
+                            const uint64_t dW = word(data + q + 8);
+                            if ((dW & 0xFFu) == 0x05u || (dW & 0xFFu) == 0x0Du)
+                                ++nXyz;
+                            if ((dW & 0xFFu) == 0x00u)
+                                ++nVtx;
+                            std::cerr << "   q" << k << " A=0x" << std::hex << word(data + q)
+                                      << " D=0x" << dW << std::dec << "\n";
+                        }
+                        std::cerr << "   window: qws=" << n << " xyz=" << nXyz
+                                  << " primInWindow=" << nVtx << " (NLOOP=" << state.tag.NLOOP
+                                  << " -> " << (state.tag.NLOOP * (state.tag.NREG ? state.tag.NREG : 16))
+                                  << " A+D pairs)\n";
+                    }
                     offset += 16;
                     continue;
                 }
@@ -376,7 +434,9 @@ namespace
                            << " rgba=" << s_adRgba << " black=" << s_rgbBlack << " a0="
                            << s_rgbZeroA << " a255=" << s_rgbOpaque << " tme=" << s_primTme
                            << " abe=" << s_primAbe << " fge=" << s_primFge << " iip="
-                           << s_primIip
+                           << s_primIip << " ptype=" << s_primType[0] << "/" << s_primType[1]
+                           << "/" << s_primType[2] << "/" << s_primType[3] << "/" << s_primType[4]
+                           << "/" << s_primType[5] << "/" << s_primType[6] << "/" << s_primType[7]
                            << std::hex << " c0=0x" << s_rgbaSample[0] << " c1=0x"
                            << s_rgbaSample[1] << " c2=0x" << s_rgbaSample[2] << " p0=0x"
                            << s_primSample[0] << " Z1=0x" << s_zbuf1 << " F1=0x" << s_frame1

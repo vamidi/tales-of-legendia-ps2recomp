@@ -2738,6 +2738,112 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 45 - raw PACKED packets decode cleanly and on-screen; geometry, colour and TEST are all exonerated
+
+Added a raw-packet capture at the tag boundary in `observeGIF` (one PACKED packet at >= 2 MiB,
+five at >= 12 MiB), dumping the tag plus the following QWs verbatim - no decoding, so nothing can
+be blamed on the walk. Tag boundaries are not in doubt; they mirror the upstream state machine.
+
+Loading phase, bytes=2,097,264, `NLOOP=12 NREG=1 EOP=1 FLG=0`, path 2:
+
+    q0 A=0x3f80000080445967 D=0x1  RGBAQ  R=0x67 G=0x59 B=0x44 A=0x80, Q=1.0f
+    q1 A=0x80038            D=0x3  UV     U=56  V=8
+    q2 A=0x150080e0821c     D=0xd  XYZ3   X=0x821c Y=0x80e0 Z=0x15008
+    q3 A=0x10800a8          D=0x3  UV     U=168 V=264
+    q4 A=0x150080e0826f     D=0x5  XYZ2   X=0x826f Y=0x80e0 Z=0x15008
+    q5 A=0x5120d            D=0x47 TEST_1
+
+Black phase, bytes=12,583,072 - same shape, same RGBAQ, same TEST:
+
+    q2 XYZ3  X=0x898f Y=0x80c0 Z=0x15008      q4 XYZ2  X=0x89ff Y=0x80c0
+
+Applying the frontend's own XYOFFSET (0x7000, 0x7200) = (1792.0, 1824.0):
+
+| phase | vertex | screen |
+|---|---|---|
+| loading | (2081.75, 2062.0) | **(289.75, 238.0)** |
+| loading | (2086.94, 2062.0) | **(294.94, 238.0)** |
+| black | (2200.94, 2060.0) | **(408.94, 236.0)** |
+| black | (2207.94, 2060.0) | **(415.94, 236.0)** |
+
+All four are inside the 512x448 scissor. **The geometry is on-screen.** Every "off-screen vertices"
+statement from Sessions 39-44 was probe error.
+
+TEST decoded with parallel-gs's own `TESTBits` (`gs_registers.hpp`: ATE bit 0, ATST bits 1-3,
+AREF bits 4-11, AFAIL bits 12-13, DATE bit 14, DATM bit 15, ZTE bit 16, ZTST bits 17-18;
+ZTST_NEVER=0, ALWAYS=1, GEQUAL=2, GREATER=3):
+
+| value | source | decode |
+|---|---|---|
+| 0x5120d | raw packet | ATE=1 ATST=6(EQUAL) AREF=0x20 AFAIL=1 DATE=1 ZTE=1 ZTST=2(GEQUAL) |
+| 0x5000D | snapshot ctx0, renders | ATE=1 ATST=6 AREF=0 AFAIL=0 DATE=1 ZTE=1 ZTST=2 |
+| 0x50000 | snapshot ctx0, black | **ATE=0** (alpha test off) DATE=1 ZTE=1 ZTST=2 |
+| 0x5000C | snapshot ctx1, black | **ATE=0** ATST=6 DATE=1 ZTE=1 ZTST=2 |
+
+In the black phase the alpha test is *disabled* and the depth test is GEQUAL against a Z buffer
+that reads zero, so both tests pass. `ZBUF_1 = 0x300000a8` decodes to ZBP=0xA8=168 (unit 2048 bytes
+-> byte 0x54000), ZPSM=3 (Z-32), ZMSK=0; during loading the first non-zero word in all of VRAM is
+0x54008, i.e. right at the Z base, so Z writes really did happen then and really do not now.
+
+**Display vs draw buffer, settled.** The game writes DISPFB2 = `0x1000` repeatedly (>= 12, capped)
+and never writes DISPFB1; `pmode=0x66` enables circuit 2 only. parallel-gs's `DISPFBBits` is
+FBP[0:8], FBW[9:14], PSM[15:19], DBX[32:42], DBY[43:53] and our frontend decodes it identically
+(`gs_frontend.cpp:212-214`), so `0x1000` = FBP 0, FBW 8, PSM 0 -> display reads byte 0, 512 wide,
+CT32, while FRAME says FBP 224. That mismatch is real, **but it is not the cause of the black
+screen**: the census reads all 4 MiB after a full `flush_submit`/`wait_timeline`, and finds 593
+non-zero words total, so nothing is rendered *anywhere*, at any FBP.
+
+Also visible in the black phase: the game issues BITBLTBUF/TRXPOS/TRXREG/TRXDIR writes through
+packed A+D (D=0x50/0x51/0x52/0x53, and D=0x0F for the AD pseudo-register - both match the GIF table
+in `gs_types.h`). `SBP=0` with `DBP=0x1F0`/`0x1F4` (496/500): it copies *from* the displayed buffer
+toward the top of VRAM, which is exactly where the only surviving non-zero words live
+(0x3A7000..0x3FF43C).
+
+**So the fault lies between "primitive accepted" and "pixels written".** Sane on-screen geometry,
+non-black colour, alpha test off, depth GEQUAL vs zeroed Z, masks open, full-screen scissor, 58,273
+primitives inside 1,077 real render passes - and zero output. One concrete lead survives from the
+raw dump: in both samples the XYZ3/XYZ2 pair carries **identical Y** (0x80e0 then 0x80c0), i.e. a
+zero-height extent, and `xyz=133,912 / prim=70,728 = 1.89` vertices per PRIM write, which is the
+signature of two-vertex primitives (sprites/lines). A zero-height sprite is degenerate by
+definition. That cannot be the whole story, because the loading-phase sample has the same property
+and did render, so it must be checked against the PRIM type rather than inferred.
+
+**Next move:** extend the raw capture to cover the PRIM write that governs each packet (the dumped
+window starts at RGBAQ, so the controlling PRIM is in the preceding packet), and log per packet:
+PRIM type/IIP/TME/ABE/CTXT, the count of XYZ2/XYZ3 writes that follow, and the two vertex extents.
+Compare the vertex count against what that primitive type requires - an incomplete primitive is
+accepted and counted but writes nothing, which is exactly the observed signature.
+
+That follow-up ran in the same session. The flag decode was wrong first: parallel-gs's `PRIMBits`
+is PRIM bits 0-2, IIP 3, TME 4, FGE 5, ABE 6, AA1 7, FST 8, CTXT 9-10, so the earlier counts keyed
+on bits 1/2/3 and every `tme`/`abe`/`fge` figure in Session 44 was mislabelled. Re-measured:
+
+    prim=69912  ptype(Point/Line/LineStrip/Tri/TriStrip/TriFan/Sprite/?) = 66338/0/0/0/0/0/3574/0
+    lastPRIM=0x7ff8  type=0 iip=1 tme=1 abe=1 fst=1 ctxt=3
+    window: qws=12 xyz=4 primInWindow=0 (NLOOP=12 -> 12 A+D pairs)
+
+The scene is drawn as **textured points** (66,338) plus sprites (3,574) - no triangles at all. The
+packet shape confirms it: RGBAQ + UV + XYZ per point, 12 A+D pairs = 4 points, and the window really
+does hold 4 XYZ writes and no PRIM write. So the vertex-count-per-primitive theory is dead: the
+packets are complete and self-consistent, and a point has no extent to be degenerate about.
+
+What survives is the anomaly inside the PRIM value itself: `0x7ff8` decodes as PRIM=0 (Point),
+IIP=1, TME=1, FGE=1, ABE=1, AA1=1, FST=1, **CTXT=3**, FIX=0xF. CTXT is a 2-bit context selector and
+only 0 and 1 are defined - 3 is out of range, and it decides whose FRAME the rasteriser uses. During
+loading, context 2's FRAME is `0/0` (FBP 0, **FBW 0**, a zero-width buffer); after the transition
+both contexts read 224/8. A draw routed into a zero-width buffer is counted but writes nothing,
+which is exactly the observed signature.
+
+Caveat that must be settled before acting on it: the FLG=1 reglist pairing in this walk is
+known-broken (Session 44), so `CTXT=3` may be a mis-paired read rather than something the game
+programmed. The low bits are probably genuine - the Point/Sprite split matches the packet structure
+- but the upper bits are precisely where that pairing error lives.
+
+**Next move:** trigger the raw dump on the PRIM write itself (`D & 0xFF == 0x00`) and print the
+surrounding QWs, so the PRIM value comes from raw bytes rather than from the walk. If CTXT=3 is
+real, the question becomes what parallel-gs does with an out-of-range selector, and whether the game
+programs PRIM that way or our delivery is corrupting the upper bits of the A word.
+
 ### Session 44 - the census is authoritative; the primitives are clipped, and my GIF walk is not a usable instrument
 
 **The census can be trusted, and that is now proven rather than assumed.** `GS::snapshotVRAM()`
