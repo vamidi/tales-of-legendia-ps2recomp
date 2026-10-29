@@ -2738,7 +2738,54 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
-### Session 47 - the census write-back is proven sound; the scene's sprites draw under an EMPTY ctx0 scissor the game itself writes
+### Session 48 - parallel-gs renders EXACTLY what the game submits; the black-phase scene geometry is DEGENERATE at the GIF level (zero-height sprites, collapsed TriStrips)
+
+**The scissor is definitively dead as the blocker, and so is the "rasteriser is dropping pixels" theory.**
+With `PARALLEL_GS_DEBUG=ON` (CMake cache flag - NOT a source patch; parallel-gs rebuilt, ~5 min; the
+gs_interface TU is the `gs_interface_transfer_tails.cpp` unity file) parallel-gs's own TRACE shows every
+register write, vertex, Primitive (with BB + blend string), DRAW, "Degenerate Draw" and "Degenerate BB".
+Runs: 190 (unpatched), 191 (`PS2X_FORCE_FULL_SCISSOR=1`), both streaming, logs `%TEMP%\ps2_run190/191.{err,out}`
+(21 MB stdout each).
+
+**Verified addressing model (parallel-gs, and our census already matches it):** FRAME/ZBUF FBP/ZBP unit =
+8192-byte pages (`PGS_PAGE_ALIGNMENT_BYTES`); TEX0 TBP0/CBP and BITBLTBUF SBP/DBP unit = 256-byte blocks
+(`PGS_BLOCK_ALIGNMENT_BYTES`). The game's composite pass samples `TBP0=0x1C00` -> 0x1C0000 == FBP224 x 8192,
+i.e. it reads back exactly the scene buffer it rendered to. Self-consistent; census `nzWindow` uses the same
+8192-byte FBP unit.
+
+**Black-phase draw census from the trace (run191, patched, 110 s):**
+- Unpatched (run190): every textured sprite = `Degenerate Draw` (17,132x - the empty ctx0 scissor
+  SCAX0=1>SCAX1=0). Patched (run191): `Degenerate Draw = 0`, but 20,794 `Degenerate BB` instead.
+- The sprite quads are ZERO-HEIGHT: e.g. VERT (2293.56,2052)-(2302.12,2052) - Y1==Y2 exactly; BB LO [502,228]
+  HI [510,227] -> inverted -> culled. (My packed-path probe found 812/1190 packed sprite pairs non-degenerate,
+  max extent 640x896 - but those are the full-screen *clears*; the textured sprites are the zero-height ones.)
+- Black-phase TriStrips (CTXT=1, TME=1, reglist [RGBAQ,XYZ2]x14 with `ADC||1` writes between every vertex):
+  ALL vertices identical (2047.5, 0), RGBAQ=0, ST=0 -> collapsed garbage, off-screen, culled.
+- **Textured Primitives with TexIndex>=1 in the black phase: ZERO.** The only DRAWn prims (10,550) are the
+  black clears (64x224 tiles, ABE=0, RGBAQ=0) and the composite pass (64-px columns, SCANMSK 3/2 fields,
+  blend `(Cs-Cd)*FIX+Cd` with FIX=0x6B/0x59/0x64, sampling the scene buffer at 0x1C0000).
+- Blend strings: loading = `(Cs-Cs)*As+Cs` (=Cs, visible); black-phase = `(Cs-Cd)*FIX+Cd`. ALPHA_1 raw
+  0x6B00000064 (A=0x64, FIX=0x6B) etc. FIX path is fine - it just multiplies black-by-black.
+- Census at every forced tick: nzWords=593 (texture/CLUT words at 0x3A7000..0x3FF43C == the game's
+  CBP/TBP0 0x3a70/0x3a80 x 256 exactly). Scene buffer (0x1C0000) stays zero because every scene prim is
+  degenerate; composite then copies black to the display buffer.
+
+**Conclusion: the GS pipeline is exonerated end-to-end.** parallel-gs rasterises everything non-degenerate
+the game submits; the game simply *stops submitting valid scene geometry* after the loading->black transition.
+The black screen is upstream of the GS: either (A) our VIF1->GIF path corrupts the scene's vertex packets
+(the collapsed TriStrips with interleaved ADC writes smell like CD/DVD data bytes being interpreted as
+GIF reglist packets - session 38's raw-QW path2 forwarding is the suspect), or (B) the game is EE/IOP-stalled
+in a loading loop (syscall id=0xffffffd1 loop at pc=0x1155bc, main thread parked at 0x10bf38/0x1f75xx,
+vbLagMax 707 ms) and the degenerate draws are its own loading filler.
+
+**Build state note:** `PARALLEL_GS_DEBUG:BOOL=ON` is now IN THE CMAKE CACHE (trace costs ~21 MB stdout per
+run and a ~5 min parallel-gs rebuild to toggle). Consider `-DPARALLEL_GS_DEBUG=OFF` once the fork resolves.
+
+**New probe (committed):** packed-path vertex-pair extent histogram in `gs_parallel_backend.cpp`
+(`m_pairCount/m_pairZero/m_pairMaxW/m_pairMaxH/m_pairRaw`, printed in `[GS-sc]` as
+`pairs=/zero4=/zero6=/maxWH=/pr0=/pr1=`).
+
+
 
 **The census-vs-rasteriser contradiction is resolved: the census is sound end-to-end.**
 `mark_submission_timeline` (page_tracker.cpp:935) calls `flush_render_pass` *before* queueing the

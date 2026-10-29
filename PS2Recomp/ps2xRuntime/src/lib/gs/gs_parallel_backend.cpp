@@ -9,14 +9,29 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace
 {
     constexpr size_t VramSize = 4 * 1024 * 1024;
+    // TEMP EXPERIMENT (session 47, option B): when set, rewrite the game's
+    // per-frame empty ctx0 SCISSOR_1 write (0x100000001) to the full-screen
+    // value in the forwarded GIF stream, to test whether that scissor is THE
+    // blocker for the black scene.
+    bool forceFullScissorEnabled()
+    {
+        static const bool v = [] {
+            const char *e = std::getenv("PS2X_FORCE_FULL_SCISSOR");
+            return e && *e && *e != '0';
+        }();
+        return v;
+    }
     uint64_t word(const void *data)
     {
         uint64_t value;
@@ -122,6 +137,25 @@ namespace
         GSGLInterop interop;
         mutable ParallelGS::GSInterface gs;
         GSRegisters &priv;
+        // TEMP EXPERIMENT (session 47): PACKED-path SCISSOR_1 offsets within the
+        // current chunk whose A word is the empty rect, recorded by observeGIF
+        // and patched by the forward site when PS2X_FORCE_FULL_SCISSOR is set.
+        std::vector<std::pair<size_t, uint64_t>> m_scisPatch;
+        uint64_t m_scisPatched = 0u;
+        // TEMP DIAGNOSTIC (session 48): vertex-pair extents on the PACKED path
+        // (FLG=0, reliable A+D pairing).  Consecutive XYZ2/XYZ3 A words within
+        // one primitive are paired (the pair resets at each PRIM write), and
+        // |dx|/|dy| in 12.4 fixed point are histogrammed per prim type to test
+        // whether the black-phase sprites are degenerate (zero-area) quads.
+        uint64_t m_xyzPrev = 0;
+        bool m_haveXyzPrev = false;
+        uint32_t m_pairPrim = 0;
+        uint64_t m_pairCount[8] = {};
+        uint64_t m_pairZero[8] = {};
+        uint32_t m_pairMaxW = 0, m_pairMaxH = 0;
+        uint64_t m_pairRaw[4][2] = {};
+        uint32_t m_pairRawPrim[4] = {};
+        uint32_t m_pairSamples = 0;
         struct Lock
         {
             std::lock_guard<std::recursive_mutex> guard;
@@ -464,6 +498,45 @@ namespace
                         observeRegister(adReg, adValue);
                     }
                     applyAD(adReg, adValue);
+                    // TEMP DIAGNOSTIC (session 48): pair consecutive XYZ2/XYZ3
+                    // A words within one primitive (PACKED path only) and
+                    // histogram |dx|/|dy| in 12.4 units.  A sprite is degenerate
+                    // when dx==0 or dy==0; parallel-gs rasterises zero-area
+                    // primitives to nothing, which would explain the census's
+                    // zero pixels despite sane scissor/TEST/ALPHA state.
+                    if (adReg == 0x00u)
+                    {
+                        m_pairPrim = uint32_t(adValue & 7u);
+                        m_haveXyzPrev = false;
+                    }
+                    else if (adReg == 0x05u || adReg == 0x0Du)
+                    {
+                        if (m_haveXyzPrev)
+                        {
+                            const uint32_t x0 = uint32_t(m_xyzPrev) & 0xFFFFu;
+                            const uint32_t y0 = (uint32_t(m_xyzPrev >> 16)) & 0xFFFFu;
+                            const uint32_t x1 = uint32_t(adValue) & 0xFFFFu;
+                            const uint32_t y1 = (uint32_t(adValue >> 16)) & 0xFFFFu;
+                            const uint32_t w = x1 > x0 ? x1 - x0 : x0 - x1;
+                            const uint32_t h = y1 > y0 ? y1 - y0 : y0 - y1;
+                            ++m_pairCount[m_pairPrim & 7u];
+                            if (!w || !h)
+                                ++m_pairZero[m_pairPrim & 7u];
+                            if (w > m_pairMaxW)
+                                m_pairMaxW = w;
+                            if (h > m_pairMaxH)
+                                m_pairMaxH = h;
+                            if (m_pairSamples < 4u && s_gifBytes >= (12u << 20))
+                            {
+                                m_pairRaw[m_pairSamples][0] = m_xyzPrev;
+                                m_pairRaw[m_pairSamples][1] = adValue;
+                                m_pairRawPrim[m_pairSamples] = m_pairPrim;
+                                ++m_pairSamples;
+                            }
+                        }
+                        m_xyzPrev = adValue;
+                        m_haveXyzPrev = true;
+                    }
                     // TEMP DIAGNOSTIC (session 47): what SCISSOR values does the
                     // guest actually send?  parallel-gs holds ctx0 scissor
                     // 0x100000001 (empty: SCAX0=1,SCAX1=0,SCAY0=1,SCAY1=0) during
@@ -482,6 +555,8 @@ namespace
                                       << " val=0x" << adValue << std::dec << std::endl;
                         }
                     }
+                    if (adReg == 0x40u && adValue == 0x100000001ull && forceFullScissorEnabled())
+                        m_scisPatch.push_back({offset, 0x01bf000001ff0000ull});
                     if (adReg == 0x00u && wantPrimRaw())
                     {
                         takePrimRaw();
@@ -622,7 +697,29 @@ namespace
                 }
             }
             observeGIF(path, data, size);
-            gs.gif_transfer(path, data, size);
+            // TEMP EXPERIMENT (session 47, option B): forward a patched copy with
+            // the empty ctx0 SCISSOR_1 rewrites applied.
+            if (forceFullScissorEnabled() && !m_scisPatch.empty())
+            {
+                std::vector<uint8_t> buf(data, data + size);
+                for (const auto &p : m_scisPatch)
+                {
+                    if (p.first + 8u <= size)
+                    {
+                        std::memcpy(buf.data() + p.first, &p.second, 8);
+                        ++m_scisPatched;
+                    }
+                }
+                m_scisPatch.clear();
+                if (m_scisPatched <= 5u || (m_scisPatched & 0x1FFull) == 0u)
+                    std::cerr << "[GS-scisPatch] patched=" << m_scisPatched << std::endl;
+                gs.gif_transfer(path, buf.data(), size);
+            }
+            else
+            {
+                m_scisPatch.clear();
+                gs.gif_transfer(path, data, size);
+            }
             // Session 41: parallel-gs's own accounting.  Everything in the
             // census above only proves what *we* parsed; this proves what it
             // actually rasterised and copied.  consume_flush_stats() resets the
@@ -666,6 +763,13 @@ namespace
                                   << " tr=0x" << rs.trxreg.bits
                                   << " td=" << rs.trxdir.bits
                                   << " rgba=0x" << rs.rgbaq.bits
+                                  << std::dec
+                                  << " pairs=" << m_pairCount[4] << "/" << m_pairCount[6]
+                                  << " zero4=" << m_pairZero[4] << " zero6=" << m_pairZero[6]
+                                  << " maxWH=" << m_pairMaxW << "/" << m_pairMaxH
+                                  << std::hex
+                                  << " pr0=" << m_pairRaw[0][0] << ":" << m_pairRaw[0][1]
+                                  << " pr1=" << m_pairRaw[1][0] << ":" << m_pairRaw[1][1]
                                   << std::dec << std::endl;
                     }
                 }
