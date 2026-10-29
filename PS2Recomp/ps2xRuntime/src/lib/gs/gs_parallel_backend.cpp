@@ -464,6 +464,24 @@ namespace
                         observeRegister(adReg, adValue);
                     }
                     applyAD(adReg, adValue);
+                    // TEMP DIAGNOSTIC (session 47): what SCISSOR values does the
+                    // guest actually send?  parallel-gs holds ctx0 scissor
+                    // 0x100000001 (empty: SCAX0=1,SCAX1=0,SCAY0=1,SCAY1=0) during
+                    // the black-phase textured-sprite window.  This logger shows
+                    // whether the game wrote that itself or we mangled it.  PACKED
+                    // (FLG=0) A+D pairing is reliable (both halves share one QW);
+                    // false positives on vertex data are possible but recognizable
+                    // by value shape.
+                    {
+                        static uint32_t s_scisPrints = 0u;
+                        if ((adReg == 0x40u || adReg == 0x41u) && s_scisPrints < 48u)
+                        {
+                            ++s_scisPrints;
+                            std::cerr << "[GS-scis] " << (adReg == 0x40u ? "SCISSOR_1" : "SCISSOR_2")
+                                      << " bytes=" << s_gifBytes << " off=0x" << std::hex << offset
+                                      << " val=0x" << adValue << std::dec << std::endl;
+                        }
+                    }
                     if (adReg == 0x00u && wantPrimRaw())
                     {
                         takePrimRaw();
@@ -625,6 +643,95 @@ namespace
                     std::cerr << "[GSpost] bytes=" << s_psBytes << " prims=" << s_psPrims
                               << " passes=" << s_psPasses << " copies=" << s_psCopies
                               << " palettes=" << s_psPalettes << std::endl;
+                    // TEMP DIAGNOSTIC (session 47): compact per-threshold sampler of
+                    // the state that decides coverage.  Session 47 found ctx0's
+                    // scissor = 0x100000001 (SCAX0=1,SCAX1=0,SCAY0=1,SCAY1=0 ->
+                    // empty) while textured blended sprites (PRIM=0x15e) were the
+                    // active draw, and full-screen scissor only alongside
+                    // untextured unblended sprites (PRIM=0x106 = clears).  Sample
+                    // every 256 KiB to see which state dominates the black phase.
+                    {
+                        const auto &rs = gs.get_register_state();
+                        const uint64_t pb = rs.prim.bits;
+                        const uint64_t s0 = rs.ctx[0].scissor.bits, s1 = rs.ctx[1].scissor.bits;
+                        std::cerr << "[GS-sc] bytes=" << s_psBytes
+                                  << std::hex << " prim=0x" << pb << " type=" << (pb & 7ull)
+                                  << " ctxt=" << ((pb >> 9) & 3ull) << " tme=" << ((pb >> 4) & 1ull)
+                                  << " abe=" << ((pb >> 6) & 1ull)
+                                  << " c0sc=0x" << s0 << " c1sc=0x" << s1
+                                  << " c0fbp=0x" << (rs.ctx[0].frame.bits & 0x1FFull)
+                                  << " c1fbp=0x" << (rs.ctx[1].frame.bits & 0x1FFull)
+                                  << " bb=0x" << rs.bitbltbuf.bits
+                                  << " tp=0x" << rs.trxpos.bits
+                                  << " tr=0x" << rs.trxreg.bits
+                                  << " td=" << rs.trxdir.bits
+                                  << " rgba=0x" << rs.rgbaq.bits
+                                  << std::dec << std::endl;
+                    }
+                }
+                // TEMP DIAGNOSTIC (session 47): parallel-gs's OWN register state,
+                // read from get_register_state() - the only trusted source left
+                // after session 46 voided the walk's values.  The open question is
+                // what PRIM the stream really carries: CTXT especially, because
+                // gs_interface.cpp indexes registers.ctx[prim.desc.CTXT] with no
+                // clamp and ctx[] holds only two entries, so CTXT=2/3 is
+                // out-of-bounds garbage (degenerate draws -> zero pixels AND zero
+                // Z, which is exactly the black-phase signature).  Dump at byte
+                // thresholds straddling the loading->black transition (~10-12 MB).
+                static const uint64_t s_regDumpAt[] = {4u << 20, 8u << 20, 12u << 20, 16u << 20,
+                                                       24u << 20, 32u << 20, 40u << 20};
+                static uint32_t s_regDumpN = 0u;
+                while (s_regDumpN < 7u && s_psBytes >= s_regDumpAt[s_regDumpN])
+                {
+                    ++s_regDumpN;
+                    const auto &rs = gs.get_register_state();
+                    const uint64_t pb = rs.prim.bits;
+                    std::cerr << "[GS-reg] #" << s_regDumpN << " bytes=" << s_psBytes
+                              << std::hex << "\n  PRIM=0x" << pb
+                              << " type=" << (pb & 7ull) << " iip=" << ((pb >> 3) & 1ull)
+                              << " tme=" << ((pb >> 4) & 1ull) << " fge=" << ((pb >> 5) & 1ull)
+                              << " abe=" << ((pb >> 6) & 1ull) << " aa1=" << ((pb >> 7) & 1ull)
+                              << " fst=" << ((pb >> 8) & 1ull) << " CTXT=" << ((pb >> 9) & 3ull)
+                              << " FIX=0x" << ((pb >> 11) & 0x1FFFull)
+                              << " prmodecont=0x" << rs.prmodecont.bits
+                              << "\n  RGBAQ=0x" << rs.rgbaq.bits << " UV=0x" << rs.uv.bits
+                              << " ST=0x" << rs.st.bits << " FOG=0x" << rs.fog.bits
+                              << " SCANMSK=0x" << rs.scanmsk.bits << " PABE=0x" << rs.pabe.bits
+                              << " DIMX=0x" << rs.dimx.bits << " DTHE=0x" << rs.dthe.bits
+                              << " TEXCLUT=0x" << rs.texclut.bits << " TEXA=0x" << rs.texa.bits
+                              << " COLCLAMP=0x" << rs.colclamp.bits;
+                    for (unsigned ci = 0; ci < 2; ++ci)
+                    {
+                        const auto &cc = rs.ctx[ci];
+                        const uint64_t fb = cc.frame.bits, zb = cc.zbuf.bits, tb = cc.test.bits;
+                        std::cerr << "\n  ctx" << ci
+                                  << " FRAME=0x" << fb << " fbp=" << (fb & 0x1Full)
+                                  << " fbw=" << ((fb >> 16) & 0x3Full) << " psm=" << ((fb >> 24) & 0x3Full)
+                                  << " FMASK=0x" << (fb >> 32)
+                                  << " ZBUF=0x" << zb << " zbp=" << (zb & 0x1Full)
+                                  << " zpsm=" << ((zb >> 24) & 0xFull) << " zmsk=" << ((zb >> 56) & 1ull)
+                                  << " TEST=0x" << tb << " ATE=" << (tb & 1ull)
+                                  << " ATST=" << ((tb >> 1) & 7ull) << " AREF=0x" << ((tb >> 4) & 0xFFull)
+                                  << " AFAIL=" << ((tb >> 12) & 3ull) << " DATE=" << ((tb >> 14) & 1ull)
+                                  << " DATM=" << ((tb >> 15) & 1ull) << " ZTE=" << ((tb >> 16) & 1ull)
+                                  << " ZTST=" << ((tb >> 17) & 3ull)
+                                  << " ALPHA=0x" << cc.alpha.bits << " A=0x" << (cc.alpha.bits & 0xFFull)
+                                  << " B=0x" << ((cc.alpha.bits >> 8) & 0xFFull)
+                                  << " C=0x" << ((cc.alpha.bits >> 16) & 0xFFull)
+                                  << " D=0x" << ((cc.alpha.bits >> 24) & 0xFFull)
+                                  << " XYOFF=0x" << cc.xyoffset.bits
+                                  << " SCIS=0x" << cc.scissor.bits
+                                  << " TEX0=0x" << cc.tex0.bits << " tbp0=0x" << (cc.tex0.bits & 0x3FFFull)
+                                  << " tbw=" << ((cc.tex0.bits >> 14) & 0x3Full)
+                                  << " psm=" << ((cc.tex0.bits >> 20) & 0x3Full)
+                                  << " tw=" << ((cc.tex0.bits >> 26) & 0xFull)
+                                  << " th=" << ((cc.tex0.bits >> 30) & 0xFull)
+                                  << " tcc=" << ((cc.tex0.bits >> 34) & 1ull)
+                                  << " tfx=" << ((cc.tex0.bits >> 35) & 3ull)
+                                  << " cbp=0x" << ((cc.tex0.bits >> 37) & 0x3FFFull)
+                                  << " FBA=0x" << cc.fba.bits << " CLAMP=0x" << cc.clamp.bits;
+                    }
+                    std::cerr << std::dec << std::endl;
                 }
             }
         }

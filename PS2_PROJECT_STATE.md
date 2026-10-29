@@ -2738,6 +2738,53 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 47 - the census write-back is proven sound; the scene's sprites draw under an EMPTY ctx0 scissor the game itself writes
+
+**The census-vs-rasteriser contradiction is resolved: the census is sound end-to-end.**
+`mark_submission_timeline` (page_tracker.cpp:935) calls `flush_render_pass` *before* queueing the
+write-back, then `cb.sync_vram_host_page` + `cb.flush(PAGE_TRACKER_FLUSH_WRITE_BACK_BIT)`;
+`GSInterface::flush` (gs_interface.cpp:398-412) turns those page bits into
+`renderer.flush_readback`, which is a GPU copy `buffers.gpu -> buffers.cpu` (gs_renderer.cpp:1591,
+1513) and `buffers.cpu` is exactly what `begin_host_vram_access()` maps for the census. This
+parallel-gs version has no per-page render targets/rebar - the compute ubershader rasterises into
+the linear `buffers.gpu` - so there is no stale-shadow window. The 593-word census is truth.
+
+**New trusted instrument**: `[GS-reg]` (full `get_register_state()` dump at 4/8/12/16/24/32/40 MB)
+and `[GS-sc]` (compact per-256 KiB sampler: PRIM, both scissors, both FBP, BITBLTBUF/TRX*, RGBAQ)
+and `[GS-scis]` (PACKED-path SCISSOR_1/2 writes as the walk sees them) in `gs_parallel_backend.cpp`.
+First use, runs 183/184 (both B-streaming; run185 was B-idle, GIF traffic parked below 256 KiB):
+
+- **CTXT=2/3 UB hypothesis is DEAD**: parallel-gs's own `prim` carries **CTXT=0** throughout.
+- **The scene is drawn as textured, blended SPRITES** (`PRIM=0x15e`: type=6, IIP=1, TME=1, ABE=1,
+  FST=1, CTXT=0) - 90%+ of the 58k primitives - into FBP 224 by both contexts (`c0fbp=c1fbp=0xe0`).
+- **ctx0's scissor is `0x100000001` = SCAX0=1, SCAX1=0, SCAY0=1, SCAY1=0 - an EMPTY rect** for
+  essentially the entire black phase, and `[GS-scis]` proves **the game itself writes that value**
+  (SCISSOR_1 A word at packet off=0x10, alternating per frame with the full-screen
+  `0x1bf000001ff0000`). Not a walk artifact, not our MMIO path.
+- The only full-scissor draws are untextured unblended sprites (`PRIM=0x6`, RGBAQ=0) = **black
+  clears**, plus rare TriStrips (`0x25c`, CTXT=1, TME=1, ABE=1, full scissor, FBP 224, TEX0
+  tbp0=0x3a80/cbp=0x3a70 - pointing into the one surviving VRAM region 0x3A7000..0x3FF43C).
+- TEST fully exonerated with correct DATM: black phase `TEST=0x50000/0x5000C` = ATE=0, **DATE=0**
+  (the earlier "DATE=1" table was a mis-decode of 0x5000D), ZTE=1 ZTST=GEQUAL vs zeroed Z.
+  FMASK (FRAME upper 32, never printed before) = **0x0**. ALPHA=0x44 (A=68, normal blend).
+- During loading, ctx1 FRAME was FBP **0** (the displayed buffer) - that is why the loading screen
+  rendered; after the transition both contexts point at FBP 224 while DISPFB2 stays `0x1000` (FBP 0).
+
+**Reading**: the sprites that make up the scene are clipped by the empty ctx0 scissor - which on
+real HW would clip them too, so either the game intends those draws as a masked/secondary pass
+(and the visible image is the rare CTXT=1 TriStrips, which nonetheless also land nowhere per the
+census), or the empty scissor is corruption *upstream of parallel-gs* - i.e. our VIF1->GIF path
+assembled that A word from the game's VIF stream and mangled it. The per-frame alternation
+(full/empty at the same packet offset) is the signature to chase in the guest's VIF code.
+
+**Next move**: decide between (A) trace the SCISSOR_1 producer through `ps2_vif1_interpreter.cpp`
++ Ghidra (find the game's VIF UNPACK/CODEC that emits the scissor QW and check our decode), or
+(B) decisive 10-line experiment: rewrite SCISSOR_1 `0x100000001` -> full-screen in the forwarded
+GIF stream and see whether the scene appears. (B) answers in one run whether the scissor is THE
+blocker; (A) finds the root cause. Also still open: how the game presents FBP 224 to a display
+reading FBP 0 (BITBLTBUF direction was never sampled from a trusted source - now added to
+`[GS-sc]` but only captured in the B-idle run185, needs a streaming run).
+
 ### Session 46 - CTXT=3 was probe error again; the raw stream is an on-screen triangle strip
 
 Triggered the raw dump on the A+D write itself (`D & 0xFF == 0x00`) in both the packed and the
