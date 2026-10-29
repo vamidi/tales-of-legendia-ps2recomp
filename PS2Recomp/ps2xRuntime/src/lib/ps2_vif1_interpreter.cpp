@@ -13,6 +13,13 @@ static bool ps2xWatchVif1()
     return enabled;
 }
 
+// TEMP DIAGNOSTIC (session 49): gate for the overrun/truncation detectors.
+static bool ps2xGifProbeOn()
+{
+    static const bool enabled = std::getenv("PS2X_GIF_PROVENANCE") != nullptr;
+    return enabled;
+}
+
 enum VIFCmd : uint8_t
 {
     VIF_NOP = 0x00,
@@ -85,6 +92,52 @@ namespace
 
             if (payloadBytes > static_cast<uint64_t>(sizeBytes - offset))
                 return 0u;
+            offset += static_cast<uint32_t>(payloadBytes);
+        }
+
+        return 0u;
+    }
+
+    // TEMP DIAGNOSTIC (session 49): like pendingGifImageQwc but reports the
+    // tagLo of ANY tag (PACKED/REGLIST/IMAGE) whose payload overruns the end
+    // of the DIRECT chunk.  A non-zero result means the guest's GIF packet
+    // continues past this chunk; pendingGifImageQwc only carries IMAGE
+    // continuations, so a PACKED/REGLIST overrun would be re-parsed as VIF
+    // codes on the next DMA - the suspected source of the degenerate
+    // black-phase draw packets.
+    uint64_t overrunGifTagLo(const uint8_t *data, uint32_t sizeBytes)
+    {
+        if (!data || sizeBytes < 16u)
+            return 0u;
+
+        uint32_t offset = 0u;
+        while (offset + 16u <= sizeBytes)
+        {
+            uint64_t tagLo = 0u;
+            std::memcpy(&tagLo, data + offset, sizeof(tagLo));
+            offset += 16u;
+
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+
+            uint64_t payloadBytes = 0u;
+            if (flg == 0u) // PACKED
+                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 16ull;
+            else if (flg == 1u) // REGLIST
+            {
+                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 8ull;
+                payloadBytes = (payloadBytes + 15ull) & ~15ull;
+            }
+            else if (flg == kGifFmtImage)
+                payloadBytes = static_cast<uint64_t>(nloop) * 16ull;
+            else
+                return 0u; // FLG=3 interleave: walk stops, treat as no overrun
+
+            if (payloadBytes > static_cast<uint64_t>(sizeBytes - offset))
+                return tagLo;
             offset += static_cast<uint32_t>(payloadBytes);
         }
 
@@ -580,6 +633,53 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     std::cerr << "[VIF1-direct] submitted qwCount=" << qwCount << std::endl;
 
                 const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
+                // TEMP DIAGNOSTIC (session 49): overrun + truncation detectors,
+                // gated behind PS2X_GIF_PROVENANCE=1 so the tag walk costs
+                // nothing when the probe is off (the walk on every DIRECT was
+                // suspected of biasing the streaming/idle host race).
+                const uint64_t overTag = ps2xGifProbeOn() ? overrunGifTagLo(data + pos, qwCount * 16u) : 0ull;
+                if (overTag != 0u)
+                {
+                    const uint64_t ovrFlg = (overTag >> 58) & 0x3ull;
+                    static uint32_t s_ovrImage = 0u, s_ovrPrints = 0u;
+                    if (ovrFlg == 2u) // IMAGE: benign, pending carries it
+                    {
+                        if ((++s_ovrImage & 0xFFFu) == 0u)
+                            std::cerr << "[VIF1-tagovr] imageCount=" << s_ovrImage << std::endl;
+                    }
+                    else if (s_ovrPrints < 100u) // PACKED/REGLIST overrun: the suspect
+                    {
+                        ++s_ovrPrints;
+                        std::cerr << "[VIF1-tagovr] tag=0x" << std::hex << overTag
+                                  << " flg=" << ovrFlg
+                                  << " nloop=" << (overTag & 0x7FFFull)
+                                  << " nreg=" << ((overTag >> 60) & 0xFull)
+                                  << " eop=" << ((overTag >> 63) & 0x1ull)
+                                  << " qw=" << std::dec << qwCount
+                                  << " trunc=" << (truncated ? 1 : 0)
+                                  << " pendingQw=" << pendingImageQw << std::endl;
+                    }
+                }
+                // TEMP DIAGNOSTIC (session 49): truncation detector.  A DIRECT
+                // whose requested Qwc exceeds the DMA chunk leaves VIF1 in the
+                // middle of data mode; the next processVIF1Data call resumes
+                // parsing *commands* while real hardware would continue the
+                // DIRECT's data.  Only IMAGE overruns get pending carry-over,
+                // so every other truncated DIRECT mis-parses the continuation.
+                if (truncated)
+                {
+                    static uint32_t s_truncPrints = 0u;
+                    if (s_truncPrints < 60u)
+                    {
+                        ++s_truncPrints;
+                        const uint64_t gaddr = m_rdram ? static_cast<uint64_t>((data + pos) - m_rdram) : 0ull;
+                        std::cerr << "[VIF1-trunc] n=" << s_truncPrints
+                                  << " gaddr=0x" << std::hex << gaddr << " cmd=0x" << cmd
+                                  << " fwdQw=" << std::dec << qwCount
+                                  << " pendingQw=" << pendingImageQw
+                                  << " overTag=0x" << std::hex << overTag << std::dec << std::endl;
+                    }
+                }
                 if (pendingImageQw != 0u)
                 {
                     m_vif1PendingPath2ImageQwc = pendingImageQw;

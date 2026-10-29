@@ -2738,6 +2738,45 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 49 - VIF1→GIF provenance probes built; the streaming/idle host race shifted IDLE-dominant (8 runs); idle stall root-located to the IOP IxAudio callback loop (new workstream fork pending)
+
+**Direction A (user-chosen session 48) is instrumented but BLOCKED: since session 48, every run idles on
+the loading screen and never reaches the black phase.** Probes built (all TEMP, env-gated
+`PS2X_GIF_PROVENANCE=1`): (1) `submitGifPacket` funnel writes fixed-40B binary records
+(seq/path/gaddr/size/hl/first-QW) to `%TEMP%\ps2_prov_sub.bin` (buffered fwrite, fflush/256; per-line
+cerr cost ~20 MB in streaming runs and stderr/stdout split breaks TRACE ordering - that's why it's binary);
+(2) backend `ProcessGIF` prints `[GS-recv] path size qw0 qwEnd` to **stdout** immediately before
+`gs.gif_transfer`, so parallel-gs TRACE lines are attributable to the submit buffer that carried them;
+(3) `ps2_vif1_interpreter.cpp`: `overrunGifTagLo` detector - `[VIF1-tagovr]` (PACKED/REGLIST tag payload
+running past the DIRECT chunk; IMAGE ones counted benign) and `[VIF1-trunc]` (DIRECT qwCount exceeding the
+DMA chunk: VIF1 stays in data-mode on hardware but our next `processVIF1Data` re-parses COMMANDS - only
+IMAGE overruns get the session-38 pending carry-over). **Runs 192-199: `[VIF1-trunc]`=0, PACKED
+`[VIF1-tagovr]`=0** - the mis-parse path never fired in any run observed so far (all idle though - see below).
+
+**Race record corrected**: streaming runs carry ~6.8 MB GIF traffic (`[GIFrecv] total=6815920 p2=6815280`),
+NOT 27-40 MB; the 21 MB figure was the stdout TRACE size. Streaming: 190/191 (census nz=593 at forced3000).
+Idle: nz=98728 throughout, `[GSpost] bytes=786496 prims=2527` plateau. Post-session-48 runs 192,193,194,
+195,196,197,198(probes OFF),199 ALL idle - probe overhead exonerated (198 off, still idle); host timing
+shifted. Runs 192/193/195 killed at 130 s, 194/196/197/198/199 at 150 s.
+
+**Idle stall root-located (guest-side, Ghidra 8192)**: IOP RPC event sequences are IDENTICAL across runs
+through `FILE close slot1` (fileio sid=0x80000001 open/read/close of two small files). Streaming (190) then
+binds sid=0x20000/0x90000300/0x90000301/0x80000400 and runs the audio loop; 199 bound 0x20000 at tick ~400
+(`IxAudio Ver 1.0.0.7` Kprintf on rpc=1 init) and issued rpc=0xFFFF (stream submit) ONCE; 190 issued it 66x.
+sid=0x20000 = game's IxAudio IOP module (moduleFn=0x6A9A4 IOP VA, executed as emulated IOP code).
+Thread 6 (entry 0x218908, prio 99) = EE-side RPC SERVER: `SifSetRpcQueue(sid=0x90000302, handler=0x2188c0)`
+then server loop FUN_00118d18 (pc 0x118d50 = SleepThread branch). IxAudio calls BACK into the EE via
+IOP→EE RPC 0x90000302 to pull stream data. In 190 thread 6 = Ready (packet arrived, SetDma=75); in 199
+thread 6 = Waiting-sleep, IOP never issued the callback (SetDma=56). The 0x90000200 rpc=1032 data-service
+calls (x6) happen in BOTH 190 and 199 - not the discriminator. The 0x1155bc/0xffffffd1 "loop" is just a
+GetThreadId+self-sema poll helper (FUN_001155a8), NOT a park site.
+**So: black phase requires the audio streaming loop to iterate; it stalls after 1 iteration in 199 and
+never starts in 198. Until the IOP→EE callback path is fixed, the black screen (direction A) is only
+reachable by lottery.** Fork pending user decision: (C) fix IOP audio callback stall first (makes
+streaming+black screen deterministic, also fixes the loading-freeze variant) vs (A-lottery) keep retrying
+for streaming runs. Next C step: instrument IOP-side SIF send path (IOP→EE 0x90000302 call) + SPU2 core
+interrupts to see what IxAudio waits on after rpc=0xFFFF.
+
 ### Session 48 - parallel-gs renders EXACTLY what the game submits; the black-phase scene geometry is DEGENERATE at the GIF level (zero-height sprites, collapsed TriStrips)
 
 **The scissor is definitively dead as the blocker, and so is the "rasteriser is dropping pixels" theory.**

@@ -4,6 +4,7 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -2046,10 +2047,70 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
         m_gifArbiter->drain();
 }
 
+// TEMP DIAGNOSTIC (session 49): provenance stamp gate for the VIF1->GIF
+// corruption trace.  Opt-in via PS2X_GIF_PROVENANCE=1; correlates each GIF
+// submit buffer (guest source address + first QW) with the buffer boundary
+// the parallel-gs backend sees, so TRACE lines can be attributed to the
+// VIF code that produced them.  The submit side is recorded as fixed-size
+// binary records (per-line cerr cost ~20 MB in a streaming run and the
+// stderr/stdout split breaks ordering against parallel-gs's TRACE).
+struct Ps2xProvSubRec
+{
+    uint64_t seq;
+    uint32_t path;
+    uint32_t size;
+    uint64_t gaddr;   // guest address when src is ram/spd, else 0
+    uint64_t qw0Lo;   // first QW low/high of the submitted buffer
+    uint64_t qw0Hi;
+    uint32_t srcKind; // 0 other, 1 ram, 2 spd
+    uint32_t hl;
+};
+static FILE *ps2xProvSubFile()
+{
+    static FILE *f = [] {
+        if (!std::getenv("PS2X_GIF_PROVENANCE"))
+            return static_cast<FILE *>(nullptr);
+        const char *t = std::getenv("TEMP");
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s\\ps2_prov_sub.bin", t ? t : ".");
+        FILE *fp = std::fopen(path, "wb");
+        if (fp)
+            std::setvbuf(fp, nullptr, _IOFBF, 1u << 20);
+        return fp;
+    }();
+    return f;
+}
+
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
     if (!data || sizeBytes < 16)
         return;
+
+    // TEMP DIAGNOSTIC (session 49): provenance stamp at the submit funnel.
+    if (FILE *pf = ps2xProvSubFile())
+    {
+        static uint64_t s_subSeq = 0u;
+        Ps2xProvSubRec rec{};
+        rec.seq = ++s_subSeq;
+        rec.path = static_cast<uint32_t>(pathId);
+        rec.size = sizeBytes;
+        rec.hl = path2DirectHl ? 1u : 0u;
+        std::memcpy(&rec.qw0Lo, data, 8u);
+        std::memcpy(&rec.qw0Hi, data + 8u, 8u);
+        if (m_rdram && data >= m_rdram && data < m_rdram + PS2_RAM_SIZE)
+        {
+            rec.srcKind = 1u;
+            rec.gaddr = static_cast<uint64_t>(data - m_rdram);
+        }
+        else if (m_scratchpad && data >= m_scratchpad && data < m_scratchpad + PS2_SCRATCHPAD_SIZE)
+        {
+            rec.srcKind = 2u;
+            rec.gaddr = static_cast<uint64_t>(data - m_scratchpad);
+        }
+        std::fwrite(&rec, sizeof(rec), 1, pf);
+        if ((s_subSeq & 0xFFu) == 0u)
+            std::fflush(pf);
+    }
 
     // TEMP DIAGNOSTIC (session 37): Path2 image accounting at the entry of the
     // submit funnel.  The VIF1 image path reports ~4.4 MB of submitted Path2

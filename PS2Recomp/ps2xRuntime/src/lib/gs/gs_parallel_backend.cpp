@@ -32,6 +32,13 @@ namespace
         }();
         return v;
     }
+    // TEMP DIAGNOSTIC (session 49): gate for the buffer-boundary provenance
+    // stamp (see [GIFsub2] in ps2_memory.cpp).  Opt-in via PS2X_GIF_PROVENANCE=1.
+    bool gifProvenanceEnabled()
+    {
+        static const bool v = std::getenv("PS2X_GIF_PROVENANCE") != nullptr;
+        return v;
+    }
     uint64_t word(const void *data)
     {
         uint64_t value;
@@ -695,6 +702,18 @@ namespace
                     std::cerr << "[GIFrecv] total=" << s_inTotal << " p1=" << s_inBytes[1]
                               << " p2=" << s_inBytes[2] << " p3=" << s_inBytes[3] << std::endl;
                 }
+            }
+            // TEMP DIAGNOSTIC (session 49): buffer-boundary stamp.  Printed to
+            // STDOUT immediately before parallel-gs consumes this buffer, so
+            // every TRACE line (tag, VERT, Primitive, Degenerate) that follows
+            // belongs to it; match qw0 hex against the ps2_prov_sub.bin record
+            // to recover the guest source address and VIF code.
+            if (gifProvenanceEnabled())
+            {
+                std::cout << "[GS-recv] path=" << path << " size=" << size
+                          << " qw0=0x" << std::hex << word(data + 8) << ":" << word(data)
+                          << " qwEnd=0x" << word(data + size - 8) << ":" << word(data + size - 16)
+                          << std::dec << std::endl;
             }
             observeGIF(path, data, size);
             // TEMP EXPERIMENT (session 47, option B): forward a patched copy with
