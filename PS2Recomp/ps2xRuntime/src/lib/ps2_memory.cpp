@@ -2083,6 +2083,16 @@ static FILE *ps2xProvSubFile()
 
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
+    {
+        static uint64_t s_dbgSubmits = 0u, s_dbgBytes = 0u;
+        ++s_dbgSubmits;
+        s_dbgBytes += sizeBytes;
+        if ((s_dbgSubmits & 0x3FFu) == 0u || s_dbgSubmits <= 3u)
+            std::fprintf(stderr, "[GIF-funnel] submits=%llu bytes=%llu path=%u size=%u drain=%u\n",
+                         static_cast<unsigned long long>(s_dbgSubmits),
+                         static_cast<unsigned long long>(s_dbgBytes),
+                         static_cast<unsigned>(pathId), sizeBytes, drainImmediately ? 1u : 0u);
+    }
     if (!data || sizeBytes < 16)
         return;
 
