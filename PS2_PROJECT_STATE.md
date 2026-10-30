@@ -2738,9 +2738,9 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
-### Session 53 - GS re-measured after the ADXF fix: the scene reaches gameplay, the empty ctx0 scissor is real but is NOT the whole story
+### Session 53 - GS re-measured after the ADXF fix: the 593-vs-98,728 census jump is the loading->black PHASE TRANSITION, not the scissor; the dump was reading past the stride
 
-All numbers below are from the current build (ADXF semaphore deferral + corrected probes), 100 s runs.
+All numbers below are from the current build (ADXF semaphore deferral + corrected probes), 100-140 s runs.
 45-60 s runs are TOO SHORT and will mislead you: at 45 s the log shows almost no GS traffic at all
 (19 `[GS-scis]` writes, `sGifBytes` < 256 KiB), while at 100 s the same build reports 8,128 primitives,
 151 render passes, 11,444 copies and 5.2 MB of GIF traffic. Always run >= 100 s before judging the GS.
@@ -2748,28 +2748,45 @@ All numbers below are from the current build (ADXF semaphore deferral + correcte
 **A/B against my own change first (it is clean):** fix vs `PS2X_FILEIO_SYNC=1` at 100 s give identical
 `[GS-scis]=48`, `[GS-m]=24`, `[GSpost]=20/21`, audio 55/57. The semaphore deferral does not affect the GS.
 
-**`[FB-dump]` census is the trustworthy coverage instrument.** `nzWindow()` counts non-zero 32-bit
-words in the DISPFB buffer and in each context's FRAME FBP (8192-byte page units):
-
-| configuration | nzWords (all 4 MiB) | nzDisp2 | nzCtx0 | nzCtx1 |
-|---|---|---|---|---|
-| unpatched | **593** | 0 | 0 | 0 |
-| `PS2X_FORCE_FULL_SCISSOR=1` | **98,728** | 32,768 | 32,768 | 32,768 |
-
-The 593 words sit entirely at `0x3A7000..0x3FF43C` - texture/CLUT data, no framebuffer content at all.
-So unpatched, **nothing is rendered into any buffer**.
-
-**But the scissor is NOT sufficient.** With the scissor forced, the dumped images are still black:
+**RETRACTED: "the tight ctx0 scissor is the black-screen cause."** I claimed this because forcing the
+scissor appeared to take `nzWords` from 593 to 98,728. It does not. `[FB-dump]` samples fire on
+cumulative-GIF-byte thresholds (0.6, 2.4, 3.0, 3.45, 4.2, 4.8, 5.4, 5.7 MB), so a sample lands either
+before or after the loading->black transition, and that is what changes the value:
 
 ```
-gs_draw7_forced5700.bmp   512x448  nonBlack=0.7%  avgRGB=1,1,1   (ctx1 fbp=224, the rendered buffer)
-gs_frame7_forced5700.bmp  640x448  nonBlack=0.5%  avgRGB=0,0,0   (DISPFB)
-gs_slab7_forced5700.bmp   640x76   nonBlack=3.5%  avgRGB=3,3,3
+run A (unpatched)  : 0.6 2.4 3.0 -> 98,728   (all still loading)
+run B (unpatched)  : 0.6 2.4 -> 98,728, 3.0 -> 593   (transition seen here)
+run C (scissor set): 0.6 2.4 3.0 3.45 4.2 -> 98,728  (never transitioned)
+run D (scissor set): 0.6 2.4 -> 98,728, 3.0 -> 593   (transition seen here)
 ```
 
-A ~1/255 average is faint residue, not a scene. So forcing the scissor writes ~390 KB of non-zero
-words but does not compose a visible frame - Session 48's "the scene geometry does not draw" survives,
-the scissor was only one factor.
+The A/B **inverts** between repeats, so it is run variance, not the patch. Treat `nzWords` as a *phase
+detector* (98,728 = loading screen present, 593 = black phase), never as a coverage metric for the patched
+vs unpatched comparison. Any future A/B here must compare samples from the SAME phase.
+
+**The dump-width bug was real and is now fixed.** `renderRegion()` addresses pixels with the DISPFB FBW
+stride (`fbw*64` = 512 px for `fbw=8`) but the frame path looped `w = hostPresentationWidth` (640) columns,
+so every row wrapped 128 columns into the next and the dumped image was smeared. The guest's own scissor
+(0,0..511,447 from `0x1bf000001ff0000`) confirms 512 is the real width. `gs_frontend.cpp` now clamps
+`w` to `fbw*64` when they disagree; dumps are 512x448 and stride-correct.
+
+**What the corrected dumps show (512x448, sampled every 2nd pixel):**
+
+| file | phase | nonBlack | avg RGB |
+|---|---|---|---|
+| `gs_frame0_forced600.bmp` | loading | 0.7 % | 1,1,1 |
+| `gs_frame4_forced4200.bmp` | loading | 0.7 % | 1,1,1 |
+| `gs_draw4_forced4200.bmp` | loading | 0.7 % | 1,1,1 |
+| `gs_frame2_forced3000.bmp` | black | **0.0 %** | 0,0,0 |
+| `gs_draw2_forced3000.bmp` | black | **0.0 %** | 0,0,0 |
+
+Sparse content in the loading phase is consistent with text on black ("NOW LOADING"); the black phase is
+**exactly empty in both the rendered and the displayed buffer**. Session 48's core finding therefore
+stands unchanged: after the transition the game submits primitives that draw no pixels. The scissor is
+not the cause and `PS2X_FORCE_FULL_SCISSOR` should be treated as inert.
+
+**Still true from the earlier measurement:** in the black phase `nzWords=593` and all 593 words are
+texture/CLUT data at `0x3A7000..0x3FF43C` - no framebuffer content anywhere.
 
 **Geometry is NOT mostly degenerate**, contrary to Session 48's "every sprite is zero-height". The
 packed-path histogram in the same runs reports `pairs=1190, zero6=378, maxWH=10240/14336`, i.e. 68 % of
@@ -2800,11 +2817,12 @@ phase: ZERO", which is consistent: the sprites draw but sample an unbound textur
 integers in a struct array, so it does NOT establish that the game writes that scissor. `0x37f0000027f0000`
 does not occur in the ELF at all, so the "wide" scissor is computed at runtime.
 
-**Next moves, in order of expected value:** (1) fix the dump width/stride so images are usable, then
-(2) chase texture binding - TEX0/TEX1 TBP0/CBP/CLUT against the surviving VRAM region
-`0x3A7000..0x3FF43C`, since 68 % of sprite pairs are geometrically fine and "TexIndex>=1 draws = 0"
-is the outstanding anomaly. The scissor question should wait until the instrument disagreement in (1)
-of the caveats above is resolved.
+**Next move: the texture path.** 68 % of sprite pairs are geometrically fine (`pairs=1190, zero6=378,
+maxWH=10240/14336`) and the black-phase framebuffers are *exactly* zero, while the only populated VRAM is
+texture/CLUT data at `0x3A7000..0x3FF43C`. Session 48's "Textured Primitives with TexIndex>=1 in the black
+phase: ZERO" is the outstanding anomaly: the sprites are issued, they are not clipped out by geometry, so
+they must be sampling an unbound/shadowed texture and writing black. Chase TEX0/TEX1 TBP0/CBP/CLUT
+resolution against that region first. The scissor question is closed - do not spend more time on it.
 
 
 

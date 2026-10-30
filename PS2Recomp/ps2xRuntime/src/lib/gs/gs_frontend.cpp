@@ -223,6 +223,14 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
         w = 1024u;
     if (h > 1024u)
         h = 1024u;
+    // renderRegion() addresses with the FBW stride below, so reading more
+    // columns than that stride wraps each row into the next.  hostPresentationWidth
+    // says 640 for this title while DISPFB FBW=8 gives a 512-pixel stride, and the
+    // guest's own scissor (0,0..511,447 from 0x1bf000001ff0000) confirms 512 is the
+    // real width - so a 640-wide read smeared every row by 128 columns.  That is
+    // why dumped "frames" looked black/noise.  Never read past the stride.
+    if (fbw != 0u && w > fbw * 64u)
+        w = fbw * 64u;
     bool fbwGuessed = false;
     if (fbw == 0u)
     {
