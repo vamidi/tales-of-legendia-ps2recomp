@@ -997,6 +997,13 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
+namespace
+{
+    // TEMP DIAGNOSTIC (native backend): how far do guest GIF packets get through the
+    // frontend parser when a non-raw backend is installed?
+    uint64_t g_glDbgPkts = 0u, g_glDbgKicks = 0u, g_glDbgDraws = 0u, g_glDbgEarly = 0u;
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -1010,8 +1017,18 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
+    if ((++g_glDbgPkts & 0x3FFu) == 0u)
+    {
+        std::cerr << "[GS-parse] pkts=" << g_glDbgPkts << " kicks=" << g_glDbgKicks
+                  << " kicksDrawing=" << g_glDbgDraws << " imageEarly=" << g_glDbgEarly
+                  << std::endl;
+    }
+
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+    {
+        ++g_glDbgEarly;
         return;
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
@@ -1949,6 +1966,14 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 
 void GS::vertexKick(bool drawing)
 {
+    ++g_glDbgKicks;
+    if (drawing)
+        ++g_glDbgDraws;
+    if ((g_glDbgKicks & 0xFFFu) == 0u)
+    {
+        std::cerr << "[GS-kick] kicks=" << g_glDbgKicks << " kicksDrawing=" << g_glDbgDraws
+                  << " vtxCount=" << m_vtxCount << std::endl;
+    }
     ++m_vtxCount;
     ++m_vtxIndex;
 
