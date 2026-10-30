@@ -2738,6 +2738,89 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 55 - HANDOVER: native GS renderer identified and blocked on an ABI constraint; do not swap ps2_runtime.h
+
+**Reference found (after Celosia was ruled out and deleted).**
+`Arzaroth/SoulCaliburIII_Recomp` pins **`boubou666/PS2Recomp` branch `sc3/native-vu1`** (cloned to
+`D:\Personal\C++\PS2Recomp-sc3`). That branch contains a shipping **native OpenGL GS renderer**:
+`ps2xRuntime/src/lib/gs/gs_native_backend.cpp` (160 KB), `src/lib/native/native_texture_cache.cpp` (15 KB),
+`include/runtime/native/native_gs_hook.h`, plus `native_gif.cpp`, `native_renderer_gs.cpp`. It is installed
+exactly as we tried:
+
+```cpp
+if (GLFWwindow *shared = GSNativeBackend::createSharedContext())
+    m_gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
+```
+
+Confirmed from their code: `GSNativeBackend` derives from the **same `GSRasterBackend`** and implements
+**`Submit`** - so the frontend route IS the correct one. My earlier "the frontend is bypassed" conclusion
+was an artifact of probes that printed only every 1024th call (see the lesson at the end).
+
+**THE BLOCKER - never replace `ps2xRuntime/include/ps2_runtime.h`.**
+The fork redefined the recompiled-function ABI:
+
+```
+ours:  using RecompiledFunction = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
+fork:  using RecompiledFunction = Ps2RecompiledFunction;      // from ps2_recomp_abi.h
+```
+
+All ~53,000 generated files in `ps2xRuntime/src/runner/` compile against OUR signature
+(`ctx->pc = getRegU32(ctx, 31);`). Swapping that header breaks every one of them. The fork also lacks
+`ps2_recompiled_functions.h` (4.6 MB of our generated ToL table). Therefore: **hand-merge only.**
+`src/lib/` and *additive* headers are safe; `ps2_runtime.h` and the generated headers are not.
+
+**The six integration points, located (this is the whole remaining task):**
+
+| # | File | What is missing | Notes |
+|---|---|---|---|
+| 1 | `include/runtime/gs/gs_backend.h` | `fillNativeRegisters(GsDrawTarget&, const GSContext&)` | additive static; needs `native_gs_hook.h` |
+| 2 | `include/runtime/gs/gs_types.h` | `PresentationFrame::glTexture` | one `uint32_t` field |
+| 3 | `src/lib/gs/gs_frontend.cpp` | present path sets `m_hostPresentationTexture = frame.glTexture` | ~line 1545 in their tree |
+| 4 | `src/lib/ps2_runtime.cpp` | `UploadFrame(..., uint32_t &outGlTexture)` | draws the shared texture instead of pixels |
+| 5 | `src/lib/gs/ps2_gs_memory.cpp` + header | `byteOfPixel<T>`, `byteOf`, `PageOf`, `BlockOf` | tables already exist in our tree |
+| 6 | `ps2xRuntime/CMakeLists.txt` | raylib glad include path + `SKIP_UNITY_BUILD_INCLUSION` | `"${raylib_SOURCE_DIR}/src;${raylib_SOURCE_DIR}/src/external/glfw/include"` |
+
+Point 5 detail - our tree already has `PageTableC32/C16/C16S/C8(P8)/P4/Z32/Z16/Z16S` and `ReadTexture`
+uses them, so only the thin wrappers need adding:
+
+```cpp
+u32 byteOf(...)   { switch (psm) { case C32: return byteOfPixel<C32>(PageTableC32, bp, bw, x, y); ... } }
+u32 PageOf(...)   { return byteOf(...) / GS_PAGE_SIZE; }   // 8192
+u32 BlockOf(...)  { return byteOf(...) / 256u; }
+```
+
+**The presentation finding that explains our black frames.** Their `PresentationFrame` carries a **GL
+texture**, not pixels:
+
+```cpp
+// A renderer drawing on a GL context shared with the window's hands the picture
+// over as a texture instead of pixels (GSNativeBackend::presentOnGpu).
+uint32_t glTexture = 0;
+```
+
+Our first attempt rendered to the default framebuffer and used `glReadPixels`, i.e. read back the wrong
+context - hence 0.0 % non-black every time. Use a **shared context** and hand the texture over.
+
+**Their own list of bugs a native GS hits** (from the SC3 README) - use as a validation checklist, since
+emulation hides all of them: sample pixels at integer coordinates as the GS does (otherwise a 1-pixel seam
+every 64 pixels); HIGHLIGHT/HIGHLIGHT2 add vertex alpha at its own scale; blend with `Ad` at the GS scale;
+draws must test against the ZBUF they name (their shadow pass darkened the whole frame); with COLCLAMP off
+keep the low 8 bits (shadow volumes wrap past white); a colour buffer read as Z follows the Z format's
+block order; untextured draws need their own colour.
+
+**State at handover.** `daf3ef3`, tag `pre-native-backend-swap`, tree clean and building; `GSNativeBackend`
+sources are in the tree but NOT in the build; `PS2X_GS_NATIVE` is off and parallel-gs remains the default.
+**The loading screen has still never been validated through the native path.**
+
+**Three lessons that cost real time in this stretch - apply them:**
+1. **A probe that prints only every 1024th call reads as zero.** `[GS-parse]`, `[GSB]`, `[GIF-arb]` were all
+   "0" by sampling sparsity, not by absence; `submitGifPacket` printed instantly once it logged the first 3
+   calls. Always print the first call, then sample.
+2. **One header edit per build.** Editing `gs_backend.h` + `ps2_gs_memory.h` together blew a 15-minute cap
+   and forced a wide recompile.
+3. **Do not size a change by file count - size it by dependents.** A "swap 120 files" plan nearly deleted
+   the ToL `data/CD` override, and would have broken 53,000 generated files via one header.
+
 ### Session 54 - Celosia reviewed: it renders with a NATIVE renderer fed by game overrides, not the GS; decision to keep our GIF decode and replace the GS
 
 Reviewed `github.com/HenryKun55/celosia` (Shadow of the Colossus, same PS2Recomp base, cloned to
