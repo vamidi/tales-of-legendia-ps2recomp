@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace ps2x::native
 {
@@ -136,7 +137,16 @@ namespace ps2x::native
         virtual void beginFrame(uint32_t width, uint32_t height) = 0;
         virtual void setScissor(int32_t x0, int32_t y0, int32_t x1, int32_t y1) = 0;
         virtual void draw(PrimitiveType type, MeshId mesh, const DrawState &state) = 0;
+        // Immediate geometry: the GS seam submits 1-3 vertices per primitive, so
+        // this is the form the bridge uses. Cached meshes go through draw().
+        virtual void drawVertices(PrimitiveType type, const Vertex *vertices, uint32_t count,
+                                  const DrawState &state) = 0;
         virtual void endFrame() = 0;
+
+        // Reads the frame just drawn back as RGBA (row 0 = top). The GS seam needs
+        // pixels, not just a presented window, because the runtime shows the frame
+        // through its own path. Returns false when the backend cannot read back.
+        virtual bool readback(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) = 0;
     };
 
     // Backends. Return nullptr when the platform/API is not built in.

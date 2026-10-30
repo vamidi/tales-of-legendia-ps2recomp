@@ -293,22 +293,42 @@ namespace ps2x::native
                 m_pendingScissor[3] = y1;
             }
 
-            void draw(PrimitiveType type, MeshId, const DrawState &state) override
+            void draw(PrimitiveType, MeshId, const DrawState &) override
             {
-                // Vertices were queued by the bridge; this only records ordering.
-                if (m_vertices.size() == m_recorded)
+                // Cached meshes are not used by the GS seam yet.
+            }
+
+            void drawVertices(PrimitiveType type, const Vertex *vertices, uint32_t count,
+                              const DrawState &state) override
+            {
+                if (vertices == nullptr || count == 0u)
                     return;
+                const uint32_t first = uint32_t(m_vertices.size());
+                m_vertices.reserve(m_vertices.size() + count);
+                for (uint32_t i = 0u; i < count; ++i)
+                {
+                    const Vertex &v = vertices[i];
+                    GlVertex g;
+                    g.x = v.x;
+                    g.y = v.y;
+                    g.u = v.u;
+                    g.v = v.v;
+                    g.r = float(v.rgba & 0xFFu) / 255.0f;
+                    g.g = float((v.rgba >> 8) & 0xFFu) / 255.0f;
+                    g.b = float((v.rgba >> 16) & 0xFFu) / 255.0f;
+                    g.a = float((v.rgba >> 24) & 0xFFu) / 255.0f;
+                    m_vertices.push_back(g);
+                }
                 FrameDraw d;
                 d.type = type;
-                d.first = m_recorded;
-                d.count = uint32_t(m_vertices.size()) - m_recorded;
+                d.first = first;
+                d.count = count;
                 d.texture = state.texture;
                 d.textured = state.textured;
                 d.blending = state.blending;
                 d.linear = state.linearFilter;
                 std::memcpy(d.scissor, m_pendingScissor, sizeof(d.scissor));
                 m_draws.push_back(d);
-                m_recorded = uint32_t(m_vertices.size());
             }
 
             // The bridge appends here; draw() then records the range.
@@ -365,6 +385,29 @@ namespace ps2x::native
                     gl().gl_DrawArrays(toGlPrimitive(d.type), int(d.first), int(d.count));
                 }
                 gl().gl_BindVertexArray(0);
+            }
+
+            bool readback(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) override
+            {
+                width = m_width;
+                height = m_height;
+                rgba.assign(static_cast<size_t>(m_width) * m_height * 4u, 0u);
+                gl().gl_PixelStorei(0x0D05 /*GL_PACK_ALIGNMENT*/, 1);
+                gl().gl_ReadPixels(0, 0, int(m_width), int(m_height), kGLRGBA, kGLUnsignedByte,
+                                   rgba.data());
+                // GL origin is bottom-left; PresentationFrame wants row 0 at the top.
+                const size_t rowBytes = static_cast<size_t>(m_width) * 4u;
+                std::vector<uint8_t> tmp(rowBytes);
+                for (uint32_t y = 0u; y < m_height / 2u; ++y)
+                {
+                    uint8_t *a = rgba.data() + static_cast<size_t>(y) * rowBytes;
+                    uint8_t *b = rgba.data() + static_cast<size_t>(m_height - 1u - y) * rowBytes;
+                    std::memcpy(tmp.data(), a, rowBytes);
+                    std::memcpy(a, b, rowBytes);
+                    std::memcpy(b, tmp.data(), rowBytes);
+                }
+                // GL gives RGBA; PresentationFrame expects RGBA too.
+                return true;
             }
 
             // Exposed for the bridge's texture decode.
