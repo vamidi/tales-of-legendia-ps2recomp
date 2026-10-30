@@ -2940,45 +2940,28 @@ bypassing TME reveals pixels while forcing `As = 0x80` does not, the sampled tex
 colour and alpha: `Cs * As = 0 * 0.5 = 0`. A texture read returning (0,0,0,0) points at the read itself -
 TBP0 `0x3FF000`, TBW=1, PSM `0x14` (T8) and the CBP `0x3FF400` CLUT lookup - not at the blend.
 
-**Texture/CLUT sampled directly - the index range and the palette do not match.** `PS2X_TEX_DUMP=1` maps
-VRAM at `0x3FF000` (TBP0) through `gs.map_vram_read` and decodes the T8 index -> CLUT entry path. Twelve
-black-phase samples, all showing the same CLUT:
+**RETRACTED: there is no CLUT/index mismatch. The texture is T4, not T8.** `GS_PSM_T8 = 19 (0x13)` and
+`GS_PSM_T4 = 20 (0x14)` in `gs_types.h`, so PSM `0x14` is **T4 - 4-bit indexed**, which my earlier note read
+as T8. That single misread invalidates the "indices miss the palette" conclusion:
 
-```
-clut@0x3FF400: 0 : 50000004 : 33ffffff : 3bffffff : ffffff : 8ffffff : 44ffffff : 4cffffff
-```
+- A T4 texture uses a **16-entry** palette and 4-bit indices `0..15`. The measured `clutNz=15 range=1..15`
+  is therefore exactly right, not truncated - entry 0 is simply transparent black.
+- Each texture byte carries **two** 4-bit indices (high and low nibble), so bytes like `0xc0`, `0xf0`,
+  `0x0f` decode to indices `12/0`, `15/0`, `0/15` - all inside `0..15`.
+- The "every other byte is zero" pattern that looked like 16-bit data is just index-0 texels.
 
-Decoded as CT32 (A in bits 24-31) entries 0-7 are: **entry 0 = 0x00000000 (transparent)**, entry 1 =
-`0x50000004` (near-black, A=0x50), entries 2-7 = white with alpha `0x33, 0x3B, 0x00, 0x08, 0x44, 0x4C`.
-That is a real, populated palette - and it is **byte-identical in every one of the 12 samples**, so the CLUT
-is loaded once and never changes.
+So texture binding, CLUT placement, CLUT extent and index decode are all **consistent and correct**. The
+palette itself decodes (CT32, alpha in bits 24-31) as: entry 0 `0x00000000` transparent, entry 1
+`0x50000004` dark red with A=0x50, entries 2-7 white with alpha `0x33 0x3B 0x00 0x08 0x44 0x4C`.
 
-The texture at `0x3FF000` is the opposite: it **changes on every sample** -
+**What that leaves unexplained.** With a white palette at alpha `0x33-0x4C` and a black destination, the
+blend `Cs * As` should give roughly `0xFF * 0.4 ~= 0x66` - clearly visible - yet the black-phase BMP reads
+**0.0 % non-black** while TME-off gives 6.7 %. Either the sampled UVs land mostly in index-0 (transparent)
+regions, or the alpha is not reaching the blend as `As`. That is the next thing to measure, and it needs a
+real sample of the blended output rather than more static inspection of the palette.
 
-```
-0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0
-0:0:c0:0:0:0:f0:0:c0:0:0:f:0:0:d0:e
-0:0:10:0:30:0:90:0:0:0:0:f:e0:0:0:6
-f0:0:20:0:f0:0:a0:0:b0:0:0:0:f0:0:0:0
-```
-
-so the game is streaming new texture data into that address throughout the black phase (consistent with an
-animated/fade texture, and with the varying CLUT alphas).
-
-**The failure is the mapping.** The decoded samples are `i0=0x00 -> CLUT[0] = 0x0 (a=0)`,
-`i10=0xD0 -> 0x0 (a=0)`, `i20=0x0 -> 0x0`, `i30=0x0 -> 0x0`: the indices in use land on **zero/transparent
-CLUT entries**, so the sampled texel is (0,0,0,0) and the blend `Cs*As` is 0 - exactly the black screen, and
-consistent with `PS2X_FORCE_ALPHA` failing to help (forcing `As` does nothing when `Cs` is also 0).
-
-Two candidate causes, both testable:
-1. **The texture data does not look 8-bit.** Every other byte at `0x3FF000` is zero
-   (`f0:0:20:0:f0:0:a0:0`), the signature of a **16-bit** texture, yet TEX0 reports PSM `0x14` (T8). If PSM/TBW
-   are mis-decoded, the index extraction is meaningless.
-2. **The CLUT base or its extent is wrong.** Only a handful of entries are populated and the in-use indices
-   (0xC0-0xF0) are far outside them, which would also happen if CBP or the CSM split were mis-handled.
-
-Next: dump all 256 CLUT entries (not 8) and the first 64 texture bytes as both 8-bit and 16-bit, and check
-which interpretation yields indices that fall inside the populated palette.
+**Lesson worth keeping:** decode PSM through `gs_types.h`, never from memory. Reading `0x14` as T8 cost two
+sessions of wrong conclusions.
 
 
 

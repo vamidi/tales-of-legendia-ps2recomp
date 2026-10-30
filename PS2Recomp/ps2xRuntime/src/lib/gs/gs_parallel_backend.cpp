@@ -893,7 +893,7 @@ namespace
                         if (texDumpEnabled() && s0 == 0x100000001ull)
                         {
                             static uint32_t s_texPrints = 0u;
-                            if (s_texPrints < 12u)
+                            if (s_texPrints < 4u)
                             {
                                 gs.flush();
                                 const uint8_t *mapped =
@@ -903,31 +903,49 @@ namespace
                                     ++s_texPrints;
                                     uint8_t buf[0x800];
                                     std::memcpy(buf, mapped, sizeof(buf));
-                                    // Mapped from 0x3FF000, so the CLUT at 0x3FF400 is +0x400.
-                                    constexpr uint32_t kClutOff = 0x400u;
-                                    auto byteAt = [&](uint32_t off) { return unsigned(buf[off]); };
+                                    constexpr uint32_t kClutOff = 0x400u; // 0x3FF400 - 0x3FF000
                                     auto wordAt = [&](uint32_t off) {
                                         uint32_t v = 0u;
                                         std::memcpy(&v, buf + off, sizeof(v));
                                         return v;
                                     };
-                                    std::cerr << "[TEX] tex@0x3FF000:";
-                                    for (uint32_t i = 0u; i < 16u; ++i)
-                                        std::cerr << std::hex << (i ? ":" : "") << byteAt(i);
-                                    std::cerr << " clut@0x3FF400:";
-                                    for (uint32_t i = 0u; i < 8u; ++i)
-                                        std::cerr << std::hex << (i ? ":" : "")
-                                                  << wordAt(kClutOff + i * 4u);
-                                    std::cerr << " | samples:";
-                                    for (uint32_t s = 0u; s < 4u; ++s)
+                                    auto alphaOf = [&](uint32_t idx) {
+                                        return (wordAt(kClutOff + (idx & 0xFFu) * 4u) >> 24) & 0xFFu;
+                                    };
+                                    // CLUT extent: how many of the 256 entries are populated?
+                                    uint32_t clutNz = 0u, clutLo = 256u, clutHi = 0u;
+                                    for (uint32_t i = 0u; i < 256u; ++i)
                                     {
-                                        const uint32_t idx = byteAt(s * 16u);
-                                        const uint32_t e = wordAt(kClutOff + (idx & 0xFFu) * 4u);
-                                        std::cerr << " i" << s * 16u << "=0x" << std::hex << idx
-                                                  << "->0x" << e << "(a=0x" << ((e >> 24) & 0xFFu)
-                                                  << ")";
+                                        if (wordAt(kClutOff + i * 4u) != 0u)
+                                        {
+                                            ++clutNz;
+                                            if (i < clutLo)
+                                                clutLo = i;
+                                            if (i > clutHi)
+                                                clutHi = i;
+                                        }
                                     }
-                                    std::cerr << std::dec << std::endl;
+                                    std::cerr << "[TEX] clutNz=" << clutNz
+                                              << " range=" << (clutNz ? clutLo : 0u) << ".."
+                                              << clutHi << " tex32=";
+                                    for (uint32_t i = 0u; i < 32u; ++i)
+                                        std::cerr << std::hex << (i ? ":" : "") << unsigned(buf[i]);
+                                    // 8-bit indices: byte i
+                                    std::cerr << std::dec << " | as8 idx/alpha:";
+                                    for (uint32_t i = 0u; i < 10u; ++i)
+                                        std::cerr << " " << std::hex << unsigned(buf[i]) << "/"
+                                                  << alphaOf(buf[i]) << std::dec;
+                                    // 16-bit indices: little-endian halfword at byte i*2
+                                    std::cerr << " | as16 idx/alpha(lo,hi):";
+                                    for (uint32_t i = 0u; i < 5u; ++i)
+                                    {
+                                        const uint32_t lo = buf[i * 2u];
+                                        const uint32_t hi = buf[i * 2u + 1u];
+                                        std::cerr << " " << std::hex << (lo | (hi << 8)) << "["
+                                                  << alphaOf(lo) << "," << alphaOf(hi) << "]"
+                                                  << std::dec;
+                                    }
+                                    std::cerr << std::endl;
                                 }
                             }
                         }
