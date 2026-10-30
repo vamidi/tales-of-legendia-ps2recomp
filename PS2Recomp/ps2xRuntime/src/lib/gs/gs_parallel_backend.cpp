@@ -84,6 +84,18 @@ namespace
         }();
         return v;
     }
+    // Session 54: log the UV/ST the black-phase sprites sample.  TEX0 says PSM 0x14
+    // (T4, 16-entry palette, index 0 transparent), so if every UV is 0 the sprites
+    // sample texel 0 -> index 0 -> fully transparent, which would explain a 0.0%
+    // framebuffer without anything being wrong in the texture path.
+    bool uvDumpEnabled()
+    {
+        static const bool v = [] {
+            const char *e = std::getenv("PS2X_UV_DUMP");
+            return e && *e && *e != '0';
+        }();
+        return v;
+    }
     // TEMP DIAGNOSTIC (session 54): the last BITBLTBUF the guest wrote.  Shared
     // between the observeGIF walk (writer) and ProcessGIF's payload probe
     // (reader), which are different functions - a function-local static in the
@@ -305,7 +317,8 @@ namespace
             // TEX0_1 0x06) are the same in both schemes.
             static uint64_t s_adPrim = 0u;    // PRIM (0x00)     - one per primitive
             static uint64_t s_adXyz = 0u;     // XYZ2 (0x05)     - one per vertex
-            static uint64_t s_adTex = 0u;     // TEX0_1 (0x06)
+    static uint64_t s_adTex = 0u;     // TEX0_1 (0x06)
+    static uint64_t s_adTexFlush = 0u; // TEXFLUSH (0x3F) - required after a texture upload
             static uint64_t s_adFrame = 0u;   // FRAME_1 (0x4C)
             static uint64_t s_adRgba = 0u;    // RGBAQ (0x01)    - one per vertex/colour
             static uint32_t s_xyoff1 = 0u, s_xyoff2 = 0u;
@@ -437,7 +450,7 @@ namespace
                     break;
                 }
                 case 0x06: ++s_adTex; break;                                // TEX0_1
-                case 0x18: s_xyoff1 = uint32_t(adValue); break;             // XYOFFSET_1
+                case 0x3F: ++s_adTexFlush; break;                            // TEXFLUSH
                 case 0x40: s_scissor1 = adValue; break;                     // SCISSOR_1
                 case 0x42: s_alpha1 = uint32_t(adValue); break;             // ALPHA_1
                 case 0x50: bitbltMirror() = adValue; break;                  // BITBLTBUF
@@ -630,6 +643,32 @@ namespace
                         m_scisPatch.push_back({offset, adValue & ~0x10ull}); // clear PRIM.TME
                     if (adReg == 0x01u && forceRgbaqEnabled())
                         m_scisPatch.push_back({offset, kBrightRgbaq});
+                    // Session 54: does the black-phase sprite sample a real texel?
+                    if (uvDumpEnabled() && (adReg == 0x02u || adReg == 0x03u) &&
+                        s_scissor1 == 0x100000001ull)
+                    {
+                        static uint32_t s_uvPrints = 0u;
+                        static uint64_t s_uvSample[24] = {};
+                        static uint32_t s_uvReg[24] = {};
+                        if (s_uvPrints < 24u)
+                        {
+                            s_uvSample[s_uvPrints] = adValue;
+                            s_uvReg[s_uvPrints] = adReg;
+                            ++s_uvPrints;
+                            if (s_uvPrints == 24u)
+                            {
+                                std::cerr << "[UV] black-phase samples (reg 0x02=ST, 0x03=UV):";
+                                for (uint32_t i = 0u; i < 24u; ++i)
+                                {
+                                    const uint32_t u = uint32_t(s_uvSample[i]) & 0x3FFFu;
+                                    const uint32_t v = uint32_t(s_uvSample[i] >> 16) & 0x3FFFu;
+                                    std::cerr << " [" << std::hex << s_uvReg[i] << ":"
+                                              << u << "," << v << std::dec << "]";
+                                }
+                                std::cerr << std::endl;
+                            }
+                        }
+                    }
                     // Session 54: force a known non-zero sampled alpha.
                     if (forceAlphaEnabled())
                     {
@@ -660,7 +699,7 @@ namespace
                           << " up=" << uploadedBytes << " px=" << transfer.copiedPixels << "/"
                           << transfer.totalPixels << " prim=" << s_adPrim << " xyz=" << s_adXyz
                           << " in=" << s_xyzIn << " out=" << s_xyzOut << " X=" << s_minX << ".."
-                          << s_maxX << " Y=" << s_minY << ".." << s_maxY << " tex=" << s_adTex
+                           << s_maxX << " Y=" << s_minY << ".." << s_maxY << " tex=" << s_adTex << " texflush=" << s_adTexFlush
                           << " frame=" << s_adFrame
                            << " rgba=" << s_adRgba << " black=" << s_rgbBlack << " a0="
                            << s_rgbZeroA << " a255=" << s_rgbOpaque << " tme=" << s_primTme

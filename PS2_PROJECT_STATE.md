@@ -2954,11 +2954,31 @@ So texture binding, CLUT placement, CLUT extent and index decode are all **consi
 palette itself decodes (CT32, alpha in bits 24-31) as: entry 0 `0x00000000` transparent, entry 1
 `0x50000004` dark red with A=0x50, entries 2-7 white with alpha `0x33 0x3B 0x00 0x08 0x44 0x4C`.
 
-**What that leaves unexplained.** With a white palette at alpha `0x33-0x4C` and a black destination, the
-blend `Cs * As` should give roughly `0xFF * 0.4 ~= 0x66` - clearly visible - yet the black-phase BMP reads
-**0.0 % non-black** while TME-off gives 6.7 %. Either the sampled UVs land mostly in index-0 (transparent)
-regions, or the alpha is not reaching the blend as `As`. That is the next thing to measure, and it needs a
-real sample of the blended output rather than more static inspection of the palette.
+**Option A exhausted: every measurable sampling input is correct.** Three more probes, all on genuine
+black-phase runs:
+
+1. **UV/ST are real, not a corner sample.** `PS2X_UV_DUMP=1` logs the UV (0x03) writes made while the
+   ctx0 scissor is the black-phase marker: `38,8`, `e8,108`, `d8,d8`, `88,118`, ... In 12.4 fixed point
+   those are texels (3,0), (14,16), (13,13), (8,17) - the sprites sample across the texture, not texel 0.
+2. **TEXFLUSH is present, not missing.** The walk now counts it (`tex=` / `texflush=` in `[GS-census]`):
+   the black phase issues **403 TEX0 writes and 25,334 TEXFLUSH writes**. A missing post-upload flush is
+   therefore ruled out.
+3. **The texture, CLUT and palette are all correct** (previous section): T4, 16 entries, in-range indices.
+
+So: geometry fine, scissor correct, texture bound, CLUT correct, indices in range, UVs real, flush present,
+uploads carrying non-zero data - and the framebuffer is still 0.0 % with `TME=1` while `TME=0` draws 6.7 %.
+Everything observable from our side is right, which means the remaining fault is inside the texture
+sampling/blend application itself, and **it cannot be narrowed further by inspecting guest state**. That is
+the point to stop guessing at the GS.
+
+**Recommended next options (pick one, do not keep probing blindly):**
+- **Reference capture.** Run the same ISO under PCSX2 at the same point and capture the screen, so the
+  question becomes a diff instead of an inference. This is the only way to learn what the scene is
+  *supposed* to look like - and it would also settle whether the black phase is a real bug at all rather
+  than a legitimate fade/loading overlay (the palette is white at alpha 0x33-0x4C and the texture animates,
+  which is exactly what a fade looks like).
+- **Consolidate.** The ADXF fix and the instrument corrections are real value; the state log now prevents
+  re-walking five wrong theories.
 
 **Lesson worth keeping:** decode PSM through `gs_types.h`, never from memory. Reading `0x14` as T8 cost two
 sessions of wrong conclusions.
