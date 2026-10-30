@@ -19,9 +19,16 @@ Do not publish `data`, `out` or `tools\\.build`. They may contain user inputs,
 extracted game files or generated derivatives.
 
 
-| Step                                                                | Status      | Note                     |
-|---------------------------------------------------------------------|-------------|--------------------------|
-| Base game compiles, but is missing MMI functions and has CP0 errors | In Progress | Screen is currently pink |
+*Status as of **Session 51** (2026-10-30). If `PS2_PROJECT_STATE.md` has a higher session number, this table is stale.*
+
+| Milestone | Status | Note |
+|-----------|--------|------|
+| Boot chain — SIF/RPC, IOP modules, all six MBS archives mount | ✅ Working | Syscalls and stubs implemented; no I/O stall |
+| First rendered frame ("NOW LOADING") | ✅ Verified | Confirmed from a framebuffer dump, not just a counter |
+| ADXF asset streaming | ⚠️ Flaky | ~10% of runs still deadlock in `ADXF_GetPtStat`; residual cause unknown |
+| Scene rendering after the load transition | ❌ Blocked | Geometry is submitted but degenerate at the GIF level (zero-height sprites) → black screen |
+| Build speed | ⚠️ Slow | Tree is an MSVC **Debug** build; `clang-cl + Ninja + Release` is far faster |
+| Overall | 🚧 In progress | Evidence, history and next steps: [`PS2_PROJECT_STATE.md`](PS2_PROJECT_STATE.md) |
 
 ### Legal notice
 

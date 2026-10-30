@@ -32,6 +32,13 @@ This table tells you WHERE to find detailed instructions. Load the resource file
 | **PS2 hardware deep-dive** | `08-infinite-knowledge-base.md` → `09-ps2tek.md` | 230KB holy grail — registers, SCMD, SIF, VIF, SPU2 |
 | **Runtime debugging / A/B comparison** | `12-pcsx2-mcp-playbook.md` | PCSX2 DebugServer, breakpoints, register inspection, A/B comparison |
 | **Stuck on "why" / need reasoning framework** | `13-decisional-brain.md` | 5-step reasoning loop, diagnosis escalation, anti-patterns |
+| **Locating/validating the game ELF** | `14-ps2-elf-files.md` | ISO extraction, naming, section layout, magic-byte check |
+| **Analyzer: no symbols / bad function boundaries** | `15-ps2x-analyzer.md` | DWARF vs JAL scanner vs Ghidra map |
+| **TOML keys / stubs vs skip vs patch decisions** | `16-ps2x-recomp.md` | Verified TOML reference + generated-output review |
+| **Runtime internals: which file to edit for a syscall/stub** | `17-ps2x-runtime.md` | Real repo paths + log-symptom → action table |
+| **Per-build address binding / custom wrapper** | `18-game-override-hooks.md` | Override API, matcher semantics, PC-advance trap |
+| **Stripped game, boot → menu triage** | `19-stripped-game-walkthrough.md` | End-to-end loop: analyze → recompile → bind → debug |
+| **`ctx->` field lookup / register debugging** | `20-r5900-context-layout.md` | Verified `R5900Context` + helper functions |
 | **Unknown PS2 topic** | `db-ps2-index.md` | **Master router** — maps any topic to the right db-*.md file |
 | **Hardware diagrams** | `resources/images/IMAGE_CATALOG.md` | 80 classified images from PS2 PDFs |
 
@@ -236,6 +243,13 @@ For full tool catalog, A/B comparison workflow, and recipes → load `12-pcsx2-m
 | `11-operational-phases.md` | Phase 0-5 deep workflow + test protocols |
 | `12-pcsx2-mcp-playbook.md` | PCSX2 DebugServer tools, A/B comparison, recipes |
 | `13-decisional-brain.md` | Reasoning loop, diagnosis escalation, anti-patterns |
+| `14-ps2-elf-files.md` | ELF sections, disc extraction, naming, magic bytes |
+| `15-ps2x-analyzer.md` | `ps2_analyzer` discovery paths, generated TOML shape |
+| `16-ps2x-recomp.md` | `ps2_recomp` + verified TOML reference, `stubs`/`skip`/`patches` |
+| `17-ps2x-runtime.md` | Runtime layout, syscall/stub edit locations, symptom → action |
+| `18-game-override-hooks.md` | Game override API, ELF matching, PC-advance trap |
+| `19-stripped-game-walkthrough.md` | Boot → menu walkthrough for symbol-less games |
+| `20-r5900-context-layout.md` | EE/IOP summary + verified `R5900Context` layout |
 | `db-ps2-index.md` | **Master router** → maps topic to db file |
 | `db-syscalls.md` | EE syscall table |
 | `db-sdk-functions.md` | SDK function stubs |

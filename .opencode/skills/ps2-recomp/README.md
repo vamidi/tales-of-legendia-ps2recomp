@@ -107,6 +107,57 @@ Start at Phase 0 — detect my build config and report before doing anything.
 
 ---
 
+## 📚 Resource Library
+
+The agent loads these on demand — it does **not** read them all at boot. `SKILL.md` §1 tells it which one to reach for.
+
+**Core pipeline & workflow**
+
+| File | Content |
+|------|---------|
+| `00` `SKILL.md` | Decision router, boot sequence, prohibitions, build gate |
+| `01-ps2-hardware-bible.md` | Memory maps, I/O registers, EE/IOP architecture |
+| `02-mips-r5900-isa.md` | MIPS→C++ translation (MMI, COP0, FPU) |
+| `03-ps2recomp-pipeline.md` | CLI args, TOML schema, output format |
+| `04-runtime-syscalls-stubs.md` | Syscall implementation, stubs, runtime structure |
+| `05-ghidra-ghydramcp-guide.md` | Ghidra scripting, MCP tool usage |
+| `06-game-porting-playbook.md` | `sub_xxx` inference, triage strategies |
+| `07-ps2-code-patterns.md` | DMA, VIF, GS packets, CD/IOP loops |
+
+**Hardware deep-dive**
+
+| File | Content |
+|------|---------|
+| `08-infinite-knowledge-base.md` | Search instructions for `09-ps2tek.md` |
+| `09-ps2tek.md` | 230 KB PS2 hardware reference |
+| `db-*.md` | Master router + syscalls, SDK functions, registers, memory map, ISA, VU, architecture, overlays |
+| `resources/images/IMAGE_CATALOG.md` | 80 classified hardware diagrams |
+
+**Agent discipline & debugging**
+
+| File | Content |
+|------|---------|
+| `10-agent-guardrails.md` | Mistake taxonomy, root-cause protocol, adversarial split |
+| `11-operational-phases.md` | Phase 0-5 workflow with entry/exit criteria |
+| `12-pcsx2-mcp-playbook.md` | PCSX2 DebugServer tools, A/B comparison |
+| `13-decisional-brain.md` | Reasoning loop, diagnosis escalation, anti-patterns |
+
+**Toolchain-as-built (derived from the [PS2Recomp wiki](https://github.com/ran-j/PS2Recomp/wiki))**
+
+| File | Content |
+|------|---------|
+| `14-ps2-elf-files.md` | ELF sections, disc extraction, naming conventions, magic-byte check |
+| `15-ps2x-analyzer.md` | `ps2_analyzer`: DWARF vs JAL scanner vs Ghidra map |
+| `16-ps2x-recomp.md` | `ps2_recomp`: verified TOML reference, `stubs`/`skip`/`patches` |
+| `17-ps2x-runtime.md` | Runtime layout, where to edit syscalls/stubs, log-symptom table |
+| `18-game-override-hooks.md` | Override API, ELF matching, the PC-advance trap |
+| `19-stripped-game-walkthrough.md` | Boot → menu walkthrough for symbol-less games |
+| `20-r5900-context-layout.md` | EE/IOP summary + verified `R5900Context` field layout |
+
+> Files `14`–`20` were ported from the project wiki with **paths and struct layouts re-verified against this repo**. Where the wiki had drifted (e.g. `src/lib/ps2_syscalls.cpp` → `src/lib/Kernel/Syscalls/`, and an outdated `R5900Context`), the corrected version is what ships.
+
+---
+
 ## 🤝 How to Collaborate (The Human-in-the-Loop)
 
 While the agent is highly autonomous, PS2 reverse engineering requires your eyes:
