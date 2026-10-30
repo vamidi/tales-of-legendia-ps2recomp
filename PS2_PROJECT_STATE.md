@@ -2808,9 +2808,38 @@ draws must test against the ZBUF they name (their shadow pass darkened the whole
 keep the low 8 bits (shadow volumes wrap past white); a colour buffer read as Z follows the Z format's
 block order; untextured draws need their own colour.
 
-**State at handover.** `daf3ef3`, tag `pre-native-backend-swap`, tree clean and building; `GSNativeBackend`
-sources are in the tree but NOT in the build; `PS2X_GS_NATIVE` is off and parallel-gs remains the default.
-**The loading screen has still never been validated through the native path.**
+**PROGRESS SINCE THE HANDOVER ABOVE (points 5, 2 and the texaRaw field are DONE):**
+
+| # | Point | Status | Commit |
+|---|---|---|---|
+| 5 | `GSMem::byteOf` / `PageOf` / `BlockOf` | **DONE, green** | `1910c39` |
+| 2 | `PresentationFrame::glTexture` | **DONE, green** | `50f1489` |
+| 1 | `fillNativeRegisters` | field added, function NOT written | `50f1489` |
+| 3 | `gs_frontend.cpp` present path | todo | |
+| 4 | `ps2_runtime.cpp` `UploadFrame(... outGlTexture)` | todo | |
+| 6 | CMake glad + `SKIP_UNITY` | todo | |
+
+**STRUCTURAL FINDING - their `GSContext` is our `GSDrawState`.** Our `GSContext` (gs_types.h L180-195) is
+only `frame`, `scissor`, `tex0`, `xyoffset`. The fork's `GSContext` carries the whole drawing state
+(`texaRaw`, `alpha`, `test`, `clamp`, `fogcol`, `zbuf`). So:
+
+- `texaRaw` belongs on **`GSDrawState`** (it is there now) - it looked misplaced but is correct.
+- `fillNativeRegisters(GsDrawTarget&, const GSContext&)` must be written against **`GSDrawState`**, and the
+  `NativeDraw` virtual must take **`GSDrawState`** too. Copying their signature verbatim fails on every
+  field it reads.
+
+**State now.** HEAD `50f1489`, tree clean and building, 3 commits to push
+(`503aa1d`, `1910c39`, `50f1489`). Tag `pre-native-backend-swap` at `daf3ef3`. `GSNativeBackend` sources
+are in the tree but NOT in the build; `PS2X_GS_NATIVE` is off and parallel-gs remains the default.
+**The loading screen has still never been validated through the native path** - but notes 2-4 replace the
+`glReadPixels` mechanism that made every earlier attempt black, so point 4 is the first place a non-black
+frame would mean anything.
+
+**Fourth lesson:** *a green build proves it compiles, not that it landed in the right place.* `texaRaw`
+applied to the wrong struct and still built, because nothing consumed it yet. Print the surrounding struct
+boundaries after any structural edit, and prefer tools that fail loudly over scripted text surgery - in
+this stretch `.Insert()` on a fixed-size PowerShell array silently did nothing while printing "inserted".
+
 
 **Three lessons that cost real time in this stretch - apply them:**
 1. **A probe that prints only every 1024th call reads as zero.** `[GS-parse]`, `[GSB]`, `[GIF-arb]` were all
