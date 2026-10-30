@@ -2940,11 +2940,45 @@ bypassing TME reveals pixels while forcing `As = 0x80` does not, the sampled tex
 colour and alpha: `Cs * As = 0 * 0.5 = 0`. A texture read returning (0,0,0,0) points at the read itself -
 TBP0 `0x3FF000`, TBW=1, PSM `0x14` (T8) and the CBP `0x3FF400` CLUT lookup - not at the blend.
 
-**Next move: does our texture read return non-zero?** Sample the GS texture path directly for TBP0
-`0x3FF000` / PSM T8 / CBP `0x3FF400` at a few (u,v) and compare against the uploaded payload (which is
-known non-zero, ~27 % of bytes). If the read returns 0 while the bytes are present, the fault is in
-T8/CLUT addressing or the CPSM/CSM/CSA decode; if it returns the uploaded data, the fault moves to the
-UV/ST coordinates or to how parallel-gs applies the texture for these sprites.
+**Texture/CLUT sampled directly - the index range and the palette do not match.** `PS2X_TEX_DUMP=1` maps
+VRAM at `0x3FF000` (TBP0) through `gs.map_vram_read` and decodes the T8 index -> CLUT entry path. Twelve
+black-phase samples, all showing the same CLUT:
+
+```
+clut@0x3FF400: 0 : 50000004 : 33ffffff : 3bffffff : ffffff : 8ffffff : 44ffffff : 4cffffff
+```
+
+Decoded as CT32 (A in bits 24-31) entries 0-7 are: **entry 0 = 0x00000000 (transparent)**, entry 1 =
+`0x50000004` (near-black, A=0x50), entries 2-7 = white with alpha `0x33, 0x3B, 0x00, 0x08, 0x44, 0x4C`.
+That is a real, populated palette - and it is **byte-identical in every one of the 12 samples**, so the CLUT
+is loaded once and never changes.
+
+The texture at `0x3FF000` is the opposite: it **changes on every sample** -
+
+```
+0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0
+0:0:c0:0:0:0:f0:0:c0:0:0:f:0:0:d0:e
+0:0:10:0:30:0:90:0:0:0:0:f:e0:0:0:6
+f0:0:20:0:f0:0:a0:0:b0:0:0:0:f0:0:0:0
+```
+
+so the game is streaming new texture data into that address throughout the black phase (consistent with an
+animated/fade texture, and with the varying CLUT alphas).
+
+**The failure is the mapping.** The decoded samples are `i0=0x00 -> CLUT[0] = 0x0 (a=0)`,
+`i10=0xD0 -> 0x0 (a=0)`, `i20=0x0 -> 0x0`, `i30=0x0 -> 0x0`: the indices in use land on **zero/transparent
+CLUT entries**, so the sampled texel is (0,0,0,0) and the blend `Cs*As` is 0 - exactly the black screen, and
+consistent with `PS2X_FORCE_ALPHA` failing to help (forcing `As` does nothing when `Cs` is also 0).
+
+Two candidate causes, both testable:
+1. **The texture data does not look 8-bit.** Every other byte at `0x3FF000` is zero
+   (`f0:0:20:0:f0:0:a0:0`), the signature of a **16-bit** texture, yet TEX0 reports PSM `0x14` (T8). If PSM/TBW
+   are mis-decoded, the index extraction is meaningless.
+2. **The CLUT base or its extent is wrong.** Only a handful of entries are populated and the in-use indices
+   (0xC0-0xF0) are far outside them, which would also happen if CBP or the CSM split were mis-handled.
+
+Next: dump all 256 CLUT entries (not 8) and the first 64 texture bytes as both 8-bit and 16-bit, and check
+which interpretation yields indices that fall inside the populated palette.
 
 
 

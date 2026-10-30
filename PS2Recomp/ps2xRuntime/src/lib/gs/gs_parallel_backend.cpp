@@ -73,6 +73,17 @@ namespace
         }();
         return v;
     }
+    // Session 54: dump the raw bytes at the T8 texture (0x3FF000) and CLUT
+    // (0x3FF400) the black-phase sprites sample, decode index -> CLUT entry, and
+    // report the colour+alpha actually stored there.
+    bool texDumpEnabled()
+    {
+        static const bool v = [] {
+            const char *e = std::getenv("PS2X_TEX_DUMP");
+            return e && *e && *e != '0';
+        }();
+        return v;
+    }
     // TEMP DIAGNOSTIC (session 54): the last BITBLTBUF the guest wrote.  Shared
     // between the observeGIF walk (writer) and ProcessGIF's payload probe
     // (reader), which are different functions - a function-local static in the
@@ -876,6 +887,50 @@ namespace
                         const auto &rs = gs.get_register_state();
                         const uint64_t pb = rs.prim.bits;
                         const uint64_t s0 = rs.ctx[0].scissor.bits, s1 = rs.ctx[1].scissor.bits;
+                        // Session 54: what is actually stored at the T8 texture and its
+                        // CLUT, and what colour+alpha does index -> CLUT yield?  The
+                        // sprites use TBP0 0x3FF000 / TBW=1 / PSM=T8 / CBP 0x3FF400.
+                        if (texDumpEnabled() && s0 == 0x100000001ull)
+                        {
+                            static uint32_t s_texPrints = 0u;
+                            if (s_texPrints < 12u)
+                            {
+                                gs.flush();
+                                const uint8_t *mapped =
+                                    static_cast<const uint8_t *>(gs.map_vram_read(0x3FF000u, 0x800u));
+                                if (mapped != nullptr)
+                                {
+                                    ++s_texPrints;
+                                    uint8_t buf[0x800];
+                                    std::memcpy(buf, mapped, sizeof(buf));
+                                    // Mapped from 0x3FF000, so the CLUT at 0x3FF400 is +0x400.
+                                    constexpr uint32_t kClutOff = 0x400u;
+                                    auto byteAt = [&](uint32_t off) { return unsigned(buf[off]); };
+                                    auto wordAt = [&](uint32_t off) {
+                                        uint32_t v = 0u;
+                                        std::memcpy(&v, buf + off, sizeof(v));
+                                        return v;
+                                    };
+                                    std::cerr << "[TEX] tex@0x3FF000:";
+                                    for (uint32_t i = 0u; i < 16u; ++i)
+                                        std::cerr << std::hex << (i ? ":" : "") << byteAt(i);
+                                    std::cerr << " clut@0x3FF400:";
+                                    for (uint32_t i = 0u; i < 8u; ++i)
+                                        std::cerr << std::hex << (i ? ":" : "")
+                                                  << wordAt(kClutOff + i * 4u);
+                                    std::cerr << " | samples:";
+                                    for (uint32_t s = 0u; s < 4u; ++s)
+                                    {
+                                        const uint32_t idx = byteAt(s * 16u);
+                                        const uint32_t e = wordAt(kClutOff + (idx & 0xFFu) * 4u);
+                                        std::cerr << " i" << s * 16u << "=0x" << std::hex << idx
+                                                  << "->0x" << e << "(a=0x" << ((e >> 24) & 0xFFu)
+                                                  << ")";
+                                    }
+                                    std::cerr << std::dec << std::endl;
+                                }
+                            }
+                        }
                         std::cerr << "[GS-sc] bytes=" << s_psBytes
                                   << std::hex << " prim=0x" << pb << " type=" << (pb & 7ull)
                                   << " ctxt=" << ((pb >> 9) & 3ull) << " tme=" << ((pb >> 4) & 1ull)
