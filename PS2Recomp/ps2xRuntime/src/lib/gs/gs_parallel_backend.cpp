@@ -777,6 +777,18 @@ namespace
                                   << " c0sc=0x" << s0 << " c1sc=0x" << s1
                                   << " c0fbp=0x" << (rs.ctx[0].frame.bits & 0x1FFull)
                                   << " c1fbp=0x" << (rs.ctx[1].frame.bits & 0x1FFull)
+                                  // TEX0/TEX1: is a texture actually bound during the black
+                                  // phase, and where does TBP0 point?  The only populated
+                                  // VRAM in that phase is 0x3A7000..0x3FF43C, so TBP0*256
+                                  // outside that range cannot sample anything.
+                                  << " t0=0x" << rs.ctx[0].tex0.bits
+                                  << " t1=0x" << rs.ctx[1].tex0.bits
+                                  // TEX0: TBP0 bits 0-13 (x256 = byte address), TBW 14-19,
+                                  // PSM 20-25, CBP 37-50.
+                                  << " t0tbp=0x" << ((rs.ctx[0].tex0.bits & 0x3FFFull) * 256ull)
+                                  << " t0tbw=" << ((rs.ctx[0].tex0.bits >> 14) & 0x3Full)
+                                  << " t0psm=0x" << ((rs.ctx[0].tex0.bits >> 20) & 0x3Full)
+                                  << " t0cbp=0x" << (((rs.ctx[0].tex0.bits >> 37) & 0x3FFFull) * 256ull)
                                   << " bb=0x" << rs.bitbltbuf.bits
                                   << " tp=0x" << rs.trxpos.bits
                                   << " tr=0x" << rs.trxreg.bits

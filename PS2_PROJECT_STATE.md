@@ -2785,8 +2785,32 @@ Sparse content in the loading phase is consistent with text on black ("NOW LOADI
 stands unchanged: after the transition the game submits primitives that draw no pixels. The scissor is
 not the cause and `PS2X_FORCE_FULL_SCISSOR` should be treated as inert.
 
-**Still true from the earlier measurement:** in the black phase `nzWords=593` and all 593 words are
-texture/CLUT data at `0x3A7000..0x3FF43C` - no framebuffer content anywhere.
+**Scissor: conclusively ruled out (properly this time).** `PS2X_FORCE_FULL_SCISSOR` was never inert - it
+does fire (`[GS-scisPatch] patched=3,4,5`), it is just rare because it keys on the exact value
+`0x100000001`, which the packed walk only occasionally catches. With the patch confirmed active,
+parallel-gs's own register state during the black-phase `prim=0x15e` sprites reads:
+
+```
+[GS-sc] prim=0x15e c0sc=0x1bf000001ff0000 c0fbp=0xe0     <- correct full-screen scissor
+[FB-dump] forced3000 census: nzWords=593 ... nzCtx0=0     <- still nothing drawn
+```
+
+So with a correct 0,0..511,447 scissor, a bound texture (TBP0 `0x3FF000`, PSM `0x14` = T8, CBP `0x3FF400`
+- all inside the one populated region) and ~11,700 textured sprites submitted, **the framebuffer stays
+empty**. The scissor and the texture binding are both exonerated; the defect is in the primitive data
+itself (vertex extents / colour / blend), which is Session 48's original conclusion.
+
+**Texture binding is NOT the problem either** (this session's new `[GS-sc]` TEX0 fields). Black-phase
+`prim=0x15e` reports `t0=0x2007FE8599407FF0` -> TBP0 `0x3FF000`, TBW from bits 14-19, PSM `0x14` (T8,
+8-bit indexed), CBP `0x3FF400`. The populated VRAM is `0x3A7000..0x3FF43C`, so both the texture and its
+CLUT sit inside real data. The final sample is `prim=0x25c` with TBP0 `0x1C0000` - the composite pass
+sampling the scene buffer, which is empty because the scene prims drew nothing.
+
+**Run-to-run variance is large and must be controlled for.** Of 4 runs at 120 s: two reached the GS
+(31 `[GSpost]` samples, 8.1 MB GIF, 11,692 prims, 217 passes) and two stalled early - one on the ADXF
+deadlock (77 `E0041303`), one in asset init with no CRI message at all (`lastPc=0x198ef8`, call chain
+`0x1b76f8 -> 0x198e0c -> 0x198ef8`, i.e. the ready-flag area). A GS conclusion drawn from a single run is
+worthless; check `[GSpost]` is non-zero before believing any GS sample.
 
 **Geometry is NOT mostly degenerate**, contrary to Session 48's "every sprite is zero-height". The
 packed-path histogram in the same runs reports `pairs=1190, zero6=378, maxWH=10240/14336`, i.e. 68 % of
@@ -2817,12 +2841,13 @@ phase: ZERO", which is consistent: the sprites draw but sample an unbound textur
 integers in a struct array, so it does NOT establish that the game writes that scissor. `0x37f0000027f0000`
 does not occur in the ELF at all, so the "wide" scissor is computed at runtime.
 
-**Next move: the texture path.** 68 % of sprite pairs are geometrically fine (`pairs=1190, zero6=378,
-maxWH=10240/14336`) and the black-phase framebuffers are *exactly* zero, while the only populated VRAM is
-texture/CLUT data at `0x3A7000..0x3FF43C`. Session 48's "Textured Primitives with TexIndex>=1 in the black
-phase: ZERO" is the outstanding anomaly: the sprites are issued, they are not clipped out by geometry, so
-they must be sampling an unbound/shadowed texture and writing black. Chase TEX0/TEX1 TBP0/CBP/CLUT
-resolution against that region first. The scissor question is closed - do not spend more time on it.
+**Next move: the primitive data itself.** With the scissor correct, the texture bound and the CLUT inside
+populated VRAM, ~11,700 `prim=0x15e` sprites still produce zero pixels - so the defect is in the vertex
+extents, the per-vertex colour/blend, or how the primitive is assembled from the stream. Session 48's
+evidence (sprites with `Y1 == Y2`, BB `[502,228]..[510,227]` inverted) is the place to resume. Note the
+`pairs=/zero6=` histogram in `[GS-sc]` counts raw QW *pairs* from our own packed walk, which Session 46
+showed can pair vertex data falsely, so corroborate it against parallel-gs's own per-primitive TRACE
+(`PARALLEL_GS_DEBUG=ON`, ~21 MB stdout per run) rather than trusting the histogram alone.
 
 
 
