@@ -32,6 +32,30 @@ namespace
         }();
         return v;
     }
+    // TEMP DIAGNOSTIC (session 54): decisive experiment for the black phase.  With
+    // TME=1 the texture replaces the vertex colour, and a dark/mostly-index-0
+    // texture samples to near-black - which the VRAM census cannot distinguish from
+    // "nothing drawn".  Clearing TME makes the primitive use its vertex colour (a
+    // dark brown 0x2B171180, i.e. non-zero) and forcing RGBAQ makes it bright
+    // opaque, so either way rasterised pixels become visible in the census.
+    bool forceNoTexEnabled()
+    {
+        static const bool v = [] {
+            const char *e = std::getenv("PS2X_FORCE_NOTEX");
+            return e && *e && *e != '0';
+        }();
+        return v;
+    }
+    bool forceRgbaqEnabled()
+    {
+        static const bool v = [] {
+            const char *e = std::getenv("PS2X_FORCE_RGBAQ");
+            return e && *e && *e != '0';
+        }();
+        return v;
+    }
+    // R=G=B=0x80, A=0x80, Q=1.0
+    constexpr uint64_t kBrightRgbaq = 0x3F80000080808080ull;
     // TEMP DIAGNOSTIC (session 54): the last BITBLTBUF the guest wrote.  Shared
     // between the observeGIF walk (writer) and ProcessGIF's payload probe
     // (reader), which are different functions - a function-local static in the
@@ -573,6 +597,11 @@ namespace
                     }
                     if (adReg == 0x40u && adValue == 0x100000001ull && forceFullScissorEnabled())
                         m_scisPatch.push_back({offset, 0x01bf000001ff0000ull});
+                    // Session 54: does a black-phase primitive rasterise at all?
+                    if (adReg == 0x00u && forceNoTexEnabled())
+                        m_scisPatch.push_back({offset, adValue & ~0x10ull}); // clear PRIM.TME
+                    if (adReg == 0x01u && forceRgbaqEnabled())
+                        m_scisPatch.push_back({offset, kBrightRgbaq});
                     if (adReg == 0x00u && wantPrimRaw())
                     {
                         takePrimRaw();
@@ -756,7 +785,9 @@ namespace
             }
             // TEMP EXPERIMENT (session 47, option B): forward a patched copy with
             // the empty ctx0 SCISSOR_1 rewrites applied.
-            if (forceFullScissorEnabled() && !m_scisPatch.empty())
+            // Patches are only queued when one of the PS2X_FORCE_* experiment flags is
+            // set, so an empty vector means "no experiment active".
+            if (!m_scisPatch.empty())
             {
                 std::vector<uint8_t> buf(data, data + size);
                 for (const auto &p : m_scisPatch)

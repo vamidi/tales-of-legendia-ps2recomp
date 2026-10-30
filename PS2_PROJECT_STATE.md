@@ -2915,10 +2915,42 @@ established is whether the primitives rasterise at all - and the VRAM census *ca
 it counts only non-zero words. A dark or mostly-index-0 texture sampling to near-black is indistinguishable
 from nothing being drawn.
 
-**Next move (decisive, cheap):** force a bright RGBAQ (or clear TME) on one black-phase draw using the same
-A+D rewrite mechanism `PS2X_FORCE_FULL_SCISSOR` already uses, and see whether pixels appear in the
-framebuffer. Bright pixels = the primitives draw and the black is a texture/colour value; still nothing =
-the primitives do not rasterise and the fault is in vertex assembly.
+**DECISIVE: the black-phase primitives DO rasterise - the texture/blend path is what zeroes the output.**
+New env-gated A+D rewrites (`PS2X_FORCE_NOTEX` clears `PRIM.TME`; `PS2X_FORCE_RGBAQ` writes
+`0x3F80000080808080`, R=G=B=A=0x80, Q=1.0) reuse the same `m_scisPatch` mechanism as the scissor patch.
+140 s runs, same machine, black-phase samples:
+
+| arm | `patched` | nzWords | nzDisp2 | nzCtx0 | nzCtx1 |
+|---|---|---|---|---|---|
+| baseline | 0 | **593** | 0 | 0 | 0 |
+| `NOTEX` + `RGBAQ` | **37,376** | **116,305** | 512 | 0 | 0 |
+
+So with the texture path bypassed the scene rasterises (593 -> 116,305 non-zero words, ~463 KB written).
+**Geometry, vertex assembly, the scissor and the primitive submission are all fine.** The black screen is
+the texture sample or the blend collapsing to zero.
+
+The mechanism fits the ALPHA register exactly. Session 48 recorded the black-phase ALPHA as
+`0x6B00000064`, i.e. low word `0x64` -> A=0 (Cs), B=1 (Cd), C=2, D=1, with FIX `0x6B` in bits 32-39:
+
+```
+output = (A - B) * C + D = (Cs - Cd) * As + Cd
+```
+
+With the destination black (`Cd = 0`) this is just `Cs * As`. So the result is zero whenever the **sampled
+alpha `As` is 0** (or `Cs` is 0). Bypassing TME makes the vertex colour the source (R=0x2B G=0x17 B=0x11,
+A=0x80 -> `As = 1.0`), which is exactly why the pixels appear.
+
+**Next move: the texture's alpha, not its colour.** The sprites sample a T8 (indexed) texture, so `As`
+comes from the CLUT entry's alpha (CPSM) or from TEXA/TCC. Check the CLUT uploaded to `0x3FF400`: if its
+entries have A=0 (or the CLUT is not applied at all, leaving index 0 -> transparent), `As = 0` and the
+blend reduces to `Cd` = black, which is precisely the observed behaviour. A one-run check is to force TCC
+to 1 or inject a non-zero alpha via TEXA and see whether the scene appears without touching PRIM.
+
+**Note on where the pixels land:** even in the patched arm `nzCtx0` and `nzCtx1` stay 0 while `nzWords`
+jumps by ~463 KB, so the rasterised output is NOT inside the FBP 224 window that `nzWindow()` samples. The
+window base is `fbp * 8192` = `0x1C0000` for fbp=224 - worth confirming that is the right base and size,
+because it means the earlier "the context framebuffer is empty" readings may be looking at the wrong
+window entirely.
 
 
 
