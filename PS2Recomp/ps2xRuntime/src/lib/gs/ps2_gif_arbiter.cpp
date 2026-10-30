@@ -1,6 +1,10 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+
+// TEMP DIAGNOSTIC (native backend receive path).
+static uint64_t g_gifDbgSubmit = 0u, g_gifDbgDrain = 0u, g_gifDbgFwd = 0u;
 
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
@@ -20,6 +24,11 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
 
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
 {
+    if ((++g_gifDbgSubmit & 0x3FFu) == 0u)
+        std::fprintf(stderr, "[GIF-arb] submit=%llu drain=%llu fwd=%llu (last size=%u)\n",
+                     static_cast<unsigned long long>(g_gifDbgSubmit),
+                     static_cast<unsigned long long>(g_gifDbgDrain),
+                     static_cast<unsigned long long>(g_gifDbgFwd), sizeBytes);
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
 
@@ -56,9 +65,11 @@ void GifArbiter::drain()
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
+            ++g_gifDbgFwd;
             m_processFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }
+    ++g_gifDbgDrain;
     m_queue.clear();
 }
 
