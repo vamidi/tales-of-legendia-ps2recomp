@@ -319,8 +319,11 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+// outGlTexture: the renderer's own texture holding the frame (PresentationFrame::glTexture), drawn instead of tex.
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight, uint32_t &outGlTexture)
 {
+    static uint32_t s_lastGlTexture = 0u;
+    outGlTexture = 0u;
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
@@ -340,6 +343,19 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
+    // A renderer on a context shared with the window hands the picture over as its own texture (GS native back
+    // end): the window draws that, no readback and no upload. Checked before the parallel path so either renderer
+    // can hand one over; the other returns false and its own path runs.
+    s_lastGlTexture = 0u;
+    if (uint32_t texture = 0u, textureWidth = 0u, textureHeight = 0u;
+        rt->gs().latchedHostPresentationTexture(texture, textureWidth, textureHeight))
+    {
+        outGlTexture = s_lastGlTexture = texture;
+        outWidth = s_lastWidth = textureWidth;
+        outHeight = s_lastHeight = textureHeight;
+        s_hasUploadedFrame = true;
+        return;
+    }
 #ifdef PS2X_GS_PARALLEL
     float aspect = 0.0f;
     rt->gs().getLatchedGpuFrame(outWidth, outHeight, aspect);
@@ -349,6 +365,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        outGlTexture = s_lastGlTexture;
         return;
     }
 
@@ -4108,15 +4125,31 @@ void PS2Runtime::run()
 
             uint32_t presentWidth = FB_WIDTH;
             uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-            UploadFrame(frameTex, this, presentWidth, presentHeight);
+            uint32_t presentGlTexture = 0u;
+            UploadFrame(frameTex, this, presentWidth, presentHeight, presentGlTexture);
 
             Texture2D presentationTexture = frameTex;
             float aspectRatio = 0.0f;
+            // The GS renderer's own texture (GS native back end, on the window's shared context): drawn as it is.
+            if (presentGlTexture != 0u)
+            {
+                presentationTexture = {};
+                presentationTexture.id = presentGlTexture;
+                presentationTexture.width = static_cast<int>(presentWidth);
+                presentationTexture.height = static_cast<int>(presentHeight);
+                presentationTexture.mipmaps = 1;
+                presentationTexture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            }
 #ifdef PS2X_GS_PARALLEL
-            auto gpuFrame = m_gs.getLatchedGpuFrame(presentWidth, presentHeight, aspectRatio);
-            presentationTexture = {};
+            // One renderer owns the picture: a texture handed over above wins, so the parallel path is skipped then.
+            std::shared_ptr<GSGpuFrame> gpuFrame;
+            if (presentGlTexture == 0u)
+                gpuFrame = m_gs.getLatchedGpuFrame(presentWidth, presentHeight, aspectRatio);
             if (gpuFrame)
+            {
+                presentationTexture = {};
                 presentationTexture = Texture2D{gpuFrame->AcquireTexture(), int(presentWidth), int(presentHeight), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+            }
 #endif
 
             BeginDrawing();

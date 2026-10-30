@@ -320,7 +320,7 @@ struct PresentationFrame
 
     explicit operator bool() const
     {
-        return (gpu || !pixels.empty()) && width != 0u && height != 0u;
+        return (gpu || glTexture != 0u || !pixels.empty()) && width != 0u && height != 0u;
     }
 };
 

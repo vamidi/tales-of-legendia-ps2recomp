@@ -68,7 +68,7 @@ public:
     };
     // rows: how far down the native draw may write (its scissor), what the target then covers in GS memory.
     FrameTarget frameTarget(const GSFrameReg &frame, const GSZbufReg &zbuf, uint32_t rows);
-    void NativeDraw(uint64_t group, const GSContext &context) override;
+    void NativeDraw(uint64_t group, const GSDrawState &state) override;
     bool PresentsOnDrawThread() const override { return true; }
 
     // One axis of a sprite as drawn at an internal scale: corners p0, p1 in window coordinates with texel coordinates

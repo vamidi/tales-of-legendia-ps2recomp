@@ -519,6 +519,7 @@ void GS::reset()
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame.clear();
         m_hostPresentationGpuFrame.reset();
+        m_hostPresentationTexture = 0u;
         m_hostPresentationWidth = 0u;
         m_hostPresentationHeight = 0u;
         m_hostPresentationDisplayFbp = 0u;
@@ -890,6 +891,7 @@ void GS::latchHostPresentationFrame()
             std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
             m_hostPresentationFrame.clear();
             m_hostPresentationGpuFrame.reset();
+            m_hostPresentationTexture = 0u;
             m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
             return;
@@ -918,6 +920,7 @@ void GS::latchHostPresentationFrame()
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame = std::move(frame.pixels);
         m_hostPresentationGpuFrame = std::move(frame.gpu);
+        m_hostPresentationTexture = frame.glTexture;
         m_hostPresentationAspectRatio = frame.aspectRatio;
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
@@ -2132,6 +2135,10 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     batch.state.context = m_ctx[m_prim.ctxt ? 1 : 0];
     batch.state.prim = m_prim;
     batch.state.texa = m_texa;
+    // The raw TEXA word a native draw hands to the hook (GsDrawTarget::texa), rebuilt from the parsed
+    // fields: TEXA defines only TA0, AEM and TA1, so this is the register bit for bit.
+    batch.state.texaRaw = static_cast<uint64_t>(m_texa.ta0) | (m_texa.aem ? (1ull << 15) : 0ull) |
+                          (static_cast<uint64_t>(m_texa.ta1) << 32);
     batch.state.texclut = m_texclut;
     batch.state.pabe = m_pabe;
     batch.state.scanmsk = m_scanmsk;
@@ -2194,6 +2201,17 @@ std::shared_ptr<GSGpuFrame> GS::getLatchedGpuFrame(uint32_t &width, uint32_t &he
     return m_hostPresentationGpuFrame;
 }
 
+bool GS::latchedHostPresentationTexture(uint32_t &outTexture, uint32_t &outWidth, uint32_t &outHeight) const
+{
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    if (!m_hasHostPresentationFrame || m_hostPresentationTexture == 0u)
+        return false;
+    outTexture = m_hostPresentationTexture;
+    outWidth = m_hostPresentationWidth;
+    outHeight = m_hostPresentationHeight;
+    return true;
+}
+
 void GS::shutdownBackend()
 {
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
@@ -2201,6 +2219,7 @@ void GS::shutdownBackend()
     std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
     m_hostPresentationGpuFrame.reset();
     m_hostPresentationFrame.clear();
+    m_hostPresentationTexture = 0u;
     m_hasHostPresentationFrame = false;
     m_backend.reset();
 }

@@ -139,6 +139,9 @@ public:
                                           uint32_t *outDisplayFbp = nullptr,
                                           uint32_t *outSourceFbp = nullptr,
                                           bool *outUsedPreferred = nullptr) const;
+    // The latched frame as the renderer's own GL texture (PresentationFrame::glTexture), when it handed one over
+    // instead of pixels (GS native back end, on a context shared with the window): false when there is none.
+    bool latchedHostPresentationTexture(uint32_t &outTexture, uint32_t &outWidth, uint32_t &outHeight) const;
     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
@@ -227,6 +230,8 @@ private:
     bool m_hasPreferredDisplaySource = false;
     std::vector<uint8_t> m_hostPresentationFrame;
     std::shared_ptr<GSGpuFrame> m_hostPresentationGpuFrame;
+    // The renderer's own GL texture for the frame, when it hands one over instead of pixels (native backend).
+    uint32_t m_hostPresentationTexture = 0;
     float m_hostPresentationAspectRatio = 0.0f;
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationHeight = 0;

@@ -1660,14 +1660,15 @@ GSNativeBackend::FrameTarget GSNativeBackend::frameTarget(const GSFrameReg &fram
     return out;
 }
 
-void GSNativeBackend::NativeDraw(uint64_t group, const GSContext &context)
+void GSNativeBackend::NativeDraw(uint64_t group, const GSDrawState &state)
 {
     const ps2x::native::GsDrawHook hook = ps2x::native::gsDrawHook();
     if (!hook)
         return;
+    const GSContext &context = state.context;
     const FrameTarget frame = frameTarget(context.frame, context.zbuf, context.scissor.y1 + 1u);
     ps2x::native::GsDrawTarget target;
-    fillNativeRegisters(target, context);
+    fillNativeRegisters(target, state);
     target.framebuffer = frame.framebuffer;
     target.color = frame.color;
     target.depth = frame.depth;
