@@ -2738,6 +2738,341 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 53 - GS re-measured after the ADXF fix: the scene reaches gameplay, the empty ctx0 scissor is real but is NOT the whole story
+
+All numbers below are from the current build (ADXF semaphore deferral + corrected probes), 100 s runs.
+45-60 s runs are TOO SHORT and will mislead you: at 45 s the log shows almost no GS traffic at all
+(19 `[GS-scis]` writes, `sGifBytes` < 256 KiB), while at 100 s the same build reports 8,128 primitives,
+151 render passes, 11,444 copies and 5.2 MB of GIF traffic. Always run >= 100 s before judging the GS.
+
+**A/B against my own change first (it is clean):** fix vs `PS2X_FILEIO_SYNC=1` at 100 s give identical
+`[GS-scis]=48`, `[GS-m]=24`, `[GSpost]=20/21`, audio 55/57. The semaphore deferral does not affect the GS.
+
+**`[FB-dump]` census is the trustworthy coverage instrument.** `nzWindow()` counts non-zero 32-bit
+words in the DISPFB buffer and in each context's FRAME FBP (8192-byte page units):
+
+| configuration | nzWords (all 4 MiB) | nzDisp2 | nzCtx0 | nzCtx1 |
+|---|---|---|---|---|
+| unpatched | **593** | 0 | 0 | 0 |
+| `PS2X_FORCE_FULL_SCISSOR=1` | **98,728** | 32,768 | 32,768 | 32,768 |
+
+The 593 words sit entirely at `0x3A7000..0x3FF43C` - texture/CLUT data, no framebuffer content at all.
+So unpatched, **nothing is rendered into any buffer**.
+
+**But the scissor is NOT sufficient.** With the scissor forced, the dumped images are still black:
+
+```
+gs_draw7_forced5700.bmp   512x448  nonBlack=0.7%  avgRGB=1,1,1   (ctx1 fbp=224, the rendered buffer)
+gs_frame7_forced5700.bmp  640x448  nonBlack=0.5%  avgRGB=0,0,0   (DISPFB)
+gs_slab7_forced5700.bmp   640x76   nonBlack=3.5%  avgRGB=3,3,3
+```
+
+A ~1/255 average is faint residue, not a scene. So forcing the scissor writes ~390 KB of non-zero
+words but does not compose a visible frame - Session 48's "the scene geometry does not draw" survives,
+the scissor was only one factor.
+
+**Geometry is NOT mostly degenerate**, contrary to Session 48's "every sprite is zero-height". The
+packed-path histogram in the same runs reports `pairs=1190, zero6=378, maxWH=10240/14336`, i.e. 68 % of
+sprite pairs are non-degenerate with extents up to 640x896. That points at the *texture* path rather
+than the vertices - and Session 48 already noted "Textured Primitives with TexIndex>=1 in the black
+phase: ZERO", which is consistent: the sprites draw but sample an unbound texture and output black.
+
+**State at the same instant** (`[GS-sc]`): `prim=0x15e` (sprite, CTXT=0, TME=1, ABE=1),
+`c0sc=0x100000001` (empty), `c1sc=0x1bf000001ff0000` (0,0..511,447), `c0fbp=c1fbp=0xe0` (FBP 224),
+`pmode=0x66`, `dispfb1=0x1400` (FBP 0), `dispfb2=0x1000` (FBP 0), `c0xy=0x7000/0x7200`
+(XYOFFSET 1792,1824). Display reads FBP 0; both contexts render to FBP 224.
+
+**Two instrument caveats found this session - do not trust these blindly:**
+
+1. `[GS-census] S1/S2` (our mirror) and `[GS-sc] c0sc/c1sc` (parallel-gs `get_register_state()`) do not
+   agree with `[GS-scis]` (the packed-path walk): the walk sees `SCISSOR_1=0x1bf000001ff0000` /
+   `0x37f0000027f0000` while the other two see `0x100000001`. The same log also shows a GIF tag desync
+   (`ourFLG=0 ourNLOOP=1 ourLoop=1` vs `upFLG=2 upNLOOP=9 upLoop=9`). One of the three is wrong; the
+   "broken reglist pairing" from Session 46 is the likely reason. Resolve this before trusting any
+   scissor conclusion.
+2. **The BMP dumps are not trustworthy yet.** `gs_draw*` is written 512x448 (fbw=8 -> 512 px) while
+   `gs_frame*` is 640x448, and the presentation path reports 640x448. A width/stride mismatch in the
+   dump means a "black" BMP is weak evidence. Fix the dump width before using images as proof.
+
+**`0x100000001` in the ELF - ambiguous, not proof.** The literal occurs 5 times, at 0x29FC68, 0x29FDE8,
+0x29FF68, 0x2A00E8, 0x2A0268 (stride 0x180), and the full scissor `0x1bf000001ff0000` occurs once at
+0x289190. Five identical 8-byte values at a fixed stride is equally consistent with two adjacent `1`
+integers in a struct array, so it does NOT establish that the game writes that scissor. `0x37f0000027f0000`
+does not occur in the ELF at all, so the "wide" scissor is computed at runtime.
+
+**Next moves, in order of expected value:** (1) fix the dump width/stride so images are usable, then
+(2) chase texture binding - TEX0/TEX1 TBP0/CBP/CLUT against the surviving VRAM region
+`0x3A7000..0x3FF43C`, since 68 % of sprite pairs are geometrically fine and "TexIndex>=1 draws = 0"
+is the outstanding anomaly. The scissor question should wait until the instrument disagreement in (1)
+of the caveats above is resolved.
+
+
+
+### Session 52 - ADXF deadlock mechanism pinned exactly (two `return 3` paths, and the state byte is read back after the submit); one deferral strategy RULED OUT
+
+Session 51 got the symptom right but the mechanism was imprecise and the trace was reading the **wrong
+struct**, so its numbers meant nothing. This session fixed the probe and re-derived the loader from the
+disassembly. Everything below is from `FUN_001664d0`, `FUN_00196460`, `FUN_00196db0`, `FUN_00196f58`,
+`FUN_001970e8`, `FUN_001963a8`, `FUN_00197668`.
+
+**The loader loop ignores the load result - that is why a failed load hangs instead of erroring:**
+
+```c
+// FUN_001664d0
+for (ptid = 0; ptid < 6; ptid++) {
+    FUN_00196058(ptid, tbl, 0, bufsize);          // ADXF_LoadPartition - RETURN VALUE IGNORED
+    while (FUN_00196460(ptid) != 3) { FUN_0019a080(); }   // ADXF_GetPtStat
+}
+```
+
+**`ADXF_GetPtStat` has exactly two `return 3` paths, and only one unloads:**
+
+```c
+if (param_1 != DAT_003910ac) return -3;          // slot mismatch -> E0041303, the observed spin
+if (FUN_00197668(handle) != 3) return that;      // FUN_00197668 == *(char*)(handle+1)
+...scan entries, cursor DAT_003910a4++...
+  (a) all entries consumed -> FUN_001963a8();  // clears slot 0x3910ac := -1
+      if (bVar2) return 3;                     //  <- correct completion
+  (b) buffer pass exhausted -> FUN_001970e8(...) issues a read
+      -> return *(char*)(handle+1);            //  <- returns 3 with NO unload
+```
+
+Path (b) returns 3 whenever the read has already completed by the time the byte is read. The slot is
+then never cleared, `LoadPartition(ptid+1)` fails with `E0042401`, its result is discarded, and
+`GetPtStat(ptid+1)` answers `-3` forever.
+
+**Two corrections to Session 51:**
+
+1. **`FUN_00196db0`'s `remaining == 0` branch is NOT involved.** The trace confirms `remaining` never
+   approaches 0: `pos` advances **1 per call** while `total` is 17204-436462, and `size` is 1 every time.
+   Path (a) can never be reached either - the scan consumes ~254 entries per pass but the entry count is
+   430/790/7931.
+2. **The trace was reading the I/O handle where it needed `table[ptid]`.** Two distinct objects:
+   - I/O handle, `*0x3910a8` (slot 0 of a 16-entry pool at `0x390738`, stride 0x44): `+1` state byte,
+     `+0xc` total, `+0x14` position, `+0x18` destination, `+0x1c` transfer size, `+0x30` base,
+     `+0x28` byte size.
+   - `table[ptid]` at `0x390b78 + ptid*4` (stride 4 - verified from `sll v0,s0,0x2` at `0x1964f4`):
+     `+8` entry count, `+0xc` is a **u16** entry count and `+0xf` is the 32-bit-entries flag, so a 32-bit
+     read at `+0xc` mixes them.
+
+   The probe now reports both correctly (`count` from `table[ptid]+8`, the rest from the handle) plus
+   `remaining`.
+
+**Why the race exists.** `FUN_00196db0` stores `*(handle+1) = 2` **after** the submit, so a completion
+that happens inside `FUN_0019f648` would be overwritten. I checked every later call in that function -
+`FUN_0019f570` (`*(q+0x44)=v`), `FUN_0019ed68`, `FUN_0019ee18` (`FUN_0019eda0`, which writes the
+**queue's** `+1`, not the handle's) - none of them writes the handle byte. So the `3` is not produced by
+anything after the `=2` store. It arrives from the I/O completion path while the guest is between
+`FUN_00196db0` returning and `FUN_00196460` reading the byte back - a window of a few dozen
+instructions that a scheduler checkpoint can land in. That matches the intermittent rate.
+
+**Tried and RULED OUT this session (all reverted, do not repeat):**
+
+1. **Deferring the cdvd stream `0xB` store (0x385260) to the next scheduler iteration, semaphore left
+   inline** - no effect (2/6 deadlocks). Proves the `0xB` word is not what flips the handle byte.
+2. **Deferring the *entire* libcdvd stream read** (transfer + descriptor + `0xB` + semaphore replayed
+   from `processPendingEvents`, via a `DeferredCdvdRead` queue and
+   `drainDeferredCompletions(EeScheduler&, PS2Runtime&, uint8_t*)`) - no effect (1/6). Reverted: it is a
+   large semantic change (deferred guest I/O) with no measured gain.
+3. **Deferring the fileio reply** (Session 51) - still much worse, 9/14.
+
+**`bufsz = 1` is CORRECT - measured, not assumed, and the "should be ~15" theory is dead.** The value the
+loader stores at `0x3910b4` is `a3 = s2 >> 11` at `0x196334`, and the prologue at `0x1961c8` loads `$s2`
+from **`$t3` (`$11`)**, not `$a3` (`$7`) - a first probe read `$a3` and got `0x1FFFEC0`, a stack address,
+which is what exposed the mistake. Logging `$t3` at every `ADXF_LoadPartition` (0x1961a8) entry gives:
+
+```
+[ADXF-load] ptid=0 t3(size)=0x800 sectors=1
+[ADXF-load] ptid=1 t3(size)=0x800 sectors=1
+... same for all six partitions
+```
+
+`0x800` = 2048 bytes = exactly one 2048-byte sector, uniformly across all six partitions. So the ADXF
+read buffer really is one sector and `0x3910b4` is faithfully the guest's own value. Do not re-open this
+as an emulation bug - it is a dead end.
+
+What the numbers actually imply: `count` (entries) is 430/790/7931, `cursor` advances 1 per entry and
+the scan handles ~254 entries per 2048-byte buffer pass, so a partition needs `count/254` calls - which
+matches the observed 19-33 calls per partition. Path (a) is normally reached and unloads correctly.
+The failure is a single path-(b) call returning 3 before `cursor` reaches `count`, i.e. roughly one
+misaligned checkpoint in ~186 chances per run - hence the low but non-zero rate.
+
+**State shipped:** the Session 51 semaphore deferral only (`g_deferredFileIoSemas` ->
+`drainDeferredFileIoSemaphores`, called from `EeScheduler::processPendingEvents`), plus the corrected
+`PS2X_ADXF_TRACE` probe (which now also logs `ADXF_LoadPartition`'s `$t3` size argument as
+`[ADXF-load]`). Measured 3/4 healthy in the final sanity batch; the ~10-25% residual persists.
+
+### Session 51 - ADXF deadlock root-caused to instantaneous fileio completion; deferring the completion semaphore cuts it ~26% -> ~10% but does NOT eliminate it
+
+**Root cause is now measured, not inferred.** A new `PS2X_ADXF_TRACE=<max lines>` probe (env-gated, default
+off) dumps the ADXF loader state on every `ADXF_GetPtStat` (0x196460) entry, de-duplicated so the spin
+collapses to one line per state change. It prints `ptid`, the slot global `0x3910ac`, the handle state byte
+`*(char*)(0x3910a8+1)`, the entry cursor `0x3910a4`, and `handle+0x8/0xc/0x14`.
+
+Healthy trace (slot always equals ptid, each partition unloads before the next):
+
+```
+[ADXF] ptid=0 slot=0 state=2 cursor=0 count=... pos=0 total=894 bufsz=1 n=1
+[ADXF] ptid=0 slot=0 state=3 cursor=255 ...
+[ADXF] ptid=1 slot=1 state=2 cursor=0 ...        <- slot cleared, next ptid accepted
+```
+
+Deadlocked trace (the signature is `ptid` advancing while `slot` stays behind):
+
+```
+[ADXF] ptid=2 slot=2 state=3 cursor=1535 pos=7 total=223038 n=15
+[ADXF] ptid=3 slot=2 state=3 cursor=1791 pos=8 total=223038 n=16   <- E0042401, then -3 forever
+```
+
+**Mechanism, confirmed against the decompiler:**
+
+- `FUN_001963a8` is the *only* writer that clears the slot `0x3910ac` (it also zeroes the cursor
+  `0x3910a4`). `ADXF_GetPtStat` calls it on exactly one path: when the entry cursor reaches the entry
+  count (`count <= DAT_003910a4`).
+- When a buffer pass instead runs out of room (`iVar11 >= DAT_003910b4 << 9`), GetPtStat issues the next
+  read via `FUN_001970e8` and then **returns the handle state byte** `*(char*)(handle+1)` directly.
+- `FUN_00196db0` sets that byte to **2** (busy) after submitting. It only ever sets **3** itself in the
+  `remaining == 0` branch, which is unreachable here (`handle+0xc` is a byte total, `handle+0x14` a block
+  index, so `remaining` is never 0).
+- Therefore a `3` in that return can only come from the read **completion callback** firing between the
+  `= 2` store and `FUN_001970e8`'s read. On hardware the CD/HDD transfer takes milliseconds, so the byte is
+  reliably 2 and the loader keeps polling. This runtime performed the whole fileio read inside the RPC, so
+  the completion can land in that window - the loader then believes the partition is done, skips the
+  unload, and the slot is never released.
+
+**Change made (all env-gated, reversible):**
+
+- `Kernel/Stubs/SIF.cpp`: the fileio completion semaphore is no longer signalled inside the RPC. It is
+  pushed onto `g_deferredCompletions` and released on the next scheduler iteration by the new
+  `ps2_stubs::drainDeferredCompletions(EeScheduler &, uint8_t *rdram)`. `PS2X_FILEIO_SYNC=1` restores the
+  old in-call signal for A/B runs.
+- `Kernel/EeScheduler.cpp`: `processPendingEvents()` drains that queue at the top of every loop iteration.
+- `lib/ps2_runtime.cpp`: `PS2X_ADXF_TRACE` probe described above.
+
+**Interleaved paired A/B (the trustworthy measurement), 45 s runs, 8 pairs, fix and control alternated so
+host load is shared:**
+
+| pair | fix | control |
+|---|---|---|
+| 1 | ok (70 lines) | **deadlock** (51) |
+| 2 | **deadlock** (57) | **deadlock** (55) |
+| 3 | ok (69) | ok (71) |
+| 4 | ok (70) | **deadlock** (25) |
+| 5 | ok (68) | **deadlock** (58) |
+| 6 | ok (73) | ok (74) |
+| 7 | ok (70) | ok (70) |
+| 8 | ok (71) | **deadlock** (34) |
+| **total** | **1 / 8** | **5 / 8** |
+
+Four pairs failed only with the old behaviour, none failed only with the fix (McNemar exact one-sided
+p~0.06). Pooled over every sample: fix **4 / 35 (11 %)**, control **8 / 20 (40 %)** against the original
+5 / 19 (26 %).
+
+**The rate is strongly load-dependent** - one fix batch scored 0/12 and a later one 2/5 with logically
+identical code. Never compare arms across batches; always interleave. This is the single biggest trap here.
+
+Every healthy fix run loads all six partitions (`maxPtid=5`, `mismatch=0`) and streams IxAudio
+(`sid=131072` count 2-14). The reduction is real but the residual is not closed.
+
+**Two things that were tried and REVERTED, do not repeat them:**
+
+1. **Deferring the fileio reply itself** (`handleRead` queues, `IopSubsystem::runEeCycles` drains one read
+   per quantum) made it **worse: 9 / 14**. The guest's stdio layer evidently needs the result pointer and
+   receive word written in the call; only the semaphore may be delayed.
+2. **Deferring the libcdvd stream completion** (the `0xB` store at `0x385260` + cdvd command semaphore in the
+   `kSifSidCdvdStream`/rpc 1 handler, which is the real completion source for ADXF partition data) made it
+   **much worse: deadlock at ptid 2 after 12 lines on the first run**. `FUN_00196db0` begins with a
+   queue-idle check (`FUN_0019ed60` / `FUN_0019eec8`) that aborts a request still marked busy, so that
+   completion must stay synchronous. Note for anyone continuing: ADXF's partition payloads do **not** go
+   through fileio (only ~8 fileio reads per run); they go through this cdvd stream handler.
+
+**Still open:** ~5 % of runs still deadlock, and the mechanism for the residual is not identified. The
+`PS2X_ADXF_TRACE` probe is the tool to attack it: capture a failing run and compare `state`/`cursor`/`pos`
+at the last healthy line against a passing run.
+
+**Classification warning:** one run per configuration proves nothing here - the control arm
+(`PS2X_FILEIO_SYNC=1`) produced 2 healthy runs out of 2, which the ~26% baseline easily allows. Always use
+>=10 samples, and read the `ptid != slot` mismatch count, not "did it look idle".
+
+### Session 50 - The idle runs are NOT an IOP audio stall: ADXF never releases its single-partition slot (`E0042401`), and the game spins forever in `ADXF_GetPtStat`
+
+**Session 49's "the IOP never issues the 0x90000302 callback" is a downstream symptom, not the cause.** The
+EE dies first, inside the CRI ADXF partition loader at tick ~266, before IxAudio is ever called.
+
+**Measured split (15 runs, 40-100 s each): 9 streaming, 5 idle (~1/3).** Session 49's 8/8-idle no longer
+reproduces. Heavy probes correlate with the idle branch (`PS2X_IOP_THR_TRACE`, `PS2X_GIF_PROVENANCE`), so the
+race is timing-sensitive: never read one run as a regression signal, and expect probe overhead to bias it.
+
+**Idle signature** (all five idle runs agree): `[CRI-msg] tick=266 "E0041303:illigal parameter
+'ptid'.(ADXF_GetPtStat)"`, final `adxf=1000000000000000`, **zero** `sid=131072` (IxAudio) dispatches, **zero**
+`MBS\*.MBS` opens - only `PTN_INFO.BIN`/`PTN_INFO.NAM` are ever read. A streaming run opens all six MBS
+packages, calls IxAudio 2-58x, and reaches the black phase.
+
+**Root cause, read off the guest's own global** (`PS2X_WATCH_LO=0x3910ac PS2X_WATCH_HI=0x3910b0`):
+
+| run | writes to 0x3910ac (`DAT_003910ac`) |
+|---|---|
+| stream (run14) | -1,0,-1,1,-1,2,-1,3,-1,4,-1,5,-1 |
+| idle (run15) | -1,0 **[stops]** |
+| idle (run12) | -1,0,-1,1,-1,2,-1,3,-1,4 **[stops]** |
+
+`0x3910ac` is ADXF's *single-partition* slot. It is set by `ADXF_LoadPartition` (`FUN_001961a8`, store
+pc=0x196250) and cleared **only** by `ADXF_UnloadPartition` (`FUN_001963a8`, store pc=0x1963e0), which
+`ADXF_GetPtStat` (`FUN_00196460`) calls on its "all files consumed" path. The game loads partitions 0..5
+sequentially (`FUN_001664d0`, thread entry 0x1664c0): for each it calls `ADXF_LoadPartition` (thunk
+0x196058) then spins `while (ADXF_GetPtStat(ptid) != 3) ADXF_ExecServer();` (0x196460 / 0x19a080). When the
+unload does not happen, the next `ADXF_LoadPartition` is refused with **`E0042401:multi load partition`**
+(string 0x3c1a18) and the game spins forever on `ADXF_GetPtStat`, printing E0041303 - which is exactly the
+"idle on the loading screen" state. `FUN_001664d0` discards `ADXF_LoadPartition`'s return value, so the
+refusal is silent.
+
+**Confirmed mechanism - `ADXF_GetPtStat` has a return-3 path that skips the unload.** Its tail is:
+
+```c
+lVar8 = FUN_001970e8(handle, blocks, buf);   // issue the next async read
+if (lVar8 < 0) { FUN_001963a8(); cVar4 = 4; }
+else           { cVar4 = *(char *)(handle + 1); }   // <-- file-state byte
+return cVar4;                                       // 3 == "done", but NO unload
+```
+
+So a read that is **already complete** when the call returns makes `GetPtStat` report 3 while the table
+conversion has not run and the slot is still held. Our HLE fileio `read`
+(`ps2xIOP/src/modules/fileio.cpp` `handleRead`) completes **synchronously** - host read + `writeGuest`
+inside the same call - so the file-state byte is always 3 on return. Whether the game observes it depends on
+where the IOP burst lands relative to the EE poll, which is why the deadlock hits a *random* partition
+(observed at ptid 0, 1, 2, 3, 4) and why probe overhead shifts the rate. On real hardware the IOP fileio
+read is asynchronous, so the byte reads "in progress" and the poll continues into the conversion pass.
+
+**Classification warning for future sessions:** `adxf=1000000000000000` at 40 s is NOT idle - it just means
+one handle is still open mid-stream. Runs 12/13/16/19 were initially misread that way. The only reliable
+idle-vs-streaming signal is the `0x3910ac` store trace: a healthy run always ends with a final `-1`
+(`-1,0,-1,1,...,-1,5,-1`); a deadlocked one stops right after a `ptid` write with no unload. The other
+reliable signal is a long (100 s) run's `sid=131072` count: 0 = stuck, 50+ = streaming.
+
+**Probes added this session (TEMP, env-gated, default off, zero behaviour change):**
+- `PS2X_IOP_SIF_TRACE=1` - `ps2xIOP/src/emulator/services/iop_rpc.cpp` traces every `sifcmd` sendcmd
+  (cid/size/owns/extra + drop reason); `ps2xRuntime/.../Stubs/SIF.cpp` traces the EE half of
+  `dispatchSifCommand` (NO HANDLER / QUEUED). Result: the IOP guest **never** calls `sifcmd` ordinal 12/13,
+  so `sendSifCommand` has exactly one caller and it is never reached - the IOP->EE command path is not
+  exercised by this game's audio at all.
+- `PS2X_IOP_THR_TRACE=1` - `ps2xIOP/src/emulator/core/iop_kernel.cpp` `setThreadState`
+  (tid/state/pc/entry/prio/waitId). IxAudio's module fn is IOP VA 0x6a9a4 (tid 13); the busy thread is tid
+  15 (entry 0x70de0, blocks on semaphore 7).
+
+**Existing instruments that answered this (no rebuild):**
+`PS2X_WATCH_CALLS=0x196058,0x196460,0x1961a8,0x195f20,0x19a080,0x195a18` with `PS2X_WATCH_CALLS_N` -
+`[EE-call]` carries a0 = ptid. The `PS2X_WATCH_LO/HI/N` store watch on 0x3910ac is the single best
+idle-vs-streaming signal. Note `[CRI-msg]` prints only the *current* message, so `E0042401` is overwritten by
+the `E0041303` flood - watch `0x195a18`'s a0 to see every distinct CRI error string.
+
+**Next step (fork):** this is an I/O-timing question, not a GS question.
+(A) Make the HLE fileio read **not complete inside the issuing call** - queue it and transfer the data on a
+later IOP quantum (the real IOP/CD behaviour). This is the root fix and would make runs deterministic.
+Smallest version: defer completion by one `runEeCycles` quantum, which alone makes the file-state byte read
+"in progress" on return. Larger version: model CD/HDD latency proportional to the byte count.
+(B) Accept the ~1/3 loss and go back to direction A on a streaming run - run 1 already proved the black
+phase is reachable with 58 IxAudio RPCs and is **not** audio-gated.
+
 ### Session 49 - VIF1→GIF provenance probes built; the streaming/idle host race shifted IDLE-dominant (8 runs); idle stall root-located to the IOP IxAudio callback loop (new workstream fork pending)
 
 **Direction A (user-chosen session 48) is instrumented but BLOCKED: since session 48, every run idles on

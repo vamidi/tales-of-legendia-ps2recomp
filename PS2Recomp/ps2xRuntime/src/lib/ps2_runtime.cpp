@@ -1866,6 +1866,126 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             }
         }
     }
+    // PS2X_ADXF_TRACE=<max lines> dumps the CRI ADXF partition-loader state on
+    // every ADXF_GetPtStat (0x196460) entry, de-duplicated so the loader's spin
+    // collapses to one line per state change.
+    //
+    // Why: the loader (FUN_001664d0) is
+    //     for (ptid = 0; ptid < 6; ptid++) {
+    //         FUN_00196058(ptid, ...);            // LoadPartition, result IGNORED
+    //         while (FUN_00196460(ptid) != 3) { FUN_0019a080(); }
+    //     }
+    // and GetPtStat has exactly two `return 3` paths:
+    //   (a) all entries consumed -> FUN_001963a8() unloads (slot 0x3910ac := -1)
+    //       -> return 3.  Correct.
+    //   (b) the buffer pass limit (bufsz << 9) is hit first -> FUN_001970e8
+    //       issues a read -> `return *(char*)(handle+1)` with NO unload.  If
+    //       FUN_00196db0 took its `remaining == 0` branch the byte is 3, so
+    //       GetPtStat reports "complete" while the slot is still set.
+    // Then LoadPartition(ptid+1) is refused with E0042401 "multi load partition",
+    // its result is ignored, and GetPtStat(ptid+1) answers -3 ("illegal
+    // parameter 'ptid'") forever.
+    //
+    // So the trace has to distinguish (a) from (b): remaining==0 means (b) is
+    // reachable, remaining>0 with state==3 means the completion fired inside the
+    // RPC (the emulator's read is synchronous), count==cursor means (a).
+    static const uint32_t s_adxfTraceCap = [] {
+        const char *env = std::getenv("PS2X_ADXF_TRACE");
+        if (env == nullptr)
+        {
+            return 0u;
+        }
+        const unsigned long v = std::strtoul(env, nullptr, 10);
+        return static_cast<uint32_t>(v);
+    }();
+    if (s_adxfTraceCap != 0u && targetPc == 0x196460u)
+    {
+        static uint32_t s_adxfLines = 0u;
+        static uint32_t s_adxfLast[8] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                         0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+        auto ram32 = [&](uint32_t address) {
+            uint32_t value = 0u;
+            std::memcpy(&value, rdram + (address & 0x01FFFFFFu), sizeof(value));
+            return value;
+        };
+        auto ram8 = [&](uint32_t address) {
+            uint8_t value = 0u;
+            std::memcpy(&value, rdram + (address & 0x01FFFFFFu), sizeof(value));
+            return value;
+        };
+        const uint32_t ptid = GPR_U32(ctx, 4);
+        const uint32_t slot = ram32(0x003910ACu);
+        const uint32_t cursor = ram32(0x003910A4u);
+        const uint32_t handle = ram32(0x003910A8u);
+        const uint32_t bufsz = ram32(0x003910B4u);
+        const uint32_t state = handle != 0u ? ram8(handle + 1u) : 0u;
+        // Two different objects, easy to confuse:
+        //   * the I/O handle (0x3910a8, normally 0x390738) carries +0xc byte
+        //     total, +0x14 byte position, +0x18 destination, +0x1c transfer size
+        //     and the +1 state byte read by FUN_00197668;
+        //   * table[ptid] (0x390b78 + ptid*4, stride 4 - verified in the
+        //     disassembly at 0x1964f4) carries the +8 entry count that the scan
+        //     loop compares DAT_003910a4 against.
+        const uint32_t desc = (ptid < 16u) ? ram32(0x00390B78u + ptid * 4u) : 0u;
+        const uint32_t count = desc != 0u ? ram32(desc + 8u) : 0u;
+        const uint32_t total = handle != 0u ? ram32(handle + 0xCu) : 0u;
+        const uint32_t pos = handle != 0u ? ram32(handle + 0x14u) : 0u;
+        const uint32_t size = handle != 0u ? ram32(handle + 0x1Cu) : 0u;
+        const uint32_t remaining = total - pos;
+        if (s_adxfLines < s_adxfTraceCap &&
+            (s_adxfLast[0] != ptid || s_adxfLast[1] != slot || s_adxfLast[2] != state ||
+             s_adxfLast[3] != cursor || s_adxfLast[4] != pos || s_adxfLast[5] != count ||
+             s_adxfLast[6] != size || s_adxfLast[7] != remaining))
+        {
+            s_adxfLast[0] = ptid;
+            s_adxfLast[1] = slot;
+            s_adxfLast[2] = state;
+            s_adxfLast[3] = cursor;
+            s_adxfLast[4] = pos;
+            s_adxfLast[5] = count;
+            s_adxfLast[6] = size;
+            s_adxfLast[7] = remaining;
+            ++s_adxfLines;
+            std::cerr << "[ADXF] ptid=" << ptid
+                      << " slot=" << slot
+                      << " state=" << state
+                      << " cursor=" << cursor
+                      << " count=" << count
+                      << " pos=" << pos
+                      << " total=" << total
+                      << " remaining=" << remaining
+                      << " size=" << size
+                      << " bufsz=" << bufsz
+                      << " handle=0x" << std::hex << handle << std::dec
+                      << " n=" << s_adxfLines
+                      << std::endl;
+        }
+    }
+    // PS2X_ADXF_TRACE also reports ADXF_LoadPartition's arguments.  The loader
+    // (FUN_001664d0) allocates (ptnCount+1)*4 + 0x11c bytes per partition and
+    // passes that as the 4th argument; FUN_001961a8 then stores `a3 >> 11`
+    // (bytes -> 2048-byte sectors) to 0x3910b4, which is the buffer size
+    // FUN_00196db0 clamps every read to.  Logging a3 here is what settles
+    // whether the small value seen at 0x3910b4 is the guest's own arithmetic
+    // or something the emulator corrupted.
+    if (s_adxfTraceCap != 0u && targetPc == 0x1961A8u)
+    {
+        static uint32_t s_loadLines = 0u;
+        static uint32_t s_loadLastPtid = 0xFFFFFFFFu;
+        const uint32_t ptid = GPR_U32(ctx, 4);
+        if (s_loadLines < 32u && s_loadLastPtid != ptid)
+        {
+            s_loadLastPtid = ptid;
+            ++s_loadLines;
+            const uint32_t sizeArg = GPR_U32(ctx, 11);
+            std::cerr << "[ADXF-load] ptid=" << ptid
+                      << " a1=0x" << std::hex << GPR_U32(ctx, 5)
+                      << " a2=0x" << GPR_U32(ctx, 6)
+                      << " t3(size)=0x" << sizeArg << std::dec
+                      << " sectors=" << (sizeArg >> 11)
+                      << " line=" << s_loadLines << std::endl;
+        }
+    }
     // PS2X_WATCH_POISON=<lo>:<hi> installs a software watchpoint over a small guest
     // RAM range (<= 0x40 bytes).  Every inter-function transfer compares the range
     // against a shadow copy and reports the first word that changed.  Unlike the

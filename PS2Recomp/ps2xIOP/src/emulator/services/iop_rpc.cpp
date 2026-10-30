@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -15,6 +17,63 @@
 
 namespace ps2x::iop::detail
 {
+    // TEMP DIAGNOSTIC (session 50): trace the IOP -> EE SIF command path.
+    // The IxAudio stream loop only advances when the IOP calls back into the EE
+    // (sid 0x90000302), and an idle run means that callback never arrives. This
+    // traces every sifcmd import the IOP guest makes, and every early return
+    // that silently drops a command, so "never attempted" and "attempted but
+    // dropped" can be told apart.  Default off: no behaviour change.
+    namespace
+    {
+        bool iopSifTraceEnabled() noexcept
+        {
+            static const bool enabled = []()
+            {
+                const char *const value = std::getenv("PS2X_IOP_SIF_TRACE");
+                return value != nullptr && value[0] != '\0' && value[0] != '0';
+            }();
+            return enabled;
+        }
+
+        bool iopSifTraceBudget() noexcept
+        {
+            static uint32_t printed = 0u;
+            constexpr uint32_t kMaxLines = 4000u;
+            if (printed >= kMaxLines)
+                return false;
+            ++printed;
+            if (printed == kMaxLines)
+            {
+                // Deliberately not a log() call: this must not look like a guest line.
+                std::fprintf(stderr, "[IOP-SIF] trace budget exhausted (%u lines)\n", kMaxLines);
+            }
+            return true;
+        }
+
+        void iopSifTrace(IopHost &host, const std::string &line) noexcept
+        {
+            if (!iopSifTraceEnabled() || !iopSifTraceBudget())
+                return;
+            host.log(LogLevel::Info, line);
+        }
+
+        const char *iopThreadStateName(IopThreadState state) noexcept
+        {
+            switch (state)
+            {
+            case IopThreadState::Dormant: return "Dormant";
+            case IopThreadState::Ready: return "Ready";
+            case IopThreadState::Running: return "Running";
+            case IopThreadState::Sleep: return "Sleep";
+            case IopThreadState::Delay: return "Delay";
+            case IopThreadState::Semaphore: return "Semaphore";
+            case IopThreadState::EventFlag: return "EventFlag";
+            case IopThreadState::Suspended: return "Suspended";
+            case IopThreadState::Dead: return "Dead";
+            }
+            return "?";
+        }
+    }
     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
         : m_host(host), m_memory(memory), m_kernel(kernel)
     {
@@ -167,9 +226,27 @@ namespace ps2x::iop::detail
             const uint32_t extraDestination = m_memory.read32(stackPointer + 16u);
             const int32_t signedExtraSize = static_cast<int32_t>(m_memory.read32(stackPointer + 20u));
 
+            const bool trace = iopSifTraceEnabled();
+            const auto traceDrop = [&](const char *why)
+            {
+                if (!trace)
+                    return;
+                std::ostringstream out;
+                out << "[IOP-SIF] sendcmd DROPPED (" << why << ") cid=0x" << std::hex << commandId
+                    << " pkt=0x" << packetAddress << " size=" << std::dec << packetSize
+                    << " extraSrc=0x" << std::hex << extraSource
+                    << " extraDst=0x" << extraDestination << " extraSize=" << std::dec << signedExtraSize
+                    << " sp=0x" << std::hex << stackPointer << " pc=0x" << cpu.pc << std::dec;
+                iopSifTrace(m_host, out.str());
+            };
+
             if (packetAddress == 0u || packetSize < kHeaderSize || packetSize > kMaxPacketSize ||
                 !m_memory.ownsRamRange(packetAddress, packetSize))
             {
+                traceDrop(packetAddress == 0u ? "pkt==0"
+                          : packetSize < kHeaderSize ? "size<16"
+                          : packetSize > kMaxPacketSize ? "size>112"
+                                                        : "pkt not owned");
                 setV0(0u);
                 return true;
             }
@@ -177,6 +254,7 @@ namespace ps2x::iop::detail
             std::array<uint8_t, kMaxPacketSize> packet{};
             if (!m_memory.readRam(packetAddress, packet.data(), packetSize))
             {
+                traceDrop("readRam failed");
                 setV0(0u);
                 return true;
             }
@@ -189,6 +267,10 @@ namespace ps2x::iop::detail
                     !m_memory.ownsRamRange(extraSource, extraSize) ||
                     !m_host.writeGuest(extraDestination, m_memory.ram().data() + IopMemory::physicalAddress(extraSource), extraSize))
                 {
+                    traceDrop(extraSource == 0u ? "extraSrc==0"
+                              : extraDestination == 0u ? "extraDst==0"
+                              : !m_memory.ownsRamRange(extraSource, extraSize) ? "extraSrc not owned"
+                                                                              : "writeGuest failed");
                     setV0(0u);
                     return true;
                 }
@@ -199,9 +281,41 @@ namespace ps2x::iop::detail
             std::memcpy(packet.data() + 4u, &extraDestination, sizeof(extraDestination));
             std::memcpy(packet.data() + 8u, &commandId, sizeof(commandId));
 
+            const auto payloadWord = [&packet](size_t offset)
+            {
+                uint32_t word = 0u;
+                std::memcpy(&word, packet.data() + offset, sizeof(word));
+                return word;
+            };
+            const auto tracePayload = [&payloadWord](std::ostringstream &out)
+            {
+                out << " payload[0..3]="
+                    << std::hex << payloadWord(0u) << ','
+                    << payloadWord(4u) << ','
+                    << payloadWord(8u) << ','
+                    << payloadWord(12u) << std::dec;
+            };
+
             if (!m_host.sendSifCommand(commandId, packet.data(), packetSize))
             {
                 // A command without an EE handler is still a completed DMA on  real hardware. Only malformed packets fail above.
+                if (trace)
+                {
+                    std::ostringstream out;
+                    out << "[IOP-SIF] sendcmd cid=0x" << std::hex << commandId
+                        << " size=" << std::dec << packetSize << " -> EE reported NO HANDLER";
+                    tracePayload(out);
+                    iopSifTrace(m_host, out.str());
+                }
+            }
+            else if (trace)
+            {
+                std::ostringstream out;
+                out << "[IOP-SIF] sendcmd cid=0x" << std::hex << commandId
+                    << " size=" << std::dec << packetSize << " extraSize=" << extraSize
+                    << " -> DELIVERED";
+                tracePayload(out);
+                iopSifTrace(m_host, out.str());
             }
 
             const uint32_t dmaId = m_nextDmaId++;

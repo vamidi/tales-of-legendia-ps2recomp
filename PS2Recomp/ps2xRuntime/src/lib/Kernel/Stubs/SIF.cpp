@@ -15,10 +15,55 @@
 #include <mutex>
 #include <sstream>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace ps2_stubs
 {
+    namespace
+    {
+        // Deferred fileio completion notifications.
+        //
+        // The guest's stdio layer submits fileio RPCs asynchronously: it posts
+        // the request and then blocks on the semaphore named in the request
+        // header until the IOP signals it.  On hardware that signal arrives
+        // only after the CD/HDD transfer really happened, so the caller
+        // observes "in progress" for a while.
+        //
+        // Answering inside the RPC - which is what this runtime used to do -
+        // makes every transfer look instantaneous, and CRI's ADXF partition
+        // loader depends on the delay.  ADXF_GetPtStat (0x196460) polls the
+        // handle state byte; when a buffer pass runs out it issues the next
+        // read through FUN_001970e8 and returns *(char *)(handle + 1) as the
+        // new state.  With an instantaneous read that byte is already 3 by the
+        // time it is read, so GetPtStat reports "complete" without ever running
+        // the unload helper FUN_001963a8 - the only code that clears the
+        // current-partition slot global 0x3910ac.  The slot stays set, the next
+        // ADXF_LoadPartition (0x1961a8) is refused with E0042401 "multi load
+        // partition", and the loader then spins forever on the -3 "illigal
+        // parameter 'ptid'" answer.
+        //
+        // Holding the signal until the next scheduler iteration restores the
+        // "still in progress" observation without changing the transfer itself.
+        //
+        // NOTE: only the fileio semaphore may be delayed.  Deferring the fileio
+        // reply itself made the loader much worse - see the session log.
+        std::vector<int> g_deferredFileIoSemas;
+
+        // Guest stores that must land *after* the RPC returns.  Used for the
+        // libcdvd stream handler's 0xB "normal end" word at 0x385260: CRI's ADXF
+        // loader (ADXF_GetPtStat, 0x196460) issues a read and then returns the
+        // handle state byte directly, so completing the transfer inside the
+        // submit makes it report "done" without running the unload that clears
+        // the partition slot 0x3910ac.  The semaphore is still released inline,
+        // because FUN_00196db0 starts with a queue-idle check that aborts a
+        // request left looking busy.
+        // PS2X_FILEIO_SYNC=1 restores the old in-call completion for A/B runs.
+        const bool g_fileIoSyncCompletion = std::getenv("PS2X_FILEIO_SYNC") != nullptr;
+    }
+
+    // drainDeferredFileIoSemaphores is defined at the end of this file.
+
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         TODO_NAMED("sceSifCmdIntrHdlr", rdram, ctx, runtime);
@@ -69,6 +114,15 @@ namespace ps2_stubs
         const bool g_sifVerboseLogs = []
         {
             const char *e = std::getenv("PS2_SIF_VERBOSE");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+
+        // TEMP DIAGNOSTIC (session 50): the EE half of the IOP -> EE command path.
+        // Shares PS2X_IOP_SIF_TRACE with the IOP side so one flag shows both ends
+        // of the handshake the IxAudio stream loop depends on.  Default off.
+        const bool g_sifCmdTrace = []
+        {
+            const char *e = std::getenv("PS2X_IOP_SIF_TRACE");
             return e != nullptr && e[0] != '\0' && e[0] != '0';
         }();
 
@@ -802,12 +856,24 @@ namespace ps2_stubs
                             // rejects ids that no longer exist.
                             if (completionSema > 0u)
                             {
-                                const int signalled = runtime->eeScheduler().signalSemaphore(
-                                    static_cast<int>(completionSema), true);
+                                const int semaId = static_cast<int>(completionSema);
+                                int signalled = semaId;
+                                if (g_fileIoSyncCompletion)
+                                {
+                                    signalled = runtime->eeScheduler().signalSemaphore(semaId, true);
+                                }
+                                else
+                                {
+                                    // Complete on the next scheduler iteration
+                                    // (see g_deferredFileIoSemas).
+                                    g_deferredFileIoSemas.push_back(semaId);
+                                }
                                 if (g_sifVerboseLogs)
                                 std::cerr << "[SIF-iop] fileio completion sema=" << completionSema
                                           << " rpc=0x" << std::hex << rpcNumber << std::dec
-                                          << " ret=" << signalled << std::endl;
+                                          << " ret=" << signalled
+                                          << (g_fileIoSyncCompletion ? " sync" : " deferred")
+                                          << std::endl;
                             }
                         }
                     }
@@ -970,6 +1036,8 @@ namespace ps2_stubs
                             const uint32_t lsn = runtime->Load32(rdram, ctx, callPayloadAddr + 0x00u);
                             const uint32_t sectors = runtime->Load32(rdram, ctx, callPayloadAddr + 0x04u);
                             const uint32_t dest = runtime->Load32(rdram, ctx, callPayloadAddr + 0x08u);
+                            const uint32_t cdvdCommandSema =
+                                runtime->Load32(rdram, ctx, kSifCdvdCommandSemaAddr);
                             R5900Context scratch{};
                             scratch.pc = 0x001029a8u;
                             setScratchGpr(scratch, 4, lsn);
@@ -991,13 +1059,11 @@ namespace ps2_stubs
                             // anything else is an error (it signals the error semaphore
                             // instead of releasing the loader).  Leaving the descriptor
                             // empty and storing 0xB reproduces the completion the ADXF
-                            // loader waits for(handle status 2 -> 3).
+                            // loader waits for (handle status 2 -> 3).
                             for (uint32_t off = 0u; off < 0x60u; off += 4u)
                             {
                                 runtime->Store32(rdram, ctx, kSifCdvdStreamRespDesc + off, 0u);
                             }
-                            runtime->Store32(rdram, ctx, kSifCdvdStreamStatusAddr,
-                                             kSifCdvdStreamStatusEnd);
 
                             // Hand the command semaphore back.  FUN_001014c0 clears
                             // the "command pending" word (0x385234) for 0xB but does
@@ -1007,8 +1073,8 @@ namespace ps2_stubs
                             // "Ncmd fail sema cur_cmd:%d keep_cmd:%d").  That made
                             // every partition open after the pt-info transfer fail
                             // with "can't open" and wedged the loader.
-                            const uint32_t cdvdCommandSema =
-                                runtime->Load32(rdram, ctx, kSifCdvdCommandSemaAddr);
+                            runtime->Store32(rdram, ctx, kSifCdvdStreamStatusAddr,
+                                             kSifCdvdStreamStatusEnd);
                             if (cdvdCommandSema > 0u)
                             {
                                 runtime->eeScheduler().signalSemaphore(
@@ -1342,12 +1408,32 @@ namespace ps2_stubs
             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
             const auto handler = g_sifCmdHandlers.find(commandId);
             if (handler == g_sifCmdHandlers.end() || handler->second.function == 0u)
+            {
+                if (g_sifCmdTrace)
+                {
+                    std::ostringstream out;
+                    out << "[SIF-cmd] cid=0x" << std::hex << commandId
+                        << " size=" << std::dec << packetSize
+                        << " -> NO EE HANDLER registered (registered=" << g_sifCmdHandlers.size() << ')';
+                    std::cerr << out.str() << std::endl;
+                }
                 return false;
+            }
             registered = handler->second;
         }
 
         if (!runtime->hasFunction(registered.function))
+        {
+            if (g_sifCmdTrace)
+            {
+                std::ostringstream out;
+                out << "[SIF-cmd] cid=0x" << std::hex << commandId
+                    << " -> handler 0x" << registered.function
+                    << " is NOT in the recompiled function table";
+                std::cerr << out.str() << std::endl;
+            }
             return false;
+        }
 
         const uint32_t packetAddress = runtime->guestMalloc(static_cast<uint32_t>(packetSize), 16u);
         if (packetAddress == 0u)
@@ -1382,6 +1468,15 @@ namespace ps2_stubs
                 runtime->guestFree(packetAddress);
             };
             runtime->eeScheduler().queueInvocation(std::move(invocation));
+            if (g_sifCmdTrace)
+            {
+                std::ostringstream out;
+                out << "[SIF-cmd] cid=0x" << std::hex << commandId
+                    << " size=" << std::dec << packetSize
+                    << " -> QUEUED handler=0x" << std::hex << registered.function
+                    << " arg=0x" << registered.argument << " pkt=0x" << packetAddress;
+                std::cerr << out.str() << std::endl;
+            }
             return true;
         }
         catch (...)
@@ -2047,5 +2142,34 @@ namespace ps2_stubs
     void sceSifWriteBackDCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
+    }
+
+    // Releases the fileio completion semaphores that were held back to the next
+    // scheduler iteration.
+    //
+    // Why: CRI's ADXF partition loader (FUN_001664d0) is
+    //     for (ptid = 0; ptid < 6; ptid++) {
+    //         ADXF_LoadPartition(ptid);            // result IGNORED
+    //         while (ADXF_GetPtStat(ptid) != 3) { spin; }
+    //     }
+    // and GetPtStat (0x196460) has two `return 3` paths: one that first calls
+    // FUN_001963a8 (which clears the partition slot 0x3910ac), and one that just
+    // returns the handle state byte after issuing a read.  If that read has
+    // already completed the byte is 3, so GetPtStat reports "done" with the slot
+    // still set; LoadPartition then fails with E0042401, its result is ignored,
+    // and the loader spins forever on -3 "illigal parameter 'ptid'".  Holding
+    // the signal back reduces how often the completion lands inside the poll.
+    void drainDeferredFileIoSemaphores(EeScheduler &scheduler)
+    {
+        if (g_deferredFileIoSemas.empty())
+        {
+            return;
+        }
+        std::vector<int> pending;
+        pending.swap(g_deferredFileIoSemas);
+        for (const int id : pending)
+        {
+            (void)scheduler.signalSemaphore(id, true);
+        }
     }
 }

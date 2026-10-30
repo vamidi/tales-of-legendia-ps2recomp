@@ -4,11 +4,75 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace ps2x::iop::detail
 {
     namespace
     {
+        // TEMP DIAGNOSTIC (session 50): IOP thread state transitions.  An idle
+        // boot means the IxAudio IOP thread never issues its EE callback, so the
+        // question is whether it is asleep (and on what) or simply never
+        // scheduled.  Default off: no behaviour change.
+        bool iopThreadTraceEnabled() noexcept
+        {
+            static const bool enabled = []()
+            {
+                const char *const value = std::getenv("PS2X_IOP_THR_TRACE");
+                return value != nullptr && value[0] != '\0' && value[0] != '0';
+            }();
+            return enabled;
+        }
+
+        bool iopThreadTraceBudget() noexcept
+        {
+            static uint32_t printed = 0u;
+            constexpr uint32_t kMaxLines = 6000u;
+            if (printed >= kMaxLines)
+                return false;
+            ++printed;
+            if (printed == kMaxLines)
+                std::fprintf(stderr, "[IOP-THR] trace budget exhausted (%u lines)\n", kMaxLines);
+            return true;
+        }
+
+        const char *iopThreadStateName(IopThreadState state) noexcept
+        {
+            switch (state)
+            {
+            case IopThreadState::Dormant: return "Dormant";
+            case IopThreadState::Ready: return "Ready";
+            case IopThreadState::Running: return "Running";
+            case IopThreadState::Sleep: return "Sleep";
+            case IopThreadState::Delay: return "Delay";
+            case IopThreadState::Semaphore: return "Semaphore";
+            case IopThreadState::EventFlag: return "EventFlag";
+            case IopThreadState::Suspended: return "Suspended";
+            case IopThreadState::Dead: return "Dead";
+            }
+            return "?";
+        }
+
+        void iopThreadTrace(const IopThread &thread,
+                            IopThreadState previous,
+                            IopThreadState next) noexcept
+        {
+            if (!iopThreadTraceEnabled() || !iopThreadTraceBudget())
+                return;
+            std::fprintf(stderr,
+                         "[IOP-THR] tid=%d %s->%s pc=0x%08X entry=0x%08X prio=%u waitId=%d bits=0x%08X mode=0x%X\n",
+                         thread.id,
+                         iopThreadStateName(previous),
+                         iopThreadStateName(next),
+                         thread.cpu.pc,
+                         thread.entry,
+                         thread.priority,
+                         thread.waitId,
+                         thread.waitBits,
+                         thread.waitMode);
+        }
+
         uint32_t alignUp(uint32_t value, uint32_t alignment)
         {
             if (alignment <= 1u)
@@ -42,6 +106,7 @@ namespace ps2x::iop::detail
     {
         if (thread.state == state)
             return;
+        iopThreadTrace(thread, thread.state, state);
         thread.state = state;
         m_scheduleDirty = true;
         if (state == IopThreadState::Dead)

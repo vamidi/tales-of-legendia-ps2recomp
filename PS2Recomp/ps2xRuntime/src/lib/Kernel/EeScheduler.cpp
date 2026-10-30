@@ -16,6 +16,13 @@
 #include <string>
 #include <vector>
 
+// Defined in Kernel/Stubs/SIF.cpp: releases the fileio completion semaphores
+// that were deferred to the next scheduler iteration.
+namespace ps2_stubs
+{
+    void drainDeferredFileIoSemaphores(EeScheduler &scheduler);
+}
+
 namespace
 {
     // TEMP DIAGNOSTIC (session 26): the boot now streams assets correctly and then
@@ -2478,6 +2485,9 @@ void EeScheduler::applyPendingPreemption()
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
+    // Fileio completions are held for one iteration so the guest observes the
+    // transfer as still in progress (see g_deferredFileIoSemas in SIF.cpp).
+    ps2_stubs::drainDeferredFileIoSemaphores(*this);
     processDueDeadlines();
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
