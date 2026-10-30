@@ -2885,15 +2885,40 @@ census of only **593 non-zero words (~2.4 KB)** in the black phase, the uploads 
 *payload is effectively zero*. During the loading phase the same census reads 98,728 non-zero words, so
 the upload path itself works - something about the black-phase content is empty.
 
-**Next move: inspect the image payload, not the addresses.** Dump the first bytes the guest hands to the
-IMAGE path for a `DBP=0x3FF000` transfer (source LSN/host pointer, or the uploaded QWs) and compare with
-what lands in VRAM. The question is now precisely: is the guest sending zeros, or are we dropping the
-bytes between the DMA/VIF source and `gs.write_register(HWREG)`? A 700:1 ratio between uploaded bytes and
-non-zero VRAM words is the anomaly to explain.
+**The upload payload is NOT zero - the guest sends real data and we forward it.** `PS2X_IMAGE_DUMP=1`
+counts non-zero bytes in every raw GIF chunk forwarded while BITBLTBUF DBP == 0x3FF0 (i.e. the texture the
+black-phase sprites sample), plus the first 32 bytes. Two independent 140 s black-phase runs give the
+identical sequence:
 
-Also keep in mind: because the census cannot see black, do not use `nzWords` to decide whether primitives
-draw. If a "drawn in black vs not drawn at all" question comes up again, force a bright RGBAQ or disable
-`TME` for one draw and check whether pixels appear.
+```
+[IMG] dbp=0x3FF000 chunk=64  nz=14  cumBytes=64   cumNz=14   first=3:80:0:0:0:0:af:10:e:0:...
+[IMG] dbp=0x3FF000 chunk=16  nz=5   cumBytes=80   cumNz=19   first=c:80:0:0:0:0:af:18:f:0:...
+[IMG] dbp=0x3FF000 chunk=192 nz=46  cumBytes=272  cumNz=65   first=0:0:0:0:c:0:0:50:0:70:fd:bf:4:...
+[IMG] dbp=0x3FF000 chunk=208 nz=62  cumBytes=512  cumNz=133  first=c:80:0:0:0:40:af:10:e:0:...67:59:44:20...
+[IMG] dbp=0x3FF000 chunk=192 nz=59  cumBytes=784  cumNz=211  first=0:0:0:0:c:0:0:50:f9:8f:0:...
+```
+
+~22-30 % of payload bytes are non-zero, and the values are structured (repeating `af:10:e` / `af:18:f`
+patterns = plausible CLUT/texture data), not noise and not a zero fill. **So neither of the two
+hypotheses holds**: the guest is not sending zeros, and we are not dropping the bytes.
+
+This also reconciles the earlier 700:1 "bytes uploaded vs non-zero VRAM words" observation: that ratio was
+never meaningful, because `imageBytes` counts *all* uploads across the whole run (1.7 MB, mostly the
+loading-phase textures which are later overwritten by the black-phase clears), while the census is a
+snapshot of the black phase only. The black-phase texture really is sparse - ~2.4 KB of non-zero data
+across the top ~4 KB of VRAM - and that is exactly what the payload above accounts for.
+
+**Where that leaves the black screen.** The pipeline is now verified end to end: uploads land on the right
+address (DBP 0x3FF000 / 0x3FF400), carry non-zero structured data, the texture is bound (TBP0/TBW/PSM/CBP
+all sane), the scissor is correct, the vertex colour is a dark brown, and the game is running. What is NOT
+established is whether the primitives rasterise at all - and the VRAM census *cannot* answer that, because
+it counts only non-zero words. A dark or mostly-index-0 texture sampling to near-black is indistinguishable
+from nothing being drawn.
+
+**Next move (decisive, cheap):** force a bright RGBAQ (or clear TME) on one black-phase draw using the same
+A+D rewrite mechanism `PS2X_FORCE_FULL_SCISSOR` already uses, and see whether pixels appear in the
+framebuffer. Bright pixels = the primitives draw and the black is a texture/colour value; still nothing =
+the primitives do not rasterise and the fault is in vertex assembly.
 
 
 

@@ -32,6 +32,15 @@ namespace
         }();
         return v;
     }
+    // TEMP DIAGNOSTIC (session 54): the last BITBLTBUF the guest wrote.  Shared
+    // between the observeGIF walk (writer) and ProcessGIF's payload probe
+    // (reader), which are different functions - a function-local static in the
+    // walk is not visible from the forwarder.
+    uint64_t &bitbltMirror()
+    {
+        static uint64_t v = 0u;
+        return v;
+    }
     // TEMP DIAGNOSTIC (session 49): gate for the buffer-boundary provenance
     // stamp (see [GIFsub2] in ps2_memory.cpp).  Opt-in via PS2X_GIF_PROVENANCE=1.
     bool gifProvenanceEnabled()
@@ -379,7 +388,7 @@ namespace
                 case 0x18: s_xyoff1 = uint32_t(adValue); break;             // XYOFFSET_1
                 case 0x40: s_scissor1 = adValue; break;                     // SCISSOR_1
                 case 0x42: s_alpha1 = uint32_t(adValue); break;             // ALPHA_1
-                case 0x47: s_test1 = uint32_t(adValue); break;              // TEST_1
+                case 0x50: bitbltMirror() = adValue; break;                  // BITBLTBUF
                 case 0x4C: ++s_adFrame; s_frame1 = uint32_t(adValue); break; // FRAME_1
                 case 0x4D: s_frame2 = uint32_t(adValue); break;             // FRAME_2
                 case 0x4E: s_zbuf1 = adValue; break;                        // ZBUF_1
@@ -716,6 +725,35 @@ namespace
                           << std::dec << std::endl;
             }
             observeGIF(path, data, size);
+            // TEMP DIAGNOSTIC (session 54): is the IMAGE payload the guest sends for
+            // DBP=0x3FF000 actually zeros, or do we lose it?  Guest GIF traffic
+            // reaches parallel-gs through THIS raw path, not through UploadImage(),
+            // so the payload has to be counted here.  BITBLTBUF is mirrored by the
+            // walk above.  0x3FF000 is the TBP0 the black-phase sprites sample.
+            {
+                static const bool s_imageDump = std::getenv("PS2X_IMAGE_DUMP") != nullptr;
+                static uint32_t s_imgPrints = 0u;
+                static uint64_t s_imgBytes = 0u, s_imgNonZero = 0u;
+                if (s_imageDump && s_imgPrints < 12u && data != nullptr &&
+                    ((bitbltMirror() >> 32) & 0x3FFFu) == 0x3FF0u)
+                {
+                    uint64_t nz = 0u;
+                    for (size_t i = 0u; i < size; ++i)
+                    {
+                        if (data[i] != 0u)
+                            ++nz;
+                    }
+                    s_imgBytes += size;
+                    s_imgNonZero += nz;
+                    std::cerr << "[IMG] dbp=0x3FF000 chunk=" << size << " nz=" << nz
+                              << " cumBytes=" << s_imgBytes << " cumNz=" << s_imgNonZero
+                              << " first=";
+                    for (size_t i = 0u; i < 32u && i < size; ++i)
+                        std::cerr << std::hex << (i ? ":" : "") << unsigned(data[i]);
+                    std::cerr << std::dec << std::endl;
+                    ++s_imgPrints;
+                }
+            }
             // TEMP EXPERIMENT (session 47, option B): forward a patched copy with
             // the empty ctx0 SCISSOR_1 rewrites applied.
             if (forceFullScissorEnabled() && !m_scisPatch.empty())
@@ -945,6 +983,46 @@ namespace
                 return;
             size = uint32_t(std::min<size_t>(size, transferBytes - uploadedBytes));
             observeImage(size);
+            // TEMP DIAGNOSTIC (session 54): is the IMAGE payload the guest hands us
+            // actually zero, or do we drop it?  Tracks the DBP=0x3FF000 transfer -
+            // the texture the black-phase sprites sample - counting non-zero bytes
+            // per completed transfer and sampling the first 32 bytes.
+            {
+                static const bool s_imageDump = std::getenv("PS2X_IMAGE_DUMP") != nullptr;
+                static uint64_t s_imgBytes = 0u, s_imgNonZero = 0u;
+                static uint32_t s_imgPrints = 0u;
+                static bool s_imgSampled = false;
+                if (s_imageDump)
+                {
+                    const uint32_t dbp = uint32_t((bitblt >> 32) & 0x3FFFu);
+                    if (dbp == 0x3FF0u)
+                    {
+                        for (uint32_t i = 0u; i < size; ++i)
+                        {
+                            if (data[i] != 0u)
+                                ++s_imgNonZero;
+                        }
+                        s_imgBytes += size;
+                        if (!s_imgSampled && s_imgPrints < 8u)
+                        {
+                            s_imgSampled = true;
+                            std::cerr << "[IMG] dbp=0x" << std::hex << (dbp * 256u) << " first=";
+                            for (uint32_t i = 0u; i < 32u && i < size; ++i)
+                                std::cerr << std::hex << (i ? ":" : "") << unsigned(data[i]);
+                            std::cerr << std::dec << " (chunk=" << size << ")" << std::endl;
+                        }
+                        if (transferBytes != 0u && uploadedBytes >= transferBytes && s_imgPrints < 8u)
+                        {
+                            ++s_imgPrints;
+                            std::cerr << "[IMG] dbp=0x3FF000 transfer done bytes=" << s_imgBytes
+                                      << " nonZero=" << s_imgNonZero << std::endl;
+                            s_imgBytes = 0u;
+                            s_imgNonZero = 0u;
+                            s_imgSampled = false;
+                        }
+                    }
+                }
+            }
             while (size)
             {
                 auto n = std::min<size_t>(size, 8 - uploadTailSize);
