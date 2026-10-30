@@ -2806,11 +2806,37 @@ itself (vertex extents / colour / blend), which is Session 48's original conclus
 CLUT sit inside real data. The final sample is `prim=0x25c` with TBP0 `0x1C0000` - the composite pass
 sampling the scene buffer, which is empty because the scene prims drew nothing.
 
-**Run-to-run variance is large and must be controlled for.** Of 4 runs at 120 s: two reached the GS
-(31 `[GSpost]` samples, 8.1 MB GIF, 11,692 prims, 217 passes) and two stalled early - one on the ADXF
-deadlock (77 `E0041303`), one in asset init with no CRI message at all (`lastPc=0x198ef8`, call chain
-`0x1b76f8 -> 0x198e0c -> 0x198ef8`, i.e. the ready-flag area). A GS conclusion drawn from a single run is
-worthless; check `[GSpost]` is non-zero before believing any GS sample.
+**The census cannot see black - this is the single most important instrument caveat here.** `nzWords` and
+`nzWindow()` count *non-zero* words, so "the guest drew a black quad" and "the guest drew nothing" are
+indistinguishable. Everything above that reads "the framebuffer is empty" must be re-read as "the
+framebuffer holds no non-zero colour", which is not the same claim.
+
+That matters because the black-phase sprites are **not** colourless. `[GS-sc]` reports
+`rgba=0x3F8000008011172B` throughout, i.e. **R=0x2B G=0x17 B=0x11 A=0x80** (dark brown, Q=1.0). With
+`TME=1` the texture replaces the vertex colour, and the blend `(Cs-Cd)*FIX+Cd` with `Cd=0` reduces to
+`Cs*0.836`, so the final pixel is the *texture* colour scaled down. A dark texture therefore yields near
+black, and a black texture yields exactly 0 - invisible to the census.
+
+**Texture geometry looks wrong for the top of VRAM.** Decoding `t0=0x2007FE8599407FF0`: TBP0 `0x3FF0`
+(x256 = `0x3FF000`), **TBW = 1** (64 texels per row), PSM `0x14` (T8), CBP `0x3FF4` (x256 = `0x3FF400`).
+At TBW=1 a 64-wide T8 texture of height N occupies N*64 bytes from `0x3FF000`; a 64-tall one fills
+`0x3FF000..0x3FFFFF`, i.e. the **last 4 KiB of VRAM**, and its CLUT at `0x3FF400` overlaps that range. The
+populated data in VRAM ends at `0x3FF43C`, so only ~0x43C bytes of a ~4 KiB texture have content and the
+rest samples index 0. That is a plausible source of uniformly black output, and it is a *data* question
+(uploads), not a binding question: `[GS-census]` shows 1.7 MB of `imageBytes` uploaded overall, so the
+guest is uploading textures - the open question is whether any of it lands on DBP `0x3FF000`.
+
+**Trace census for a full black-phase run (parallel-gs TRACE, 140 s, `PARALLEL_GS_DEBUG=ON`):**
+14,699 `Primitive` lines + 5,814 `Degenerate BB` lines. Of the `Primitive` lines, **`TexIndex >= 1` on
+only 5** - effectively every black-phase primitive shares texture-state slot 0, consistent with the single
+TEX0 seen above. The dominant valid shapes are 64-pixel-wide full-height columns (`0..63`, `64..127`, ...,
+`448..511`, 186 occurrences each) which is the composite pass. Early vertices are a clean full-screen quad:
+`VERT #1 X:1792 Y:1824` / `VERT #2 X:2432 Y:2720` against XYOFFSET (1792,1824) -> (0,0)..(640,896).
+
+**The game is running, not stuck, during the black phase:** 49 distinct PCs across the last 300 vblank
+samples with a varied call chain (`0x22d328 -> 0x23df2c -> 0x238a64 -> 0x1ec290 -> 0x15ccbc -> 0x164d88 ->
+0x165bd0`); the most frequent single PC is `0x1f75f8` at 12/300. So the black phase is an active state,
+not a hang.
 
 **Geometry is NOT mostly degenerate**, contrary to Session 48's "every sprite is zero-height". The
 packed-path histogram in the same runs reports `pairs=1190, zero6=378, maxWH=10240/14336`, i.e. 68 % of
@@ -2841,13 +2867,33 @@ phase: ZERO", which is consistent: the sprites draw but sample an unbound textur
 integers in a struct array, so it does NOT establish that the game writes that scissor. `0x37f0000027f0000`
 does not occur in the ELF at all, so the "wide" scissor is computed at runtime.
 
-**Next move: the primitive data itself.** With the scissor correct, the texture bound and the CLUT inside
-populated VRAM, ~11,700 `prim=0x15e` sprites still produce zero pixels - so the defect is in the vertex
-extents, the per-vertex colour/blend, or how the primitive is assembled from the stream. Session 48's
-evidence (sprites with `Y1 == Y2`, BB `[502,228]..[510,227]` inverted) is the place to resume. Note the
-`pairs=/zero6=` histogram in `[GS-sc]` counts raw QW *pairs* from our own packed walk, which Session 46
-showed can pair vertex data falsely, so corroborate it against parallel-gs's own per-primitive TRACE
-(`PARALLEL_GS_DEBUG=ON`, ~21 MB stdout per run) rather than trusting the histogram alone.
+**Uploads DO target the sampled addresses - the data itself is the problem.** Decoding BITBLTBUF from the
+black-phase samples (`DBP = (bits >> 32) & 0x3FFF`, x256):
+
+```
+0x14013FF000000000  x25  SBP=0x0  DBP=0x3FF000   <- the texture TBP0 the sprites sample
+0x13FF400000000     x11  SBP=0x0  DBP=0x3FF400   <- the CLUT CBP the sprites sample
+0x13A7000000000     x4   SBP=0x0  DBP=0x3A7000   <- loading-phase upload
+```
+
+(An earlier note in this log claimed uploads were going to `0x13FF00` instead - that was my own bit-slicing
+error; `0x14013FF000000000 >> 32 = 0x14013FF0`, not `0x14013FF`. The addresses are correct.)
+
+So the guest uploads to exactly the texture and CLUT the sprites sample, and binds them, and the sampled
+result is still black. Combined with `[GS-census] imageBytes=1732768` (1.7 MB uploaded) against a VRAM
+census of only **593 non-zero words (~2.4 KB)** in the black phase, the uploads are arriving but their
+*payload is effectively zero*. During the loading phase the same census reads 98,728 non-zero words, so
+the upload path itself works - something about the black-phase content is empty.
+
+**Next move: inspect the image payload, not the addresses.** Dump the first bytes the guest hands to the
+IMAGE path for a `DBP=0x3FF000` transfer (source LSN/host pointer, or the uploaded QWs) and compare with
+what lands in VRAM. The question is now precisely: is the guest sending zeros, or are we dropping the
+bytes between the DMA/VIF source and `gs.write_register(HWREG)`? A 700:1 ratio between uploaded bytes and
+non-zero VRAM words is the anomaly to explain.
+
+Also keep in mind: because the census cannot see black, do not use `nzWords` to decide whether primitives
+draw. If a "drawn in black vs not drawn at all" question comes up again, force a bright RGBAQ or disable
+`TME` for one draw and check whether pixels appear.
 
 
 
