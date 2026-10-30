@@ -718,7 +718,14 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
 #ifdef PS2X_GS_PARALLEL
-        m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
+        // PS2X_GS_CPU=1 keeps the software rasteriser that GS::init() installs.
+        // Both backends are fed by the same GIF packet decoding, so running the
+        // CPU one separates "our GIF/vertex decode is wrong" from "parallel-gs
+        // rasterises it wrong" - the question the black phase has never answered.
+        if (std::getenv("PS2X_GS_CPU") == nullptr)
+        {
+            m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
+        }
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
