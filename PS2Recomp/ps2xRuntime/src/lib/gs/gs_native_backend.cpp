@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/gs_texture_page_cache.h"
 #include "runtime/native/native_texture_cache.h"
+#include "runtime/native/native_gs_hook.h"
 
 // raylib's OpenGL 3.3 loader: its function pointers are loaded by raylib for the window context and stay valid on a
 // context that shares with it.
