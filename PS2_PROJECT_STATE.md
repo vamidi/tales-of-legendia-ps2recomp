@@ -2850,6 +2850,30 @@ correctly today through both backends, so a GL backend that reproduces the loadi
 is then a separate question about game state, not about whether the renderer works. This removes the need
 for the CPU-backend comparison entirely.
 
+**Sync status with the fork (measured; do NOT bulk-copy).** Our `PS2Recomp/` is the fork's base **plus our
+own work**, and the fork adds only ~131 lines across 19 files. Our files are consistently larger by exactly
+that work: `SIF.cpp` +1328, `ps2_runtime.cpp` +1707, `EeScheduler.cpp` +1006, `gs_parallel_backend.cpp`
++894, `gs_frontend.cpp` +395, `game_overrides.cpp` +212 - and the last is **not** a diagnostic: it is
+`talesOfLegendiaAssetPaths()` (`game_overrides.cpp:196`), the override that points `sceCdSearchFile` /
+`sceCdRead` at the extracted `data/CD` tree. Copying the fork's file over it removes the game's asset
+loading entirely. `ps2_iop_host.cpp` (+52) and `ps2_iop_transport.h` (+13) likewise hold real work.
+
+A bulk sync was attempted and reverted from HEAD within the same step (no commit happened); the tree is
+byte-identical to `7c389c5`. **Merge the fork by hand, file by file, and check that the `-` side of each
+diff is diagnostics before discarding it.**
+
+Fork changes merged so far: `ps2_vif1_interpreter.cpp` Path2 image-tag construction (tested - it does NOT
+fix the black phase). Still unmerged: `EeScheduler.cpp` vblank/event pacing, `System.cpp` smode1 LC/CMOD +
+CreateThread stack, `Sync.cpp` interruptSafe semaphores, `ps2_runtime.cpp` frame_timing/heap/`hasFunction`,
+and the new `runtime/frame_timing.h`.
+
+**Native backend started:** `ps2xRuntime/src/lib/native/native_backend.h` defines the API-neutral,
+Switch-shaped interface (`Backend`, 32-byte `Vertex`, `DrawState`, `Caps`, `TextureId`/`MeshId`) with the
+portability rules written into the header: no API types, vertex+fragment only, RGBA8 textures only,
+clip/depth conventions per backend, single-threaded contract. Factories: `createGlBackend()` now,
+`createDeko3dBackend()` later. Celosia's `native/` was never upstream, so this directory cannot conflict
+with a fork merge.
+
 
 ### Session 53 - GS re-measured after the ADXF fix: the 593-vs-98,728 census jump is the loading->black PHASE TRANSITION, not the scissor; the dump was reading past the stride
 
