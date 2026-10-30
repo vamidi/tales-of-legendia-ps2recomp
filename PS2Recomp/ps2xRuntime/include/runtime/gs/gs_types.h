@@ -236,6 +236,8 @@ struct GSDrawState
     GSContext context{};
     GSPrimReg prim{};
     GSTexaReg texa{};
+    // TEXA as written by the guest (GSNativeBackend::fillNativeRegisters needs the raw word).
+    uint64_t texaRaw = 0;
     GSTexClutReg texclut{};
     bool pabe = false;
     uint64_t scanmsk = 0;
@@ -311,6 +313,9 @@ struct PresentationFrame
     uint32_t displayFbp = 0;
     uint32_t sourceFbp = 0;
     bool usedPreferred = false;
+    // A renderer drawing on a GL context shared with the window's hands the picture
+    // over as a texture instead of pixels: rows top first, width x height (GSNativeBackend).
+    uint32_t glTexture = 0;
     float aspectRatio = 0.0f;
 
     explicit operator bool() const
