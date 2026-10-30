@@ -2738,6 +2738,69 @@ if (!$p.HasExited) { $p.Kill() | Out-Null }
   capped at 256 edges), `PS2X_DUMP_MEM=<addr>:<len>` (one-shot RAM dump), plus the existing
   `PS2X_WATCH_LO/HI/N` store watch.
 
+### Session 54 - Celosia reviewed: it renders with a NATIVE renderer fed by game overrides, not the GS; decision to keep our GIF decode and replace the GS
+
+Reviewed `github.com/HenryKun55/celosia` (Shadow of the Colossus, same PS2Recomp base, cloned to
+`D:\Personal\C++\celosia`). Read the README, `docs/native_renderer_map.md`, `runtime/native_renderer.h`,
+`src/lib/native/*`, and `game/overrides/sotc_native.cpp`.
+
+**What draws the screen there: a native renderer, with no VIF/VU1/GIF/GS emulation in the path.**
+`docs/native_renderer_map.md` states the goal verbatim: "a Metal renderer fed at this level (model + matrix
++ material), with no VIF/VU1/GIF/GS emulation". `native_renderer.h`'s API is model-level - `uploadMesh` /
+`uploadTexture` / `frameMesh` / `draw(mesh, clipMatrix, DrawState)` plus `setFog` / `setBloom` /
+`addScreenBlur` / `setGlowComposite` / `setDepthOfField` / `setShown`. The Metal (`native_renderer_metal.mm`,
+106 KB) and GL (`native_renderer_gl.cpp`, 219 KB) backends are fed by `game/overrides/sotc_native.cpp`
+(425 KB), which reads the game's own model header (draw packets at `+0x60/+0x64`), per-packet VIF batches
+(GIF tag, V3-32 positions, V2-16 ST, V4-8 colours, MSCNT, triangle strips), the surface table, and textures
+from the game's own `NTO2` texture object (pixels `+0x14`, CLUT `+0x18`, format `+0x1c`), decoded out of GS
+block order. Skinned parts posed on the CPU from bone palettes; lit batches lit per-vertex as the VU1 lit
+microcode does. The emulated GS still runs, but only as a fidelity reference (`SOTC_NATIVE=2` draws without
+showing; `PS2X_GS_GPU=0` rasterises the emulated view on the CPU).
+
+**The hooking mechanism is already ours.** `game_overrides.h` is byte-identical between the two trees
+(0 differing lines, including `PS2_REGISTER_GAME_OVERRIDE`), and both runtimes expose the same
+`lookupFunction` / `registerFunction` / `replaceFunction` / `hasFunction`. The pattern is:
+
+```cpp
+g_modelDisp = runtime.lookupFunction(kModelDisp);    // 0x01097118 - keep the original
+runtime.registerFunction(kModelDisp, modelDispHook); // install ours; the hook chains to g_modelDisp
+```
+
+Note it is NOT one function: Celosia hooks ~17 draw entry points (`modelDisp`, `getCameraContext`, `gsReg`,
+`texTransRequest`, `pushLayer`, `popLayer`, `glEnd`, `spriteTexFast`, `shadowDisp`, `ptclEnv/Vtx/Mat`,
+`screenBlur`, `meshDisp`, `zFog`, `sendMsg`, `recvMsg`). Correcting an earlier note that said "find ToL's
+equivalent of modelDisp" - it is a set of entry points at several levels (models, sprites, particles, 2D,
+display-list layers).
+
+**Transferability, measured:** infrastructure ~free (override API identical, hook pattern trivial);
+`native_renderer.h` + `native_renderer.cpp` (136 KB) are platform-neutral and importable; **the GL backend
+is NOT** - `native_renderer_gl.cpp` is guarded by `#if defined(__APPLE__) || (defined(__vita__) &&
+defined(PS2X_VITA_SDL2_SHIM))` and includes `<OpenGL/gl3.h>` / `vitaGL.h` with no loader, so it does not
+compile on Windows; the Metal backend is macOS-only. Our runtime has no direct GL entry point either
+(raylib owns the context; parallel-gs uses Vulkan). Content - decoding ToL's own model/surface/packet/
+texture formats - is 0 % transferable and is the actual work.
+
+**Decision: keep our GIF decoding, replace the GS rasteriser with a native one.** Our `gs_frontend.cpp`
+already decodes GIF packets into `GSPrimitiveBatch` and calls `GSRasterBackend::Submit`, and
+`gs_cpu_backend.cpp` already implements a full software GS on that seam. A GL backend implementing the same
+`GSRasterBackend` interface therefore reuses all of our decoding, and replaces exactly the component that
+is failing. `GSVertex` carries x, y, z, rgba, fog, s/t, u/v and `GSDrawState` carries TEX0/TEXA/CLUT/prim/
+alpha/test - everything a native draw needs.
+
+**Diagnostic added: `PS2X_GS_CPU=1`** skips `setRasterBackend(CreateParallelGSBackend(...))`, leaving the
+`GSCpuBackend` from `GS::init()`. Both backends share the same frontend GIF decoding, so this separates
+"our decode is wrong" from "parallel-gs rasterises it wrong". First result: the CPU backend renders the
+loading phase normally (0.7 % non-black, 129 colours vs parallel-gs's 117), so the frontend decode does
+produce drawable primitives. It has NOT yet been caught in the black phase - software rasterising slows the
+guest enough that a 300 s run still sat on the loading screen - so a much longer run is pending. **If the
+CPU backend renders the black phase correctly, the frontend decode is sound and the GL backend is safe to
+build on it; if it is also black, the decode is the bug and must be fixed first.**
+
+Caveat when using `PS2X_GS_CPU=1`: `[GS-sc]` and the black-phase marker `c0sc=0x100000001` come from the
+parallel backend and are absent. Use the `[FB-dump]` census line instead - it prints the decoded ctx0
+scissor for either backend, and `0,0..0,0` is the empty (black-phase) rect.
+
+
 ### Session 53 - GS re-measured after the ADXF fix: the 593-vs-98,728 census jump is the loading->black PHASE TRANSITION, not the scissor; the dump was reading past the stride
 
 All numbers below are from the current build (ADXF semaphore deferral + corrected probes), 100-140 s runs.
