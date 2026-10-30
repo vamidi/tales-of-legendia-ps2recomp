@@ -56,6 +56,23 @@ namespace
     }
     // R=G=B=0x80, A=0x80, Q=1.0
     constexpr uint64_t kBrightRgbaq = 0x3F80000080808080ull;
+    // TEX0 bit 34 is TCC (0 = RGB-only texture, so alpha comes from TEXA;
+    // 1 = RGBA texture, alpha comes from the texture/CLUT and TEXA is ignored).
+    // TEXA: TA0 = bits 0-7, AEM = bit 15, TA1 = bits 32-39.
+    constexpr uint64_t kTexaFixedAlpha = 0x0000008000000080ull;
+    constexpr uint64_t kTex0TccBit = 1ull << 34;
+    // Session 54: forces a known non-zero sampled alpha.  The black-phase sprites
+    // use a T8 texture with TCC=1, so As comes from the CLUT entry; if that alpha is
+    // 0 the ALPHA blend (Cs-Cd)*As+Cd collapses to Cd = black.  Clearing TCC and
+    // pinning TEXA makes As = 0x80 regardless of the texture contents.
+    bool forceAlphaEnabled()
+    {
+        static const bool v = [] {
+            const char *e = std::getenv("PS2X_FORCE_ALPHA");
+            return e && *e && *e != '0';
+        }();
+        return v;
+    }
     // TEMP DIAGNOSTIC (session 54): the last BITBLTBUF the guest wrote.  Shared
     // between the observeGIF walk (writer) and ProcessGIF's payload probe
     // (reader), which are different functions - a function-local static in the
@@ -602,6 +619,14 @@ namespace
                         m_scisPatch.push_back({offset, adValue & ~0x10ull}); // clear PRIM.TME
                     if (adReg == 0x01u && forceRgbaqEnabled())
                         m_scisPatch.push_back({offset, kBrightRgbaq});
+                    // Session 54: force a known non-zero sampled alpha.
+                    if (forceAlphaEnabled())
+                    {
+                        if (adReg == 0x06u || adReg == 0x07u) // TEX0_1 / TEX0_2
+                            m_scisPatch.push_back({offset, adValue & ~kTex0TccBit});
+                        else if (adReg == 0x3Bu) // TEXA
+                            m_scisPatch.push_back({offset, kTexaFixedAlpha});
+                    }
                     if (adReg == 0x00u && wantPrimRaw())
                     {
                         takePrimRaw();
@@ -752,6 +777,18 @@ namespace
                           << " qw0=0x" << std::hex << word(data + 8) << ":" << word(data)
                           << " qwEnd=0x" << word(data + size - 8) << ":" << word(data + size - 16)
                           << std::dec << std::endl;
+            }
+            // If TCC is cleared but the guest never writes TEXA, the alpha would
+            // default to 0 and the blend would still collapse to Cd.  Pin TEXA once.
+            if (forceAlphaEnabled())
+            {
+                static bool s_texaPinned = false;
+                if (!s_texaPinned)
+                {
+                    s_texaPinned = true;
+                    gs.write_register(static_cast<ParallelGS::RegisterAddr>(0x3Bu),
+                                      kTexaFixedAlpha);
+                }
             }
             observeGIF(path, data, size);
             // TEMP DIAGNOSTIC (session 54): is the IMAGE payload the guest sends for

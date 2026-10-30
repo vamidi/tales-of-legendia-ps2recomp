@@ -2915,42 +2915,36 @@ established is whether the primitives rasterise at all - and the VRAM census *ca
 it counts only non-zero words. A dark or mostly-index-0 texture sampling to near-black is indistinguishable
 from nothing being drawn.
 
-**DECISIVE: the black-phase primitives DO rasterise - the texture/blend path is what zeroes the output.**
-New env-gated A+D rewrites (`PS2X_FORCE_NOTEX` clears `PRIM.TME`; `PS2X_FORCE_RGBAQ` writes
-`0x3F80000080808080`, R=G=B=A=0x80, Q=1.0) reuse the same `m_scisPatch` mechanism as the scissor patch.
-140 s runs, same machine, black-phase samples:
+**The VRAM census is NOT a coverage metric - retract every nz* number from Sessions 47-54.**
+`nzWindow()` scans VRAM **linearly** from `fbp * 8192`, but the GS framebuffer is stored block-swizzled;
+`GSMem::ReadCT32` (used by the BMP writer) applies that addressing, `nzWindow` does not. So `nzDisp2`,
+`nzCtx0` and `nzCtx1` do not measure framebuffer contents at all. Proof: on a genuine black-phase run with
+`PS2X_FORCE_ALPHA=1` the census reports `nzWords=229,969 disp=188,416` while the BMP for the *same*
+`forced3000` sample reports **0.0 % non-black and exactly 1 colour**. A buffer with one colour cannot hold
+188,416 non-zero words. `nzWords` (the whole-4 MiB count) still tells you *something was written
+somewhere*, but it says nothing about what is visible.
 
-| arm | `patched` | nzWords | nzDisp2 | nzCtx0 | nzCtx1 |
-|---|---|---|---|---|---|
-| baseline | 0 | **593** | 0 | 0 | 0 |
-| `NOTEX` + `RGBAQ` | **37,376** | **116,305** | 512 | 0 | 0 |
+**Only the BMP dumps are trustworthy for coverage.** They read through `GSMem::ReadCT32`, i.e. real GS
+block addressing, at the stride-correct width after the fix above. Coverage numbers, measured that way on
+black-phase samples (`forced3000`):
 
-So with the texture path bypassed the scene rasterises (593 -> 116,305 non-zero words, ~463 KB written).
-**Geometry, vertex assembly, the scissor and the primitive submission are all fine.** The black screen is
-the texture sample or the blend collapsing to zero.
+| arm | nonBlack | colours | verdict |
+|---|---|---|---|
+| baseline | 0.0 % | 1 | black |
+| `PS2X_FORCE_NOTEX` + `PS2X_FORCE_RGBAQ` | **6.7 %** | 3 | pixels appear |
+| `PS2X_FORCE_ALPHA` (TCC cleared + TEXA=0x80) | **0.0 %** | 1 | no change |
 
-The mechanism fits the ALPHA register exactly. Session 48 recorded the black-phase ALPHA as
-`0x6B00000064`, i.e. low word `0x64` -> A=0 (Cs), B=1 (Cd), C=2, D=1, with FIX `0x6B` in bits 32-39:
+**So: the primitives DO rasterise (TME off makes 6.7 % of the draw buffer non-black), but forcing a
+non-zero sampled alpha does NOT help - the scene stays black.** That kills the pure-alpha theory. Since
+bypassing TME reveals pixels while forcing `As = 0x80` does not, the sampled texel must be zero in *both*
+colour and alpha: `Cs * As = 0 * 0.5 = 0`. A texture read returning (0,0,0,0) points at the read itself -
+TBP0 `0x3FF000`, TBW=1, PSM `0x14` (T8) and the CBP `0x3FF400` CLUT lookup - not at the blend.
 
-```
-output = (A - B) * C + D = (Cs - Cd) * As + Cd
-```
-
-With the destination black (`Cd = 0`) this is just `Cs * As`. So the result is zero whenever the **sampled
-alpha `As` is 0** (or `Cs` is 0). Bypassing TME makes the vertex colour the source (R=0x2B G=0x17 B=0x11,
-A=0x80 -> `As = 1.0`), which is exactly why the pixels appear.
-
-**Next move: the texture's alpha, not its colour.** The sprites sample a T8 (indexed) texture, so `As`
-comes from the CLUT entry's alpha (CPSM) or from TEXA/TCC. Check the CLUT uploaded to `0x3FF400`: if its
-entries have A=0 (or the CLUT is not applied at all, leaving index 0 -> transparent), `As = 0` and the
-blend reduces to `Cd` = black, which is precisely the observed behaviour. A one-run check is to force TCC
-to 1 or inject a non-zero alpha via TEXA and see whether the scene appears without touching PRIM.
-
-**Note on where the pixels land:** even in the patched arm `nzCtx0` and `nzCtx1` stay 0 while `nzWords`
-jumps by ~463 KB, so the rasterised output is NOT inside the FBP 224 window that `nzWindow()` samples. The
-window base is `fbp * 8192` = `0x1C0000` for fbp=224 - worth confirming that is the right base and size,
-because it means the earlier "the context framebuffer is empty" readings may be looking at the wrong
-window entirely.
+**Next move: does our texture read return non-zero?** Sample the GS texture path directly for TBP0
+`0x3FF000` / PSM T8 / CBP `0x3FF400` at a few (u,v) and compare against the uploaded payload (which is
+known non-zero, ~27 % of bytes). If the read returns 0 while the bytes are present, the fault is in
+T8/CLUT addressing or the CPSM/CSM/CSA decode; if it returns the uploaded data, the fault moves to the
+UV/ST coordinates or to how parallel-gs applies the texture for these sprites.
 
 
 
