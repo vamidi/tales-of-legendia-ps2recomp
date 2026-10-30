@@ -2825,6 +2825,31 @@ macro-generated function table filled by `glfwGetProcAddress`, no glad. Reuse it
 so it predates or diverges from Celosia's native work. Confirm which fork commit it corresponds to before
 adding files under `src/lib/native/`, or the next upstream merge will conflict exactly there.
 
+**The `PS2X_GS_CPU` diagnostic is INCONCLUSIVE - do not re-run it expecting an answer.** A 600 s run never
+left the loading screen, and it plateaued at the same 5.7 MB of GIF traffic as the 300 s run, so it is not
+merely slow. It ends in a scheduler deadlock, not a rendering failure:
+
+```
+E0041303 (ADXF deadlock): 0        CRI-msg: 0
+[EE-wd] report=1 executing=0 tid=1 diagStage=3 dbgPc=0x165ba8 livePc=0x15c720
+```
+
+`executing=0` means every EE thread is parked with the watchdog firing. So the software rasteriser path
+stalls before the black phase for reasons unrelated to the GS, and it cannot be used to compare decoders.
+Raising the watchdog or reducing threads might get it further, but that is a separate investigation.
+
+**What IS validated about the GIF decode:** the loading phase renders correctly through both decoders
+(CPU: 0.7 % non-black, 129 colours; parallel-gs: 0.7 %, 117 colours), parallel-gs's own trace reports sane
+geometry (`VERT (1792,1824)` and `(2432,2720)` = a clean full-screen quad), real UVs (texels (3,0), (14,16),
+(13,13), (8,17)), and a sane TEX0/TBW/PSM/CBP. What is unproven is specifically the black phase through a
+decoder other than parallel-gs - and that cannot be obtained with `PS2X_GS_CPU`.
+
+**Revised plan: use the loading phase as the known-good reference for the new renderer.** It renders
+correctly today through both backends, so a GL backend that reproduces the loading screen ("NOW LOADING",
+0.7 % non-black) has a validated decode + draw path end to end. Build and check that first; the black phase
+is then a separate question about game state, not about whether the renderer works. This removes the need
+for the CPU-backend comparison entirely.
+
 
 ### Session 53 - GS re-measured after the ADXF fix: the 593-vs-98,728 census jump is the loading->black PHASE TRANSITION, not the scissor; the dump was reading past the stride
 
