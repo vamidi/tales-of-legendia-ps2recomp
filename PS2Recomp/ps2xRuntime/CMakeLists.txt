@@ -682,3 +682,4 @@ set_source_files_properties(
     src/lib/vu/vu_unit.cpp src/lib/vu/vu_runtime.cpp 
     src/lib/vu/vu_context.cpp
     PROPERTIES COMPILE_OPTIONS "${PS2X_VU_FP_OPTIONS}")
+
