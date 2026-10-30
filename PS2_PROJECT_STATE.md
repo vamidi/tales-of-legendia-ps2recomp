@@ -2800,6 +2800,31 @@ Caveat when using `PS2X_GS_CPU=1`: `[GS-sc]` and the black-phase marker `c0sc=0x
 parallel backend and are absent. Use the `[FB-dump]` census line instead - it prints the decoded ctx0
 scissor for either backend, and `0,0..0,0` is the empty (black-phase) rect.
 
+**Requirement for the native renderer: Nintendo Switch support, designed for from the start.** The target
+graphics API there is deko3d (or GL through EGL), so the renderer must NOT be written directly against GL.
+
+- A `NativeBackend` interface (init, create/upload texture, create/upload mesh, begin/end frame, draw,
+  present, render targets) with `gl` and `deko3d` implementations. No GL call appears in game-facing or
+  renderer-core code.
+- Vertex + fragment shaders only: no compute, no geometry, no tessellation. That rules out GPU skinning
+  through compute; pose on the CPU (as Celosia does) or skin in the vertex shader.
+- Shaders are written per API and kept mirrored (GLSL now, DKSH later), so the shader set has to stay
+  small - a handful of passes, not dozens.
+- Backend-provided conventions, decided once and never scattered: clip/depth range (GL clip -1..1 with
+  depth 0..1 vs deko3d 0..1), Y-flip at present, and texture origin.
+- RGBA8 textures only, no compressed formats, explicit vertex layout, fixed uniform layout.
+- Bounded mesh/texture caches with eviction (Switch homebrew has far less RAM).
+- Render on a thread of its own and present from it.
+
+**GL loading without a new dependency:** `gs_gl_interop.cpp` already demonstrates the pattern - a
+macro-generated function table filled by `glfwGetProcAddress`, no glad. Reuse it, behind a per-platform
+`load()` (EGL/libnx on Switch). Do not build the renderer on raylib's rlgl, which is not the portable path.
+
+**Open item:** our `PS2Recomp/` is a vendored copy (no nested `.git`) of the user's fork
+`ran-j/PS2Recomp` branch `feature/performance-patch-1`. It carries `android/` and `vita/` but no `native/`,
+so it predates or diverges from Celosia's native work. Confirm which fork commit it corresponds to before
+adding files under `src/lib/native/`, or the next upstream merge will conflict exactly there.
+
 
 ### Session 53 - GS re-measured after the ADXF fix: the 593-vs-98,728 census jump is the loading->black PHASE TRANSITION, not the scissor; the dump was reading past the stride
 
