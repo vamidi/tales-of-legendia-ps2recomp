@@ -2882,6 +2882,66 @@ on the GS thread - plus `m_markerGroup`/`m_markerIndex`/`m_markerContext` for co
 `GSNativeBackend` is not installed either (no `createSharedContext()` call site in `src/`). Both belong in
 `gs_frontend.h/.cpp` + `ps2_runtime.cpp` and should be done in ONE pass, then a single full rebuild.
 
+### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
+
+**Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
+
+What landed:
+
+- **`GS::queueNativeDraw(uint64_t group, int context)`** (`gs_frontend.h/.cpp`). It snapshots the drawing
+  state and hands it to the rasteriser: `m_backend->NativeDraw(group, state)`. Our GS has **no command
+  queue** (grep: no `QueuedCommand`, no `enqueue`, no `shouldQueue`), so the marker is dispatched where it
+  is placed - the same order a queue would preserve - and that is written into the header comment. The
+  base-class default (`gs_backend.h`) already no-ops for CPU/parallel-gs, so a marker is free there.
+- **`GS::currentDrawState(int context)`**, extracted from `buildDrawBatch`. A marker and a primitive batch
+  now read the registers through one function (TEX0/TEXA+`texaRaw`/ALPHA/TEST/CLAMP/FOGCOL/ZBUF, texture
+  size, `linearFilter` from TEX1). `buildDrawBatch` is now 6 lines and byte-identical in behaviour.
+- **Backend selection in `ps2_runtime.cpp::initialize()`** is one ladder with one flag:
+  `PS2X_GS_RENDERER=native` -> `GSNativeBackend` on `createSharedContext()`; else `PS2X_GS_NATIVE=1` ->
+  the older `GsNativeBridge`; else `PS2X_GS_CPU=1` -> software; else parallel-gs. Any successful install
+  sets `gsBackendInstalled`, so the parallel backend can never overwrite a texturised one (that ordering
+  bug would have shown up only as a black window).
+- **`PS2X_GS_MARKER_LOG=1`** logs the first 8 markers with group/context/TEX0/ALPHA/TEST/SCISSOR - the
+  project's "print the first call, then sample" rule, since there is no producer yet.
+- **`native_texture_cache.cpp`** joined the build. This was the link error that proved the install was
+  real: referencing `GSNativeBackend` pulled its object out of the static lib, and `ps2x_tests` /
+  `ps2_vu1_tests` then failed with 3 unresolved `ps2x::native::TextureCache` symbols (LNK2019/LNK1120).
+
+**Verified, first native run in the project's history (`PS2X_GS_RENDERER=native`, 40 s):**
+
+```
+[gs:native] OpenGL renderer: NVIDIA GeForce RTX 3060/PCIe/SSE2
+[gs:native] target fbp=0 redrawn as psm=0x0 fbw=8 (was psm=0x0 fbw=10)
+[gs:native] target as texture: fbp=224 fbw=8 psm=0x0 -> tex tbw=8 tw=10 th=9 fst=1 into fbp=0
+[gs:native] gpu present #1 pmode=0x66 smode2=0x1 dispfb2=0x1000 ... bottom=1 0,0 512x448 out 512x448
+```
+
+So: the shared context is created on the window's GL, real GS traffic is rasterised into native targets
+and sampled back, and `Present()` returns a **GL texture** (`frame.glTexture`) - which is exactly what the
+`UploadFrame` handover from session 56 consumes. No GL errors, process alive at 40 s. **0 `[GS-marker]`
+lines**: nothing produces markers yet, so nothing fires and nothing races - the expected result, and the
+only honest reading of "wired".
+
+**The missing producer, precisely.** The sc3 branch emits markers from two places we do not have:
+`PS2Memory::setVu1SkipCallback` (a VU1 program the native port draws itself -> `queueNativeDraw(++s_group, 0)`)
+and `setVu1MscalCallback`'s HLE path (`run.nativeDraw = queueNativeDraw`), both gated on
+`ps2x::native::Renderer::instance().hasGroup(...)`. Our tree has neither the VU1 skip callback on
+`PS2Memory` nor any native model renderer, so a marker producer needs (a) the skip/HLE plumbing and (b)
+something that actually draws ToL's models. **(a) alone is cheap and worth doing first** - it makes
+`[GS-marker]` fire and proves group ordering against the GS stream.
+
+**Two things this run exposed, both pre-existing:**
+
+1. **The stderr log is flooded by one line.** `ps2_memory.cpp:2674` does
+   `RUNTIME_LOG("Marked code at " << addr << " as modified")` **once per 4-byte guest code write**, so a
+   40-55 s run writes 0.7-0.9 MB into a single unterminated-looking line and hides every other message.
+   `PS2_RUNTIME_LOGS=1` is on for this Debug build. Gate that one call (it is a code-write tracker, not a
+   diagnostic) before using stderr for any further GS work.
+2. **`GSNativeBackend` samples GS memory itself, not the shared `TextureCache`.** The sc3 frontend feeds
+   `ps2x::native::textures()` on every upload while `setUploadsWanted(true)`; our `gs_frontend.cpp` never
+   references the cache at all (grep: 0 hits), so the install deliberately does **not** call
+   `setUploadsWanted`. That is why textures still decode (from `m_vram`) but the cache path is unused.
+
 **Fourth lesson:** *a green build proves it compiles, not that it landed in the right place.* `texaRaw`
 applied to the wrong struct and still built, because nothing consumed it yet. Print the surrounding struct
 boundaries after any structural edit, and prefer tools that fail loudly over scripted text surgery - in
