@@ -3323,6 +3323,65 @@ follow the 0x3FF0 payload upstream - the guest completes the transfer setup and 
 piece is whatever is supposed to produce it (the CRI/AFS + IOP RPC path that session 58l's logs show stalling on
 `sid=0x80000597 still unclaimed`, at ~190 ms per round, is the prime suspect).
 
+### Session 58n - the 0x7FFF tags are a red herring, and the "44 bytes at 0x3FF000" was the CLUT: the texture page is COMPLETELY empty
+
+**Committed `2f1b822`.** Two earlier claims are corrected and the black-phase causal chain is now closed end to end.
+
+**1. The `NLOOP=0x7FFF` tags are real, and harmless.** `[GS-img]` showed three IMAGE tags declaring 32767 qw
+(524,272 B each) on `dbp=0x3ff4` against a TRXREG of `8x2`. They are not a walker artifact: `[GS-census]` prints
+`upFLG=3 upNLOOP=7fff` from **parallel-gs's own** decoder (hex, not decimal - my first regex misread it). Reading the
+vendored decoder settles what happens to them (`_deps/parallel_gs-src/gs/gs_interface.cpp`, read-only):
+
+- `init_transfer()` (line 3214) sets `required_qwords = RRW * RRH * bpp(DPSM) / 64` from **TRXREG at TRXDIR time**;
+- `a_d_HWREG` appends payload; `check_pending_transfer()` (line 2980) flushes once the count is reached;
+- `vram_upload` writes **only the TRXREG rect** (line 3109) - the excess payload is discarded;
+- `init_transfer()` begins with `flush_pending_transfer(false)`, which **early-returns when
+  `payload.size() == last_flushed_qwords`** (line 2992).
+
+So 512 KB against an `8x2` rect writes 64 B and throws the rest away **on real hardware too** - it cannot be hiding
+the missing texture. It also proves the exact mechanism that abandons the `0x3FF0` transfer: setup with zero
+payload, then the next `TRXDIR` flushes nothing and moves on.
+
+**2. `zeroNLOOP` falsifies the "empty image packet" hypothesis.** If the guest emitted the 0x3FF0 upload as an IMAGE
+tag with `NLOOP == 0`, every payload counter would report nothing while the packet existed. Measured:
+`zeroNLOOP=c94/0/0/0` (hex) - **3220 empty PACKED tags, ZERO empty IMAGE tags.** The guest does not emit an empty
+image packet for that page; it emits no image packet at all.
+
+**3. CORRECTION - the "44 non-zero bytes at 0x3FF000" is the CLUT, not the texture.** The page watch hashes 8 KiB
+from 0x3FF000, which *includes* `0x3FF400`. Splitting it into 256-byte pages:
+
+```
+pages 0x3ff000: 0 0 0 0 44 0 0 0
+  0x3FF000..0x3FF3FF = 0 non-zero bytes   <- the T4 texture page, COMPLETELY EMPTY
+  0x3FF400..0x3FF4FF = 44 non-zero bytes  <- the CLUT, which DID upload
+```
+
+So sessions 58g/58h/58j/58l all quoted the palette's bytes as if they were the texture's. **The texture page holds
+zero.** This also proves the backend is not the problem: the same backend, writing to the same 8 KiB region, lands
+the CLUT at 0x3FF400 and nothing at 0x3FF000 - the difference is the missing payload.
+
+**The chain is now closed, every link measured:**
+
+| # | link | evidence |
+|---|---|---|
+| 1 | texture page `0x3FF000` is empty | page split: `0 0 0 0 44 ...` |
+| 2 | because the guest never sends its payload | 518 setups, `tags=0`, 0 B, no empty IMAGE tag either |
+| 3 | empty T4 page -> every texel = index 0 | `PS2X_T4_DUMP`: `idx0 used 4096/4096` |
+| 4 | `palette[0]` at `0x3FF400` is `0x00000000` -> alpha 0 | T4 dump entry 0 |
+| 5 | `TEST=0x5120D` (ATE=1, ATST=GREATER, AREF=0x20) rejects every pixel | `[GS-reg]` |
+| 6 | nothing rasterises | `nzWords=600`, `nzDisp2=0`, `nzCtx0=30`, `nzCtx1=37` |
+
+That is why `PS2X_FORCE_ALPHA` "works": it defeats step 5. It was never a sampler bug.
+
+**Next:** the guest side only. The game completes a T4 upload setup for `0x3FF000` 518 times and never supplies the
+data, so the missing piece is whatever is meant to produce it. Prime suspect is unchanged: the CRI/AFS + IOP RPC
+path (`sid=0x80000597 still unclaimed`, ~190 ms per round, `[WATCH-ENTRY] pc=0x1663a0 (CRI/AFS bootstrap thread
+body)`). Do **not** re-open the sampler, alpha, display pairing or backend hypotheses - all four are now measured
+out.
+
+**Methodology:** the transition lost the boot race twice in a row before succeeding on attempt 3, with the *same*
+binary; keep retrying to 3 attempts at 220 s before drawing a conclusion.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
