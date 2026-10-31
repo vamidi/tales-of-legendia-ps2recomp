@@ -3382,6 +3382,66 @@ out.
 **Methodology:** the transition lost the boot race twice in a row before succeeding on attempt 3, with the *same*
 binary; keep retrying to 3 attempts at 220 s before drawing a conclusion.
 
+### Session 58o - CRI/AFS + `sid=0x80000597` traced: that path is HEALTHY; the payload DOES reach the GS (274 qw via HWREG) and still does not land
+
+**Committed `5ccec30`.** Traced the missing upload through the CRI/AFS and IOP RPC path as asked. It ends in a
+negative - that path is not where the texture is lost - and turned up two errors in session 58m.
+
+**`0x80000597` = `kSifSidCdvdMain`** (`SIF.cpp:356`), libcdvd's **main** channel (`CdSearchFile` rpc 0). The ADXF
+library links its own libcdvd and talks to `cdvd.irx` through these sids instead of the imported `sceCd*` entries, so
+the runtime serves them from the host-CD model in the `!iopHandled` fallback. **No IOP module will ever register
+this sid**, so `catchUpIopForSid` -> `canBindRpc` is false by construction:
+
+- the "still unclaimed after 32 rounds" line is **expected behaviour, not a fault**;
+- it costs 32 x 1 MiB EE cycles; measured 184 ms once, but that is emulated-IOP module init landing inside the call
+  - the *next* catch-up runs the same 4.4 M cycles in **3 ms**. Not a fixable stall, and `catchUp` is the only place
+  the IOP is advanced, so it must not simply be skipped for HLE sids.
+
+**The CD/AFS chain is functional end to end** (`PS2_SIF_VERBOSE=1` makes it observable):
+
+```
+11175 CRI/AFS bootstrap thread        11275 DVCI mounted all 6 AFS
+11999-13028 AFS opened: SYS_REG, MAP, SND, FIELD, BATTLE, MOVIE  (all six)
+    19 binds, 19 RPC ENDs posted
+    75 cdvd stream reads, ZERO failures (no [sceCdRead] unresolved / recovered)
+    data read into EE RAM at 0x63d600 544768 B, 0x6bf140 522240 B, 0x69c200 389120 B,
+                              0x67d200 262144 B, 0x653940 79872 B, 0x64f140 51200 B
+```
+
+Guest kputs report no failures at all (only DVCI success + three successful `sceSifAllocIopHeap`). `FUN_001029a8`
+(the guest stream-issue function) confirms our request layout exactly: `+0x00 lsn, +0x04 sectors, +0x08 dest`. So
+**the texture source data really is in EE RAM** - and the guest itself memsets the descriptor at `0x386300`
+(`FUN_00117bf0(0x386300,0x90)`), so our zeroing there is redundant, not destructive.
+
+**CORRECTION 1 - "no IMAGE tag" != "no payload".** The GS feeds a host->local transfer **two** ways: an IMAGE tag,
+or `HWREG` (0x51) writes inside a packed tag, where the A word *is* 8 bytes of image data (`observeImage(8)`).
+Session 58m's ledger counted only IMAGE tags and therefore reported `0 bytes` for `0x3FF000` while the guest was
+delivering **274 qwords = 4384 B** there.
+
+**CORRECTION 2 - attribute to the TRXDIR-latched destination, not the last BITBLTBUF.** `[GS-hwtag]` shows the HWREG
+writes live inside one giant packed tag (`NLOOP=32511 NREG=16 FLG=0`) at loops 15/36/65, with a `BITBLTBUF` between
+individual qwords. On the GS a `BITBLTBUF` write does **not** retarget a transfer that has already started - the
+transfer is latched at `TRXDIR` (`transfer_state.copy` in parallel-gs). Mis-attributing over-counted `0x3ff0` by
+2.2x (617 -> 274 qw) and under-counted `0x3ff4` (433 -> 818 qw).
+
+**So where it actually stands.** `0x3FF000` receives 274 qwords and is still **byte-for-byte empty**
+(`pages 0x3ff000: 0 0 0 0 44 0 0 0`) while `0x3FF400` holds the 44-byte CLUT. Per transfer the guest delivers
+**~1 qword against a 12-qword need** (24x16 T4 = 192 B):
+
+```
+[GS-xferq] dbp=0x3ff0 previous transfer received 1 / 0 / 0 / 1 / 0 / 1 / 1 / 1 / 0 / 1 / 1 / 4 / 0 / 0 / 2 / 1 qword(s)
+262 TRXDIR writes vs 518 BITBLTBUF writes, 274 HWREG qwords total
+```
+
+Because the transfer is latched at `TRXDIR` and parallel-gs requires the full `TRXREG`-derived `required_qwords`
+before `check_pending_transfer` flushes, a 1-qword fragment writes nothing. **The upload is starved, not lost.**
+
+**Next (GS side, not CRI):** why the guest emits only ~1 qword per transfer. The data is in EE RAM and the cdvd path
+delivers it, so this is now a packet-construction question: the HWREG image writes are scattered through a
+32511-loop packed tag rather than grouped per transfer. Compare that packet against PCSX2 (running, EE PC 0x114c60)
+to see whether real hardware receives the same 1-qword fragments - if it does, the guest intends them and the GS
+must accept a partial write; if it does not, our VIF1/GIF forwarding is splitting the tag's image runs.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
