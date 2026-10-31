@@ -2888,6 +2888,62 @@ on the GS thread - plus `m_markerGroup`/`m_markerIndex`/`m_markerContext` for co
 `GSNativeBackend` is not installed either (no `createSharedContext()` call site in `src/`). Both belong in
 `gs_frontend.h/.cpp` + `ps2_runtime.cpp` and should be done in ONE pass, then a single full rebuild.
 
+### Session 58 - VU1 GROUND TRUTH: the microprogram inventory captured from our own runtime, cross-checked byte-exact against PCSX2; the loading screen does not use VU1
+
+**PCSX2 MCP is set up and working (`C:\PCSX2-MCP-v1.0.0`, entry `mcp.servers.pcsx2` in the global
+opencode.jsonc). Same disc as ours (`SLUS-21201`), so comparisons are valid.** Its debugger has a narrow safe
+surface, mapped empirically:
+
+| Works | Landmine |
+|---|---|
+| `read_memory` / `read_string` / `find_pattern` / `memory_diff` | `get_threads`, `get_modules`, `get_backtrace` - they call `cpu->GetThreadList()`/`GetModuleList()` from the patch's **detached client thread** (`DebugServer.cpp:972`), which is what logs `QObject::startTimer: Timers cannot be started from another thread` and kills the socket |
+| code `set_breakpoint` then hit gives a valid state | memory watchpoints on the VU/MMIO window (kill the server) |
+| `read_registers` **at a breakpoint hit** | `read_registers` after a bare `pause` (unflushed JIT: all-zero GPRs, PC 0x81FC0) |
+| `continue`, `pause`, `step`, save/load state, `game_info` | VU memory reads (always zeros - VU0 *and* VU1, so the read path does not expose VU memory at all) |
+
+Two state facts worth keeping: at a vblank hit `gp = 0x003E2BF0`, **identical to our recomp's GP** (same binary,
+same globals), and `sp = 0x81FB0` is a **kernel interrupt stack** - which is why "PC=0x81FC0 with zeroed GPRs"
+keeps appearing on a bare pause: that is the EE kernel idle loop between frames, not a broken read
+(`Cause` = Syscall, `EPC` = 0x81FC0, CP0 otherwise sane).
+
+**ToL never references VU1 memory from EE code**: zero xrefs to `0x11008000`/`0x1100C000` in the binary. The
+microprograms exist only as **VIF1 MPG payloads**, which is why every MSCAL runs at pc 0. (Bonus: the 23
+`lui 0x1100` sites are the VU-touching EE functions; `FUN_00138A60` is a **VU0** uploader - a VIF0 DIRECT of 2
+qw to `0x11000000`.)
+
+**Captured with our own runtime (`7c69de3`, `PS2X_VU1_MPG_LOG=1` + `PS2X_VU1_MSCAL_LOG=1`):**
+
+| dest | bytes | instructions | fnv1a64 |
+|---|---|---|---|
+| 0x0000 | 2048 | 256 | `e4d4463511f41856` |
+| 0x0800 | 2048 | 256 | `023a65ee1602779d` |
+| 0x1000 | 2048 | 256 | `45292269cba9ba1e` |
+| 0x1800 | 2048 | 256 | `a86bce2a2461708b` |
+| 0x2000 | 2048 | 256 | `d3c9f20f76f00db8` |
+| 0x2800 | 2048 | 256 | `b9479fad9373202d` |
+| 0x3000 | 184 | 23 | `a2c4ff3a8fd5a500` |
+
+One image of **12,472 B = 1,559 instructions** at VU1 pc 0, uploaded as seven MPG commands (6 x 256 qw + 23 qw)
+and re-uploaded several times per run. Dumps: `<TEMP>\vu1prog_<hash>.bin`.
+
+**Cross-checked against PCSX2, byte-exact:** chunk 0's first 16 bytes
+(`F0 03 0E 10 FF 02 00 00 7C 73 F4 81 FF 02 00 00`) occur **exactly once** in the real game's RAM, at
+`0x003820C0`, and at `0x003828C4` the real game holds the next **VIFcode `0x4A000100`** (MPG, 256 qw) - the guest
+keeps tag+payload pairs in one buffer. So our upload path is faithful and the runtime capture is a valid
+ground-truth instrument. (A pattern search must use `?? ?? 00 4A`, not `?? 00 00 4A`: `num` = 256 sets the
+second byte. VIFcode words are 4-byte aligned inside 16-byte-aligned chains, so ignore misaligned hits.)
+
+**THE POLICY ANSWER FOR THE LOADING PHASE: VU1 draws nothing there.** All 7 MSCALs ran with `pc=0 TOP=0 ITOP=0`
+and kicked **0 PATH1 bytes**; the GS received only **PATH2 2320 B and PATH3 160 B x2** - the 2D loading screen.
+So the loading screen (the one phase we can render correctly) is *EE-built PATH2/PATH3 geometry*, and a native
+renderer validated on it never touches VU1. VU1 policy only matters in the 3D state - which is exactly the black
+phase we cannot render yet. **Consequence: keep the port effort on the black-phase/EE draw path; do not build the
+VU1 gate policy first.**
+
+Open items: the captured image still needs a VU microprogram disassembler to say what the 1,559 instructions do
+(no VU disassembler in our tree; the sc3 branch's `ps2_vu1_replay` tool has one recipe); the "which program
+draws" column is empty by *state*, not by bug.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
