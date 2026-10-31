@@ -3482,6 +3482,60 @@ wrong offset, and both the rect and the `required` derived from it can be wrong.
 3. Investigate defect 2 separately - "enough data, T4 destination, nothing written" is a bounded parallel-gs path
    question (`compute_page_rect` for T4 + DBW=1, or the partial-flush path).
 
+### Session 58q - PCSX2 ground truth: the guest builds a COMPLETE 1152-byte transfer, our setup packet is byte-identical, and PCSX2 contains NO 0x7FFF tag at all
+
+**Committed `649c181`.** Step 1 of the previous plan (REGLIST stride) is done and verified; it was **not** the cause.
+The PCSX2 comparison narrows the defect to a single well-defined place.
+
+**1. REGLIST stride fixed (16 -> 8 bytes per register word).** A REGLIST loop is `nreg*8 + nreg*8 = 16*nreg` bytes;
+the frontend and the GIF spec advance 8, `observeGIF` advanced 16. Verified with the built-in check across 51
+censuses: **0 `ourNLOOP`/`upNLOOP` mismatches**, FLG always agrees, `ourLoop - upLoop` stays small and
+non-cumulative (13, 1, 0, 1, 1, 0, 8, 0, 5, 1) - the "one packet ahead" relationship, not a stride divergence. It did
+**not** change the TRXREG decode: the suspicious `rect=0x12` survived, so that rect is a genuine guest write
+(`RRW=0` -> `required_qwords=0` -> parallel-gs marks the transfer inactive, which is correct).
+
+**2. `[GS-drop]`: the raw forwarder dropped unaligned chunks invisibly - measured ZERO, so not the cause.** Kept as a
+permanent guard because a tag split across a DMA boundary would fail silently there.
+
+**3. PCSX2 ground truth (the decisive comparison).** EE PC `0x114c60`. Searching EE RAM for the BITBLTBUF value
+`00000000f03f01145000000000000000` found 4 real packets. The cleanest one, at `0x15a37e0`:
+
+```
+GIFtag        NLOOP=4 FLG=0(PACKED) NREG=1
+  BITBLTBUF   0x14013ff000000000   dbp=0x3ff0 dbw=1 dpsm=0x14 (T4)
+  TRXREG      0x30 x 0x30          = 48x48
+  HWREG       0
+  TRXDIR      0                    host->local
+GIFtag        NLOOP=0x48 = 72 FLG=2 (IMAGE)   -> 1152 bytes
+```
+
+**48x48 T4 = 1152 B = exactly 72 qwords**, so this is a *complete* transfer. A second instance at `0x15a4750` is the
+setup-only form (`NLOOP=3`: BITBLTBUF + HWREG + TRXDIR), and `0x15a4860` carries `TEX0_1 = 0x2007fe8599407ff0` -
+the exact TEX0 our own `[GS-sc]` reports, confirming these are the right packets.
+
+**4. Our forwarded setup packet is BYTE-FOR-BYTE IDENTICAL to PCSX2's.** `[GS-pkt]` dump of the packet carrying the
+first `0x3ff0` BITBLTBUF (`path=2 size=64`) matches PCSX2's `0x15a4750` exactly, all 64 bytes. So the forwarder is
+not corrupting this packet.
+
+**5. PCSX2 contains NO `NLOOP=0x7FFF` tag anywhere.** `find_pattern` for `ff7f00000000af18` over the whole of EE RAM:
+**no matches**. Yet our port reads `nloop=32767` three times, attributed to `0x3ff4` instead of `0x3ff0`, and
+`[GS-census] upNLOOP=7fff` shows **parallel-gs reads the same garbage**. So the corruption is in the bytes handed to
+the backend, not in the probe - and it is *not* in the setup packet.
+
+**Where that leaves it, precisely:** the setup packet is perfect, the guest never emits `0x7FFF`, therefore the
+corruption is in the **later packet that carries the IMAGE tag** (the `NLOOP=72` one). Everything downstream -
+`nloop=32767`, the 1.5 MB of bogus "image bytes", the misattribution to `0x3ff4`, and the starved/flat texture
+uploads - follows from that one desync.
+
+**Next: dump the packet that produces the bogus `0x7FFF` tag and diff it against PCSX2 byte for byte.** Arm `[GS-pkt]`
+on the first IMAGE tag whose NLOOP is 0x7FFF instead of on the first 0x3ff0 BITBLTBUF (the current dump only catches
+the setup). That is the last localisation step; the corruption will either be visible in those bytes or it is a
+packet-boundary/tag-split effect that survives QW alignment.
+
+**Methodology note:** the boot race got materially worse after the stride fix - 5 consecutive non-transitions, then a
+transition on attempt 6, versus 1-in-3 before. The fix makes `observeGIF` run ~2x the REGLIST iterations, so budget
+more attempts.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
