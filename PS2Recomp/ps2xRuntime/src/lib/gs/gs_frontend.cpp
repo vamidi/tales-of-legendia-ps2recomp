@@ -15,6 +15,9 @@
 #include <sstream>
 #include <vector>
 
+// Defined below, next to GS::ReadVram it samples through; called from vertexKick for every submitted draw.
+static void ps2xProbe2dDraw(const GS &gs, const GSPrimitiveBatch &batch);
+
 // ---------------------------------------------------------------------------
 // TEMP diagnostic (session 25, first-frame triage): framebuffer BMP dump.
 // The entry runner window has no GS image path, so the frames the guest
@@ -2027,6 +2030,7 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
+        ps2xProbe2dDraw(*this, batch);
         m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
@@ -2111,6 +2115,51 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 
     m_backend = std::move(backend);
     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
+}
+
+// PS2X_2D_PROBE=1: the state of the first 2D draws and then every 512th, to see why one phase rasterises and
+// another stays black. Prints exactly what a draw samples - texture, CLUT entry, vertex alpha, blend/test, scissor -
+// so a working "NOW LOADING" glyph can be diffed against a logo screen that draws nothing. Every sprite at the black
+// phase is prim=0x15E: textured (tme), alpha-blended (abe), fst - and with ABE an alpha of 0 makes a sprite
+// invisible rather than wrong, which is the first hypothesis this has to confirm or kill.
+static void ps2xProbe2dDraw(const GS &gs, const GSPrimitiveBatch &batch)
+{
+    static const bool enabled = std::getenv("PS2X_2D_PROBE") != nullptr;
+    if (!enabled)
+        return;
+    static uint64_t s_draws = 0u;
+    const uint64_t index = s_draws++;
+    if (index >= 12u && (index % 512u) != 0u)
+        return;
+
+    const GSDrawState &st = batch.state;
+    const GSContext &ctx = st.context;
+    const GSTex0Reg &t = ctx.tex0;
+    const GSVertex &v0 = batch.vertices[0];
+    const uint32_t texel = gs.ReadVram(t.psm, t.tbp0, t.tbw, v0.u, v0.v);
+    const bool indexed = t.psm == GS_PSM_T8 || t.psm == GS_PSM_T8H || t.psm == GS_PSM_T4 ||
+                         t.psm == GS_PSM_T4HL || t.psm == GS_PSM_T4HH;
+    const uint32_t clutX = indexed
+                               ? ((t.csm == 0u) ? (texel & 0xFFu)
+                                                : (static_cast<uint32_t>(t.csa) * 16u + (texel & 0xFFu)))
+                               : 0u;
+    const uint32_t clut = indexed ? gs.ReadVram(t.cpsm, t.cbp, 1u, clutX, 0u) : 0u;
+    std::fprintf(stderr,
+                 "[2D] #%llu prim=%u verts=%u tme=%u abe=%u iip=%u fst=%u ct=%u aa1=%u "
+                 "v0=(%.2f,%.2f) rgba=%02x%02x%02x%02x uv=(%u,%u) "
+                 "tex0{tbp=%x tbw=%u psm=%x tw=%u th=%u tcc=%u tfx=%u cbp=%x cpsm=%x csm=%u csa=%u} "
+                 "texa{ta0=%02x aem=%u ta1=%02x} alpha=%08x test=%08x sc=%u,%u-%u,%u ofs=%u,%u texel=%08x clut=%08x\n",
+                 static_cast<unsigned long long>(index), static_cast<unsigned>(st.prim.type), batch.vertexCount,
+                 st.prim.tme ? 1u : 0u, st.prim.abe ? 1u : 0u, st.prim.iip ? 1u : 0u, st.prim.fst ? 1u : 0u,
+                 st.prim.ctxt ? 1u : 0u, st.prim.aa1 ? 1u : 0u, v0.x, v0.y, v0.r, v0.g, v0.b, v0.a,
+                 static_cast<unsigned>(v0.u), static_cast<unsigned>(v0.v), t.tbp0, static_cast<unsigned>(t.tbw),
+                 static_cast<unsigned>(t.psm), static_cast<unsigned>(t.tw), static_cast<unsigned>(t.th),
+                 static_cast<unsigned>(t.tcc), static_cast<unsigned>(t.tfx), t.cbp, static_cast<unsigned>(t.cpsm),
+                 static_cast<unsigned>(t.csm), static_cast<unsigned>(t.csa), static_cast<unsigned>(st.texa.ta0),
+                 st.texa.aem ? 1u : 0u, static_cast<unsigned>(st.texa.ta1),
+                 static_cast<unsigned>(ctx.alpha & 0xFFFFFFFFull), static_cast<unsigned>(ctx.test & 0xFFFFFFFFull),
+                 ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1, ctx.xyoffset.ofx, ctx.xyoffset.ofy,
+                 texel, clut);
 }
 
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
