@@ -3125,6 +3125,36 @@ started whose payload bytes never arrived (`up=0` of `need=N`). **Next instrumen
 vs completed, with their destination DBP** - that separates "we drop uploads" from "the guest never sends this
 one".
 
+### Session 58h - ROOT CAUSE FOUND: texture uploads are STARTED and their payload never arrives
+
+`PS2X_UPLOAD_STATS=1` (`f954c56`) accounts host->local transfers per destination and prints started/completed/bytes
+at every `[GS-census]`. 160 s run, black phase reached (census 600):
+
+```
+dbp=0x0     started=4   completed=0   bytes=0/4608            STARTED, NEVER COMPLETED
+dbp=0x9     started=7   completed=0   bytes=0/6016            STARTED, NEVER COMPLETED
+dbp=0x3a70  started=8   completed=8   bytes=512/512            completes - the palette that reads correctly
+dbp=0x3a80  started=11  completed=8   bytes=84480/89088        partial
+dbp=0x3ff0  started=298 completed=0   bytes=0/23808            298 started, ZERO payload bytes
+dbp=0x3ff4  started=904 completed=2   bytes=1048672/27162240   2 of 904
+```
+
+Independently confirmed by the page watch: `0x3FF000` went all-zero -> **44 non-zero bytes**, a fragment rather
+than a texture page (and the T4 dump shows the sprites sampling that page as index 0 / transparent).
+
+**So the black phase is dropped uploads, full stop** - not alpha maths, not the fade, not the display pairing,
+not a missing copy. Every earlier hypothesis in 58b-58f was a symptom of this: the sampled textures are blank
+because their pages were never written, and the one page that IS written (0x3a70's palette, 512 bytes) reads
+correctly and produces the healthy opaque draw in the T4 histogram.
+
+**Next: find where the payload goes.** The counter is fed by `observeImage` (HWREG 0x54 in the GIF A+D walk), so
+either the payload arrives on a path that walk does not see while parallel-gs *does* (then VRAM would be right -
+it is not), or it genuinely never reaches the backend. The prime suspect is the **PATH2/DIRECT image path**:
+`ps2_vif1_interpreter.cpp` submits PATH2 packets through `submitGifPacket(GifPathId::Path2)`, and `GS::processGIFPacket`
+may only forward to parallel-gs on the PATH1/GIF A+D route, leaving VIF1-DIRECT texture uploads dropped in the
+raw (parallel-gs) configuration. Instrument: log the first few PATH2 submissions with size and the current
+BITBLTBUF destination, and whether they reach `gs.gif_transfer`.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
