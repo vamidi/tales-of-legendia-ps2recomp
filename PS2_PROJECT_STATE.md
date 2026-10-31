@@ -3155,6 +3155,26 @@ may only forward to parallel-gs on the PATH1/GIF A+D route, leaving VIF1-DIRECT 
 raw (parallel-gs) configuration. Instrument: log the first few PATH2 submissions with size and the current
 BITBLTBUF destination, and whether they reach `gs.gif_transfer`.
 
+### Session 58i - PATH2 is NOT dropped by the size gate; the gap is downstream of the frontend
+
+`PS2X_PATH_LOG=1` (`5372fd8`) logs packets as they reach `GS::processGIFPacket`, whose raw branch forwards only
+16-byte-multiple sizes and silently drops anything else.
+
+**Result: nothing is dropped.** The traffic is `path=2` (VIF1 DIRECT) plus a little `path=3`; every size is a
+multiple of 16 (160, 2320, 1424, 5328, 176, 80, 32, 112, and one 16400-byte block), and `raw=1` for all of them.
+So the uploads do reach parallel-gs - the PATH2 hypothesis is dead.
+
+**The contradiction that is left:** `PS2X_UPLOAD_STATS` counts ~1 MB of payload attributed to `dbp=0x3ff4`, yet a
+page watch at `0x3FF400` shows **44 non-zero bytes** - the *same 44* as at `0x3FF000`. So either
+(a) those bytes are counted where parallel-gs discards them (its own transfer state not active when they arrive,
+since the frontend's `transfer` state and parallel-gs's are separate), or
+(b) the counter accumulates across 904 restarts of a transfer that never completes.
+
+**Next instrument:** at the moment HWREG payload bytes flow, read parallel-gs's OWN `rs.trxdir.bits` /
+`rs.bitbltbuf.bits` / `rs.trxreg.bits` and compare with the frontend's mirror. If `rs.trxdir` says 0 while bytes
+are arriving, parallel-gs is dropping them and the fix is to keep the two transfer state machines in step (or to
+stop forwarding image payloads through a path that begins its transfer somewhere else).
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
