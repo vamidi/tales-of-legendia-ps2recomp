@@ -3050,6 +3050,34 @@ Also worth knowing for whoever picks this up: the `[GS-reg]` register dump added
 (`8079a9d7 8091bde8 80ffffff ...` - alpha 0x80 intact, so palette uploads are fine) while ctx0's palette base
 was 0 (empty), and the logo sprites are `prim=0x15E ctxt=0` while the tristrips are `prim=0x25C ctxt=1`.
 
+### Session 58e - the "alpha is 0" story is only half right; TEXA IS delivered, and the controls were blunt
+
+`PS2X_TEXA_LOG=1` (`1e53459`) reads parallel-gs's own register state after every packet and logs the first 16
+distinct (TEXA, TEX0_1, TEX0_2) combinations - phase independent, which matters because two 250 s attempts at
+the TEXA-only discriminator both stayed on the loading screen (outcome A).
+
+```
+#1..#12  TEXA=0x0  ta0=0x0   ctx0{psm=0x14 tcc=1 cbp=0x3a70}
+#13..#16 TEXA=0x80 ta0=0x80  ctx0{psm=0x14 tcc=1 cbp=0x3a70}   (later ctx0 cbp=0x3ff4)
+```
+
+So **TEXA does reach the sampler** - the "TEXA not delivered" candidate is dead. The draws that matter are
+**T4 (psm 0x14) with TCC=1** over the palette at `cbp=0x3a70`, and that palette is
+`8079a9d7 8091bde8 80ffffff x6` followed by **eight zero entries**: alpha 0x80 in indices 0-7, fully transparent
+in 8-15.
+
+**Correcting 58c:** `PS2X_FORCE_ALPHA` and `PS2X_FORCE_RGBAQ` both force alpha to 0x80 *everywhere*, so they do
+not reproduce what the real path samples - they defeat the alpha test entirely, which is exactly why the whole
+display buffer fills (295k words, dense at 0x0/0x10000/0x20000). They prove the **alpha test** is what rejects
+the pixels (TEST=0x5120D: ATE=1, ATST=GREATER, AREF=0x20); they do NOT prove the sampled alpha is 0.
+
+**What is left to measure.** At a real logo draw: the texel indices the T4 texture actually holds and which
+palette half they fall in (indices 8-15 are transparent, so a mis-decoded index nibble or a wrong CLUT base
+would blank the sprite), plus whether the T4 texel read path is even correct - `PS2X_CLUT_DUMP`'s `TEXELS`
+line reported all zeros for `psm=0x14`, which is suspicious in itself and may be a limitation of dumping 4-bit
+texels through `pixelAccess(psm).read`. A correct T4 texel dump is the next instrument, not another global
+alpha override.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
