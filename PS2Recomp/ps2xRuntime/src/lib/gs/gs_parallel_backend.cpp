@@ -333,6 +333,36 @@ namespace
             }
         }
 
+        // Called from the post-packet hook: prints each distinct 4-bit texture state once, which is where those
+        // states actually exist. The byte-threshold register dump rarely lands on one.
+        void dumpT4TextureOnce()
+        {
+            static const bool s_enabled = std::getenv("PS2X_T4_DUMP") != nullptr;
+            if (!s_enabled)
+                return;
+            static uint64_t s_seen[8] = {};
+            static unsigned s_n = 0u;
+            if (s_n >= 8u)
+                return;
+            const auto &rs = gs.get_register_state();
+            for (unsigned ci = 0; ci < 2u; ++ci)
+            {
+                const uint64_t t0 = rs.ctx[ci].tex0.bits;
+                const unsigned psm = unsigned((t0 >> 20) & 0x3Fu);
+                if (psm != 0x14u && psm != 0x24u && psm != 0x2Cu) // T4, T4HL, T4HH
+                    continue;
+                const uint64_t key = (t0 & 0x3FFFu) | (static_cast<uint64_t>((t0 >> 37) & 0x3FFFu) << 16) |
+                                     (static_cast<uint64_t>(psm) << 32) | (static_cast<uint64_t>(ci) << 40);
+                bool duplicate = false;
+                for (unsigned i = 0; i < s_n; ++i)
+                    duplicate = duplicate || (s_seen[i] == key);
+                if (duplicate)
+                    continue;
+                s_seen[s_n++] = key;
+                dumpT4Texture(ci, t0, rs.texa.bits);
+            }
+        }
+
         // PS2X_TEXA_LOG=1: what the sampler actually holds (parallel-gs's own register state, not our parse) the first
         // few times it changes. Answers "does TEXA reach the sampler" without needing a particular game phase.
         void logSamplerState()
@@ -385,6 +415,56 @@ namespace
                     std::cerr << "[GS-tex24] CT24 ctx" << ci
                               << " TCC cleared -> alpha from TEXA.TA0 (n=" << ++s_patched << ")" << std::endl;
             }
+        }
+
+        // PS2X_T4_DUMP=1: a 4-bit texture and its palette, read out of raw GS memory and decoded with our own page
+        // tables - not through the psm-aware accessor, whose 4-bit read returned all zeros. Prints the index
+        // histogram next to each palette entry's alpha, so "the sprite samples the transparent half" becomes a
+        // number instead of a hypothesis. Entry indices 8-15 of the ToL palette are zero (alpha 0); if the sprite's
+        // texels land there an ATE test with AREF=0x20 rejects every pixel.
+        void dumpT4Texture(unsigned ci, uint64_t tex0bits, uint64_t texaBits)
+        {
+            const unsigned psm = unsigned((tex0bits >> 20) & 0x3Fu);
+            if (psm != 0x14u && psm != 0x24u && psm != 0x2Cu) // T4, T4HL, T4HH
+                return;
+            const unsigned tbp = unsigned(tex0bits & 0x3FFFu), tbw = unsigned((tex0bits >> 14) & 0x3Fu);
+            const unsigned tw = 1u << unsigned((tex0bits >> 26) & 0xFu);
+            const unsigned th = 1u << unsigned((tex0bits >> 30) & 0xFu);
+            const unsigned cbp = unsigned((tex0bits >> 37) & 0x3FFFu), cpsm = unsigned((tex0bits >> 51) & 0xFu);
+            const unsigned csm = unsigned((tex0bits >> 55) & 1u), csa = unsigned((tex0bits >> 56) & 0x1Fu);
+            const auto *vram = static_cast<const uint8_t *>(gs.map_vram_read(0, VramSize));
+            if (vram == nullptr)
+                return;
+            static GSMem::TexturePageCache cache;
+            unsigned hist[16] = {};
+            unsigned long sampledZeroAlpha = 0u, sampled = 0u;
+            for (unsigned y = 0; y < th; ++y)
+            {
+                for (unsigned x = 0; x < tw; ++x)
+                {
+                    const unsigned idx = unsigned(GSMem::ReadTexture(cache, vram, psm, tbp, tbw, x, y) & 0xFFu);
+                    if (idx < 16u)
+                        ++hist[idx];
+                    ++sampled;
+                }
+            }
+            std::fprintf(stderr,
+                         "\n  ctx%u T4DUMP psm=0x%x tbp=0x%x bw=%u %ux%u cbp=0x%x cpsm=0x%x csm=%u csa=%u texa=0x%llx\n",
+                         ci, psm, tbp, tbw, tw, th, cbp, cpsm, csm, csa, static_cast<unsigned long long>(texaBits));
+            for (unsigned i = 0; i < 16u; ++i)
+            {
+                const unsigned entryIndex = (csm != 0u) ? (csa * 16u + i) : i;
+                uint32_t entry = 0u;
+                if (cpsm == 0u)
+                    std::memcpy(&entry, vram + cbp * 256u + entryIndex * 4u, sizeof(entry));
+                const unsigned alpha = entry >> 24;
+                if (hist[i] != 0u && alpha <= 0x20u)
+                    sampledZeroAlpha += hist[i];
+                if (hist[i] != 0u || entry != 0u)
+                    std::fprintf(stderr, "    idx %2u used=%-6u alpha=0x%02x entry=0x%08x%s\n", i, hist[i], alpha, entry,
+                                 (hist[i] != 0u && alpha <= 0x20u) ? "  <= sampled, alpha <= AREF 0x20" : "");
+            }
+            std::fprintf(stderr, "    sampled=%lu rejectedByAlphaTest=%lu\n", sampled, sampledZeroAlpha);
         }
 
         // Observe transfer boundaries only; the upstream decoder alone executes commands.
@@ -1003,6 +1083,7 @@ namespace
                 gs.gif_transfer(path, buf.data(), size);
                 fixCt24Alpha();
                 logSamplerState();
+                dumpT4TextureOnce();
             }
             else
             {
@@ -1010,6 +1091,7 @@ namespace
                 gs.gif_transfer(path, data, size);
                 fixCt24Alpha();
                 logSamplerState();
+                dumpT4TextureOnce();
             }
             // Session 41: parallel-gs's own accounting.  Everything in the
             // census above only proves what *we* parsed; this proves what it
@@ -1203,8 +1285,7 @@ namespace
                         // VRAM. Decides whether an indexed draw's alpha is genuinely 0 in the palette (the guest
                         // expects TEXA) or we are addressing the wrong entry.
                         if (std::getenv("PS2X_CLUT_DUMP") != nullptr)
-                        {
-                            const uint64_t t0 = cc.tex0.bits;
+                        {                            const uint64_t t0 = cc.tex0.bits;
                             const unsigned cbps = unsigned((t0 >> 37) & 0x3FFFu), cpsm = unsigned((t0 >> 51) & 0xFu);
                             const unsigned csm = unsigned((t0 >> 55) & 1u), csa = unsigned((t0 >> 56) & 0x1Fu);
                             const unsigned psms = unsigned((t0 >> 20) & 0x3Fu), tbps = unsigned(t0 & 0x3FFFu);
@@ -1219,6 +1300,10 @@ namespace
                                 std::cerr << " " << std::hex << ReadVram(psms, tbps, tbws, i, 0u);
                             std::cerr << std::dec;
                         }
+                        // PS2X_T4_DUMP=1: the 4-bit texture decoded with our own page tables, beside the palette's
+                        // alpha per index - see dumpT4Texture.
+                        if (std::getenv("PS2X_T4_DUMP") != nullptr)
+                            dumpT4Texture(ci, cc.tex0.bits, rs.texa.bits);
                     }
                     std::cerr << std::dec << std::endl;
                 }
