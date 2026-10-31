@@ -3105,6 +3105,26 @@ Then the question becomes: does the guest upload to 0x3FF000 at all (in which ca
 does the game sample a page it fills by another route (a VRAM->VRAM copy we already know is absent, or a
 different base we mis-decode)?
 
+### Session 58g - page watch (option 2): 0x3FF000 is never written
+
+`PS2X_WATCH_PAGE=<hex>` (`36f3578`) hashes an 8 KB VRAM window after every packet (throttled to every 8th after
+the first 64) and prints at most 8 changes, so the question no longer depends on our BITBLTBUF mirror.
+
+**Gotcha found on the way:** `0x3FF000` is the **last page of 4 MB VRAM**, so a naive `base + 8192` overran and
+the watcher returned early *without printing anything* - which looks exactly like "no changes". The window is
+clamped now.
+
+**Result (150 s):** `[GS-page] initial base=0x3ff000 nonZeroBytes=0`, and **no change line after it** - the page
+the logo sprites sample is never written in that run. Caveat: the run stayed in the loading phase (all censuses
+98728), so the black-phase draws were not exercised; the evidence that the page is empty *while being sampled*
+comes from the T4 dump run (`tbp=0x3ff0`, all 4096 texels index 0, palette entry `0x00000000`).
+
+So either the guest uploads that page and we lose the payload, or it never uploads it in a state we reach. A
+`[GS-census] ... need=1152 up=0 px=0/288` line seen in the TEX_DUMP run leans towards the first: transfers
+started whose payload bytes never arrived (`up=0` of `need=N`). **Next instrument: count dir=0 transfers started
+vs completed, with their destination DBP** - that separates "we drop uploads" from "the guest never sends this
+one".
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
