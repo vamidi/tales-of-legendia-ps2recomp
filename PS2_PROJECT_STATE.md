@@ -3442,6 +3442,46 @@ delivers it, so this is now a packet-construction question: the HWREG image writ
 to see whether real hardware receives the same 1-qword fragments - if it does, the guest intends them and the GS
 must accept a partial write; if it does not, our VIF1/GIF forwarding is splitting the tag's image runs.
 
+### Session 58p - required-vs-received per TRXDIR: the answer is a SPLIT (guest starves the texture transfers, and the small ones have enough data and still do not land)
+
+**Committed `cadd7a8`.** `[GS-xferq]` now groups by **TRXDIR** (the point the GS latches a transfer) instead of by
+`BITBLTBUF`, and compares against the same `required_qwords` parallel-gs computes before flushing
+(`RRW*RRH*bpp/64`, `gs_interface.cpp:3214`). First 24 transfers to `0x3ff0`:
+
+| latched rect | psm | required | received | verdict |
+|---|---|---|---|---|
+| 24x16 (the logo texture) | T4 | 24 qw | **1 qw** | SHORT |
+| 24x18 | T4 | 27 qw | 0 qw | SHORT |
+| 24x20 | T4 | 30 qw | 0 qw | SHORT |
+| 24x12 | T4 | 18 qw | 0-3 qw | SHORT |
+| 8x2 | T4 | 1 qw | 1-2 qw | **ENOUGH - and the page still stays empty** |
+
+**So there are two independent defects, not one:**
+
+1. **Every texture-shaped transfer is starved** - the guest delivers ~1 of the 24 qwords a 24x16 T4 needs. This is the
+   one that matters for the logo.
+2. **The small 8x2 transfers have enough data and still do not land.** parallel-gs should flush after 1 qword
+   (`check_pending_transfer`), writing 8 bytes at `0x3FF000`; the page holds zero. The same 8x2 shape at
+   `0x3FF400` (CT32) *does* land, so this is specific to the T4 destination, not to small transfers.
+
+**Do not trust the `required` column yet.** One entry decodes as `rect=0x12` (width 0, height 18), which is not a
+real rectangle - proof that some rects are misread. Cause found while looking: **`observeGIF`'s REGLIST branch
+advances `offset += 16` per register word, while the frontend (`gs_frontend.cpp`) and the GIF spec use 8** - a
+REGLIST loop is `2*nreg` 8-byte words, not `2*nreg` qwords. So REGLIST-form `TRXREG`/`TRXDIR` are decoded from the
+wrong offset, and both the rect and the `required` derived from it can be wrong. Everything the walk derives from
+`observeRegister` shares the exposure.
+
+**Next, in this order:**
+
+1. **Fix the REGLIST stride in `observeGIF` (16 -> 8 bytes per register word).** This is a real bug regardless of the
+   black screen, and it is the cheapest thing that makes the `required` column trustworthy. Verify with the built-in
+   check: after the fix `[GS-census]`'s `ourFLG/ourNLOOP/ourLoop` must still track parallel-gs's `up*` - if it
+   diverges, 16 was right and revert.
+2. Re-run this measurement. If the texture rects become consistent and still SHORT, the guest genuinely starves the
+   upload and the next move is guest-side (PCSX2 comparison of the same packet).
+3. Investigate defect 2 separately - "enough data, T4 destination, nothing written" is a bounded parallel-gs path
+   question (`compute_page_rect` for T4 + DBW=1, or the partial-flush path).
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
