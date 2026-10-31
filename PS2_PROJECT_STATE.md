@@ -2304,9 +2304,15 @@ No work on (a)/(b) has started - this is the decision point.
   `cmd /c '"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1 && cmake --build PS2Recomp\out\build 2>&1'`
 
 ## PCSX2 MCP Status
-- **Status**: Not Connected
+- **Status**: Not Connected (server installed and verified 2026-10-31; PCSX2 not launched yet)
 - **Game Loaded**: N/A
 - **Match**: N/A
+- **Server**: `hkmodd/PCSX2-MCP` v1.0.0, extracted to `C:\PCSX2-MCP-v1.0.0` (flat: `pcsx2-qt.exe` at the root)
+- **MCP entry**: `mcp.servers.pcsx2` in `~/.config/opencode/opencode.jsonc`, `node C:\PCSX2-MCP-v1.0.0\pcsx2-mcp-server\dist\index.js`, `codemode: false`
+- **Verified**: config parses; the bridge answers MCP `initialize` + `tools/list` with **30 tools** (`check-pcsx2-mcp.ps1` under `.opencode/tmp/`); `pcsx2_status` reachable from the agent (both transports report "not connected" until the emulator runs)
+- **To connect**: launch `C:\PCSX2-MCP-v1.0.0\pcsx2-qt.exe` from its own folder (Qt DLLs live there), enable Settings -> Advanced -> **Enable Pine IPC** (needed only for `game_info`, `save_state`, `load_state`), log must show `[DebugServer] Listening on 127.0.0.1:21512`, load `data\Tales of Legendia (USA).iso`, then `pcsx2_connect`
+- **Needs**: a PS2 BIOS dump (PCSX2 ships none). Breakpoints only work once the game is past the BIOS/menu
+- **Do not** run the release's `setup-mcp.bat`: it writes Antigravity/Claude configs, not opencode's `mcp.servers` shape
 
 ## Active Runner Command
 <!-- ACTIVE RUNNER COMMAND: -->
