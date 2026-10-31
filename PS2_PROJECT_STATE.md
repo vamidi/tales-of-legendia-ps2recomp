@@ -3203,6 +3203,34 @@ instead of 9-14; `fbp` from `0x1F` instead of `0x1FF`). So "draws target fbp 224
 session 58b - rests on a decode that is provably wrong. Fix the FRAME decode first (FBP bits 0-8, FBW 9-14,
 PSM 15-19), then re-read the draw target and the display source.
 
+### Session 58k - decode corrected from parallel-gs's own headers, and an explicit override for the display source
+
+**Correction, from `_deps/parallel_gs-src/gs/gs_registers.hpp` (authoritative, not memory):**
+
+```cpp
+struct FRAMEBits { FIELD32(FBP,9); PAD32(7); FIELD32(FBW,6); PAD32(2); FIELD32(PSM,6); ... };
+struct TESTBits  { ATE 1; ATST 3; AREF 8; AFAIL 2; DATE 1; DATM 1; ZTE 1; ZTST 2; };
+struct DISPFBBits{ FIELD32(FBP,9); FIELD32(FBW,6); FIELD32(PSM,5); PAD32(12); FIELD32(DBX,11); FIELD32(DBY,11); };
+```
+
+So `FRAME=0x800e0` is **FBP=224, FBW=8, PSM=CT32** - a perfectly valid frame - and the only true defect was the
+dump masking FBP with `0x1F` instead of `0x1FF` (fixed, `f31fb66`). **The TEST decode was right all along**:
+`0x5120D` = ATE=1, ATST=GREATER, AREF=0x20, ZTE=1, **ZTST=GEQUAL** - the earlier "ZTST=NEVER" was my own
+arithmetic with wrong offsets, not the dump's. The draw-target mismatch therefore stands on correct numbers:
+**draws -> FBP 224, DISPFB2 -> FBP 0, and DISPFB2 is never rewritten.**
+
+**The reference tree has no better answer.** sc3's `updatePreferredDisplaySourceForDraw` is byte-identical to ours
+(it sets the same state at `gs_frontend.cpp:2888` there): it fires only for a full-screen `ctxt=1`,
+`alphaMode=0x64`, `alphaFix in {0x60,0x80}` textured sprite blit, which ToL's logo sprites are not (`ctxt=0`,
+`alpha=0x44`). Nothing to port - the override has to be ours.
+
+**Added `PS2X_PRESENT_FROM_CONTEXT=1`** (`f31fb66`): keeps DISPFB2 pointing at ctx0's own FRAME, the forced form
+of that heuristic. Mapping `FRAME{FBP 0-8, FBW 16-21, PSM 24-29} -> DISPFB{FBP 0-8, FBW 9-14, PSM 15-19}`, DBX/DBY
+preserved, written through `gs.write_register(0x5A)`. It fires as expected -
+`DISPFB2 0x1000 -> 0x10e0 (following ctx0 FRAME 0x800e0: fbp=224)` - **but a 160 s run stayed on the loading
+screen again (all censuses 98728), so its effect on the black phase is not yet demonstrated.** A 300 s run with
+the override is the outstanding acceptance test.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
