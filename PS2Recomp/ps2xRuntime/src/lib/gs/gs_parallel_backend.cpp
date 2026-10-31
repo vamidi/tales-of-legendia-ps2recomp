@@ -567,6 +567,36 @@ namespace
             if (uploadNeed != 0u && uploadGot >= uploadNeed && it->second.completed < it->second.started)
                 ++it->second.completed;
         }
+        // PS2X_VRAM_SCAN=1: search all of VRAM for the logo palette's first entry (0x8079a9d7, seen in the T4 dump at
+        // cbp=0x3a70) and report where it actually lives. Content-based, so it cannot be fooled by either transfer
+        // state machine: if the palette is only at 0x3A700 then uploads DO land and the page watch was misreading; if
+        // it is at 0x3FF400 the sprite samples the wrong base; if it is absent the upload really is dropped.
+        void scanVramForPalette()
+        {
+            static const bool s_enabled = std::getenv("PS2X_VRAM_SCAN") != nullptr;
+            if (!s_enabled)
+                return;
+            const auto *vram = static_cast<const uint8_t *>(gs.map_vram_read(0, VramSize));
+            if (vram == nullptr)
+                return;
+            uint32_t hits = 0u, firstOffsets[8] = {};
+            for (uint32_t off = 0u; off + 4u <= VramSize; off += 4u)
+            {
+                uint32_t w = 0u;
+                std::memcpy(&w, vram + off, sizeof(w));
+                if (w == 0x8079a9d7u)
+                {
+                    if (hits < 8u)
+                        firstOffsets[hits] = off;
+                    ++hits;
+                }
+            }
+            std::fprintf(stderr, "[GS-vramscan] paletteEntry0 hits=%u at", hits);
+            for (uint32_t i = 0u; i < hits && i < 8u; ++i)
+                std::fprintf(stderr, " 0x%x", firstOffsets[i]);
+            std::fprintf(stderr, "  (cbp*256=0x3a700 expected, sprite tbp=0x3ff000)\n");
+        }
+
         void printUploadStats(const char *when)
         {
             static const bool s_enabled = std::getenv("PS2X_UPLOAD_STATS") != nullptr;
@@ -1003,6 +1033,7 @@ namespace
             {
                 ++s_gifPrints;
                 printUploadStats("census");
+                scanVramForPalette();
                 std::cerr << "[GS-census] bytes=" << s_gifBytes << " tags=" << s_gifTags
                           << " imageBytes=" << s_gifImageBytes << " drawTags=" << s_gifDrawTags
                           << " dir=" << unsigned(transfer.direction) << " need=" << transferBytes
