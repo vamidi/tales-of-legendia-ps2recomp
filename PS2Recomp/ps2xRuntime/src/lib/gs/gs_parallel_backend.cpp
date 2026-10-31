@@ -73,6 +73,16 @@ namespace
         }();
         return v;
     }
+    // PS2X_FORCE_TEXA_ONLY=1: pin TEXA.TA0 = 0x80 but leave TCC alone. Separates "TEXA never reaches the sampler"
+    // (this alone restores the frame) from "the texture/CLUT alpha really is 0" (this alone changes nothing).
+    bool forceTexaOnlyEnabled()
+    {
+        static const bool v = [] {
+            const char *e = std::getenv("PS2X_FORCE_TEXA_ONLY");
+            return e && *e && *e != '0';
+        }();
+        return v;
+    }
     // Session 54: dump the raw bytes at the T8 texture (0x3FF000) and CLUT
     // (0x3FF400) the black-phase sprites sample, decode index -> CLUT entry, and
     // report the colour+alpha actually stored there.
@@ -737,6 +747,12 @@ namespace
                         else if (adReg == 0x3Bu) // TEXA
                             m_scisPatch.push_back({offset, kTexaFixedAlpha});
                     }
+                    // PS2X_FORCE_TEXA_ONLY=1: pin TEXA only, TCC untouched - the discriminator between "TEXA never
+                    // reaches the sampler" and "the sampled alpha really is 0".
+                    else if (forceTexaOnlyEnabled() && adReg == 0x3Bu)
+                    {
+                        m_scisPatch.push_back({offset, kTexaFixedAlpha});
+                    }
                     // A 24-bit texture (PSMCT24, psm 0x01) stores no alpha channel: the GS takes the sampled alpha
                     // from TEXA.TA0 whatever TCC says. Sampling "texture alpha" instead yields 0, and with the
                     // alpha test the game uses (TEST=0x5120D: ATE=1, ATST=GREATER, AREF=0x20) every pixel is then
@@ -897,7 +913,7 @@ namespace
             }
             // If TCC is cleared but the guest never writes TEXA, the alpha would
             // default to 0 and the blend would still collapse to Cd.  Pin TEXA once.
-            if (forceAlphaEnabled())
+            if (forceAlphaEnabled() || forceTexaOnlyEnabled())
             {
                 static bool s_texaPinned = false;
                 if (!s_texaPinned)
