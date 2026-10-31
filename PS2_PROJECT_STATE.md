@@ -2922,13 +2922,39 @@ and sampled back, and `Present()` returns a **GL texture** (`frame.glTexture`) -
 lines**: nothing produces markers yet, so nothing fires and nothing races - the expected result, and the
 only honest reading of "wired".
 
-**The missing producer, precisely.** The sc3 branch emits markers from two places we do not have:
-`PS2Memory::setVu1SkipCallback` (a VU1 program the native port draws itself -> `queueNativeDraw(++s_group, 0)`)
-and `setVu1MscalCallback`'s HLE path (`run.nativeDraw = queueNativeDraw`), both gated on
-`ps2x::native::Renderer::instance().hasGroup(...)`. Our tree has neither the VU1 skip callback on
-`PS2Memory` nor any native model renderer, so a marker producer needs (a) the skip/HLE plumbing and (b)
-something that actually draws ToL's models. **(a) alone is cheap and worth doing first** - it makes
-`[GS-marker]` fire and proves group ordering against the GS stream.
+**The producer is now in place, as plumbing (`2914b09`).** The seam lives in
+`include/runtime/native/native_vu1_gate.h`, which any translation unit can set and none has to know a renderer:
+
+- `setVu1Gate(bool (*)(const uint8_t *vu1Code, uint32_t startPc))` - "does the port draw this microprogram
+  itself?". It receives the VU1 code pointer because **Tales of Legendia uploads every microprogram at pc 0**
+  (7 of 7 `[VIF1-mscal] pc=0x0` in a 40 s run), so the entry pc alone cannot identify a program.
+- `setNativeGroupCount(n)` - groups 1..n are drawn, numbered in stream order. This is the "model group is
+  available" test: `nativeGroupAvailable(group)`. `setMscntGroups(true)` when a continued program (MSCNT) is a
+  group of its own.
+
+`PS2Memory` gained the `Vu1SkipCallback` + `m_vu1ProgramSkipped` pair (same shape as the sc3 branch), the VIF1
+interpreter consults the gate at MSCAL/MSCALF (a gated program does not run on the emulated VU1; MSCNT of a
+gated program is skipped too), and `ps2_runtime` registers the emitter - each skipped program takes the port's
+next group number and calls `m_gs.queueNativeDraw(group, 0)` only when the port declares that group.
+
+`PS2X_NATIVE_VU1_GATE=<hex pc>[,...]` stands in for a renderer until one exists: it gates the listed entry pcs
+and declares every skipped program drawn. **Verified** with `PS2X_GS_RENDERER=native`:
+
+```
+[native-vu1] gate installed: 1 VU1 program(s) skipped and drawn natively
+[GS-marker] group=1 ctx=0 tex0=0x1c00 alpha=0x44 test=0x50000 scissor=0,0..511,447   (group=1..7 x7)
+```
+
+7 markers for exactly the 7 MSCALs of the 35 s run, with the guest's real scissor. Gate unset: 0 markers, 0
+`[native-vu1]`, run healthy (tick 1800 at 35 s, 6 threads, backend installed) - default behaviour unchanged.
+
+The two `TEMP DIAGNOSTIC` blocks in that branch (`[VIF1-mscal]`, `[VIF1-mscal-code]`) are now behind
+`PS2X_VIF1_MSCAL_LOG`; they printed two stderr lines per MSCAL unconditionally.
+
+**Still missing: the renderer itself.** Nothing sets the gate for real yet, so no program is skipped and no
+marker is emitted in a normal run. A native model renderer must, per game: identify the programs it takes over
+(by code hash, not pc), call `setVu1Gate` + `setNativeGroupCount`, and draw those groups into
+`GsDrawTarget` via `ps2x::native::setGsDrawHook`.
 
 **Two things this run exposed, both pre-existing:**
 
