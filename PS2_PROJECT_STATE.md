@@ -3623,6 +3623,74 @@ sizes feeding path 2 (`ps2_vif1_interpreter.cpp` -> `submitGifPacket(GifPathId::
 `PS2Memory::processGIFPacket(srcPhysAddr, qwCount)`). If a chunk is 16 bytes short of a tag boundary, the split is in
 VIF1 DIRECT; if the chunks are tag-complete but our forwarder concatenates wrongly, it is in `processGIFPacket`.
 
+### Session 58t - THE CUT FOUND: a whole 64-byte IMAGE payload chunk is missing, not 16 bytes; and the boot race measured (no regression)
+
+**Committed `1bd5405`.** Two results: the missing piece is identified, and the boot-race concern from 58q is retracted
+with a measurement.
+
+**1. The cut: an entire IMAGE payload, not a short packet.** Capturing the two packets before the desync gave:
+
+```
+packet -2 (96 B)
+0000: 04 80 00 00 00 00 af 10 0e   tag NLOOP=4 FLG=0 NREG=1 (A+D)
+0010: 00 00 00 00 f4 3f 01 00 50   BITBLTBUF dbp=0x3ff4 dpsm=CT32
+0020: 08 00 00 00 02 00 00 00 52   TRXREG = 8x2
+0030: 00 00 00 00 00 00 00 00 51   HWREG
+0040: 00 00 00 00 00 00 00 00 53   TRXDIR = 0
+0050: 04 80 00 00 00 00 af 18 0f   tag IMAGE NLOOP=4   <- header only, 0 payload
+```
+
+That is `[A = 80 B setup][B = IMAGE tag header, 16 B]` = 96 B, ending exactly on **B's header with its 64-byte payload
+pending**. The next delivered chunk starts with a **different** tag (`NLOOP=4 EOP=1 NREG=16`) and its own 64-byte
+payload. So **B's entire 64-byte IMAGE payload never reaches us.** The earlier "one qword short" framing was wrong -
+the gap is one whole IMAGE transfer, so the cause is a **dropped / never-submitted chunk**, not a trimmed packet.
+
+A dropped chunk fits the arbiter's own counter seen earlier (`[GIF-arb] submit=1024 drain=1036 fwd=1023` - one packet
+submitted, not forwarded). The arbiter copies packets whole and only reorders by path priority, so with a single
+path-2 stream the loss is upstream of it: `ps2_vif1_interpreter.cpp` `submitGifPacket(GifPathId::Path2)` or
+`PS2Memory::processGIFPacket(srcPhysAddr, qwCount)`.
+
+**2. Boot race: NO regression - retracting the 58q claim.** Measured with **no probes at all**, 4 x 200 s:
+
+```
+clean attempt 1: transition=True   98728,98728,600,600
+clean attempt 2: transition=False  all 98728
+clean attempt 3: transition=False  all 98728
+clean attempt 4: transition=True   98728,0,600
+=> 2/4 = 50%
+```
+
+That is at or above the historical ~1-in-3 (session 58l), so the REGLIST stride fix did **not** worsen it; the lower
+rates I reported in 58q/58s were all measured **with `PS2X_DBP_STATS` on**. Budget ~2 attempts.
+
+**The two outcomes are near-identical on the SIF/RPC path**, so the catch-up is not the race driver:
+
+| metric | passing | failing |
+|---|---|---|
+| `IOP catch-up` lines | 5 | 5 |
+| `still unclaimed` | 5 | 5 |
+| `claimed` | 0 | 0 |
+| `RPC BIND` | 19 | 19 |
+| slowest `rpc:route` | 706754 / 180950 / 50402 us | 714950 / 183728 / 49891 us |
+| stderr size | **2.6 MB** | **4.0 MB** |
+| `[DIAG-irq]` lines | ~6300 | ~7000 (already 1-in-240, so ~1.6 M interrupts) |
+
+So the failing outcome is the documented "outcome A": the guest takes a different path with ~30% more interrupts and
+more output - it is **not** simply slower and **not** caused by our instrumentation. `[DIAG-irq]` is already
+rate-limited (`EeScheduler.cpp:1998`, `seq % 240`), so gating it further would not change the path.
+
+**Also worth knowing:** the slowest single RPC route is **~707 ms** in both outcomes - a 0.7 s stall in the boot path
+that is independent of the race and has never been attributed. Not investigated.
+
+**Next:**
+1. **The dropped chunk (the real bug).** Count submissions at each hop for path 2 - `submitGifPacket` ->
+   `GifArbiter::submit` -> `drain`/`m_processFn` -> `ParallelBackend::ProcessGIF` - and find which hop loses one.
+   `[GIF-arb] submit/drain/fwd` already exposes it at the arbiter; add the VIF1 side to see the chunk before the
+   arbiter. A 64-byte IMAGE payload is 16-byte aligned, so the frontend's alignment gate is not it (and `[GS-drop]`
+   measured zero).
+2. Boot race: treat as an accepted variable with a 2-attempt protocol. Do not chase it before the chunk bug, which is
+   deterministic.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
