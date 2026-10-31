@@ -333,6 +333,35 @@ namespace
             }
         }
 
+        // PS2X_TEXA_LOG=1: what the sampler actually holds (parallel-gs's own register state, not our parse) the first
+        // few times it changes. Answers "does TEXA reach the sampler" without needing a particular game phase.
+        void logSamplerState()
+        {
+            static const bool s_enabled = std::getenv("PS2X_TEXA_LOG") != nullptr;
+            if (!s_enabled)
+                return;
+            const auto &rs = gs.get_register_state();
+            const uint64_t t0 = rs.ctx[0].tex0.bits, t1 = rs.ctx[1].tex0.bits, tx = rs.texa.bits;
+            static uint64_t s_lastKey = ~0ull;
+            static uint64_t s_logged = 0u;
+            const uint64_t key = t0 ^ (t1 * 31ull) ^ (tx * 131ull);
+            if (key == s_lastKey || s_logged >= 16u)
+                return;
+            s_lastKey = key;
+            ++s_logged;
+            std::fprintf(stderr,
+                         "[GS-texa] #%llu TEXA=0x%llx ta0=0x%llx aem=%llu | ctx0{psm=0x%llx tcc=%llu cbp=0x%llx} "
+                         "ctx1{psm=0x%llx tcc=%llu cbp=0x%llx}\n",
+                         static_cast<unsigned long long>(s_logged), static_cast<unsigned long long>(tx),
+                         static_cast<unsigned long long>(tx & 0xFFu), static_cast<unsigned long long>((tx >> 15) & 1u),
+                         static_cast<unsigned long long>((t0 >> 20) & 0x3Fu),
+                         static_cast<unsigned long long>((t0 >> 34) & 1u),
+                         static_cast<unsigned long long>((t0 >> 37) & 0x3FFFu),
+                         static_cast<unsigned long long>((t1 >> 20) & 0x3Fu),
+                         static_cast<unsigned long long>((t1 >> 34) & 1u),
+                         static_cast<unsigned long long>((t1 >> 37) & 0x3FFFu));
+        }
+
         // TEX0's TCC bit is meaningless for PSMCT24 (psm 0x01): the format has no alpha channel, so the GS takes the
         // sampled alpha from TEXA.TA0. A sampler that reads "texture alpha" gets 0 instead, and with ATE=1 /
         // ATST=GREATER / AREF=0x20 (Tales of Legendia's logo sprites) that rejects every pixel - the black phase.
@@ -973,12 +1002,14 @@ namespace
                     std::cerr << "[GS-scisPatch] patched=" << m_scisPatched << std::endl;
                 gs.gif_transfer(path, buf.data(), size);
                 fixCt24Alpha();
+                logSamplerState();
             }
             else
             {
                 m_scisPatch.clear();
                 gs.gif_transfer(path, data, size);
                 fixCt24Alpha();
+                logSamplerState();
             }
             // Session 41: parallel-gs's own accounting.  Everything in the
             // census above only proves what *we* parsed; this proves what it
