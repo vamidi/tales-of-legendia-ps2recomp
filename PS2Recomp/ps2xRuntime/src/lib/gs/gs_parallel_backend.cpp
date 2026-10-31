@@ -687,6 +687,8 @@ namespace
         uint32_t m_hwregDataPrints = 0u;
         uint32_t m_hwregSinceBlt = 0u;
         uint32_t m_tagCtxPrints = 0u;
+        bool m_dumpPkt = false;
+        bool m_dumpPktDone = false;
         uint32_t m_rawDpsm = 0u;
         uint32_t m_xferPrints = 0u;
         uint32_t m_rawXferDbp = 0xFFFFFFFFu;
@@ -732,6 +734,12 @@ namespace
                     std::fprintf(stderr, "[GS-xtr] BITBLTBUF dbp=0x%04x dbw=%u dpsm=0x%02x\n", dbp,
                                  unsigned((value >> 48) & 0x3Fu), unsigned((value >> 56) & 0x3Fu));
                 }
+                // Session 58q: PCSX2 shows the guest writes a *complete* 1248-byte transfer here
+                // ([tag NLOOP=4][BITBLTBUF 0x3ff0 T4][TRXREG 48x48][HWREG][TRXDIR 0][tag IMAGE NLOOP=72]).
+                // We read NLOOP=0x7fff instead, and parallel-gs agrees, so the bytes we forward are already
+                // wrong. Ask for a hex dump of the whole packet that carried the first 0x3ff0 setup.
+                if (dbp == 0x3FF0u && !m_dumpPktDone)
+                    m_dumpPkt = true;
                 break;
             }
             case 0x51u: // HWREG - the A word IS 8 bytes of image data. This is the *other* legal way to feed
@@ -1189,11 +1197,14 @@ namespace
                 }
                 else if (state.tag.FLG == 1)
                 {
-                    // Packed-reglist: a loop is nreg A words then nreg D words,
-                    // NOT interleaved.  state.reg counts 0..2*nreg-1 across both
-                    // phases so a loop straddling a DMA call stays correct.
+                    // Packed-reglist: a loop is nreg A words then nreg D words, NOT interleaved, and each
+                    // register word is 8 bytes (gs_frontend.cpp's own REGLIST path uses `offset += 8`; the GIF
+                    // spec makes a loop nreg*8 + nreg*8 = 16*nreg bytes). Advancing 16 here consumed twice the
+                    // real stride, so every REGLIST-sourced register value after the first loop was read from
+                    // the wrong offset - that is what produced impossible rects like 0x12 in [GS-xferq].
+                    // state.reg counts 0..2*nreg-1 across both phases so a loop straddling a DMA call stays correct.
                     ++s_gifDrawTags;
-                    while (offset < size && state.loop < state.tag.NLOOP)
+                    while (offset + 8u <= size && state.loop < state.tag.NLOOP)
                     {
                         if (state.reg < nreg)
                         {
@@ -1224,13 +1235,16 @@ namespace
                             }
                             ++state.reg;
                         }
-                        offset += 16;
+                        offset += 8;
                         if (state.reg >= nreg * 2u)
                         {
                             state.reg = 0;
                             ++state.loop;
                         }
                     }
+                    // A REGLIST tag whose loop is an odd number of register words carries one 8-byte pad.
+                    if (state.loop >= state.tag.NLOOP && ((state.tag.NLOOP * nreg) & 1u) != 0u)
+                        offset += 8u;
                 }
                 else
                 {
@@ -1537,6 +1551,21 @@ namespace
                 }
             }
             observeGIF(path, data, size);
+            if (m_dumpPkt && !m_dumpPktDone)
+            {
+                m_dumpPktDone = true;
+                m_dumpPkt = false;
+                std::fprintf(stderr, "[GS-pkt] packet carrying the first 0x3ff0 BITBLTBUF: path=%u size=%u\n", path,
+                             size);
+                const size_t limit = std::min<size_t>(size, 320u);
+                for (size_t off = 0u; off < limit; off += 16u)
+                {
+                    std::fprintf(stderr, "[GS-pkt] %04zx:", off);
+                    for (size_t i = 0u; i < 16u && off + i < limit; ++i)
+                        std::fprintf(stderr, " %02x", data[off + i]);
+                    std::fputc('\n', stderr);
+                }
+            }
             // PS2X_DBP_STATS=1: the per-destination accounting observeGIF fed, reported on an exponential byte
             // threshold (16 KiB, 32 KiB, 64 KiB, 128 KiB, 256 KiB, 512 KiB, 1 MiB ...) rather than per packet, so the
             // probe cannot decide the boot race (session 58l) and still reports in a run that stalls after a few

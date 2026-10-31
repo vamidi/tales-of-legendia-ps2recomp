@@ -1031,6 +1031,18 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
     {
         if (data && sizeBytes && (sizeBytes & 15u) == 0u)
             m_backend->ProcessGIF(path, data, sizeBytes);
+        else if (data && sizeBytes)
+        {
+            // An unaligned chunk cannot be expressed as whole GIF qwords, so it used to be dropped here with no
+            // trace. That desyncs parallel-gs's tag walker: the next bytes are then read as a tag header, which is
+            // how NLOOP=0x7FFF appears in a stream where PCSX2 contains no such tag. Count it.
+            static uint64_t s_droppedChunks = 0u;
+            ++s_droppedChunks;
+            if (s_droppedChunks <= 8u || (s_droppedChunks & 0xFFFu) == 0u)
+                std::fprintf(stderr, "[GS-drop] path=%u size=%u (size & 15 = %u) DROPPED; total dropped=%llu\n",
+                             path, sizeBytes, sizeBytes & 15u,
+                             static_cast<unsigned long long>(s_droppedChunks));
+        }
         return;
     }
 
