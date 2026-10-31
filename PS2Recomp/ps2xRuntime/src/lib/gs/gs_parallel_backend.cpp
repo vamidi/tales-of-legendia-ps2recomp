@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -283,6 +284,8 @@ namespace
                 uploadedBytes = uploadTailSize = 0;
                 fifoOffset = fifoTail.size();
                 xferCompletionLogged = false;
+                if (transfer.direction == 0)
+                    noteUploadStart(unsigned((bitblt >> 32) & 0x3FFFu), transferBytes);
                 // PS2X_XFER_LOG=1: every GS transfer with both buffer pointers. Tales of Legendia draws into frame
                 // buffer 224 while DISPFB2 keeps pointing at 0 and never changes, so the only thing that can put a
                 // drawn logo on screen is a direction-2 copy (VRAM->VRAM); direction 0 is host->local (an upload),
@@ -314,6 +317,7 @@ namespace
             if (transfer.direction != 0)
                 return;
             uploadedBytes = std::min(transferBytes, uploadedBytes + bytes);
+            noteUploadBytes(bytes);
             transfer.copiedPixels = std::min<size_t>(transfer.totalPixels, uploadedBytes * 8 / bitsPerPixel(unsigned(bitblt >> 56)));
             auto width = uint32_t(trxreg & 0xfff);
             if (width)
@@ -507,6 +511,55 @@ namespace
             std::fprintf(stderr, "[GS-page] %s base=0x%x nonZeroBytes=%u hash=0x%016llx check=%llu\n",
                          first ? "initial" : "changed", s_base, nonZero, static_cast<unsigned long long>(hash),
                          static_cast<unsigned long long>(s_checks));
+        }
+
+        // PS2X_UPLOAD_STATS=1: dir=0 (host->local) transfers accounted per destination DBP: how many started, how many
+        // received their whole payload, and which one is outstanding. Separates "we drop the payload" from "the guest
+        // never sends this texture" - the page watch showed 0x3FF000 is never written, and the census showed
+        // transfers with up=0 of need=N.
+        struct UploadStats
+        {
+            uint32_t started = 0u, completed = 0u;
+            uint64_t bytesStarted = 0u, bytesReceived = 0u;
+        };
+        std::map<uint32_t, UploadStats> uploads;
+        uint32_t uploadDbp = 0u;
+        size_t uploadNeed = 0u, uploadGot = 0u;
+
+        void noteUploadStart(uint32_t dbp, size_t bytes)
+        {
+            uploadDbp = dbp;
+            uploadNeed = bytes;
+            uploadGot = 0u;
+            UploadStats &s = uploads[dbp];
+            ++s.started;
+            s.bytesStarted += bytes;
+        }
+        void noteUploadBytes(size_t bytes)
+        {
+            uploadGot = std::min(uploadNeed, uploadGot + bytes);
+            const auto it = uploads.find(uploadDbp);
+            if (it == uploads.end())
+                return;
+            it->second.bytesReceived += bytes;
+            if (uploadNeed != 0u && uploadGot >= uploadNeed && it->second.completed < it->second.started)
+                ++it->second.completed;
+        }
+        void printUploadStats(const char *when)
+        {
+            static const bool s_enabled = std::getenv("PS2X_UPLOAD_STATS") != nullptr;
+            if (!s_enabled)
+                return;
+            std::fprintf(stderr, "[GS-upload] %s: %zu destination(s), outstanding dbp=0x%x got=%zu/%zu\n", when,
+                         uploads.size(), uploadDbp, uploadGot, uploadNeed);
+            for (const auto &kv : uploads)
+            {
+                std::fprintf(stderr, "[GS-upload]   dbp=0x%x started=%u completed=%u bytes=%llu/%llu%s\n", kv.first,
+                             kv.second.started, kv.second.completed,
+                             static_cast<unsigned long long>(kv.second.bytesReceived),
+                             static_cast<unsigned long long>(kv.second.bytesStarted),
+                             (kv.second.completed < kv.second.started) ? "   <= STARTED, NEVER COMPLETED" : "");
+            }
         }
 
         // Observe transfer boundaries only; the upstream decoder alone executes commands.
@@ -927,6 +980,7 @@ namespace
             if (s_gifPrints < 200u && s_gifBytes >= (static_cast<uint64_t>(s_gifPrints + 1u) << 18))
             {
                 ++s_gifPrints;
+                printUploadStats("census");
                 std::cerr << "[GS-census] bytes=" << s_gifBytes << " tags=" << s_gifTags
                           << " imageBytes=" << s_gifImageBytes << " drawTags=" << s_gifDrawTags
                           << " dir=" << unsigned(transfer.direction) << " need=" << transferBytes
