@@ -689,6 +689,9 @@ namespace
         uint32_t m_tagCtxPrints = 0u;
         bool m_dumpPkt = false;
         bool m_dumpPktDone = false;
+        bool m_dumpBad = false;
+        bool m_dumpBadDone = false;
+        size_t m_dumpBadAt = 0u;
         uint32_t m_rawDpsm = 0u;
         uint32_t m_xferPrints = 0u;
         uint32_t m_rawXferDbp = 0xFFFFFFFFu;
@@ -1125,6 +1128,14 @@ namespace
                     state.reg = state.loop = 0;
                     ++s_gifTags;
                     ++s_flg[state.tag.FLG & 3u];
+                    // Session 58r: arm the byte dump at the moment this tag HEADER is read. PCSX2 contains no
+                    // NLOOP=0x7FFF tag in either upper-word variant, so whichever packet reads one is where the
+                    // stream first goes wrong - and it is not the packet where the tag later becomes "active".
+                    if (state.tag.NLOOP == 0x7FFFu && state.tag.FLG >= 2u && !m_dumpBadDone && m_rawEnabled)
+                    {
+                        m_dumpBad = true;
+                        m_dumpBadAt = offset; // offset still points at the 16-byte tag header here
+                    }
                     // Session 58n: a texture upload the guest sets up and then never feeds would look exactly like
                     // this if the IMAGE tag it emits has NLOOP == 0 - the tag is consumed as a header with no payload,
                     // so every payload counter reports nothing. Count zero-length tags by FLG to tell "the guest sends
@@ -1188,6 +1199,13 @@ namespace
                 if (state.tag.FLG >= 2)
                 {
                     size_t count = std::min<size_t>(state.tag.NLOOP - state.loop, (size - offset) / 16);
+                    // Session 58r: PCSX2 contains NO NLOOP=0x7FFF tag anywhere, so the first one we see is the
+                    // desync point. Capture the bytes around its tag header for a byte-level diff.
+                    if (state.loop == 0u && state.tag.NLOOP == 0x7FFFu && !m_dumpBadDone && m_rawEnabled)
+                    {
+                        m_dumpBad = true;
+                        m_dumpBadAt = offset; // payload starts here; the 16-byte tag header is at offset-16
+                    }
                     observeImage(count * 16);
                     if (m_rawEnabled)
                         rawDbpImage(state.tag.NLOOP, count * 16u, data + offset, state.loop == 0u);
@@ -1551,20 +1569,32 @@ namespace
                 }
             }
             observeGIF(path, data, size);
-            if (m_dumpPkt && !m_dumpPktDone)
-            {
-                m_dumpPktDone = true;
-                m_dumpPkt = false;
-                std::fprintf(stderr, "[GS-pkt] packet carrying the first 0x3ff0 BITBLTBUF: path=%u size=%u\n", path,
-                             size);
-                const size_t limit = std::min<size_t>(size, 320u);
-                for (size_t off = 0u; off < limit; off += 16u)
+            auto dumpPacket = [&](const char *why, size_t from, size_t wantBytes) {
+                const size_t begin = from & ~size_t(15u);
+                const size_t limit = std::min<size_t>(size, begin + wantBytes);
+                std::fprintf(stderr, "[GS-pkt] %s: path=%u size=%u from=%zu\n", why, path, size, begin);
+                for (size_t off = begin; off < limit; off += 16u)
                 {
                     std::fprintf(stderr, "[GS-pkt] %04zx:", off);
                     for (size_t i = 0u; i < 16u && off + i < limit; ++i)
                         std::fprintf(stderr, " %02x", data[off + i]);
                     std::fputc('\n', stderr);
                 }
+            };
+            if (m_dumpPkt && !m_dumpPktDone)
+            {
+                m_dumpPktDone = true;
+                m_dumpPkt = false;
+                dumpPacket("setup carrying the first 0x3ff0 BITBLTBUF", 0u, 320u);
+            }
+            if (m_dumpBad && !m_dumpBadDone)
+            {
+                m_dumpBadDone = true;
+                m_dumpBad = false;
+                // The tag header sits 16 bytes before the payload; give 80 bytes of lead-in so the preceding
+                // tag/payload boundary is visible too.
+                dumpPacket("IMAGE tag with NLOOP=0x7FFF (PCSX2 has none)", m_dumpBadAt >= 80u ? m_dumpBadAt - 80u : 0u,
+                           400u);
             }
             // PS2X_DBP_STATS=1: the per-destination accounting observeGIF fed, reported on an exponential byte
             // threshold (16 KiB, 32 KiB, 64 KiB, 128 KiB, 256 KiB, 512 KiB, 1 MiB ...) rather than per packet, so the
