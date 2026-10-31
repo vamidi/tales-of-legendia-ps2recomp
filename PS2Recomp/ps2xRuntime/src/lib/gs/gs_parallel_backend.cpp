@@ -323,6 +323,31 @@ namespace
             }
         }
 
+        // TEX0's TCC bit is meaningless for PSMCT24 (psm 0x01): the format has no alpha channel, so the GS takes the
+        // sampled alpha from TEXA.TA0. A sampler that reads "texture alpha" gets 0 instead, and with ATE=1 /
+        // ATST=GREATER / AREF=0x20 (Tales of Legendia's logo sprites) that rejects every pixel - the black phase.
+        // Applied to the register after the packet is dispatched, which is path independent (packed A+D, reglist or
+        // DIRECT), unlike a byte patch inside one decoder branch.
+        void fixCt24Alpha()
+        {
+            static const bool s_enabled = std::getenv("PS2X_NO_CT24_FIX") == nullptr;
+            if (!s_enabled)
+                return;
+            const auto &rs = gs.get_register_state();
+            for (unsigned ci = 0; ci < 2u; ++ci)
+            {
+                const uint64_t t0 = rs.ctx[ci].tex0.bits;
+                if ((t0 & kTex0TccBit) == 0u || ((t0 >> 20) & 0x3Fu) != 0x01u)
+                    continue;
+                gs.write_register(static_cast<ParallelGS::RegisterAddr>(ci == 0u ? 0x06u : 0x07u),
+                                  t0 & ~kTex0TccBit);
+                static uint64_t s_patched = 0u;
+                if (s_patched < 3u)
+                    std::cerr << "[GS-tex24] CT24 ctx" << ci
+                              << " TCC cleared -> alpha from TEXA.TA0 (n=" << ++s_patched << ")" << std::endl;
+            }
+        }
+
         // Observe transfer boundaries only; the upstream decoder alone executes commands.
         // Start from upstream's saved PATH state, including packets split across DMA calls.
         void observeGIF(uint32_t path, const uint8_t *data, size_t size)
@@ -712,6 +737,13 @@ namespace
                         else if (adReg == 0x3Bu) // TEXA
                             m_scisPatch.push_back({offset, kTexaFixedAlpha});
                     }
+                    // A 24-bit texture (PSMCT24, psm 0x01) stores no alpha channel: the GS takes the sampled alpha
+                    // from TEXA.TA0 whatever TCC says. Sampling "texture alpha" instead yields 0, and with the
+                    // alpha test the game uses (TEST=0x5120D: ATE=1, ATST=GREATER, AREF=0x20) every pixel is then
+                    // rejected - that is the black phase: Tales of Legendia's logo sprites are prim=0x15E
+                    // (sprite, tme, abe, ctxt=0) over a CT24 texture with TCC=1 and TEXA=0x80. The correction is
+                    // applied after the packet is dispatched (see fixCt24AfterPacket) because TEX0 does not always
+                    // arrive as a packed A+D pair.
                     if (adReg == 0x00u && wantPrimRaw())
                     {
                         takePrimRaw();
@@ -924,11 +956,13 @@ namespace
                 if (m_scisPatched <= 5u || (m_scisPatched & 0x1FFull) == 0u)
                     std::cerr << "[GS-scisPatch] patched=" << m_scisPatched << std::endl;
                 gs.gif_transfer(path, buf.data(), size);
+                fixCt24Alpha();
             }
             else
             {
                 m_scisPatch.clear();
                 gs.gif_transfer(path, data, size);
+                fixCt24Alpha();
             }
             // Session 41: parallel-gs's own accounting.  Everything in the
             // census above only proves what *we* parsed; this proves what it
@@ -1118,6 +1152,26 @@ namespace
                                   << " tfx=" << ((cc.tex0.bits >> 35) & 3ull)
                                   << " cbp=0x" << ((cc.tex0.bits >> 37) & 0x3FFFull)
                                   << " FBA=0x" << cc.fba.bits << " CLAMP=0x" << cc.clamp.bits;
+                        // PS2X_CLUT_DUMP=1: the palette and the first texels this context samples, read straight out of
+                        // VRAM. Decides whether an indexed draw's alpha is genuinely 0 in the palette (the guest
+                        // expects TEXA) or we are addressing the wrong entry.
+                        if (std::getenv("PS2X_CLUT_DUMP") != nullptr)
+                        {
+                            const uint64_t t0 = cc.tex0.bits;
+                            const unsigned cbps = unsigned((t0 >> 37) & 0x3FFFu), cpsm = unsigned((t0 >> 51) & 0xFu);
+                            const unsigned csm = unsigned((t0 >> 55) & 1u), csa = unsigned((t0 >> 56) & 0x1Fu);
+                            const unsigned psms = unsigned((t0 >> 20) & 0x3Fu), tbps = unsigned(t0 & 0x3FFFu);
+                            const unsigned tbws = unsigned((t0 >> 14) & 0x3Fu);
+                            std::cerr << "\n  ctx" << ci << " CLUT cpsm=0x" << std::hex << cpsm << " base=0x" << cbps
+                                      << " csm=" << std::dec << csm << " csa=" << csa << ":";
+                            for (unsigned i = 0; i < 16u; ++i)
+                                std::cerr << " " << std::hex << ReadVram(cpsm, cbps, 1u, i, 0u);
+                            std::cerr << std::dec << "\n  ctx" << ci << " TEXELS psm=0x" << std::hex << psms
+                                      << " tbp=0x" << tbps << std::dec << ":";
+                            for (unsigned i = 0; i < 8u; ++i)
+                                std::cerr << " " << std::hex << ReadVram(psms, tbps, tbws, i, 0u);
+                            std::cerr << std::dec;
+                        }
                     }
                     std::cerr << std::dec << std::endl;
                 }
