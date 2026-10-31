@@ -2984,6 +2984,44 @@ pixels, brightness map). PowerShell array indexing bit twice; it uses a hashtabl
 `PS2X_2D_PROBE` only works on batch backends (parallel-gs is raw: `UsesRawCommands()` at
 `gs_parallel_backend.cpp:766` bypasses the frontend entirely).
 
+### Session 58c - ROOT CAUSE of the black phase: the sampled alpha is 0, and ctx0's alpha test rejects everything
+
+**Three structural theories, all falsified by measurement, in this order:**
+
+1. *Dark/wrong texture or CLUT.* `PS2X_FORCE_NOTEX=1` changed **nothing** - the census was byte-identical
+   (`nzWords=600`, `nzCtx0=30 nzCtx1=37`). Texturing is not what makes those pixels vanish.
+2. *A VRAM->VRAM copy bridges the draw buffer into the displayed one.* `PS2X_XFER_LOG=1` over 135 s: **97
+   transfers, all `dir=0`** (host->local uploads, 18 completed), **zero `dir=2`**. Nothing copies between
+   buffers, so nothing can move fbp 224 into the displayed fbp 0.
+3. *A dropped DISPFB swap.* `writeDisplayFramebuffer` counts a flip only when DISPFB.FBP (bits 0-8) changes, and
+   ToL writes `DISPFB2 = 0x1000` (FBP 0, FBW 8) unchanged every frame. `flips=0` is therefore correct for this
+   title, not a lost swap.
+
+**The guest side is healthy.** `PS2X_2D_PROBE` per-window summary: from draw ~4097 the windows are
+28-58 % black / 210-366 textured, colours cycling `2b171120 -> 2b171140 -> 2b171180` and `80808080` - the fade
+advances and thousands of textured logo draws are submitted per frame, in a repeating per-frame pattern.
+
+**`PS2X_FORCE_ALPHA=1` is the answer.** Every census, black phase included, goes **600 -> 295336**, dense blocks
+at **0x0 / 0x10000 / 0x20000** - VRAM from address 0, i.e. **the display buffer `DISPFB2` names**. Geometry,
+colours, fade, draw target and display target were all fine; only the alpha was wrong.
+
+**Why alpha 0 hides everything, twice over** (ctx0 state at that moment):
+`FRAME=0x800e0` -> FBP 224, `TEST=0x5120d` -> **ATE=1, ATST=6 (GREATER), AREF=0x20, AFAIL=1**. Every pixel is
+rejected unless `As > 0x20`, so alpha 0 draws nothing at all; and `ALPHA=0x44` (A=Cs,B=Cd,C=As,D=Cd) would
+collapse `(Cs-Cd)*As + Cd` to `Cd` = black even without the test.
+
+**Where the alpha should come from.** `[TEX]` dump: `clutNz=13 range=0..15` (the 16-entry palette IS populated)
+but the decoded `as8 idx/alpha` is `0/0` for the sampled indices, while `TEXA=0x80`. So the guest set a usable
+`TA0 = 0x80` and a populated CLUT, and we still hand the rasteriser alpha 0. Two candidate bugs, both local to
+the sampler: (a) we take alpha from the CLUT even when TEX0.TCC = 0 (alpha must then come from TEXA.TA0), or
+(b) the indexed CLUT fetch returns the wrong entry/word. A T8 palette used with TCC=0 typically stores RGB with
+a zero alpha byte, which matches `clutNz=13` with `as8` all zero.
+
+**Next: fix the alpha derivation in the sampler** (TCC=0 -> `TA0`; TME=0 -> vertex alpha), then re-run with
+`PS2X_FORCE_ALPHA` unset and expect the black-phase census to sit at ~295k instead of 600. That single number is
+the acceptance test: the logo screens become visible, and the MPG movie behind them is reachable for the first
+time (its ffmpeg `sceMpeg` stub has never run: 0 calls, 0 IPU writes).
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
