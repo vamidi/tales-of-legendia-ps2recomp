@@ -3536,6 +3536,50 @@ packet-boundary/tag-split effect that survives QW alignment.
 transition on attempt 6, versus 1-in-3 before. The fix makes `observeGIF` run ~2x the REGLIST iterations, so budget
 more attempts.
 
+### Session 58r - DESYNC LOCALISED: a palette entry is being parsed as a tag header because the inherited page state is one qword off
+
+**Committed `33efbc5`.** Arming `[GS-pkt]` on the tag **read** (rather than on the first `0x3ff0` BITBLTBUF, or on where
+a tag becomes "active") caught the exact packet. Two earlier armings gave misleading answers - keep this lesson.
+
+```
+[GS-pkt] IMAGE tag with NLOOP=0x7FFF (PCSX2 has none): path=2 size=80 from=0
+0000: 04 80 00 00 00 00 00 08  00 00 00 00 00 00 00 00   tag NLOOP=4 FLG=2 (IMAGE) NREG=16
+0010: 00 00 00 00 04 00 00 50  ff ff ff 00 ff ff ff 08
+0020: ff ff ff 11 ff ff ff 19   <- a TAG is read HERE, inside the payload
+0030: ff ff ff 33 ff ff ff 3b
+0040: ff ff ff 55 ff ff ff 5d
+```
+
+**The packet is complete and self-contained**: 16 + 64 = **80 bytes** = one IMAGE tag (NLOOP=4, 64 B) plus its
+4-qword payload. The payload is a grey ramp (`ffffff00, ffffff08, ffffff11, ...`) - the CLUT the T4 dump described.
+
+**`NLOOP=0x7FFF` is an artifact of reading palette data as a tag header.** At offset `0x20` the qword is
+`0x19ffffff11ffffff`; its low 15 bits are all ones, so NLOOP reads 0x7FFF. Nothing writes such a tag - PCSX2 has none
+in either upper-word variant (`ff7f00000000af18`, `ff7f00000000af10`: both no matches).
+
+**So the walker consumed 1 of the 4 payload qwords**: it entered this packet with an open-tag state that was **one
+qword off**. parallel-gs reads the same value (`upNLOOP=7fff`), so the defect is in the **cross-packet payload
+accounting**, not in the probe and not in the setup packet (which is byte-identical to PCSX2's).
+
+**Consequences of this one off-by-one:** every later tag boundary is wrong, which produces the three `NLOOP=0x7FFF`
+tags, the ~1.5 MB of bogus "image bytes", the misattribution of the texture to `0x3ff4`, the `[GS-xferq]` "starved"
+verdict, and ultimately an empty `0x3FF000`.
+
+**Also confirmed on the way** (do not re-derive): `rect=24x16` is a genuine guest TRXREG write - `[GS-pkt]` caught a
+clean `[tag NLOOP=2][TEXFLUSH][TRXREG 24x16]` packet. And `[GS-drop]` measured **zero** unaligned drops, so the
+16-byte alignment gate in `processGIFPacket` is not the cause.
+
+**Next: log the inherited tag state at packet entry and find the boundary that is off by one.** For the ~10 packets
+before the bad one, print `path`, `size`, and the `state` carried in (`tag.NLOOP`, `tag.FLG`, `loop`, `reg`). The
+offending boundary will show as a packet whose IMAGE payload count does not match `size`. Prime suspects, in order:
+
+1. `ParallelBackend`'s `fifoTail` / `fifoOffset` handling - it holds back 16 bytes and the tail logic is only
+   exercised when a packet ends mid-tag;
+2. parallel-gs's own `gif_transfer` continuation state vs. our `observeGIF` copy (they agree, so this is one bug, not
+   two);
+3. VIF1 DIRECT block splitting (`ps2_vif1_interpreter.cpp` `submitGifPacket(GifPathId::Path2)`) emitting a chunk that
+   is 16-aligned but not tag-aligned.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
