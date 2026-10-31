@@ -2835,6 +2835,53 @@ are in the tree but NOT in the build; `PS2X_GS_NATIVE` is off and parallel-gs re
 `glReadPixels` mechanism that made every earlier attempt black, so point 4 is the first place a non-black
 frame would mean anything.
 
+### Session 56 - ALL SIX INTEGRATION POINTS DONE and green; NativeDraw takes GSDrawState, the texture handover works, and the native backend is in the build
+
+**Committed (`eadf37a`, `8a96569`), tree clean, `cmake --build PS2Recomp\out\build` exits 0.**
+
+| # | Point | Status |
+|---|---|---|
+| 5 | `GSMem::byteOf` / `PageOf` / `BlockOf` | done earlier, `1910c39` |
+| 2 | `PresentationFrame::glTexture` | done earlier, `50f1489`; `operator bool` now also accepts a texture-only frame |
+| 1 | `fillNativeRegisters` | **written** (`gs_backend.h`), against `GSDrawState`; `NativeDraw` virtual takes `GSDrawState` too |
+| 3 | frontend publish path | done: `GS::latchedHostPresentationTexture()` + `m_hostPresentationTexture` latched from `frame.glTexture`, cleared on reset/no-backend/shutdown |
+| 4 | `UploadFrame(..., uint32_t &outGlTexture)` | done: returns the renderer's own texture and the present path draws it as a `Texture2D` with that id |
+| 6 | CMake | done: `gs_native_backend.cpp` is a `SKIP_UNITY_BUILD_INCLUSION` TU with raylib's `src` + bundled GLFW includes, define `PS2X_HAVE_NATIVE_GS=1` |
+
+**What `fillNativeRegisters` maps, since the two structs differ:** TEX0 is rebuilt from the parsed
+`GSTex0Reg`; `texa` = `state.texaRaw`; `alpha`/`test`/`clamp` = `state.context.*`; `fogcol` = `fogR |
+fogG<<8 | fogB<<16` (the frontend keeps the FOGCOL bytes); `zmask` = `state.context.zbuf.zmask`. XYOFFSET
+and SCISSOR come from `state.context` in `NativeDraw` itself. `texaRaw` was added last session but nothing
+wrote it - `GS::buildDrawBatch` now rebuilds it from `m_texa` (TA0, AEM, TA1 - TEXA defines nothing else),
+so the field is live and exact rather than silently 0.
+
+**Ordering decision in `UploadFrame`:** the native-texture check sits BEFORE the `#ifdef PS2X_GS_PARALLEL`
+early return, because that define is on by default (`cmake/ParallelGS.cmake`), and before the "cached frame"
+early return. The parallel `getLatchedGpuFrame` is only called when no texture was handed over, so one
+renderer owns the picture and `ReleaseTexture` still pairs with `AcquireTexture`.
+
+**Measured costs (the reason the "one header per build" rule needs the real numbers):**
+- `gs_backend.h` (60-ish dependents) -> **4 unity TUs** + link, minutes.
+- `gs_frontend.h` -> **FULL rebuild, 1747 steps, 25-40 min**: every runner unity TU reaches it through
+  `ps2_runtime.h`. `ninja -t deps | grep gs_frontend.h` counted only 56 objects and was WRONG as a cost
+  estimate (the deps listing does not cover the whole build). Treat any edit to `gs_frontend.h`,
+  `gs_types.h` or `ps2_runtime.h` as a full rebuild and batch it.
+- A **PUBLIC** `target_compile_definitions(ps2_runtime ...)` also reaches `ps2EntryRunner` -> full rebuild
+  again. `PS2X_HAVE_NATIVE_GS` is PUBLIC to stay faithful to the sc3 branch; changing it costs 1757 TUs.
+- **16-way parallel cl exhausts the commit limit** on this box (64 GB RAM, no page file): one unity TU died
+  with `C3859`/`C1076` "paging file is too small". `CMAKE_BUILD_PARALLEL_LEVEL=4` finished the tail fine.
+  If a unity TU ever fails with C1076, it is resource pressure, not a code error - rerun with less
+  parallelism before touching the source.
+
+**What is NOT wired yet (next, and it is another full rebuild):** nothing calls `NativeDraw`.
+The sc3 branch has `GS::queueNativeDraw(group, context)` - a `QueuedCommand::Kind::Call` marker in the GS
+queue that snapshots `m_ctx[index]` (+ `texaRaw`, `fogcol`) and calls `m_backend->NativeDraw(group, state)`
+on the GS thread - plus `m_markerGroup`/`m_markerIndex`/`m_markerContext` for coalescing and
+`gsForPresentation()`. Our tree has NONE of those (grep for `markerGroup`, `gsForPresentation`,
+`QueuedCommand::Kind::Call` = 0 hits), so the native renderer still has no draw entry point and
+`GSNativeBackend` is not installed either (no `createSharedContext()` call site in `src/`). Both belong in
+`gs_frontend.h/.cpp` + `ps2_runtime.cpp` and should be done in ONE pass, then a single full rebuild.
+
 **Fourth lesson:** *a green build proves it compiles, not that it landed in the right place.* `texaRaw`
 applied to the wrong struct and still built, because nothing consumed it yet. Print the surrounding struct
 boundaries after any structural edit, and prefer tools that fail loudly over scripted text surgery - in
@@ -2845,8 +2892,9 @@ this stretch `.Insert()` on a fixed-size PowerShell array silently did nothing w
 1. **A probe that prints only every 1024th call reads as zero.** `[GS-parse]`, `[GSB]`, `[GIF-arb]` were all
    "0" by sampling sparsity, not by absence; `submitGifPacket` printed instantly once it logged the first 3
    calls. Always print the first call, then sample.
-2. **One header edit per build.** Editing `gs_backend.h` + `ps2_gs_memory.h` together blew a 15-minute cap
-   and forced a wide recompile.
+2. **One header per build.** Editing `gs_backend.h` + `ps2_gs_memory.h` together blew a 15-minute cap
+   and forced a wide recompile. Session 56 measured the real ladder: `gs_backend.h` = 4 unity TUs,
+   `gs_frontend.h`/`gs_types.h`/`ps2_runtime.h` = the whole 1747-step runner build.
 3. **Do not size a change by file count - size it by dependents.** A "swap 120 files" plan nearly deleted
    the ToL `data/CD` override, and would have broken 53,000 generated files via one header.
 
