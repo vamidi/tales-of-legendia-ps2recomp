@@ -687,6 +687,12 @@ namespace
         uint32_t m_hwregDataPrints = 0u;
         uint32_t m_hwregSinceBlt = 0u;
         uint32_t m_tagCtxPrints = 0u;
+        uint32_t m_rawDpsm = 0u;
+        uint32_t m_xferPrints = 0u;
+        uint32_t m_rawXferDbp = 0xFFFFFFFFu;
+        uint32_t m_rawXferW = 0u, m_rawXferH = 0u, m_rawXferPsm = 0u;
+        uint32_t m_rawXferRequired = 0u, m_rawXferGot = 0u;
+        bool m_rawXferActive = false;
         uint32_t m_rawLatchedDbp = 0xFFFFFFFFu;
         bool m_rawLatchedActive = false;
         const bool m_rawEnabled = (std::getenv("PS2X_DBP_STATS") != nullptr);
@@ -699,17 +705,7 @@ namespace
             case 0x50u: // BITBLTBUF
             {
                 const uint32_t dbp = uint32_t((value >> 32) & 0x3FFFu);
-                // Session 58o: how many HWREG qwords actually arrived for the *previous* transfer to this
-                // destination. If the guest intends RRW*RRH*bpp/64 and we receive ~1, either it sends ~1 or we
-                // drop the rest; if we receive the full count and the page is still empty, the GS is discarding it.
-                if (dbp == 0x3FF0u && m_hwregPrints < 16u)
-                {
-                    ++m_hwregPrints;
-                    std::fprintf(stderr,
-                                 "[GS-xferq] dbp=0x3ff0 previous transfer received %u hwreg qword(s) = %u byte(s)\n",
-                                 m_hwregSinceBlt, m_hwregSinceBlt * 16u);
-                }
-                m_hwregSinceBlt = 0u;
+                m_rawDpsm = uint32_t((value >> 56) & 0x3Fu);
                 m_rawDbpCurrent = dbp;
                 m_rawHaveDbp = true;
                 ++m_rawDbp[dbp].bitbltWrites;
@@ -750,6 +746,7 @@ namespace
                     ++d.hwregQw;
                     ++d.deliveredQw;
                     ++m_hwregSinceBlt;
+                    ++m_rawXferGot;
                     if (d.scannedBytes < 1024u)
                     {
                         const auto *bytes = reinterpret_cast<const uint8_t *>(&value);
@@ -787,6 +784,30 @@ namespace
             case 0x53u: // TRXDIR - this is what latches the transfer in the GS
                 if (m_rawHaveDbp)
                 {
+                    // Session 58p, the decisive measurement: a transfer is latched at TRXDIR, so group by TRXDIR,
+                    // NOT by BITBLTBUF. Report what the previous latched transfer received against the same
+                    // required_qwords parallel-gs computes (RRW*RRH*bpp/64) before it will flush anything.
+                    if (m_rawXferActive && m_rawXferDbp == 0x3FF0u && m_xferPrints < 24u)
+                    {
+                        ++m_xferPrints;
+                        const bool enough = m_rawXferGot >= m_rawXferRequired;
+                        std::fprintf(stderr,
+                                     "[GS-xferq] dbp=0x3ff0 latched rect=%ux%u psm=0x%02x required=%u qw "
+                                     "received=%u qw (%u B)%s\n",
+                                     m_rawXferW, m_rawXferH, m_rawXferPsm, m_rawXferRequired, m_rawXferGot,
+                                     m_rawXferGot * 16u,
+                                     enough ? "  <= ENOUGH: backend had the data and did not write it"
+                                            : "  <= SHORT: guest starved the transfer");
+                    }
+                    m_rawXferDbp = m_rawDbpCurrent;
+                    m_rawXferW = m_rawRectW;
+                    m_rawXferH = m_rawRectH;
+                    m_rawXferPsm = m_rawDpsm;
+                    m_rawXferRequired =
+                        (m_rawRectW * m_rawRectH * bitsPerPixel(m_rawDpsm)) / 64u;
+                    m_rawXferGot = 0u;
+                    m_rawXferActive = true;
+
                     m_rawLatchedDbp = m_rawDbpCurrent;
                     m_rawLatchedActive = true;
                     RawDbp &d = m_rawDbp[m_rawDbpCurrent];
