@@ -416,6 +416,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_cpu_backend.cpp
     src/lib/native/native_gl_backend.cpp
     src/lib/native/native_gs_bridge.cpp
+    src/lib/native/native_texture_cache.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp

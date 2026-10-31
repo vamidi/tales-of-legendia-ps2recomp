@@ -142,6 +142,13 @@ public:
     // The latched frame as the renderer's own GL texture (PresentationFrame::glTexture), when it handed one over
     // instead of pixels (GS native back end, on a context shared with the window): false when there is none.
     bool latchedHostPresentationTexture(uint32_t &outTexture, uint32_t &outWidth, uint32_t &outHeight) const;
+    // A native renderer's draws at this point of the GS stream: a VU1 program it draws itself, whose PATH1 output
+    // never reaches the GS. The marker carries the drawing state where it sits in the stream, so the native draws
+    // sort with the GS draws around them (a particle in front of a mesh, a HUD over it). This runtime has no GS
+    // command queue - the GS draws where it is called - so the marker is dispatched where it is placed, which is
+    // the order a queue would have preserved. group numbers the marker the way the native port numbers its draws;
+    // context picks the GS context (0/1) its registers come from.
+    void queueNativeDraw(uint64_t group, int context);
     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
@@ -177,6 +184,9 @@ private:
     void processImageData(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes);
     GSPrimitiveBatch buildDrawBatch(int vertexCount) const;
+    // The GS state a draw made right now would use: a batch's GSDrawState without the vertices. The native draw
+    // marker and the primitive batches read the same registers through it.
+    GSDrawState currentDrawState(int context) const;
     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
     GSPresentationRequest buildPresentationRequestUnlocked() const;
 

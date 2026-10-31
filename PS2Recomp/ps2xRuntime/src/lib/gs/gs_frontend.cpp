@@ -2132,29 +2132,67 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     batch.vertexCount = static_cast<uint8_t>(std::min(vertexCount, 3));
     for (int i = 0; i < batch.vertexCount; ++i)
         batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[i];
-    batch.state.context = m_ctx[m_prim.ctxt ? 1 : 0];
-    batch.state.prim = m_prim;
-    batch.state.texa = m_texa;
-    // The raw TEXA word a native draw hands to the hook (GsDrawTarget::texa), rebuilt from the parsed
-    // fields: TEXA defines only TA0, AEM and TA1, so this is the register bit for bit.
-    batch.state.texaRaw = static_cast<uint64_t>(m_texa.ta0) | (m_texa.aem ? (1ull << 15) : 0ull) |
-                          (static_cast<uint64_t>(m_texa.ta1) << 32);
-    batch.state.texclut = m_texclut;
-    batch.state.pabe = m_pabe;
-    batch.state.scanmsk = m_scanmsk;
-    batch.state.dimx = m_dimx;
-    batch.state.dthe = m_dthe;
-    batch.state.colclamp = m_colclamp;
-    batch.state.fogR = m_fogR;
-    batch.state.fogG = m_fogG;
-    batch.state.fogB = m_fogB;
-    batch.state.textureWidth = static_cast<uint16_t>(1u << std::min<uint32_t>(batch.state.context.tex0.tw, 10u));
-    batch.state.textureHeight = static_cast<uint16_t>(1u << std::min<uint32_t>(batch.state.context.tex0.th, 10u));
-    const uint64_t tex1 = batch.state.context.tex1;
-    const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
-    const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
-    batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
+    batch.state = currentDrawState(m_prim.ctxt ? 1 : 0);
     return batch;
+}
+
+GSDrawState GS::currentDrawState(int context) const
+{
+    const GSContext &ctx = m_ctx[(context != 0) ? 1 : 0];
+    GSDrawState state{};
+    state.context = ctx;
+    state.prim = m_prim;
+    state.texa = m_texa;
+    // The raw TEXA word a native draw hands to the hook (GsDrawTarget::texa), rebuilt from the parsed fields:
+    // TEXA defines only TA0, AEM and TA1, so this is the register bit for bit.
+    state.texaRaw = static_cast<uint64_t>(m_texa.ta0) | (m_texa.aem ? (1ull << 15) : 0ull) |
+                    (static_cast<uint64_t>(m_texa.ta1) << 32);
+    state.texclut = m_texclut;
+    state.pabe = m_pabe;
+    state.scanmsk = m_scanmsk;
+    state.dimx = m_dimx;
+    state.dthe = m_dthe;
+    state.colclamp = m_colclamp;
+    state.fogR = m_fogR;
+    state.fogG = m_fogG;
+    state.fogB = m_fogB;
+    state.textureWidth = static_cast<uint16_t>(1u << std::min<uint32_t>(ctx.tex0.tw, 10u));
+    state.textureHeight = static_cast<uint16_t>(1u << std::min<uint32_t>(ctx.tex0.th, 10u));
+    const uint8_t mmag = static_cast<uint8_t>((ctx.tex1 >> 5u) & 0x1u);
+    const uint8_t mmin = static_cast<uint8_t>((ctx.tex1 >> 6u) & 0x7u);
+    state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
+    return state;
+}
+
+void GS::queueNativeDraw(uint64_t group, int context)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (!m_backend)
+        return;
+    // PS2X_GS_MARKER_LOG=1: the first markers that reach the rasteriser, with the registers they carry. The only
+    // way to see the marker path fire once a producer exists - print the first ones, then stop.
+    static const bool s_logMarkers = std::getenv("PS2X_GS_MARKER_LOG") != nullptr;
+    if (s_logMarkers)
+    {
+        static uint32_t s_logged = 0u;
+        if (s_logged < 8u)
+        {
+            const GSDrawState state = currentDrawState(context);
+            ++s_logged;
+            std::fprintf(stderr,
+                         "[GS-marker] group=%llu ctx=%d tex0=%#llx alpha=%#llx test=%#llx scissor=%u,%u..%u,%u\n",
+                         static_cast<unsigned long long>(group), (context != 0) ? 1 : 0,
+                         static_cast<unsigned long long>(state.context.tex0.tbp0) |
+                             (static_cast<unsigned long long>(state.context.tex0.psm) << 20),
+                         static_cast<unsigned long long>(state.context.alpha),
+                         static_cast<unsigned long long>(state.context.test), state.context.scissor.x0,
+                         state.context.scissor.y0, state.context.scissor.x1, state.context.scissor.y1);
+        }
+    }
+    // The rasteriser keeps the marker where it is: a backend that draws native groups itself (GSNativeBackend)
+    // flushes the batch collected so far and calls the hook with this state; one that does not (CPU, parallel-gs)
+    // inherits the empty default and draws nothing.
+    m_backend->NativeDraw(group, currentDrawState(context));
 }
 
 void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)

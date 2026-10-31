@@ -9,6 +9,9 @@
 #include "runtime/gs/gs_parallel_backend.h"
 #include "../src/lib/native/native_gl_backend.h"
 #endif
+#if defined(PS2X_HAVE_NATIVE_GS)
+#include "runtime/gs/gs_native_backend.h"
+#endif
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -735,20 +738,44 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+        // The GS rasteriser. All four choices are fed by the same GIF decoding in gs_frontend.cpp; they differ only
+        // in who rasterises:
+        //   PS2X_GS_RENDERER=native - GSNativeBackend (boubou666/PS2Recomp's native GS): OpenGL on a context shared
+        //                             with the window, drawing into GPU render targets and handing the picture over
+        //                             as a texture (PresentationFrame::glTexture) instead of reading pixels back.
+        //   PS2X_GS_NATIVE=1        - the earlier GL bridge over ps2x::native::Backend (src/lib/native).
+        //   PS2X_GS_CPU=1           - the software rasteriser GS::init() installs.
+        //   default                 - parallel-gs.
+        bool gsBackendInstalled = false;
+#if defined(PS2X_HAVE_NATIVE_GS)
+        if (const char *const renderer = std::getenv("PS2X_GS_RENDERER");
+            renderer != nullptr && std::string_view(renderer) == "native")
+        {
+            if (GLFWwindow *shared = GSNativeBackend::createSharedContext())
+            {
+                m_gs.setRasterBackend(std::make_unique<GSNativeBackend>(shared));
+                gsBackendInstalled = true;
+            }
+            else
+            {
+                std::cerr << "[GS-native] PS2X_GS_RENDERER=native but no shared GL context could be created; "
+                             "keeping the default rasteriser" << std::endl;
+            }
+        }
+#endif
 #ifdef PS2X_GS_PARALLEL
         // PS2X_GS_NATIVE=1 draws the GS seam through the host GPU (src/lib/native)
         // instead of parallel-gs, keeping gs_frontend's GIF decoding. Falls back to
         // the default backend when no GL context is current, so a failure here
         // cannot break a working run.
-        bool nativeInstalled = false;
-        if (std::getenv("PS2X_GS_NATIVE") != nullptr)
+        if (!gsBackendInstalled && std::getenv("PS2X_GS_NATIVE") != nullptr)
         {
             constexpr uint32_t kGsVramBytes = static_cast<uint32_t>(PS2_GS_VRAM_SIZE);
             uint8_t *gsVram = m_memory.getGSVRAM();
             if (auto native = ps2x::native::createGlGsBackend(gsVram, kGsVramBytes))
             {
                 m_gs.setRasterBackend(std::move(native));
-                nativeInstalled = true;
+                gsBackendInstalled = true;
             }
             else
             {
@@ -760,7 +787,7 @@ bool PS2Runtime::initialize(const char *title)
         // Both backends are fed by the same GIF packet decoding, so running the
         // CPU one separates "our GIF/vertex decode is wrong" from "parallel-gs
         // rasterises it wrong" - the question the black phase has never answered.
-        if (!nativeInstalled && std::getenv("PS2X_GS_CPU") == nullptr)
+        if (!gsBackendInstalled && std::getenv("PS2X_GS_CPU") == nullptr)
         {
             m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
         }
