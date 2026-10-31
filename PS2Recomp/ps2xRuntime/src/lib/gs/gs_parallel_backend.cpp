@@ -886,6 +886,68 @@ namespace
             }
         }
 
+        // Session 58s: packet-boundary history. The bogus NLOOP=0x7FFF tag is read because the backend ENTERS a
+        // packet with an open IMAGE tag one qword short, so the boundary that went wrong is the PREVIOUS packet.
+        // Keep the last 32 packet boundaries and dump them alongside the bad tag.
+        struct PktHist
+        {
+            uint32_t path = 0u, size = 0u;
+            uint32_t entryLoop = 0u, entryNloop = 0u, entryFlg = 0u, entryReg = 0u;
+            uint32_t exitLoop = 0u, exitNloop = 0u, exitFlg = 0u, exitReg = 0u;
+        };
+        PktHist m_pktHist[32];
+        uint32_t m_pktHistCount = 0u;
+        bool m_pktHistDumped = false;
+        // Bytes of the packet before the current one, so the bad tag can be shown in its true context.
+        uint8_t m_prevPkt[192] = {};
+        uint32_t m_prevPktSize = 0u;
+        uint32_t m_prevPktPath = 0u;
+
+        void recordPacket(uint32_t path, uint32_t size, bool entry)
+        {
+            const auto &gifPath = gs.get_gif_path(path & 3u);
+            if (entry)
+            {
+                m_pktHist[m_pktHistCount % 32u] = PktHist{};
+                PktHist &h = m_pktHist[m_pktHistCount % 32u];
+                h.path = path;
+                h.size = size;
+                h.entryLoop = gifPath.loop;
+                h.entryNloop = gifPath.tag.NLOOP;
+                h.entryFlg = gifPath.tag.FLG;
+                h.entryReg = gifPath.reg;
+            }
+            else
+            {
+                PktHist &h = m_pktHist[m_pktHistCount % 32u];
+                h.exitLoop = gifPath.loop;
+                h.exitNloop = gifPath.tag.NLOOP;
+                h.exitFlg = gifPath.tag.FLG;
+                h.exitReg = gifPath.reg;
+                ++m_pktHistCount;
+            }
+        }
+
+        void dumpPacketHistory()
+        {
+            if (m_pktHistDumped || m_pktHistCount == 0u)
+                return;
+            m_pktHistDumped = true;
+            const uint32_t first = m_pktHistCount > 32u ? m_pktHistCount - 32u : 0u;
+            std::fprintf(stderr, "[GS-hist] last %u packet boundaries before the bad tag:\n",
+                         m_pktHistCount - first);
+            for (uint32_t n = first; n < m_pktHistCount; ++n)
+            {
+                const PktHist &h = m_pktHist[n % 32u];
+                std::fprintf(stderr,
+                             "[GS-hist] p%u size=%u  entry(flg=%u nloop=%u loop=%u reg=%u) -> "
+                             "exit(flg=%u nloop=%u loop=%u reg=%u)%s\n",
+                             h.path, h.size, h.entryFlg, h.entryNloop, h.entryLoop, h.entryReg, h.exitFlg,
+                             h.exitNloop, h.exitLoop, h.exitReg,
+                             (h.exitFlg >= 2u && h.exitLoop < h.exitNloop) ? "   <= exited MID-IMAGE-TAG" : "");
+            }
+        }
+
         void printRawDbpStats(const char *when)
         {
             if (!m_rawEnabled)
@@ -1449,6 +1511,13 @@ namespace
                           << gs.get_gif_path(path).tag.NLOOP << " upLoop="
                           << gs.get_gif_path(path).loop << std::dec << std::endl;
             }
+
+            // Session 58s: keep this packet's bytes so the next packet's diagnostics can show the boundary that
+            // actually caused the inherited tag state.
+            m_prevPktPath = path;
+            m_prevPktSize = std::min<uint32_t>(size, static_cast<uint32_t>(sizeof(m_prevPkt)));
+            if (data != nullptr && m_prevPktSize != 0u)
+                std::memcpy(m_prevPkt, data, m_prevPktSize);
         }
 
         bool on_signal(uint64_t value) override
@@ -1595,6 +1664,17 @@ namespace
                 // tag/payload boundary is visible too.
                 dumpPacket("IMAGE tag with NLOOP=0x7FFF (PCSX2 has none)", m_dumpBadAt >= 80u ? m_dumpBadAt - 80u : 0u,
                            400u);
+                // And the PREVIOUS packet in full: the bad state was inherited from it.
+                std::fprintf(stderr, "[GS-pkt] PREVIOUS packet: path=%u size=%u\n", m_prevPktPath, m_prevPktSize);
+                const size_t prevLimit = std::min<size_t>(m_prevPktSize, sizeof(m_prevPkt));
+                for (size_t off = 0u; off < prevLimit; off += 16u)
+                {
+                    std::fprintf(stderr, "[GS-pkt] prev %04zx:", off);
+                    for (size_t i = 0u; i < 16u && off + i < prevLimit; ++i)
+                        std::fprintf(stderr, " %02x", m_prevPkt[off + i]);
+                    std::fputc('\n', stderr);
+                }
+                dumpPacketHistory();
             }
             // PS2X_DBP_STATS=1: the per-destination accounting observeGIF fed, reported on an exponential byte
             // threshold (16 KiB, 32 KiB, 64 KiB, 128 KiB, 256 KiB, 512 KiB, 1 MiB ...) rather than per packet, so the
@@ -1656,7 +1736,9 @@ namespace
                 m_scisPatch.clear();
                 if (m_scisPatched <= 5u || (m_scisPatched & 0x1FFull) == 0u)
                     std::cerr << "[GS-scisPatch] patched=" << m_scisPatched << std::endl;
+                recordPacket(path, size, true);
                 gs.gif_transfer(path, buf.data(), size);
+                recordPacket(path, size, false);
                 fixCt24Alpha();
                 logSamplerState();
                 dumpT4TextureOnce();
@@ -1666,7 +1748,9 @@ namespace
             else
             {
                 m_scisPatch.clear();
+                recordPacket(path, size, true);
                 gs.gif_transfer(path, data, size);
+                recordPacket(path, size, false);
                 fixCt24Alpha();
                 logSamplerState();
                 dumpT4TextureOnce();
