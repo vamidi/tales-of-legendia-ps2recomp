@@ -3580,6 +3580,49 @@ offending boundary will show as a packet whose IMAGE payload count does not matc
 3. VIF1 DIRECT block splitting (`ps2_vif1_interpreter.cpp` `submitGifPacket(GifPathId::Path2)`) emitting a chunk that
    is 16-aligned but not tag-aligned.
 
+### Session 58s - prime suspects worked: `fifoTail` cleared, and the off-by-one REPRODUCED - a packet ends exactly one qword short, so the next packet's tag qword is eaten as payload
+
+**Committed `d7606f4`.** Worked the prime suspects in order, by reading code first rather than spending runs.
+
+**Suspect 1 (`fifoTail` / `fifoOffset`) - ELIMINATED by reading.** Those members are used only by the local->host
+readback byte helper (`gs_parallel_backend.cpp:2131-2136`: `gs.read_transfer_fifo(fifoTail.data(), 1)` then
+`dst[i] = fifoTail[fifoOffset++]`). They do not buffer incoming GIF packets at all. Nothing to fix there.
+
+**Suspect 2 (parallel-gs `gif_transfer`) - code is correct, which is what made it findable.** `gs_interface.cpp:4300`:
+
+- entry does `size /= 16`, so `size` and `i` are in **qwords**;
+- PACKED consumes 1 qword/register and `path.reg`/`path.loop` advance exactly as the spec says;
+- REGLIST consumes 1 qword per 2 register writes (`16*nreg` bytes per loop) - correct, and the `break` on loop
+  completion plus the unconditional `i++` is exactly the odd-`nloop*nreg` half-qword pad;
+- IMAGE (line 4396) takes `num_loops = min(size - i, NLOOP - loop)`, i.e. one qword per payload qword - correct.
+
+So a *correct* backend desyncs **only** if it enters a packet with an open IMAGE tag. That is precisely what happens.
+
+**The reproduction.** `[GS-pkt]` now also dumps the packet before the bad one. They are **byte-for-byte identical** -
+the same 80-byte palette upload (`[IMAGE tag NLOOP=4][4 qwords]`, a grey ramp `ffffff00/08/11/19/...`) - and the
+boundary history shows the packet immediately before ending **one qword short**:
+
+```
+p2 size=96  entry(flg=0 nloop=1 loop=1) -> exit(flg=2 nloop=4 loop=0)   <= exited MID-IMAGE-TAG
+```
+
+A `[tag][1 A+D][4 qwords][IMAGE tag]` shape is 16+16+64+16 = **112 bytes**; that packet is **96**. It ends exactly
+**on** a tag header with zero payload outstanding, so the next packet's leading tag qword is consumed as payload:
+
+1. entry state: IMAGE tag open, `loop=0`, `NLOOP=4`;
+2. IMAGE branch takes `min(5-0, 4-0) = 4` qwords - absorbing the **tag header** `048000000000 0008` as payload;
+3. `i=4`, `loop=4`, so the next tag read lands at offset `0x40`, inside the palette;
+4. `0x19ffffff11ffffff` -> low 15 bits all ones -> **`NLOOP=0x7FFF`**.
+
+**Every other packet in the 32-entry window enters with a COMPLETE tag (`loop == nloop`)**, so this one boundary is
+the anomaly - which means a chunk is being delivered **one qword short**. That is the remaining question, and it is
+narrow now: *who* cuts the extra 16 bytes.
+
+**Next instrument (cheap, one run):** log, per packet, `size`, the first qword and the last qword, plus the DMA chunk
+sizes feeding path 2 (`ps2_vif1_interpreter.cpp` -> `submitGifPacket(GifPathId::Path2)` and
+`PS2Memory::processGIFPacket(srcPhysAddr, qwCount)`). If a chunk is 16 bytes short of a tag boundary, the split is in
+VIF1 DIRECT; if the chunks are tag-complete but our forwarder concatenates wrongly, it is in `processGIFPacket`.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
