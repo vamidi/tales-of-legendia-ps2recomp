@@ -241,9 +241,10 @@ namespace
             std::lock_guard<std::recursive_mutex> guard;
             explicit Lock(std::recursive_mutex &m) : guard(m) { Util::register_thread_index(0); }
         };
-        uint64_t bitblt = 0, trxreg = 0;
+        uint64_t bitblt = 0, trxreg = 0, trxposBits = 0;
         GSTransferSnapshot transfer;
         size_t transferBytes = 0, uploadedBytes = 0;
+        bool xferCompletionLogged = false;
         std::array<uint8_t, 8> uploadTail{};
         size_t uploadTailSize = 0;
         std::array<uint8_t, 16> fifoTail{};
@@ -256,6 +257,8 @@ namespace
                 bitblt = value;
             if (addr == GS_REG_TRXREG)
                 trxreg = value;
+            if (addr == GS_REG_TRXPOS)
+                trxposBits = value;
             if (addr == GS_REG_TRXDIR)
             {
                 transfer = {};
@@ -269,6 +272,28 @@ namespace
                 transfer.copiedPixels = transfer.direction == 2 ? transfer.totalPixels : 0;
                 uploadedBytes = uploadTailSize = 0;
                 fifoOffset = fifoTail.size();
+                xferCompletionLogged = false;
+                // PS2X_XFER_LOG=1: every GS transfer with both buffer pointers. Tales of Legendia draws into frame
+                // buffer 224 while DISPFB2 keeps pointing at 0 and never changes, so the only thing that can put a
+                // drawn logo on screen is a direction-2 copy (VRAM->VRAM); direction 0 is host->local (an upload),
+                // 1 is local->host (a readback).
+                static const bool s_logXfer = std::getenv("PS2X_XFER_LOG") != nullptr;
+                if (s_logXfer)
+                {
+                    static uint64_t s_xfers = 0u;
+                    const uint64_t n = s_xfers++;
+                    if (n < 96u || (n % 512u) == 0u)
+                        std::fprintf(stderr,
+                                     "[XFER] #%llu dir=%u src(sbp=0x%x sbw=%u spsm=0x%x) dst(dbp=0x%x dbw=%u dpsm=0x%x) "
+                                     "rect=%u,%u %ux%u px=%u bytes=%zu\n",
+                                     static_cast<unsigned long long>(n), transfer.direction,
+                                     unsigned(bitblt & 0x3FFFu), unsigned((bitblt >> 16) & 0x3Fu),
+                                     unsigned((bitblt >> 24) & 0x3Fu), unsigned((bitblt >> 32) & 0x3FFFu),
+                                     unsigned((bitblt >> 48) & 0x3Fu), unsigned((bitblt >> 56) & 0x3Fu),
+                                     unsigned(trxposBits & 0x7FFu), unsigned((trxposBits >> 16) & 0x7FFu),
+                                     unsigned(trxreg & 0xFFFu), unsigned((trxreg >> 32) & 0xFFFu),
+                                     transfer.totalPixels, transferBytes);
+                }
             }
 
             if (addr == GS_REG_HWREG)
@@ -285,6 +310,16 @@ namespace
             {
                 transfer.x = transfer.copiedPixels % width;
                 transfer.y = transfer.copiedPixels / width;
+            }
+            // PS2X_XFER_LOG=1: whether the upload actually delivered the whole rectangle. A copy whose payload never
+            // completes is indistinguishable from "nothing drawn" further down the pipeline.
+            static const bool s_logXfer = std::getenv("PS2X_XFER_LOG") != nullptr;
+            if (s_logXfer && !xferCompletionLogged && transferBytes != 0 && uploadedBytes >= transferBytes)
+            {
+                xferCompletionLogged = true;
+                std::fprintf(stderr, "[XFER] complete dbp=0x%x %ux%u px=%u bytes=%zu\n",
+                             unsigned((bitblt >> 32) & 0x3FFFu), unsigned(trxreg & 0xFFFu),
+                             unsigned((trxreg >> 32) & 0xFFFu), transfer.totalPixels, transferBytes);
             }
         }
 

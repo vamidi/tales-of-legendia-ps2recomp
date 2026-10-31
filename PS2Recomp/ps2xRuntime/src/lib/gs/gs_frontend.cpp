@@ -2129,6 +2129,27 @@ static void ps2xProbe2dDraw(const GS &gs, const GSPrimitiveBatch &batch)
         return;
     static uint64_t s_draws = 0u;
     const uint64_t index = s_draws++;
+    // PS2X_2D_PROBE=1 summary: per 512-draw *window*, so the loading phase and the black phase separate instead of
+    // averaging into one cumulative ratio. A fade that stops advancing shows up as whole windows at blackColour=100%.
+    static uint64_t s_black = 0u, s_textured = 0u;
+    const GSDrawState &st0 = batch.state;
+    const GSVertex &v00 = batch.vertices[0];
+    const bool colourZero = (v00.r | v00.g | v00.b | v00.a) == 0u;
+    if (colourZero)
+        ++s_black;
+    if (st0.prim.tme)
+        ++s_textured;
+    if (index != 0u && (index % 512u) == 0u)
+    {
+        std::fprintf(stderr,
+                     "[2Dsum] draws %llu-%llu: blackColour=%llu (%.1f%%) textured=%llu last=(prim=%u tme=%u rgba=%02x%02x%02x%02x)\n",
+                     static_cast<unsigned long long>(index - 511u), static_cast<unsigned long long>(index),
+                     static_cast<unsigned long long>(s_black), 100.0 * static_cast<double>(s_black) / 512.0,
+                     static_cast<unsigned long long>(s_textured), static_cast<unsigned>(st0.prim.type),
+                     st0.prim.tme ? 1u : 0u, v00.r, v00.g, v00.b, v00.a);
+        s_black = 0u;
+        s_textured = 0u;
+    }
     if (index >= 12u && (index % 512u) != 0u)
         return;
 
