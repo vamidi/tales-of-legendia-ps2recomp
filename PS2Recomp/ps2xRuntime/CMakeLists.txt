@@ -436,6 +436,16 @@ if(PS2X_GS_BACKEND STREQUAL "PARALLEL_GS")
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ParallelGS.cmake")
 endif()
 
+# The native GS renderer (GSNativeBackend, from boubou666/PS2Recomp's sc3/native-vu1 branch): OpenGL 3.3 through
+# raylib's own loader, drawing on a GLFW context shared with the window. Its own translation unit, because it needs
+# raylib's internal headers and must not pull them into the runtime's unity groups.
+if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID AND DEFINED raylib_SOURCE_DIR)
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_native_backend.cpp)
+    set_source_files_properties(src/lib/gs/gs_native_backend.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON
+        INCLUDE_DIRECTORIES "${raylib_SOURCE_DIR}/src;${raylib_SOURCE_DIR}/src/external/glfw/include")
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_HAVE_NATIVE_GS=1)
+endif()
+
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1
