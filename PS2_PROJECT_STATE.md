@@ -2944,6 +2944,46 @@ Open items: the captured image still needs a VU microprogram disassembler to say
 (no VU disassembler in our tree; the sc3 branch's `ps2_vu1_replay` tool has one recipe); the "which program
 draws" column is empty by *state*, not by bug.
 
+### Session 58b - BLACK PHASE: texture path exonerated, geometry rasterises, and the display source does not match the draw target
+
+**Phase confirmed from observation:** after "NOW LOADING" the game shows **logo screens** (Namco, Project Melfes,
+Sofdec ADX) and then an **MPG video**. Our port is stuck on the *logo screens*, before the movie: **0 `sceMpeg`
+calls and 0 writes to the IPU register window `0x10002000-0x10003000`** in 80-130 s runs, `MOVIE.AFS` mounted but
+never read. A movie would produce no draw calls at all (IPU -> GS image data), so empty VU1/PATH1 is meaningless
+there - but that is not where we are.
+
+**A/B on the production (parallel-gs) path, 130 s each, phase census `nzWords`:**
+
+| case | loading | black phase |
+|---|---|---|
+| baseline | 98728 | **600** |
+| `PS2X_FORCE_NOTEX=1` (texture off -> vertex colour) | 98728 | **600** (byte-identical, even `nzCtx0=30 nzCtx1=37`) |
+| `PS2X_FORCE_RGBAQ=1` (bright opaque colour) | 296360 | **116310** |
+
+So: **the texture/CLUT path is not the cause** (forcing vertex colour changes nothing), and **the geometry is
+submitted and rasterises** (forcing a bright colour fills VRAM 600 -> 116310). The primitives are drawn with
+colour 0 - black on black.
+
+**But the displayed frame stays black even then.** `gs_frame2_forced3000.bmp` (tick 3000, FORCE_RGBAQ) analysed
+with `.opencode/tmp/bmp-analyze.ps1`: `nonBlack=1024 (0.45%)`, top colours `#393939`x512 `#3d3d3d`x512,
+`rows with pixels (2): 0:512 447:512` - i.e. **only the first and last scanline**, everything else black.
+
+**That points at display pairing, not drawing.** The draws land in the context frame `fbp=224` (`ctx0frame=224/8`),
+while `[GS-m] DISPFB2 val=0x1000 fbp=0 fbw=8` - the display reads **fbp 0**. `DISPFB2` never changes and
+`flips=0,0` all run, so the game's own buffer swap never reaches us (or never happens). Either way the frame we
+present is a buffer nothing has drawn into. That is now the leading explanation for the 0.0 % black phase and it
+is consistent with every earlier observation (session 48-53: "primitives that draw no pixels" - they draw, into a
+different buffer).
+
+Next: instrument the display side - every DISPFB1/DISPFB2 write with the writer's pc, and the drawing context's
+frame at present time - to see whether the guest ever points DISPFB at 224. Our `updatePreferredDisplaySourceForDraw`
+/ `m_preferredDisplayDestFbp` heuristic exists exactly for this and may be choosing wrong.
+
+Tooling note: `.opencode/tmp/bmp-analyze.ps1` summarises a 24-bit BMP dump (coverage, bbox, top colours, rows with
+pixels, brightness map). PowerShell array indexing bit twice; it uses a hashtable accumulator now.
+`PS2X_2D_PROBE` only works on batch backends (parallel-gs is raw: `UsesRawCommands()` at
+`gs_parallel_backend.cpp:766` bypasses the frontend entirely).
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
