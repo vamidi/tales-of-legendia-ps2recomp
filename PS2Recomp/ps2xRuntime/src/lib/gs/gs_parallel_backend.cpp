@@ -310,7 +310,29 @@ namespace
             }
 
             if (addr == GS_REG_HWREG)
+            {
+                // PS2X_XFER_STATE=1: our transfer mirror beside parallel-gs's own, at the moment payload bytes flow.
+                // If its trxdir says 0 while we are accumulating bytes, it is discarding data we happily count - the
+                // gap between "1 MB received" and "44 bytes in VRAM".
+                static const bool s_logState = std::getenv("PS2X_XFER_STATE") != nullptr;
+                if (s_logState && transfer.direction == 0 && transferBytes != 0u)
+                {
+                    static uint32_t s_n = 0u;
+                    if (s_n < 16u)
+                    {
+                        ++s_n;
+                        const auto &rs = gs.get_register_state();
+                        std::fprintf(stderr,
+                                     "[GS-xferstate] #%u ours{dir=%u dbp=0x%x need=%zu up=%zu} theirs{trxdir=%llu "
+                                     "dbp=0x%llx trxreg=0x%llx}\n",
+                                     s_n, transfer.direction, unsigned((bitblt >> 32) & 0x3FFFu), transferBytes,
+                                     uploadedBytes, static_cast<unsigned long long>(rs.trxdir.bits & 3u),
+                                     static_cast<unsigned long long>((rs.bitbltbuf.bits >> 32) & 0x3FFFu),
+                                     static_cast<unsigned long long>(rs.trxreg.bits));
+                    }
+                }
                 observeImage(8);
+            }
         }
         void observeImage(size_t bytes)
         {
