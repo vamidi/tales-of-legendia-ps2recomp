@@ -3231,6 +3231,27 @@ preserved, written through `gs.write_register(0x5A)`. It fires as expected -
 screen again (all censuses 98728), so its effect on the black phase is not yet demonstrated.** A 300 s run with
 the override is the outstanding acceptance test.
 
+### Session 58l - the probes themselves were deciding the boot race (methodology, applies to every future run)
+
+Hard evidence: three consecutive 210 s runs with the page watch (8 KB VRAM hash every 8th packet) *and* the CT24
+guard (a full register-state read per packet) **never left the loading phase** (all censuses 98728). The next run
+with **nothing** enabled transitioned on the **first** attempt: `98728 -> 98728 -> 600`, tick 3440.
+
+So the instrumentation was pushing the port into its known "outcome A" boot race - exactly the class of
+self-inflicted result session 27 recorded, where a per-dispatch `memcpy` in a probe flipped A/B. Consequences:
+
+- `PS2X_CT24_FIX` is now **opt-in** (it never fires on ToL, so it must not cost anything by default).
+- `PS2X_WATCH_PAGE` samples **every 4096th packet** (was every 8th).
+- `PS2X_WATCH_PAGE` was hung off the `[GS-census]` block, which requires 256 KB of GIF bytes *in the backend's own
+  counter* and never fired at all - which is why the watch looked silent on a healthy run. It is back in the
+  post-packet hook, where it actually runs.
+- Note `census: nzWords=` lines come from the frontend's `[FB-dump]`; `[GS-census]` is a different counter in
+  `gs_parallel_backend.cpp`. Grepping "census" mixes them.
+
+**Rule for the next session: any probe that runs per packet must be assumed to change the boot outcome.** Measure
+with stride/thresholds, verify a baseline still transitions, and re-check any "no transition" result before
+believing it.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
