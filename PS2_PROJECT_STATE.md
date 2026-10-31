@@ -3252,6 +3252,77 @@ self-inflicted result session 27 recorded, where a per-dispatch `memcpy` in a pr
 with stride/thresholds, verify a baseline still transitions, and re-check any "no transition" result before
 believing it.
 
+### Session 58m - ANSWERED: 0x3FF000 is set up 518 times and NEVER receives an IMAGE payload; forwarding does not truncate
+
+**Committed `0240918`.** `PS2X_DBP_STATS=1` parses the raw GIF stream and measures payload delivered per BITBLTBUF
+destination - `DBP` plus the following IMAGE tag's `NLOOP` - and compares it with what a 32x16/64x64 T4 needs
+(256 B / 2048 B). This was the last probe the black-phase diagnosis was waiting on. It answers the question in the
+direction the earlier sessions could not resolve: **the stall is upstream of the GS.**
+
+Run: 220 s, censuses `98728 -> 0 -> 600` (black phase genuinely reached), 14,680,144 bytes of GIF traffic.
+
+```
+[GS-dbp] threshold gifBytes=8388640 destinations=8
+  dbp=0x0000 blt=15  dir=3/0/0     rect=24x20     tags=0  bytes=0          <= SET UP, NO IMAGE PAYLOAD
+  dbp=0x0009 blt=44  dir=7/0/0     rect=8x2       tags=0  bytes=0          <= SET UP, NO IMAGE PAYLOAD
+  dbp=0x01d0 blt=3   dir=0/0/0     rect=0x0       tags=0  bytes=0          <= SET UP, NO IMAGE PAYLOAD
+  dbp=0x24d0 blt=3   dir=0/0/0     rect=8x2       tags=0  bytes=0          <= SET UP, NO IMAGE PAYLOAD
+  dbp=0x3a70 blt=20  dir=8/0/0     rect=24x12     tags=8  bytes=512        (delivered == declared)
+  dbp=0x3a80 blt=17  dir=11/0/0    rect=1488x1488 tags=8  bytes=84480      (delivered == declared)
+  dbp=0x3ff0 blt=518 dir=262/0/0   rect=8x2       tags=0  bytes=0          <= SET UP, NO IMAGE PAYLOAD
+  dbp=0x3ff4 blt=521 dir=780/0/0   rect=8x2       tags=4  bytes=1048672
+```
+
+**1. Forwarding does NOT truncate.** For every well-formed transfer `delivered == declared` *and* `NLOOP * 16`
+equals `rect * bpp / 8` exactly. `[GS-img]` prints the true BITBLTBUF/IMAGE pairing, rect in force at each tag:
+
+| destination | NLOOP | bytes | TRXREG rect | expected at CT32 | verdict |
+|---|---|---|---|---|---|
+| 0x3a70 (CLUT) | 4 qw | 64 B | 8x2 | 8*2*4 = 64 | exact |
+| 0x3a80 (texture) | 1024 qw | 16384 B | 128x32 | 128*32*4 = 16384 | exact |
+| 0x3a80 | 128 qw | 2048 B | 32x16 | 32*16*4 = 2048 | exact |
+| 0x3a80 | 16 qw | 256 B | 8x8 | 8*8*4 = 256 | exact |
+| 0x3ff4 | **32767 qw** | **524272 B** | 8x2 | 8*2*4 = **64** | **8192x too big** |
+
+**2. `0x3FF0` is never fed.** `[GS-blt]` shows the guest *does* name it, and with the right format:
+`dbp=0x3ff0 dbw=1 dpsm=0x14` (**DPSM = T4**) - 518 BITBLTBUF writes, 262 TRXDIR writes with `dir=0`, and TRXREG
+rects of `24x16` / `8x2`. `[GS-xtr]` (bounded 40-event trace armed at the first such setup) shows a **complete**
+setup - `BITBLTBUF 0x3ff0 -> TRXREG 0x3ff0 rect=24x16 -> TRXDIR 0x3ff0 dir=0` - followed immediately by the next
+`BITBLTBUF` with **no IMAGE tag in between**. Across 8 MiB: **518 setups, zero payload bytes, `tags=0`.**
+Page watch agrees: `0x3FF000` goes 0 -> **44 non-zero bytes** and never grows.
+
+So the sprite at `tbp0=0x3ff0 T4 64x64 cbp=0x3ff4` (confirmed again in a `phase=black` `[GS-reg]` window) samples a
+page the guest starts to upload 518 times and never supplies. **Not our forwarding.**
+
+**3. NEW LEAD, and it is large.** Three IMAGE tags declare `NLOOP=0x7FFF` (524,272 B each) on `dbp=0x3ff4` where
+TRXREG says `8x2` (64 B) - a factor of **8192**. Those three tags are 1.57 MB of the run's 2.18 MB of
+`imageBytes`: **most of the GIF stream is being consumed as bogus image payload.** 524,272 B is one qword short of
+524,288 = a 1024x1024 T4, so the tag *shape* looks like a real large upload, but the destination and rect do not
+match it. Either the guest really streams that and our TRXREG/BITBLTBUF pairing is wrong, or those tags are
+mis-framed and are eating real commands (which would itself explain the missing 0x3FF0 payload: it would be inside
+the swallowed 1.5 MB). **Resolve this before believing any per-destination rect** - `[GS-xtr]` shows the guest does
+*not* write BITBLTBUF/TRXREG/TRXDIR in a fixed order (`TRXDIR` before `TRXREG` is common), so NLOOP is trustworthy
+per tag but the rect attached to it is not.
+
+**Methodology, two traps paid for:**
+- **Do not add a second tag walker.** The first version of this probe walked the stream itself. It desynced
+  (REGLIST register words are **8 bytes**, not 16 - the frontend gets this right, `observeGIF`'s own walk does not)
+  and, even after that fix, disagreed with parallel-gs's own state (`FLG=0 NLOOP=0x7FF8` vs `FLG=3 NLOOP=0x7FFF`).
+  It produced a clean-looking but wrong table (`0x3ff4` soaking up 2.7 MB). The probe now hooks `observeGIF`'s
+  decode. **The built-in correctness check for any tag walker is `[GS-census] ourFLG/ourNLOOP/ourLoop` vs
+  `upFLG/upNLOOP/upLoop`** - they must agree.
+- **Print thresholds must start low.** A 4 MiB threshold reported nothing at all, because some runs submit only
+  **82 KB** of GIF traffic (5 x 16400-byte VIF1 DIRECT blocks) and then stall. Thresholds are now exponential from
+  16 KiB.
+- The transition is genuinely racy and independent of the probe: two clean baselines with no probe at all also
+  stayed at 98728, while the 58l baseline transitioned at tick 3000 with the *same* 5 GIF packets. Retry up to 3x
+  at 220 s; every attempt-1 of the last four probe runs did transition.
+
+**Next:** explain the three `NLOOP=0x7FFF` tags on `0x3ff4` (are they mis-framed, or a real 512 KB stream?), then
+follow the 0x3FF0 payload upstream - the guest completes the transfer setup and never sends data, so the missing
+piece is whatever is supposed to produce it (the CRI/AFS + IOP RPC path that session 58l's logs show stalling on
+`sid=0x80000597 still unclaimed`, at ~190 ms per round, is the prime suspect).
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
