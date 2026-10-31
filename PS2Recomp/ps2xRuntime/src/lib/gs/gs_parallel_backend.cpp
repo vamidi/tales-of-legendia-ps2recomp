@@ -898,10 +898,11 @@ namespace
         PktHist m_pktHist[32];
         uint32_t m_pktHistCount = 0u;
         bool m_pktHistDumped = false;
-        // Bytes of the packet before the current one, so the bad tag can be shown in its true context.
-        uint8_t m_prevPkt[192] = {};
-        uint32_t m_prevPktSize = 0u;
-        uint32_t m_prevPktPath = 0u;
+        // Bytes of the two packets before the current one, so the bad tag can be shown in its true context.
+        uint8_t m_prevPkt[2][192] = {};
+        uint32_t m_prevPktSize[2] = {0u, 0u};
+        uint32_t m_prevPktPath[2] = {0u, 0u};
+        uint32_t m_prevPktSlot = 0u;
 
         void recordPacket(uint32_t path, uint32_t size, bool entry)
         {
@@ -1514,10 +1515,11 @@ namespace
 
             // Session 58s: keep this packet's bytes so the next packet's diagnostics can show the boundary that
             // actually caused the inherited tag state.
-            m_prevPktPath = path;
-            m_prevPktSize = std::min<uint32_t>(size, static_cast<uint32_t>(sizeof(m_prevPkt)));
-            if (data != nullptr && m_prevPktSize != 0u)
-                std::memcpy(m_prevPkt, data, m_prevPktSize);
+            m_prevPktPath[m_prevPktSlot] = path;
+            m_prevPktSize[m_prevPktSlot] = std::min<uint32_t>(size, static_cast<uint32_t>(sizeof(m_prevPkt[0])));
+            if (data != nullptr && m_prevPktSize[m_prevPktSlot] != 0u)
+                std::memcpy(m_prevPkt[m_prevPktSlot], data, m_prevPktSize[m_prevPktSlot]);
+            m_prevPktSlot = (m_prevPktSlot + 1u) % 2u;
         }
 
         bool on_signal(uint64_t value) override
@@ -1664,15 +1666,20 @@ namespace
                 // tag/payload boundary is visible too.
                 dumpPacket("IMAGE tag with NLOOP=0x7FFF (PCSX2 has none)", m_dumpBadAt >= 80u ? m_dumpBadAt - 80u : 0u,
                            400u);
-                // And the PREVIOUS packet in full: the bad state was inherited from it.
-                std::fprintf(stderr, "[GS-pkt] PREVIOUS packet: path=%u size=%u\n", m_prevPktPath, m_prevPktSize);
-                const size_t prevLimit = std::min<size_t>(m_prevPktSize, sizeof(m_prevPkt));
-                for (size_t off = 0u; off < prevLimit; off += 16u)
+                // And the two preceding packets in full: the bad state was inherited from them.
+                for (uint32_t back = 1u; back <= 2u; ++back)
                 {
-                    std::fprintf(stderr, "[GS-pkt] prev %04zx:", off);
-                    for (size_t i = 0u; i < 16u && off + i < prevLimit; ++i)
-                        std::fprintf(stderr, " %02x", m_prevPkt[off + i]);
-                    std::fputc('\n', stderr);
+                    const uint32_t slot = (m_prevPktSlot + 2u - back) % 2u;
+                    std::fprintf(stderr, "[GS-pkt] packet -%u: path=%u size=%u\n", back, m_prevPktPath[slot],
+                                 m_prevPktSize[slot]);
+                    const size_t prevLimit = std::min<size_t>(m_prevPktSize[slot], sizeof(m_prevPkt[0]));
+                    for (size_t off = 0u; off < prevLimit; off += 16u)
+                    {
+                        std::fprintf(stderr, "[GS-pkt] -%u %04zx:", back, off);
+                        for (size_t i = 0u; i < 16u && off + i < prevLimit; ++i)
+                            std::fprintf(stderr, " %02x", m_prevPkt[slot][off + i]);
+                        std::fputc('\n', stderr);
+                    }
                 }
                 dumpPacketHistory();
             }
