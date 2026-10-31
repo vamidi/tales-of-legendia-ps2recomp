@@ -510,7 +510,7 @@ namespace
             static uint64_t s_lastHash = ~0ull;
             static uint64_t s_prints = 0u;
             ++s_checks;
-            if (s_checks > 64u && (s_checks & 7u) != 0u)
+            if (s_checks > 32u && (s_checks % 4096u) != 0u)
                 return;
             const auto *vram = static_cast<const uint8_t *>(gs.map_vram_read(0, VramSize));
             if (vram == nullptr || static_cast<uint64_t>(s_base) >= VramSize)
@@ -1064,6 +1064,7 @@ namespace
                 ++s_gifPrints;
                 printUploadStats("census");
                 scanVramForPalette();
+                watchPage();
                 std::cerr << "[GS-census] bytes=" << s_gifBytes << " tags=" << s_gifTags
                           << " imageBytes=" << s_gifImageBytes << " drawTags=" << s_gifDrawTags
                           << " dir=" << unsigned(transfer.direction) << " need=" << transferBytes
