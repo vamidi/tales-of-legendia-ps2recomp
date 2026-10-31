@@ -811,6 +811,28 @@ namespace
             std::fprintf(stderr, "[GS-dbp] %s gifBytes=%llu destinations=%zu current=0x%04x\n", when,
                          static_cast<unsigned long long>(m_rawBytes), m_rawDbp.size(),
                          m_rawHaveDbp ? m_rawDbpCurrent : 0xFFFFFFFFu);
+            // The page watch's 8 KiB window at 0x3FF000 also contains the CLUT at 0x3FF400, so "0x3FF000 has 44
+            // non-zero bytes" has never distinguished the texture page from its palette. Break the window into
+            // 256-byte pages: 0x3FF000..0x3FF3FF is the texture, 0x3FF400.. is the CLUT.
+            if (const auto *vram = static_cast<const uint8_t *>(gs.map_vram_read(0, VramSize)))
+            {
+                std::fprintf(stderr, "[GS-dbp]   pages 0x3ff000:");
+                for (uint32_t pg = 0u; pg < 8u; ++pg)
+                {
+                    uint32_t nz = 0u;
+                    const uint32_t base = 0x3FF000u + pg * 256u;
+                    if (base + 256u <= VramSize)
+                    {
+                        for (uint32_t i = 0u; i < 256u; ++i)
+                        {
+                            if (vram[base + i] != 0u)
+                                ++nz;
+                        }
+                    }
+                    std::fprintf(stderr, " %u", nz);
+                }
+                std::fputc('\n', stderr);
+            }
             for (const auto &kv : m_rawDbp)
             {
                 const RawDbp &d = kv.second;
@@ -854,6 +876,7 @@ namespace
             static uint64_t s_gifDrawTags = 0u;
             static uint64_t s_gifTags = 0u;
             static uint64_t s_flg[4] = {0u, 0u, 0u, 0u};
+            static uint64_t s_zeroNloop[4] = {0u, 0u, 0u, 0u}; // tags seen with NLOOP == 0, by FLG
             static uint32_t s_gifPrints = 0u;
             // Session 39: the census tracks *bytes*, which cannot distinguish
             // "the guest stopped submitting geometry" from "the guest submits
@@ -1020,6 +1043,12 @@ namespace
                     state.reg = state.loop = 0;
                     ++s_gifTags;
                     ++s_flg[state.tag.FLG & 3u];
+                    // Session 58n: a texture upload the guest sets up and then never feeds would look exactly like
+                    // this if the IMAGE tag it emits has NLOOP == 0 - the tag is consumed as a header with no payload,
+                    // so every payload counter reports nothing. Count zero-length tags by FLG to tell "the guest sends
+                    // an empty image packet" from "the guest sends no image packet at all".
+                    if (state.tag.NLOOP == 0u)
+                        ++s_zeroNloop[state.tag.FLG & 3u];
                     // Session 45: every conclusion about *why* nothing rasterises
                     // has rested on this walk's decoded register values, and those
                     // are now known to be mis-paired (FRAME_1 read as 0x80070 while
@@ -1296,7 +1325,8 @@ namespace
                           << " XY2=0x" << s_xyoff2 << " v0=0x" << s_xyzSample[0] << " v1=0x"
                           << s_xyzSample[1] << " v2=0x" << s_xyzSample[2]
                           << " flg=" << s_flg[0] << "/" << s_flg[1] << "/" << s_flg[2] << "/"
-                          << s_flg[3] << " ourFLG=" << unsigned(state.tag.FLG) << " ourNLOOP="
+                          << s_flg[3] << " zeroNLOOP=" << s_zeroNloop[0] << "/" << s_zeroNloop[1] << "/"
+                           << s_zeroNloop[2] << "/" << s_zeroNloop[3] << " ourFLG=" << unsigned(state.tag.FLG) << " ourNLOOP="
                           << state.tag.NLOOP << " ourLoop=" << state.loop << " upFLG="
                           << unsigned(gs.get_gif_path(path).tag.FLG) << " upNLOOP="
                           << gs.get_gif_path(path).tag.NLOOP << " upLoop="
