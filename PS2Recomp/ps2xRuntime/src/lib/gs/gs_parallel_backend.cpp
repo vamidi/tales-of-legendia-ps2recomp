@@ -467,6 +467,48 @@ namespace
             std::fprintf(stderr, "    sampled=%lu rejectedByAlphaTest=%lu\n", sampled, sampledZeroAlpha);
         }
 
+        // PS2X_WATCH_PAGE=<hex byte address> (default 0x3FF000): hash one 8 KB GS page in VRAM after each packet and
+        // report when it changes. Answers "does the guest ever upload the texture the logo sprites sample" without
+        // trusting our register mirror - BITBLTBUF is not seen on every path, so PS2X_IMAGE_DUMP can stay silent
+        // while an upload really happens. Throttled to every 8th packet after the first 64; prints at most 8 changes.
+        void watchPage()
+        {
+            static const char *const s_env = std::getenv("PS2X_WATCH_PAGE");
+            if (s_env == nullptr)
+                return;
+            static const uint32_t s_base =
+                (s_env[0] != '\0') ? static_cast<uint32_t>(std::strtoul(s_env, nullptr, 16)) : 0x3FF000u;
+            static uint64_t s_checks = 0u;
+            static uint64_t s_lastHash = ~0ull;
+            static uint64_t s_prints = 0u;
+            ++s_checks;
+            if (s_checks > 64u && (s_checks & 7u) != 0u)
+                return;
+            const auto *vram = static_cast<const uint8_t *>(gs.map_vram_read(0, VramSize));
+            if (vram == nullptr || static_cast<uint64_t>(s_base) >= VramSize)
+                return;
+            const uint32_t watchBytes = std::min<uint32_t>(8192u, static_cast<uint32_t>(VramSize - s_base));
+            const uint8_t *page = vram + s_base;
+            uint64_t hash = 1469598103934665603ull;
+            uint32_t nonZero = 0u;
+            for (uint32_t i = 0u; i < watchBytes; ++i)
+            {
+                hash ^= page[i];
+                hash *= 1099511628211ull;
+                if (page[i] != 0u)
+                    ++nonZero;
+            }
+            if (hash == s_lastHash)
+                return;
+            const bool first = s_lastHash == ~0ull;
+            s_lastHash = hash;
+            if (s_prints++ >= 8u)
+                return;
+            std::fprintf(stderr, "[GS-page] %s base=0x%x nonZeroBytes=%u hash=0x%016llx check=%llu\n",
+                         first ? "initial" : "changed", s_base, nonZero, static_cast<unsigned long long>(hash),
+                         static_cast<unsigned long long>(s_checks));
+        }
+
         // Observe transfer boundaries only; the upstream decoder alone executes commands.
         // Start from upstream's saved PATH state, including packets split across DMA calls.
         void observeGIF(uint32_t path, const uint8_t *data, size_t size)
@@ -1084,6 +1126,7 @@ namespace
                 fixCt24Alpha();
                 logSamplerState();
                 dumpT4TextureOnce();
+                watchPage();
             }
             else
             {
@@ -1092,6 +1135,7 @@ namespace
                 fixCt24Alpha();
                 logSamplerState();
                 dumpT4TextureOnce();
+                watchPage();
             }
             // Session 41: parallel-gs's own accounting.  Everything in the
             // census above only proves what *we* parsed; this proves what it
