@@ -1013,6 +1013,20 @@ namespace
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    // PS2X_PATH_LOG=1: every packet as it reaches the frontend, with the size and whether the raw forwarder accepts it.
+    // The raw branch below forwards only 16-byte-multiple sizes and silently drops anything else, which is how a
+    // texture upload can vanish; this shows which path and sizes the guest actually uses.
+    if (std::getenv("PS2X_PATH_LOG") != nullptr)
+    {
+        static uint32_t s_prints = 0u;
+        if (s_prints < 48u)
+        {
+            ++s_prints;
+            std::fprintf(stderr, "[GS-path] #%u path=%u size=%u aligned=%u raw=%u\n", s_prints, path, sizeBytes,
+                         (sizeBytes & 15u) == 0u ? 1u : 0u,
+                         (m_backend && m_backend->UsesRawCommands()) ? 1u : 0u);
+        }
+    }
     if (m_backend && m_backend->UsesRawCommands())
     {
         if (data && sizeBytes && (sizeBytes & 15u) == 0u)
