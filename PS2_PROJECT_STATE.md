@@ -3078,6 +3078,33 @@ line reported all zeros for `psm=0x14`, which is suspicious in itself and may be
 texels through `pixelAccess(psm).read`. A correct T4 texel dump is the next instrument, not another global
 alpha override.
 
+### Session 58f - MEASURED: one sprite texture is an EMPTY page in VRAM (not an alpha bug)
+
+`PS2X_T4_DUMP=1` (`9428a04`) decodes 4-bit texels with **our own page tables straight out of mapped VRAM** (the
+psm-aware accessor returns all zeros for 4-bit, so it was useless) and prints, per palette index, the texel count
+and that entry's alpha, with a `rejectedByAlphaTest` total for ATE's AREF=0x20.
+
+| context | TEX0 | histogram vs palette alpha | verdict |
+|---|---|---|---|
+| ctx0 | `tbp=0x3a80 bw=4 256x128 cbp=0x3a70` | all 16 indices used; **alpha 0x80 on every entry** (grayscale ramp 0x000000, 0x0f0f0f, 0x7b7b7b ... 0xe6e6e6) | `rejected=0/32768` - healthy, fully opaque, renders |
+| ctx1 | `tbp=0x3a80 bw=1 64x64 cbp=0x3a70` | idx4 alpha 0x80 used 2593 px; idx0/2/3 alpha 0x00 | `rejected=1177/4096` - real content with transparent surround |
+| ctx0 | `tbp=0x3ff0 bw=1 64x64 cbp=0x3ff4` | **idx0 used 4096/4096**, entry `0x00000000` | `rejected=4096/4096` - the whole sprite samples an **empty page** |
+| ctx0 | `tbp=0x444 cbp=0x2222/0x1222` (psm=0x24) | idx0 all 4096, entry 0 | `rejected=4096/4096` - same shape |
+
+**So the emblematic black-phase sprite is not alpha maths at all: its texture page and palette are both zero in
+VRAM, every texel decodes to index 0, and palette[0] is transparent.** The alpha-0 story collapses into "the
+texture was never there", and `0x3FF000/0x3FF400` is exactly the pair session 54 hardcoded - it has been looking
+at an empty page all along.
+
+`PS2X_IMAGE_DUMP` (built for this question) printed **nothing**: it only fires when a transfer's `DBP == 0x3FF0`,
+and it mirrors BITBLTBUF through the *packed A+D walk*, which earlier proved not to see every register write
+(the CT24 byte patch there never fired either). So the next instrument is a mirror that catches BITBLTBUF on
+every path (reglist and DIRECT included), or simply watching VRAM: snapshot the 0x3FF000 page early and watch it.
+
+Then the question becomes: does the guest upload to 0x3FF000 at all (in which case we drop or misplace it), or
+does the game sample a page it fills by another route (a VRAM->VRAM copy we already know is absent, or a
+different base we mis-decode)?
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
