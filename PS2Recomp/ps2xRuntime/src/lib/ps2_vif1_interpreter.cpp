@@ -1,5 +1,6 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "runtime/native/native_vu1_gate.h"
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -522,24 +523,38 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
-            // TEMP DIAGNOSTIC (boot-stall triage).
-            std::cerr << "[VIF1-mscal] pc=0x" << std::hex << startPC << " top=0x" << runTop
-                      << " itop=0x" << runItop << std::dec << " opcode=0x" << std::hex << (int)opcode << std::dec
-                      << std::endl;
-            // TEMP DIAGNOSTIC (boot-stall triage): is microcode present at the entry?
-            if (m_vu1Code != nullptr && startPC + 16u <= PS2_VU1_CODE_SIZE)
+            // TEMP DIAGNOSTIC (boot-stall triage): PS2X_VIF1_MSCAL_LOG=1, since it is one line per MSCAL.
+            static const bool s_logMscal = std::getenv("PS2X_VIF1_MSCAL_LOG") != nullptr;
+            if (s_logMscal)
             {
-                std::cerr << "[VIF1-mscal-code] pc=0x" << std::hex << startPC << ":";
-                for (uint32_t w = 0u; w < 16u; w += 4u)
+                std::cerr << "[VIF1-mscal] pc=0x" << std::hex << startPC << " top=0x" << runTop
+                          << " itop=0x" << runItop << std::dec << " opcode=0x" << std::hex << (int)opcode << std::dec
+                          << std::endl;
+                // is microcode present at the entry?
+                if (m_vu1Code != nullptr && startPC + 16u <= PS2_VU1_CODE_SIZE)
                 {
-                    uint32_t word = 0u;
-                    std::memcpy(&word, m_vu1Code + startPC + w, sizeof(word));
-                    std::cerr << " " << word;
+                    std::cerr << "[VIF1-mscal-code] pc=0x" << std::hex << startPC << ":";
+                    for (uint32_t w = 0u; w < 16u; w += 4u)
+                    {
+                        uint32_t word = 0u;
+                        std::memcpy(&word, m_vu1Code + startPC + w, sizeof(word));
+                        std::cerr << " " << word;
+                    }
+                    std::cerr << std::dec << std::endl;
                 }
-                std::cerr << std::dec << std::endl;
             }
-            if (m_vuMscalCallback[1])
+            // A program the native port draws itself: it does not run on the emulated VU1. The skip callback puts a
+            // draw marker in the GS stream where its PATH1 output would have been, so native and GS draws sort.
+            m_vu1ProgramSkipped = ps2x::native::vu1Skipped(m_vu1Code, startPC);
+            if (m_vu1ProgramSkipped)
+            {
+                if (m_vu1SkipCallback)
+                    m_vu1SkipCallback(startPC);
+            }
+            else if (m_vuMscalCallback[1])
+            {
                 m_vuMscalCallback[1](startPC, runTop, runItop);
+            }
             continue;
         }
         else if (opcode == VIF_MSCNT)
@@ -556,8 +571,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
-            if (m_vuMscntCallback[1])
+            if (m_vu1ProgramSkipped)
+            {
+                // A continued program of the one VU1 skips: a group of its own only when the port counts it as one.
+                if (ps2x::native::mscntGroups() && m_vu1SkipCallback)
+                    m_vu1SkipCallback(~0u);
+            }
+            else if (m_vuMscntCallback[1])
+            {
                 m_vuMscntCallback[1](runTop, runItop);
+            }
             continue;
         }
         else if (opcode == VIF_STMASK)

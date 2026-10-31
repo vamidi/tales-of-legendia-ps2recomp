@@ -345,6 +345,15 @@ public:
     void setVu1FlushCallback(Vu1FlushCallback cb) { m_vuFlushCallback[1] = std::move(cb); }
     void setVu0FlushCallback(Vu1FlushCallback cb) { m_vuFlushCallback[0] = std::move(cb); }
 
+    // An MSCAL / MSCALF / MSCNT whose microprogram VU1 skips because the native port draws it itself
+    // (ps2x::native::setVu1Gate): the emulated program does not run, and this callback places the draw marker in the
+    // GS stream where its PATH1 output would have been. `startPC` is the program entry, or ~0u for a continued
+    // program (MSCNT) that the port counts as a group of its own.
+    using Vu1SkipCallback = std::function<void(uint32_t startPC)>;
+    void setVu1SkipCallback(Vu1SkipCallback cb) { m_vu1SkipCallback = std::move(cb); }
+    // True while the program the last MSCAL started is one VU1 skips (the native port draws it).
+    bool vu1ProgramSkipped() const { return m_vu1ProgramSkipped; }
+
     const uint8_t *getVU1Code() const { return m_vu1Code; }
     bool writeVuCode(bool vu1, uint32_t offset, std::span<const uint8_t> bytes);
     uint8_t *getVU1Data() { return m_vu1Data; }
@@ -424,6 +433,8 @@ public:
     Vu1MscalCallback m_vuMscalCallback[2];
     Vu1MscntCallback m_vuMscntCallback[2];
     Vu1FlushCallback m_vuFlushCallback[2];
+    Vu1SkipCallback m_vu1SkipCallback;
+    bool m_vu1ProgramSkipped = false; // the native port draws the running microprogram (ps2x::native::setVu1Gate)
 
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;

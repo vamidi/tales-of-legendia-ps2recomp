@@ -12,6 +12,7 @@
 #if defined(PS2X_HAVE_NATIVE_GS)
 #include "runtime/gs/gs_native_backend.h"
 #endif
+#include "runtime/native/native_vu1_gate.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -652,6 +653,56 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
 }
 
+namespace
+{
+    // PS2X_NATIVE_VU1_GATE=<hex pc>[,<hex pc>...]: the harness for the native VU1 seam, used until a native model
+    // renderer exists. It declares the MSCAL programs at those entry pcs as drawn natively (so VU1 skips them) and
+    // every skipped program as an available group - what a model renderer declares for real, through
+    // ps2x::native::setVu1Gate + setNativeGroupCount. Unset: nothing is skipped, nothing is emitted.
+    //
+    // Tales of Legendia uploads every microprogram at pc 0, so a real renderer identifies a program by its code;
+    // the harness matches on the entry pc, which is why it can only stand in for one.
+    std::vector<uint32_t> s_nativeVu1GatePcs;
+
+    bool nativeVu1Gate(const uint8_t * /*vu1Code*/, uint32_t startPc)
+    {
+        for (const uint32_t pc : s_nativeVu1GatePcs)
+        {
+            if (pc == startPc)
+                return true;
+        }
+        return false;
+    }
+
+    void installNativeVu1GateFromEnv()
+    {
+        const char *const value = std::getenv("PS2X_NATIVE_VU1_GATE");
+        if (value == nullptr || *value == '\0')
+            return;
+        for (const char *cursor = value; *cursor != '\0';)
+        {
+            char *end = nullptr;
+            const unsigned long pc = std::strtoul(cursor, &end, 16);
+            if (end != nullptr && end != cursor)
+                s_nativeVu1GatePcs.push_back(static_cast<uint32_t>(pc));
+            if (end == nullptr || end == cursor)
+            {
+                ++cursor;
+                continue;
+            }
+            cursor = *end == ',' ? end + 1 : end;
+            while (*cursor == ' ' || *cursor == ',')
+                ++cursor;
+        }
+        if (s_nativeVu1GatePcs.empty())
+            return;
+        ps2x::native::setVu1Gate(&nativeVu1Gate);
+        ps2x::native::setNativeGroupCount(UINT64_MAX); // the harness draws every program it skips
+        std::fprintf(stderr, "[native-vu1] gate installed: %zu VU1 program(s) skipped and drawn natively\n",
+                     s_nativeVu1GatePcs.size());
+    }
+}
+
 bool PS2Runtime::syncCoreSubsystems()
 {
     uint8_t *const rdram = m_memory.getRDRAM();
@@ -697,6 +748,18 @@ bool PS2Runtime::syncCoreSubsystems()
                                  { m_vu->start1(0, top, itop, true); });
     m_memory.setVu1FlushCallback([this](bool gif)
                                  { m_vu->flush1(gif); });
+    // A VU1 program the native port draws itself (ps2x::native::setVu1Gate) does not run on the emulated VU1. Its
+    // draws enter the GS stream as a marker where its PATH1 output would have been, numbered in stream order the way
+    // the port numbers its groups (a setup program that kicks no geometry draws nothing: its strips follow it).
+    m_memory.setVu1SkipCallback([this](uint32_t /*startPC*/)
+                                {
+                                    static uint64_t s_group = 0;
+                                    const uint64_t group = ++s_group;
+                                    if (!ps2x::native::nativeGroupAvailable(group))
+                                        return;
+                                    m_gs.queueNativeDraw(group, 0);
+                                });
+    installNativeVu1GateFromEnv();
     m_memory.setVu0MscalCallback([this](uint32_t pc, uint32_t, uint32_t itop)
                                  {
         auto *context = m_eeScheduler->currentContext();
