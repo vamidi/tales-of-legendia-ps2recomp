@@ -667,6 +667,7 @@ namespace
             uint64_t imageTags = 0u;                     // IMAGE tags attributed to this destination
             uint64_t declaredQw = 0u;                    // sum of those tags' NLOOP
             uint64_t deliveredQw = 0u;                   // qwords actually present in the stream
+            uint64_t hwregQw = 0u;                       // qwords delivered as HWREG (0x51) writes
             uint64_t maxTagQw = 0u;                      // largest single tag
             uint64_t nzBytes = 0u;                       // non-zero payload bytes (bounded scan)
             uint64_t scannedBytes = 0u;
@@ -682,6 +683,12 @@ namespace
         bool m_traceArmed = false;
         uint32_t m_imgPrints = 0u;
         uint32_t m_rawRectW = 0u, m_rawRectH = 0u, m_rawDir = 0xFFFFFFFFu;
+        uint32_t m_hwregPrints = 0u;
+        uint32_t m_hwregDataPrints = 0u;
+        uint32_t m_hwregSinceBlt = 0u;
+        uint32_t m_tagCtxPrints = 0u;
+        uint32_t m_rawLatchedDbp = 0xFFFFFFFFu;
+        bool m_rawLatchedActive = false;
         const bool m_rawEnabled = (std::getenv("PS2X_DBP_STATS") != nullptr);
 
         // Fed from the same points observeGIF decodes, so the destination is never inferred from a stale mirror.
@@ -692,6 +699,17 @@ namespace
             case 0x50u: // BITBLTBUF
             {
                 const uint32_t dbp = uint32_t((value >> 32) & 0x3FFFu);
+                // Session 58o: how many HWREG qwords actually arrived for the *previous* transfer to this
+                // destination. If the guest intends RRW*RRH*bpp/64 and we receive ~1, either it sends ~1 or we
+                // drop the rest; if we receive the full count and the page is still empty, the GS is discarding it.
+                if (dbp == 0x3FF0u && m_hwregPrints < 16u)
+                {
+                    ++m_hwregPrints;
+                    std::fprintf(stderr,
+                                 "[GS-xferq] dbp=0x3ff0 previous transfer received %u hwreg qword(s) = %u byte(s)\n",
+                                 m_hwregSinceBlt, m_hwregSinceBlt * 16u);
+                }
+                m_hwregSinceBlt = 0u;
                 m_rawDbpCurrent = dbp;
                 m_rawHaveDbp = true;
                 ++m_rawDbp[dbp].bitbltWrites;
@@ -720,6 +738,36 @@ namespace
                 }
                 break;
             }
+            case 0x51u: // HWREG - the A word IS 8 bytes of image data. This is the *other* legal way to feed
+                        // a host->local transfer (a PACKED A+D 0x51 write), and a ledger that only counts
+                        // IMAGE tags reports "no payload" for a texture that arrived entirely this way.
+                        // Attribution is to the destination LATCHED AT TRXDIR, not the last BITBLTBUF: the guest
+                        // writes BITBLTBUF between individual qwords inside one long packed tag, and on the GS a
+                        // BITBLTBUF write does not retarget an already-started transfer.
+                if (m_rawLatchedActive)
+                {
+                    RawDbp &d = m_rawDbp[m_rawLatchedDbp];
+                    ++d.hwregQw;
+                    ++d.deliveredQw;
+                    ++m_hwregSinceBlt;
+                    if (d.scannedBytes < 1024u)
+                    {
+                        const auto *bytes = reinterpret_cast<const uint8_t *>(&value);
+                        for (uint32_t i = 0u; i < 8u; ++i)
+                        {
+                            if (bytes[i] != 0u)
+                                ++d.nzBytes;
+                        }
+                        d.scannedBytes += 8u;
+                    }
+                    if (m_hwregDataPrints < 8u)
+                    {
+                        ++m_hwregDataPrints;
+                        std::fprintf(stderr, "[GS-hwreg] #%u dbp=0x%04x data=0x%016llx\n", m_hwregDataPrints,
+                                     m_rawDbpCurrent, static_cast<unsigned long long>(value));
+                    }
+                }
+                break;
             case 0x52u: // TRXREG
                 if (m_rawHaveDbp)
                 {
@@ -736,9 +784,11 @@ namespace
                     }
                 }
                 break;
-            case 0x53u: // TRXDIR
+            case 0x53u: // TRXDIR - this is what latches the transfer in the GS
                 if (m_rawHaveDbp)
                 {
+                    m_rawLatchedDbp = m_rawDbpCurrent;
+                    m_rawLatchedActive = true;
                     RawDbp &d = m_rawDbp[m_rawDbpCurrent];
                     const uint32_t dir = uint32_t(value & 3u);
                     m_rawDir = dir;
@@ -840,13 +890,15 @@ namespace
                 // "set up but no payload" is the discriminator: the guest names the destination and starts a
                 // host->local transfer, then nothing arrives. "never set up" puts the stall upstream of the GS.
                 const char *verdict = "";
-                if (d.bitbltWrites != 0u && d.imageTags == 0u)
-                    verdict = "   <= SET UP, NO IMAGE PAYLOAD";
+                if (d.bitbltWrites != 0u && d.deliveredQw == 0u)
+                    verdict = "   <= SET UP, NO PAYLOAD AT ALL (no IMAGE tag, no HWREG)";
+                else if (d.imageTags == 0u && d.hwregQw != 0u)
+                    verdict = "   <= fed entirely by HWREG writes";
                 else if (bytes < 256u)
                     verdict = "   <= below one 32x16 T4 (256 B)";
                 std::fprintf(stderr,
                              "[GS-dbp]   dbp=0x%04x (0x%06x) blt=%llu dir=%llu/%llu/%llu rect=%ux%u tags=%llu "
-                             "declared=%llu qw delivered=%llu qw max=%llu qw bytes=%llu nz=%llu/%llu%s\n",
+                             "declared=%llu qw delivered=%llu qw max=%llu qw hwreg=%llu qw bytes=%llu nz=%llu/%llu%s\n",
                              kv.first, kv.first * 256u, static_cast<unsigned long long>(d.bitbltWrites),
                              static_cast<unsigned long long>(d.dir0), static_cast<unsigned long long>(d.dir1),
                              static_cast<unsigned long long>(d.dir2), d.lastW, d.lastH,
@@ -854,6 +906,7 @@ namespace
                              static_cast<unsigned long long>(d.declaredQw),
                              static_cast<unsigned long long>(d.deliveredQw),
                              static_cast<unsigned long long>(d.maxTagQw),
+                             static_cast<unsigned long long>(d.hwregQw),
                              static_cast<unsigned long long>(bytes),
                              static_cast<unsigned long long>(d.nzBytes),
                              static_cast<unsigned long long>(d.scannedBytes), verdict);
@@ -1171,6 +1224,17 @@ namespace
                         // PS2X_DBP_STATS=1: BITBLTBUF/TRXREG/TRXDIR from the same decode the census trusts.
                         if (m_rawEnabled && adReg >= 0x50u && adReg <= 0x53u)
                             rawDbpRegister(adReg, adValue);
+                        // Session 58o: the tag that carries HWREG image data. If NLOOP is 12 and we log 12 of these,
+                        // the guest really sends 12 qwords per transfer and the shortfall is downstream. If NLOOP is
+                        // 1-4, the guest's own packet is short.
+                        if (m_rawEnabled && adReg == 0x51u && m_tagCtxPrints < 24u)
+                        {
+                            ++m_tagCtxPrints;
+                            std::fprintf(stderr,
+                                         "[GS-hwtag] #%u dbp=0x%04x NLOOP=%u NREG=%u FLG=%u loop=%u reg=%u EOP=%u\n",
+                                         m_tagCtxPrints, m_rawDbpCurrent, state.tag.NLOOP, state.tag.NREG,
+                                         unsigned(state.tag.FLG), state.loop, state.reg, state.tag.EOP);
+                        }
                     }
                     applyAD(adReg, adValue);
                     // TEMP DIAGNOSTIC (session 48): pair consecutive XYZ2/XYZ3
