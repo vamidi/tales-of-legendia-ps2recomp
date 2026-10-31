@@ -3022,6 +3022,34 @@ a zero alpha byte, which matches `clutNz=13` with `as8` all zero.
 the acceptance test: the logo screens become visible, and the MPG movie behind them is reachable for the first
 time (its ffmpeg `sceMpeg` stub has never run: 0 calls, 0 IPU writes).
 
+### Session 58d - the CT24 fix is a correct guard that DOES NOT FIRE; one experiment left
+
+`PS2X_FORCE_ALPHA` does two things: clears TCC on every TEX0 write and pins `TEXA=0x80`. Both together take the
+black phase from 600 to 295336 words with the dense blocks at the display buffer.
+
+**Fix attempt 1** - a byte patch inside the packed A+D walk (`m_scisPatch`, the same mechanism FORCE_ALPHA uses)
+that clears TCC when TEX0 says PSMCT24: **never fired**. So TEX0 does not arrive through that decoder branch.
+
+**Fix attempt 2** - `fixCt24Alpha()` after `gs.gif_transfer` (path independent: packed, reglist or DIRECT), same
+rule: **also never fired** across a 200 s run that *did* reach the black phase (census 600). Therefore **no
+observed TEX0 in this game is CT24-with-TCC-set**: the CT24-alpha theory is falsified. The guard is kept
+(`ab6252f`, `PS2X_NO_CT24_FIX=1` disables it) because it is correct for the format, not because it fixes ToL.
+
+**The one experiment left** (`740c039`, `PS2X_FORCE_TEXA_ONLY=1`): pin TEXA only, leave TCC alone. Frame returns
+-> TEXA never reaches the sampler (a forwarded-register/decoder bug in our backend). No change -> the sampled
+alpha genuinely is 0 and the offender is an indexed (T4/T8) texture whose CLUT entry alpha is 0.
+
+First attempt at it was **inconclusive**: the guest took the slow path (outcome A) and never left the loading
+phase - all eight census samples read 98728. Lesson: gate this experiment on the *phase* (wait for a census to
+read ~600) instead of a fixed duration; 130-200 s is not enough to guarantee the transition, and the run-to-run
+variance is large.
+
+Also worth knowing for whoever picks this up: the `[GS-reg]` register dump added earlier already prints TEX0
+(tbp/tbw/psm/tw/th/tcc/tfx/cbp) per context at cumulative-byte thresholds, and `PS2X_CLUT_DUMP=1` prints the
+16 palette words plus the first 8 texels straight from VRAM. In the run captured, ctx1's palette was correct
+(`8079a9d7 8091bde8 80ffffff ...` - alpha 0x80 intact, so palette uploads are fine) while ctx0's palette base
+was 0 (empty), and the logo sprites are `prim=0x15E ctxt=0` while the tristrips are `prim=0x25C ctxt=1`.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
