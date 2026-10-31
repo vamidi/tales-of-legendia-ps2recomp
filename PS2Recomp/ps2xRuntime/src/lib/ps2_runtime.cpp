@@ -51,6 +51,9 @@ namespace ps2_stubs
     void resetSifState();
 }
 
+// Defined in ps2_memory.cpp: PATH1 GIF bytes the VU1 has kicked (a microprogram's whole output).
+extern std::atomic<uint64_t> g_ps2xPath1GifBytes;
+
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
 #define ET_EXEC 2            // Executable file
 #define EM_MIPS 8            // MIPS architecture
@@ -743,9 +746,31 @@ bool PS2Runtime::syncCoreSubsystems()
     m_vu = std::make_unique<ps2vu::Runtime>(m_memory, [this](uint32_t cycles)
                                             { m_eeScheduler->accountCycles(cycles); });
     m_memory.setVu1MscalCallback([this](uint32_t pc, uint32_t top, uint32_t itop)
-                                 { m_vu->start1(pc, top, itop, false); });
+                                 {
+        // PS2X_VU1_MSCAL_LOG=1: what each VU1 program run produced - PATH1 GIF bytes (its draws) plus the GS packets
+        // they decoded into. A model program kicks KB per run; a setup program kicks none.
+        static const bool s_log = std::getenv("PS2X_VU1_MSCAL_LOG") != nullptr;
+        const uint64_t packetsBefore = s_log ? m_gs.nativePackedGIFPacketCount() : 0u;
+        const uint64_t path1Before = s_log ? g_ps2xPath1GifBytes.load(std::memory_order_relaxed) : 0u;
+        m_vu->start1(pc, top, itop, false);
+        if (s_log)
+        {
+            const uint64_t path1 = g_ps2xPath1GifBytes.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "[vu1-mscal] pc=0x%x top=%u itop=%u path1Bytes=%llu gifPackets=%llu\n", pc, top, itop,
+                         static_cast<unsigned long long>(path1 - path1Before),
+                         static_cast<unsigned long long>(m_gs.nativePackedGIFPacketCount() - packetsBefore));
+        } });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
-                                 { m_vu->start1(0, top, itop, true); });
+                                 {
+        static const bool s_log = std::getenv("PS2X_VU1_MSCAL_LOG") != nullptr;
+        const uint64_t path1Before = s_log ? g_ps2xPath1GifBytes.load(std::memory_order_relaxed) : 0u;
+        m_vu->start1(0, top, itop, true);
+        if (s_log)
+        {
+            const uint64_t path1 = g_ps2xPath1GifBytes.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "[vu1-mscnt] top=%u itop=%u path1Bytes=%llu\n", top, itop,
+                         static_cast<unsigned long long>(path1 - path1Before));
+        } });
     m_memory.setVu1FlushCallback([this](bool gif)
                                  { m_vu->flush1(gif); });
     // A VU1 program the native port draws itself (ps2x::native::setVu1Gate) does not run on the emulated VU1. Its

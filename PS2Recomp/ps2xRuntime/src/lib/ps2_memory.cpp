@@ -6,6 +6,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+// PATH1 GIF bytes the VU1 has kicked, process-wide. Defined here, declared where it is read (ps2_runtime.cpp) rather
+// than in a header, so the counter costs no rebuild of everything that includes ps2_memory.h.
+std::atomic<uint64_t> g_ps2xPath1GifBytes{0};
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
@@ -2093,6 +2097,10 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
                          static_cast<unsigned long long>(s_dbgBytes),
                          static_cast<unsigned>(pathId), sizeBytes, drainImmediately ? 1u : 0u);
     }
+    // A VU1 microprogram's output is exactly this: PATH1 GIF packets from XGKICK. Counted per path so the native-port
+    // inventory (PS2X_VU1_MSCAL_LOG) can say which program draws. Deliberately outside any log gate: two atomics.
+    if (pathId == GifPathId::Path1)
+        g_ps2xPath1GifBytes.fetch_add(sizeBytes, std::memory_order_relaxed);
     if (!data || sizeBytes < 16)
         return;
 

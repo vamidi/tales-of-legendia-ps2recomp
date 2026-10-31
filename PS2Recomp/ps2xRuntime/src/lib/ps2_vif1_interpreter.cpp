@@ -1,9 +1,54 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include "runtime/native/native_vu1_gate.h"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <set>
+
+// PS2X_VU1_MPG_LOG=1: every VU1 microprogram the guest uploads, and each distinct one written out as
+// <TEMP>\vu1prog_<hash>.bin. Tales of Legendia never stores to VU1 memory from EE code (the binary contains no
+// reference to 0x11008000), so its microprograms exist only as MPG payloads - all of them at destination 0, which is
+// also why every MSCAL into them uses entry pc 0. The hash of the bytes is therefore a program's only identity.
+static void captureVu1Program(unsigned destAddr, unsigned instructionCount, const uint8_t *bytes, unsigned byteCount)
+{
+    static const bool enabled = std::getenv("PS2X_VU1_MPG_LOG") != nullptr;
+    if (!enabled)
+        return;
+    if (bytes == nullptr || byteCount == 0u)
+    {
+        std::fprintf(stderr, "[vu1-prog] dest=0x%x qw=%u instr=%u MISSING PAYLOAD (did not fit the packet)\n",
+                     destAddr, instructionCount, instructionCount);
+        return;
+    }
+    // FNV-1a 64: no dependency, stable across runs, good enough to name a program by its bytes.
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned i = 0; i < byteCount; ++i)
+    {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    static std::set<uint64_t> s_seen;
+    if (!s_seen.insert(hash).second)
+    {
+        std::fprintf(stderr, "[vu1-prog] dest=0x%x qw=%u instr=%u bytes=%u hash=%016llx (seen)\n", destAddr,
+                     byteCount / 8u, instructionCount, byteCount, static_cast<unsigned long long>(hash));
+        return;
+    }
+    const char *const dir = std::getenv("TEMP");
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s\\vu1prog_%016llx.bin", (dir != nullptr) ? dir : ".",
+                  static_cast<unsigned long long>(hash));
+    std::FILE *file = std::fopen(path, "wb");
+    if (file != nullptr)
+    {
+        std::fwrite(bytes, 1u, byteCount, file);
+        std::fclose(file);
+    }
+    std::fprintf(stderr, "[vu1-prog] NEW dest=0x%x qw=%u instr=%u bytes=%u hash=%016llx -> %s\n", destAddr,
+                 byteCount / 8u, instructionCount, byteCount, static_cast<unsigned long long>(hash), path);
+}
 
 // TEMP DIAGNOSTIC gate: the per-command and per-DIRECT VIF1 traces produced
 // ~9 MB of stderr in four minutes and measurably slowed the boot, so they are
@@ -615,6 +660,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             uint32_t destAddr = (uint32_t)imm * 8u;
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
+            const uint8_t *uploaded = nullptr;
+            uint32_t uploadedBytes = 0u;
             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
             {
                 uint32_t copyBytes = mpgBytes;
@@ -623,13 +670,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 if (pos + copyBytes <= sizeBytes)
                 {
                     writeVuCode(true, destAddr, {data + pos, copyBytes});
+                    uploaded = data + pos;
+                    uploadedBytes = copyBytes;
                 }
             }
-            // TEMP DIAGNOSTIC (boot-stall triage).
-            std::cerr << "[VIF1-mpg] dest=0x" << std::hex << destAddr << std::dec
-                      << " count=" << instructionCount << " bytes=" << mpgBytes
-                      << " fits=" << ((pos + mpgBytes <= sizeBytes) ? 1 : 0)
-                      << " pos=" << pos << " size=" << sizeBytes << std::endl;
+            captureVu1Program(destAddr, instructionCount, uploaded, uploadedBytes);
             pos += mpgBytes;
             if (pos > sizeBytes)
                 break;
