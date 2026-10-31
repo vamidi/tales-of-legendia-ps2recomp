@@ -3175,6 +3175,34 @@ since the frontend's `transfer` state and parallel-gs's are separate), or
 are arriving, parallel-gs is dropping them and the fix is to keep the two transfer state machines in step (or to
 stop forwarding image payloads through a path that begins its transfer somewhere else).
 
+### Session 58j - content-based answer: uploads DO land (palette found at 0x3A7000); the transfer counters were lying
+
+`PS2X_XFER_STATE=1` printed **nothing**: no payload ever arrives while our mirror holds a valid transfer size. That
+exposes the bug in our own accounting, not in the backend:
+
+- `observeImage()` accepts bytes whenever `transfer.direction == 0`, and `direction` **defaults to 0** before any
+  TRXDIR is seen;
+- `transferBytes` is computed from `trxreg` **at TRXDIR time**, so a TRXDIR written before TRXREG leaves need=0
+  while bytes keep flowing;
+- `noteUploadBytes()` adds to `bytesReceived` unconditionally, so those bytes pile up and can never complete.
+
+Hence `PS2X_UPLOAD_STATS`' "904 started for 0x3ff4, 1 MB received, 2 completed" is meaningless.
+
+`PS2X_VRAM_SCAN=1` (`5e2d307`) settles it by content instead: scanning all 4 MB for the palette's first entry
+(`0x8079a9d7`) finds **hits=1 at 0x3A7000** - exactly `cbp 0x3a70 * 256`, where the T4 dump found it - and
+**nothing at 0x3FF400**. So **texture uploads do reach VRAM**.
+
+**What remains, stated only from content-based evidence:** the logo sprite samples `tbp=0x3FF000`, a page holding
+44 non-zero bytes whose texels all decode to index 0, while the palette it indexes is at `0x3a7000`. Either the
+guest samples a page it does not fill (and would be blank on hardware too - possible during a fade), or our
+sampling base is not the one the guest intends.
+
+**NEW ANOMALY, must be resolved before any further conclusion:** the register dump's FRAME value `0x800e0` decodes
+to FBP=224, **FBW=0** and **PSM=0x10 (invalid)** - and the dump's own bit masks are wrong (`fbw` from bits 16-21
+instead of 9-14; `fbp` from `0x1F` instead of `0x1FF`). So "draws target fbp 224" - a load-bearing claim since
+session 58b - rests on a decode that is provably wrong. Fix the FRAME decode first (FBP bits 0-8, FBW 9-14,
+PSM 15-19), then re-read the draw target and the display source.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
