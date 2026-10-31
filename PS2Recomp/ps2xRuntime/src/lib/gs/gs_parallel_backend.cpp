@@ -1,4 +1,4 @@
-#include "runtime/gs/gs_parallel_backend.h"
+﻿#include "runtime/gs/gs_parallel_backend.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/ps2_memory.h"
@@ -644,6 +644,200 @@ namespace
             }
         }
 
+        // PS2X_DBP_STATS=1 (session 58m): how many payload bytes the guest actually puts on the wire for each
+        // BITBLTBUF destination.
+        //
+        // Every earlier counter was wrong for a structural reason, not because of a typo:
+        //   - PS2X_UPLOAD_STATS sizes a transfer from TRXREG *at TRXDIR time* and defaults `direction` to 0, so a
+        //     TRXDIR written before TRXREG leaves need=0 while payload keeps piling up ("904 started, 1 MB, 2 done");
+        //   - PS2X_IMAGE_DUMP and bitbltMirror() are fed from the PACKED A+D branch only.
+        // The decode itself is NOT reimplemented here: this counts on the same walk observeGIF already performs, which
+        // the [GS-census] line proves correct every 256 KiB (its ourFLG/ourNLOOP/ourLoop track parallel-gs's own
+        // upFLG/upNLOOP/upLoop). A second, independent tag walker was tried first and desynced - do not add one back.
+        //
+        // Three mutually exclusive answers per destination:
+        //   delivered == declared, VRAM still empty -> parallel-gs drops what we forwarded
+        //   delivered <  declared                   -> our forwarding truncates the packet
+        //   set up but no IMAGE tag at all           -> the stall is upstream of the GS
+        // A 32x16 T4 sprite needs 512 px * 4 bits = 256 B (16 qw); a 64x64 one needs 2048 B (128 qw).
+        struct RawDbp
+        {
+            uint64_t bitbltWrites = 0u;                  // BITBLTBUF writes naming this destination
+            uint64_t dir0 = 0u, dir1 = 0u, dir2 = 0u;    // TRXDIR writes while this destination was current
+            uint64_t imageTags = 0u;                     // IMAGE tags attributed to this destination
+            uint64_t declaredQw = 0u;                    // sum of those tags' NLOOP
+            uint64_t deliveredQw = 0u;                   // qwords actually present in the stream
+            uint64_t maxTagQw = 0u;                      // largest single tag
+            uint64_t nzBytes = 0u;                       // non-zero payload bytes (bounded scan)
+            uint64_t scannedBytes = 0u;
+            uint32_t lastW = 0u, lastH = 0u;             // last TRXREG rectangle
+        };
+        std::map<uint32_t, RawDbp> m_rawDbp;
+        uint32_t m_rawDbpCurrent = 0xFFFFFFFFu;          // DBP named by the last BITBLTBUF
+        bool m_rawHaveDbp = false;
+        uint64_t m_rawBytes = 0u;
+        uint32_t m_rawPrints = 0u;
+        uint32_t m_rawBltPrints = 0u;
+        uint32_t m_traceLeft = 0u;                       // bounded transfer trace, armed by the first 0x3FF0 setup
+        bool m_traceArmed = false;
+        uint32_t m_imgPrints = 0u;
+        uint32_t m_rawRectW = 0u, m_rawRectH = 0u, m_rawDir = 0xFFFFFFFFu;
+        const bool m_rawEnabled = (std::getenv("PS2X_DBP_STATS") != nullptr);
+
+        // Fed from the same points observeGIF decodes, so the destination is never inferred from a stale mirror.
+        void rawDbpRegister(uint8_t reg, uint64_t value)
+        {
+            switch (reg)
+            {
+            case 0x50u: // BITBLTBUF
+            {
+                const uint32_t dbp = uint32_t((value >> 32) & 0x3FFFu);
+                m_rawDbpCurrent = dbp;
+                m_rawHaveDbp = true;
+                ++m_rawDbp[dbp].bitbltWrites;
+                if (m_rawBltPrints < 32u)
+                {
+                    ++m_rawBltPrints;
+                    std::fprintf(stderr,
+                                 "[GS-blt] #%u dbp=0x%04x (0x%06x) dbw=%u dpsm=0x%02x | sbp=0x%04x sbw=%u spsm=0x%02x\n",
+                                 m_rawBltPrints, dbp, dbp * 256u, unsigned((value >> 48) & 0x3Fu),
+                                 unsigned((value >> 56) & 0x3Fu), unsigned(value & 0x3FFFu),
+                                 unsigned((value >> 16) & 0x3Fu), unsigned((value >> 24) & 0x3Fu));
+                }
+                // Arm the bounded trace on the first T4 setup for the page the logo sprites sample, so the log shows
+                // the exact register/payload order for one real texture transfer instead of 500 retries.
+                if (m_traceLeft == 0u && dbp == 0x3FF0u && !m_traceArmed)
+                {
+                    m_traceArmed = true;
+                    m_traceLeft = 40u;
+                    std::fprintf(stderr, "[GS-xtr] armed at the first DBP=0x3FF0 (T4) setup\n");
+                }
+                if (m_traceLeft != 0u)
+                {
+                    --m_traceLeft;
+                    std::fprintf(stderr, "[GS-xtr] BITBLTBUF dbp=0x%04x dbw=%u dpsm=0x%02x\n", dbp,
+                                 unsigned((value >> 48) & 0x3Fu), unsigned((value >> 56) & 0x3Fu));
+                }
+                break;
+            }
+            case 0x52u: // TRXREG
+                if (m_rawHaveDbp)
+                {
+                    RawDbp &d = m_rawDbp[m_rawDbpCurrent];
+                    d.lastW = uint32_t(value & 0xFFFu);
+                    d.lastH = uint32_t((value >> 32) & 0xFFFu);
+                    m_rawRectW = d.lastW;
+                    m_rawRectH = d.lastH;
+                    if (m_traceLeft != 0u)
+                    {
+                        --m_traceLeft;
+                        std::fprintf(stderr, "[GS-xtr] TRXREG dbp=0x%04x rect=%ux%u\n", m_rawDbpCurrent, d.lastW,
+                                     d.lastH);
+                    }
+                }
+                break;
+            case 0x53u: // TRXDIR
+                if (m_rawHaveDbp)
+                {
+                    RawDbp &d = m_rawDbp[m_rawDbpCurrent];
+                    const uint32_t dir = uint32_t(value & 3u);
+                    m_rawDir = dir;
+                    if (dir == 0u)
+                        ++d.dir0;
+                    else if (dir == 1u)
+                        ++d.dir1;
+                    else if (dir == 2u)
+                        ++d.dir2;
+                    if (m_traceLeft != 0u)
+                    {
+                        --m_traceLeft;
+                        std::fprintf(stderr, "[GS-xtr] TRXDIR dbp=0x%04x dir=%u\n", m_rawDbpCurrent, dir);
+                    }
+                }
+                break;
+            default: break;
+            }
+        }
+
+        // One IMAGE tag chunk: NLOOP qwords of payload, attributed to the destination in force. `tagStart` is true for
+        // the first chunk only, so the tag itself is counted once even when it spans many DMA packets.
+        void rawDbpImage(uint64_t nloop, size_t deliveredBytes, const uint8_t *payload, bool tagStart)
+        {
+            if (!m_rawHaveDbp)
+                return;
+            RawDbp &d = m_rawDbp[m_rawDbpCurrent];
+            if (tagStart)
+            {
+                ++d.imageTags;
+                d.declaredQw += nloop;
+                if (nloop > d.maxTagQw)
+                    d.maxTagQw = nloop;
+                // First 24 IMAGE tags: the true BITBLTBUF/IMAGE pairing, so "which destination got the big payload"
+                // never rests on a stale mirror.
+                if (m_imgPrints < 24u)
+                {
+                    ++m_imgPrints;
+                    std::fprintf(stderr, "[GS-img] #%u dbp=0x%04x nloop=%llu qw (%llu B) rect=%ux%u dir=%u\n",
+                                 m_imgPrints, m_rawDbpCurrent, static_cast<unsigned long long>(nloop),
+                                 static_cast<unsigned long long>(nloop * 16u), m_rawRectW, m_rawRectH,
+                                 m_rawDir);
+                }
+            }
+            d.deliveredQw += deliveredBytes / 16u;
+            if (m_traceLeft != 0u)
+            {
+                --m_traceLeft;
+                std::fprintf(stderr, "[GS-xtr] IMAGE chunk dbp=0x%04x nloop=%llu this=%zu bytes (tagStart=%u)\n",
+                             m_rawDbpCurrent, static_cast<unsigned long long>(nloop), deliveredBytes,
+                             tagStart ? 1u : 0u);
+            }
+            // Content check, bounded: the first 1 KiB of payload per destination, once.
+            if (payload != nullptr && d.scannedBytes < 1024u)
+            {
+                const size_t scan = std::min<size_t>(deliveredBytes, 1024u - size_t(d.scannedBytes));
+                for (size_t i = 0u; i < scan; ++i)
+                {
+                    if (payload[i] != 0u)
+                        ++d.nzBytes;
+                }
+                d.scannedBytes += scan;
+            }
+        }
+
+        void printRawDbpStats(const char *when)
+        {
+            if (!m_rawEnabled)
+                return;
+            std::fprintf(stderr, "[GS-dbp] %s gifBytes=%llu destinations=%zu current=0x%04x\n", when,
+                         static_cast<unsigned long long>(m_rawBytes), m_rawDbp.size(),
+                         m_rawHaveDbp ? m_rawDbpCurrent : 0xFFFFFFFFu);
+            for (const auto &kv : m_rawDbp)
+            {
+                const RawDbp &d = kv.second;
+                const uint64_t bytes = d.deliveredQw * 16u;
+                // "set up but no payload" is the discriminator: the guest names the destination and starts a
+                // host->local transfer, then nothing arrives. "never set up" puts the stall upstream of the GS.
+                const char *verdict = "";
+                if (d.bitbltWrites != 0u && d.imageTags == 0u)
+                    verdict = "   <= SET UP, NO IMAGE PAYLOAD";
+                else if (bytes < 256u)
+                    verdict = "   <= below one 32x16 T4 (256 B)";
+                std::fprintf(stderr,
+                             "[GS-dbp]   dbp=0x%04x (0x%06x) blt=%llu dir=%llu/%llu/%llu rect=%ux%u tags=%llu "
+                             "declared=%llu qw delivered=%llu qw max=%llu qw bytes=%llu nz=%llu/%llu%s\n",
+                             kv.first, kv.first * 256u, static_cast<unsigned long long>(d.bitbltWrites),
+                             static_cast<unsigned long long>(d.dir0), static_cast<unsigned long long>(d.dir1),
+                             static_cast<unsigned long long>(d.dir2), d.lastW, d.lastH,
+                             static_cast<unsigned long long>(d.imageTags),
+                             static_cast<unsigned long long>(d.declaredQw),
+                             static_cast<unsigned long long>(d.deliveredQw),
+                             static_cast<unsigned long long>(d.maxTagQw),
+                             static_cast<unsigned long long>(bytes),
+                             static_cast<unsigned long long>(d.nzBytes),
+                             static_cast<unsigned long long>(d.scannedBytes), verdict);
+            }
+        }
+
         // Observe transfer boundaries only; the upstream decoder alone executes commands.
         // Start from upstream's saved PATH state, including packets split across DMA calls.
         void observeGIF(uint32_t path, const uint8_t *data, size_t size)
@@ -884,6 +1078,8 @@ namespace
                 {
                     size_t count = std::min<size_t>(state.tag.NLOOP - state.loop, (size - offset) / 16);
                     observeImage(count * 16);
+                    if (m_rawEnabled)
+                        rawDbpImage(state.tag.NLOOP, count * 16u, data + offset, state.loop == 0u);
                     s_gifImageBytes += count * 16u;
                     state.loop += uint32_t(count);
                     offset += count * 16;
@@ -908,6 +1104,16 @@ namespace
                             const uint64_t dWord = word(data + offset);
                             const uint64_t aWord = s_reglistA[path & 3u][k];
                             applyAD(uint8_t(dWord & 127), aWord);
+                            // PS2X_DBP_STATS=1: in REGLIST the register address is the tag's REGS nibble, not the
+                            // D word's low byte, so decode it from the descriptor the same way the frontend does.
+                            if (m_rawEnabled)
+                            {
+                                const uint8_t rlReg = uint8_t((word(reinterpret_cast<const uint8_t *>(&state.tag) + 8) >>
+                                                               (k * 4u)) &
+                                                              0xFu);
+                                if (rlReg >= 0x50u && rlReg <= 0x53u)
+                                    rawDbpRegister(rlReg, aWord);
+                            }
                             if ((dWord & 0xFFu) == 0x00u && wantPrimRaw())
                             {
                                 takePrimRaw();
@@ -933,6 +1139,9 @@ namespace
                     if (((descriptors >> (state.reg * 4)) & 15) == 14)
                     {
                         observeRegister(adReg, adValue);
+                        // PS2X_DBP_STATS=1: BITBLTBUF/TRXREG/TRXDIR from the same decode the census trusts.
+                        if (m_rawEnabled && adReg >= 0x50u && adReg <= 0x53u)
+                            rawDbpRegister(adReg, adValue);
                     }
                     applyAD(adReg, adValue);
                     // TEMP DIAGNOSTIC (session 48): pair consecutive XYZ2/XYZ3
@@ -1213,6 +1422,19 @@ namespace
                 }
             }
             observeGIF(path, data, size);
+            // PS2X_DBP_STATS=1: the per-destination accounting observeGIF fed, reported on an exponential byte
+            // threshold (16 KiB, 32 KiB, 64 KiB, 128 KiB, 256 KiB, 512 KiB, 1 MiB ...) rather than per packet, so the
+            // probe cannot decide the boot race (session 58l) and still reports in a run that stalls after a few
+            // hundred KiB.
+            if (m_rawEnabled)
+            {
+                m_rawBytes += size;
+                if (m_rawPrints < 12u && m_rawBytes >= (static_cast<uint64_t>(16384) << m_rawPrints))
+                {
+                    ++m_rawPrints;
+                    printRawDbpStats("threshold");
+                }
+            }
             // TEMP DIAGNOSTIC (session 54): is the IMAGE payload the guest sends for
             // DBP=0x3FF000 actually zeros, or do we lose it?  Guest GIF traffic
             // reaches parallel-gs through THIS raw path, not through UploadImage(),
