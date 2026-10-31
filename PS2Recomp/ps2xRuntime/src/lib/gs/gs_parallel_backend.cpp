@@ -567,6 +567,34 @@ namespace
             if (uploadNeed != 0u && uploadGot >= uploadNeed && it->second.completed < it->second.started)
                 ++it->second.completed;
         }
+        // PS2X_PRESENT_FROM_CONTEXT=1: keep DISPFB2 pointing at the buffer the game draws into. Tales of Legendia
+        // writes its frame context to FBP 224 and leaves DISPFB2 at FBP 0 without ever rewriting it, so nothing it
+        // draws after the loading screen would be scanned out - the same situation the frontend's
+        // "preferred display source" heuristic exists for, forced instead of inferred. Field layout comes from
+        // parallel-gs: FRAME{FBP 0-8, FBW 16-21, PSM 24-29} -> DISPFB{FBP 0-8, FBW 9-14, PSM 15-19}, DBX/DBY kept.
+        void followContextFrame()
+        {
+            static const bool s_enabled = std::getenv("PS2X_PRESENT_FROM_CONTEXT") != nullptr;
+            if (!s_enabled)
+                return;
+            const auto &rs = gs.get_register_state();
+            const uint64_t frame = rs.ctx[0].frame.bits;
+            const auto &dfb = gs.get_priv_register_state().dispfb2;
+            const uint64_t dispfb = static_cast<uint64_t>(dfb.FBP) | (static_cast<uint64_t>(dfb.FBW) << 9) |
+                                    (static_cast<uint64_t>(dfb.PSM) << 15) | (static_cast<uint64_t>(dfb.DBX) << 32) |
+                                    (static_cast<uint64_t>(dfb.DBY) << 43);
+            const uint64_t wanted = (dispfb & ~static_cast<uint64_t>(0x7FFFFull)) | (frame & 0x1FFull) |
+                                    (((frame >> 16) & 0x3Full) << 9) | (((frame >> 24) & 0x1Full) << 15);
+            if (wanted == dispfb)
+                return;
+            gs.write_register(static_cast<ParallelGS::RegisterAddr>(0x5Au), wanted); // DISPFB2
+            static uint32_t s_prints = 0u;
+            if (s_prints++ < 4u)
+                std::fprintf(stderr, "[GS-present] DISPFB2 0x%llx -> 0x%llx (following ctx0 FRAME 0x%llx: fbp=%llu)\n",
+                             static_cast<unsigned long long>(dispfb), static_cast<unsigned long long>(wanted),
+                             static_cast<unsigned long long>(frame), static_cast<unsigned long long>(frame & 0x1FFull));
+        }
+
         // PS2X_VRAM_SCAN=1: search all of VRAM for the logo palette's first entry (0x8079a9d7, seen in the T4 dump at
         // cbp=0x3a70) and report where it actually lives. Content-based, so it cannot be fooled by either transfer
         // state machine: if the palette is only at 0x3A700 then uploads DO land and the page watch was misreading; if
@@ -1233,6 +1261,7 @@ namespace
                 fixCt24Alpha();
                 logSamplerState();
                 dumpT4TextureOnce();
+                followContextFrame();
                 watchPage();
             }
             else
@@ -1242,6 +1271,7 @@ namespace
                 fixCt24Alpha();
                 logSamplerState();
                 dumpT4TextureOnce();
+                followContextFrame();
                 watchPage();
             }
             // Session 41: parallel-gs's own accounting.  Everything in the
@@ -1407,10 +1437,10 @@ namespace
                         const auto &cc = rs.ctx[ci];
                         const uint64_t fb = cc.frame.bits, zb = cc.zbuf.bits, tb = cc.test.bits;
                         std::cerr << "\n  ctx" << ci
-                                  << " FRAME=0x" << fb << " fbp=" << (fb & 0x1Full)
+                                  << " FRAME=0x" << fb << " fbp=" << (fb & 0x1FFull)
                                   << " fbw=" << ((fb >> 16) & 0x3Full) << " psm=" << ((fb >> 24) & 0x3Full)
                                   << " FMASK=0x" << (fb >> 32)
-                                  << " ZBUF=0x" << zb << " zbp=" << (zb & 0x1Full)
+                                  << " ZBUF=0x" << zb << " zbp=" << (zb & 0x1FFull)
                                   << " zpsm=" << ((zb >> 24) & 0xFull) << " zmsk=" << ((zb >> 56) & 1ull)
                                   << " TEST=0x" << tb << " ATE=" << (tb & 1ull)
                                   << " ATST=" << ((tb >> 1) & 7ull) << " AREF=0x" << ((tb >> 4) & 0xFFull)
