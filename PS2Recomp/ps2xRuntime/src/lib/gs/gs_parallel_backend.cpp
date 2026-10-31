@@ -425,7 +425,9 @@ namespace
         // DIRECT), unlike a byte patch inside one decoder branch.
         void fixCt24Alpha()
         {
-            static const bool s_enabled = std::getenv("PS2X_NO_CT24_FIX") == nullptr;
+            // Opt-in: this guard provably never fires on Tales of Legendia (no TEX0 is CT24-with-TCC-set), and it
+            // reads the whole register state on every packet, so it stays off unless asked for.
+            static const bool s_enabled = std::getenv("PS2X_CT24_FIX") != nullptr;
             if (!s_enabled)
                 return;
             const auto &rs = gs.get_register_state();
@@ -528,7 +530,7 @@ namespace
                 return;
             const bool first = s_lastHash == ~0ull;
             s_lastHash = hash;
-            if (s_prints++ >= 8u)
+            if (s_prints++ >= 32u)
                 return;
             std::fprintf(stderr, "[GS-page] %s base=0x%x nonZeroBytes=%u hash=0x%016llx check=%llu\n",
                          first ? "initial" : "changed", s_base, nonZero, static_cast<unsigned long long>(hash),
