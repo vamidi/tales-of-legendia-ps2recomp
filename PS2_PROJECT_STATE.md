@@ -3810,6 +3810,44 @@ opt-in flag, and dump the page split.
 Either result gives a workaround we control (e.g. shadow the texture into a page-aligned staging area and let the
 sampler read from there).
 
+### Session 58w - EXPERIMENT RUN: page alignment is NOT the cause - the 4-bit destination write is broken regardless
+
+**Committed `1b0f443`.** Added `PS2X_FORCE_TBP=1`, which rewrites `BITBLTBUF.DBP` **and** `TEX0.TBP0` from `0x3ff0`
+to `0x3fe0` (`0x3fe0 * 256 = 0x3FE000`, the start of page 511 - a 4-bit page is 8192 B, so a page-aligned DBP is a
+multiple of 32) using the same `m_scisPatch` byte-patch path `PS2X_FORCE_ALPHA` uses. The sampler follows the move, so
+this is an end-to-end test, and a 32-page histogram at `0x3fe000` was added so the result is directly visible.
+
+**Result - the move works and changes nothing about landing:**
+
+```
+[GS-tbp] TEX0_1 tbp0 0x3ff0 -> 0x3fe0
+[GS-tbp] BITBLTBUF dbp 0x3ff0 -> 0x3fe0 (page-aligned)
+pages 0x3fe000 (32 x 256B, page-aligned target): 2 0 0 0 0 0 0 0 ... 57 ...
+pages 0x3ff000:                                  0 0 0 0 57 0 0 0
+```
+
+The `57` in both lines is the **CLUT at `0x3FF400`** (`0x3fe000 + 20*256`), which is unchanged and still lands. The
+4-bit texture writes **2 bytes** at a page-aligned destination, exactly as it wrote 2 bytes at the mid-page one.
+
+**Conclusion: `compute_page_rect`'s straddle handling is exonerated.** The defect is in the **4-bit destination write
+itself** - `psm_word_write_mask(PSMT4)`, the `vram_upload<PSMT4>` CPU path, or `copy_vram`'s staging for a 4-bit
+destination. All three are inside `_deps/parallel_gs-src`, which quick rule 6 forbids patching.
+
+**Note the ledger is blind to the patch by construction:** `[GS-dbp]` walks the original stream and the patch is
+applied to a copy afterwards, so it still reports `dbp=0x3ff0` with `tags=20164 / 3.97 MB`. That is expected and not
+a contradiction.
+
+**Next options, in order of cost:**
+
+1. **Cheapest remaining discriminator (one flag, one run):** patch `BITBLTBUF.DPSM` from `0x14` (T4) to `0x00`
+   (CT32) on the same transfer and see whether it lands. If it does, the fault is specifically the 4-bit path
+   (`psm_word_write_mask`/`vram_upload<PSMT4>`); if it does not, the destination write is broken for the whole
+   `0x3fe0/0x3ff0` region and the geometry is still in play.
+2. **Workaround we control (no vendored edits):** intercept 4-bit uploads on our side and expand them into VRAM
+   ourselves, the way `GSNativeBackend` already does with `pullGpuPages`/`copy_vram`. We have the payload bytes
+   (`delivered=248142 qw`), the rect (`24x16`), the destination and the CLUT - everything needed.
+3. **Upstream:** this looks like a parallel-gs bug worth reporting rather than working around.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
