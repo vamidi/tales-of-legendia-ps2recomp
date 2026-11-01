@@ -40,7 +40,7 @@ if(DQ8_LINK_GENERATED)
             list(APPEND DQ8_HEAVY_SOURCES "${DQ8_SRC}")
         endif()
     endforeach()
-    if(DQ8_HEAVY_SOURCES)
+    if(DQ8_HEAVY_SOURCES AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
         list(LENGTH DQ8_HEAVY_SOURCES DQ8_HEAVY_COUNT)
         message(STATUS "dq8: ${DQ8_HEAVY_COUNT} oversized translation units build without PCH at /Od")
         set_source_files_properties(${DQ8_HEAVY_SOURCES} PROPERTIES
