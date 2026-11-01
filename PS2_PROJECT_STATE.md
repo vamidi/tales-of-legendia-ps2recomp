@@ -150,3 +150,82 @@ cmd /c '"...\vcvars64.bat" && ninja -C build/clang -j 12 dq8'
 Configure: `Clang 22.1.3`, `linking 53558 generated translation units`, `using lld` for the corpus link (lld matters:
 ld.exe would struggle with 53k objects). clang-cl on Windows uses MSVC's STL and linker, so the DQ8 wiki's libc++/LLVM-23
 caveat does not apply. Job count: 12 is fine for clang (~1 GB/job); MSVC needed 6 and still failed on the giant units.
+
+---
+
+## Session 60 (2026-11-01) — RESTART on the PS2Recomp toolchain; the black screen was a bad function map
+
+### What the project is (framing that was wrong before)
+PS2Recomp is a **static recompilation toolchain for native PC ports**, not an emulator: `ps2_analyzer` finds function
+boundaries -> `ps2_recomp` emits C++ -> `ps2xRuntime` stands in for the PS2. A port = generated corpus + runtime +
+a little per-game glue. Fix surfaces in order: **TOML (stub/skip/patch) -> game override -> runtime C++ -> regenerate**.
+Deep guest stepping is the last resort, not the first.
+
+### Tree
+Fresh start from the DQ8-Recompiled skeleton: `src/runtime` (entry/overlays), `src/gfx` (GS + SDL-GPU renderer),
+`src/ui` (F1 menu), `thirdparty/{PS2Recomp,imgui,simde}`, `config/` (function map), `data/` (gitignored: ELF, ISO, corpora).
+
+### Build (works)
+- **clang-cl 22.1.3 + lld** (`build/tol2`). MSVC's `cl.exe` CANNOT compile this corpus: four units are 8.7-9 MB /
+  ~226k-line single functions and die with `C1002` regardless of `-j`. `-j 12` is safe with clang.
+- **SDL3 3.4.18** dev package extracted to `out/sdl3` (gitignored), configured with `-DSDL3_DIR=.../cmake`.
+  `tol: SDL GPU backend available (--gs=sdlgpu)`. `SDL3.dll` must be copied beside each new `tol.exe`.
+- Corpus build with MSVC also needs `-j 6`; with clang use 12.
+- `runtime: drop /Qspectre-` (submodule `eb2d5a3`): CMake reports `MSVC=true` for clang-cl, so clang-cl parsed it as a filename.
+
+### Runtime lineage
+`vamidi/PS2Recomp` was kept, but `ps2xRuntime` was **synced from the local DQ8 reference** (`b314e1f`, 78 new files:
+native IOP + SPU2, threaded GS backend, EE fiber, host pacing, VU1 pipeline). Corpus + `RecompiledFunction` ABI
+(`void(*)(uint8_t*,R5900Context*,PS2Runtime*)`) preserved. Pushed to `vamidi/PS2Recomp`.
+Corpus shims needed afterwards, each verified against git history rather than guessed:
+`SET_GPR_ZE32` -> alias of `SET_GPR_U32` (8,152 files), `before/afterVu0Access` (1,520 files, no-ops),
+`eeTransferPending()` (old runtime forwarded to `EeScheduler::transferPending()`; no equivalent -> false).
+
+### Rename
+`DQ8 -> tol` everywhere: project `ToLRecomp`, target `tol`, `TOL_*` CMake vars/macros/namespaces/env vars,
+`cmake/Tol*.cmake`. 0 references remain. Env switches are now `TOL_GFX_*`, `TOL_GS_*`, `TOL_TRACE_*` (28 of them) —
+commands copied from the DQ8 wiki using `DQ8_*` silently do nothing.
+
+### ROOT CAUSE of the black screen: the function map, not the runtime
+`data/map.csv` (Ghidra export) treated **every secondary entry point as a function**: 40,253 of 53,221 rows were
+`entry_*`, median row 32 bytes. The recompiler emitted each fragment as a standalone function ending in
+`ctx->pc = <next instruction>`; resuming into one ran the enclosing routine's epilogue with `$ra == 0` -> `jr $ra` to
+pc 0 -> EE thread dormant. That was the whole boot failure, and it happened inside `libc-init`.
+
+**Corrected map** (`config/map.csv`, commit `0637e19`, 20,754 rows): fold an `entry_*` row into the previous row
+**only when contiguous** (`entry.Start == previous.End`).
+- 32,467 folded; 7,786 left standalone.
+- First attempt folded everything -> 12,968 rows -> `FUN_003889d8` grew to ~300 KB and the recompiler reported 5,347
+  `unhandled-opcode` errors decoding data as code. **A fold must never cross a gap.**
+- Regenerated corpus: 20,699 recompiled, 0 decode failures (was 53,558 units, 9 MB monsters). `data/output_fixed`.
+
+### Verified after the fix (TOL_TRACE_BOOT / TOL_TRACE_PARK)
+- **No `[ee-park]` at all** — the `ra == 0` dormancy is gone; `crt0` and `libc-init` both return normally.
+- `dispatchGuestBranch` DOES set `$ra` (`enter FUN_0011ea58 ra=0x001001F0` = crt0's return). No corpus-wide jal bug.
+- `FUN_0011ea58`'s frame is balanced: `addiu sp,-0x10` / `sd $ra,0(sp)` / `ld $ra,0(sp)` / `addiu sp,+0x10` in the
+  delay slot of its tail `j 0x120770`. Exonerated.
+- Entry confirmed from the ELF header: `e_entry = 0x00100008 = "entry"` (528 B). `kDefaultEntryPoint` was DQ8's
+  `0x0010008C` (+0x84); corrected, `--entry=` still overrides.
+
+### CURRENT BLOCKER (next session starts here)
+crt0 makes three JALs: `0x11EA58` (init chain), `0x114960` (FlushCache), `0x165AD0` (**main**, verified present:
+384 B, table slot 104114). Only the first runs; it exits with
+`pc=0x0011E900 ra=0x0011E9E4 sp=0x01EFFF70` (entry had `ra=0x001001F0 sp=0x01F00000`), so JALs 2 and 3 never execute
+and the window stays black (60 fps presenter, `gif packets=0 draws=0 presents=0`).
+
+Probes on `0x11E070` and `0x120770` (the last two calls in the init chain) were **never entered** — the derailment
+happens earlier in `FUN_0011ea58`. `ra=0x11E9E4` is a return address from the `0x11E9xx` cluster, i.e. a slot the
+current frame never wrote.
+
+**Next:** add the remaining init-chain callees to `kBootPoints` (`0x11E808`, `0x11E948`, `0x11EF38`, `0x11F0B0`,
+`0x11F2F0`, `0x1154B8`, `0x11EB80`) and find the first one that exits with a foreign `$ra`; then check that function's
+map row for an overlap (`entry_0010012c` nesting inside `entry` is one known overlap in this map).
+
+### Probes and build dirs
+| item | where |
+|---|---|
+| `TOL_TRACE_BOOT=1` | `src/runtime/main.cpp` (`kBootPoints` + `bootTraceCall`), prints enter/exit with pc/ra/sp |
+| `TOL_TRACE_PARK=1` | submodule `Kernel/EeScheduler.cpp`, logs every `pc == 0` dormancy with the producing function |
+| `TOL_GFX_SHOW_FPS` / `TOL_GFX_STATS_EVERY` | per-frame `[gfx]` counter line (transfers/draws/presents/ee-dispatches) |
+| working build | `build/tol2` (corrected corpus, SDL3) |
+| old corpus | still at `thirdparty/PS2Recomp/ps2xRuntime/src/runner` for A/B |

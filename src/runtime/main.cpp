@@ -127,6 +127,8 @@ namespace
     const BootPoint kBootPoints[] = {
         {0x00100008u, "crt0 entry"},
         {0x0011EA58u, "FUN_0011ea58 libc-init"},
+        {0x0011E070u, "FUN_0011e070"},
+        {0x00120770u, "FUN_00120770 tail"},
         {0x00165AD0u, "FUN_00165ad0 game-startup"},
         {0x001072B8u, "FUN_001072b8 game-run"},
     };
@@ -149,9 +151,11 @@ namespace
             std::fprintf(stderr, "[boot] probe dispatch with unknown pc=0x%08X\n", ctx->pc);
             return;
         }
-        std::fprintf(stderr, "[boot] enter %s pc=0x%08X\n", gBootName[idx], ctx->pc);
+        std::fprintf(stderr, "[boot] enter %s pc=0x%08X ra=0x%08X sp=0x%08X\n", gBootName[idx], ctx->pc,
+                     getRegU32(ctx, 31), getRegU32(ctx, 29));
         gBootOriginal[idx](rdram, ctx, runtime);
-        std::fprintf(stderr, "[boot] exit  %s pc=0x%08X\n", gBootName[idx], ctx->pc);
+        std::fprintf(stderr, "[boot] exit  %s pc=0x%08X ra=0x%08X sp=0x%08X\n", gBootName[idx], ctx->pc,
+                     getRegU32(ctx, 31), getRegU32(ctx, 29));
     }
 }
 int main(int argc, char **argv)
