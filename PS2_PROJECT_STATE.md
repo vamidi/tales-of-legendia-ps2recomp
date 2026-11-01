@@ -436,3 +436,34 @@ No graphics traffic at all: `transfers=0 draws=0 passes=0 presents=0`, and `TOL_
 thread-returns/second with `ra=0x0` and a fresh `sp=0x01FFFFF0` from `0x11E8C0` (`FUN_0011e878` interior) and
 `0x11EEF0` — thread entries whose bodies return immediately. Until the guest gets past that it never opens a
 file, so the cd-root fix cannot be validated end to end yet.
+
+---
+
+## Session 61 (cont.): does tol.exe perform file I/O? **No — it never reaches it**
+
+The earlier "0 IRX/cdrom/VFS lines" was weak evidence, because the syscall and stub layers only log *failures*.
+So both host-FS choke points were instrumented behind `TOL_TRACE_FILEIO=1`:
+
+- `PS2Vfs::open` (`ps2xRuntime/src/lib/ps2_vfs.cpp`) - the guest `fileio` path; logs guest path, resolved host
+  path, rom0 reads and every failure mode.
+- `PS2IopHostAdapter::openHostFile` (`ps2xRuntime/src/lib/ps2_iop_host.cpp`) - the IOP-side opener used for
+  `cdrom0:`, `host:`, `mc0:`; logs the resolved host path, size and handle.
+
+Result over a 15 s run launched as `data\CD\SLUS_212.01`:
+
+```
+count of [fileio] lines: 0
+probe strings found in tol.exe: 2   <- instrumentation is linked, so 0 means "never called"
+```
+
+So **tol.exe performs no file I/O at all** — not a single open attempt, successful or failed, at either layer.
+The ELF itself is read by `std::ifstream` in `loadELF` (not through these paths), and that is the only file the
+process touches.
+
+Consequence: the cd-root fix cannot be validated end to end yet, and it is not the current blocker. The guest
+stops earlier, in the thread churn (`~17 thread-returns/s, ra=0x0, sp=0x01FFFFF0` from `0x11E8C0` interior of
+`FUN_0011e878`). Until the guest starts asking for an IRX or AFS file, both `data\` and `data\CD\` launch paths
+remain observationally identical.
+
+Interpretation detail: because no IRX is ever loaded, the failure is **not** "the IOP module files are missing" -
+the guest never gets far enough to request them.
