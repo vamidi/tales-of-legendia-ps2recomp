@@ -124,16 +124,22 @@ is now the blocker.
 
 ### 1. THE NEXT ACTION (do this first, one run)
 
-Answer **"does parallel-gs see the same degenerate scissor at draw time?"**
+Answer **"does parallel-gs also see the degenerate scissor, or is our decode inventing it?"**
 
-- Start parallel-gs with `PS2X_GS_FEED=1` (the new `[GS-scissor]` ring prints on every `[FB-dump]`, and `[2D]` does not
-  exist for it, so use the ring + the existing `[GS-m]`/census).
-- If parallel-gs's `SCISSOR_1` is full-screen where ours is `1,1-0,0`, our A+D/REGLIST decode is **still misaligned in
-  the logo phase** (the IMAGE-continuation fix removed one desync; look for another) — that is in `gs_frontend.cpp`.
-- If parallel-gs also shows the degenerate value, the guest computes a collapsed rect and the hunt moves EE-side: who
-  produces the sprite's clip rect (an EE/VU value that should be non-zero, likely a fade/wipe window).
+⚠️ **The `[GS-scissor]` ring cannot answer this on its own:** it sits in `writeRegisterUnlocked`, and with parallel-gs
+`processGIFPacket` returns at the `UsesRawCommands()` fork, so that handler never runs. For parallel-gs the only
+register view we have is the backend's own readback, i.e. `c0sc=` in the `[FB-dump]` census (filled by
+`ReadRegisterState`) — and that is sampled at vblank, where both decoders agree (`0,0..511,447`). So:
+
+- **Cheapest decisive source: PCSX2** (DebugServer is set up with the same disc). Break where the logo phase draws,
+  dump the guest's GIF packet/display list from EE RAM for one frame, and decode register `0x40` by hand. If PCSX2's
+  stream contains `1,1-0,0` then the **guest** computes a collapsed rect; if it contains a 512x448 rect then **our
+  decode** is still desynced in the logo phase.
+- Prefer this over adding more probes: the question is now "what does the guest actually write", and PCSX2 is the
+  reference that already exists in this setup.
 
 ### 2. DO NOT RE-INVESTIGATE (measured out)
+
 
 | hypothesis | verdict | evidence |
 |---|---|---|
