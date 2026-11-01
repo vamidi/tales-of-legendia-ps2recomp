@@ -94,14 +94,23 @@ logo sprite is genuinely submitted (`[2D]` probes: `tbp=3ff0 psm=14 cbp=3ff4 tw=
 
 **Still open after the fix (the real black-screen cause, newly isolated):** the framebuffers stay empty on **both** the CPU
 and native backends (`nzDisp2=nzCtx0=nzCtx1=0` at every tick from 3000 on), while the loader phase did fill them
-(`nzDisp2=32768` at ticks 600/2400). The cause is the **clip region, not the texture**: the `[GS-scissor]` ring shows
-the guest writing `SCISSOR_1` alternately as a **degenerate `1,1-0,0`** and as `0,0-511,447`, and the `[2D]` probes show
-**241 of 249 logo draws use the degenerate one** — `x1 < x0` clips every fragment, so nothing can be rasterised.
-`1,1-0,0` is the packed value `x0=1,x1=0,y0=1,y1=0` (`0x00000001_00000001`). Both backends honour it because both take
-the scissor from `currentDrawState` (a literal copy of the live `m_ctx[ctx]`), so this is a decode- or guest-side
-problem, not a backend one. Next question: does parallel-gs decode the same register as valid full-screen at *draw*
-time? If it does, our A+D/REGLIST decode is still misaligned in the logo phase; if it does not, the guest is computing
-a collapsed rect (an EE/VU value that should be non-zero) and the hunt moves to the producer of that rect.
+(`nzDisp2=32768` at ticks 600/2400). The cause is the **clip region, not the texture**: `SCISSOR_1` is written as a
+degenerate `1,1-0,0` and 241-249 of ~258 logo draws use it, so every fragment is clipped.
+
+**[GS-degen] (session 59) identifies that write's origin.** It is a 32-byte `path=2` packet
+`[PACKED NLOOP=1, PRE=1 PRIM=0x15E][SCISSOR_1 = (1,1)-(0,0)]` (`cpuB28`). Its tag bytes (`… af 10`, `PRIM=0x15E`) match
+the *guest's own list-builder* format, and PCSX2 at the same screen contains **neither** that 32-byte packet **nor** even
+its 12-byte `01 00 00 00 01 00 00 00 40` prefix, while it does contain the full-screen scissor at `0x3EE0E0`. So:
+
+- the packet is **guest-written, not fabricated** by our VIF1/arbiter (a synthesised tag would not carry `PRIM=0x15E`
+  in the builder's encoding), and
+- our guest is on a **different branch** from PCSX2's: it builds a sprite-state packet with an empty clip rect that
+  PCSX2's guest never builds. Treat this as a port-side value divergence (the classic class: a stub/system service
+  returning 0 or 1 where the game expects a real number), not as a GS decode or backend bug.
+
+**Next step:** find the producer of that packet — the sprite-setup helper that emits `[PRIM=0x15E][SCISSOR_1]` — and the
+rect it passes in; then read the same struct in PCSX2 at the equivalent moment. A store watch on the display-list buffer
+(`PS2X_WATCH_LO/HI`) while it is being built will name the writing PC.
 
 **Also corrected:** the native backend is not inherently slow — `logs/nativeB2.err` reached **tick 24900 = 59 Hz** — but
 in the *logo phase* it runs at ~11 Hz (`logs/nativeB3.err`: tick 3240 in 300 s), i.e. per-frame cost grows with the
