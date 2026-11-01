@@ -1,0 +1,9 @@
+[submodule "thirdparty/PS2Recomp"]
+	path = thirdparty/PS2Recomp
+	url = https://github.com/vamidi/PS2Recomp
+[submodule "thirdparty/imgui"]
+	path = thirdparty/imgui
+	url = https://github.com/ocornut/imgui
+[submodule "thirdparty/simde"]
+	path = thirdparty/simde
+	url = https://github.com/simd-everywhere/simde
