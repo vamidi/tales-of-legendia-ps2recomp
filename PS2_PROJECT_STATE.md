@@ -117,7 +117,11 @@ cmake --build build/game --target dq8
 | `ps2_runtime` (incl. native IOP / threaded GS / VU1 pipeline) | **builds clean** |
 | `dq8_gfx_gs` (our GS/gfx layer) | **builds clean** |
 | `main.cpp` | **builds clean** |
-| `dq8_generated` (53,558 corpus TUs) + final link | in progress |
+| `dq8_generated` (53,558 corpus TUs) + final link | **compiling** — no code errors; run with `-j 6` |
+
+**Build note (this machine):** `-j 12` fails with `C1002 compiler is out of heap space` / `C3859 Failed to create
+virtual memory for PCH` / `C1076 internal heap limit` — each `cl.exe` holds the PCH, which includes the 4.6 MB
+`ps2_recompiled_functions.h`. 64 GB RAM / 16 cores needs `-j 6`. The objects already produced are kept; ninja resumes.
 
 ## 7. Open decisions
 
