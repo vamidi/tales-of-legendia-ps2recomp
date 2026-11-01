@@ -16,6 +16,100 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## NEXT SESSION — START HERE (written end of session 58x, 2026-11-01)
+
+**Goal unchanged:** get past "NOW LOADING" to the Namco / Project Melfes / Sofdec logos, then the MPG movie.
+
+**One-paragraph state.** The black phase is reached (census **593**). The logo sprite samples `tbp0=0x3ff0`, T4,
+64x64, `cbp=0x3ff4`. The renderer now receives **20,164 complete 24x16 transfers / 3.97 MB** for that destination,
+`required_qwords` matches exactly, the flush fires at precisely the right count, and `copy_vram` runs 41,511 times -
+**and VRAM at `0x3FF000` still holds 2 non-zero bytes.** Everything on our side of the boundary is measured correct.
+The fault is inside parallel-gs's copy.
+
+### 1. THE NEXT ACTION (do this first, one flag, ~1-4 runs)
+
+Black phase on the renderer we control instead of the vendored one:
+
+```powershell
+$env:PS2X_GS_RENDERER="native"
+# keep everything else off; run 200 s, repeat until a census reads < 10000
+```
+
+- **Upload lands / picture changes** -> the answer is to move the default renderer to `GSNativeBackend`, not to work
+  around a vendored bug. That backend has worked since session 57 (`[gs:native]` lines) but has **never** been run
+  against the black phase.
+- **Still empty** -> the fault is common to both backends, so it is in our feed or in the GS model, and the native
+  backend becomes the place to instrument (we own that source).
+
+### 2. IF THAT FAILS, the ranked alternatives
+
+1. **Work around it in parallel-gs's input.** The guest writes a HWREG qword **before** TRXDIR (20163 of 20163 for
+   `0x3ff0`) and `init_transfer` discards it, leaving the payload exactly at `required_qwords`. Reorder that qword
+   after TRXDIR with a 16-byte QW swap in the `m_scisPatch` path (needs a whole-QW patch; today it only patches the
+   8-byte A word). Cheap if `copy_vram` turns out to need the spare qword.
+2. **Report upstream.** This has the shape of a real parallel-gs bug: a 24x16 destination writes 2 bytes for both
+   `PSMT4` and `PSMT16`, at both a mid-page and a page-aligned address, while an 8x2 CT32 destination in the same page
+   lands fine.
+3. **Own the upload**: expand 4-bit/small uploads into VRAM ourselves. We have payload (`delivered=248142 qw`), rect,
+   destination and CLUT. Expensive; `GSNativeBackend::pullGpuPages`/`copy_vram` is the model.
+
+### 3. DO NOT RE-INVESTIGATE (all measured out, with commits)
+
+| hypothesis | verdict | evidence |
+|---|---|---|
+| sampled alpha / `TCC` / `TEXA` | dead | forcing alpha only defeats the test; TEXA does reach the sampler (58e) |
+| CT24 texture alpha | dead | the guard exists (`PS2X_CT24_FIX`) and **never fires** (58d) |
+| fade / display pairing / `DISPFB2` | dead | `PS2X_PRESENT_FROM_CONTEXT` changes guest behaviour and stalls boot (58k) |
+| our forwarding truncates image packets | dead | `delivered == declared`; hop counters byte-identical funnel->backend (58m/58q/58u) |
+| CRI/AFS / IOP RPC path | dead | 6 AFS mounted+opened, 75 stream reads zero failures, 1.8 MB read (58o) |
+| `0x80000597` "still unclaimed" | **expected, not a bug** | it is `kSifSidCdvdMain`, HLE-served; 184 ms is IOP module init (58o) |
+| `NLOOP=0x7FFF` tags are real | dead | a palette qword read as a tag; PCSX2 has no such tag (58r) |
+| missing 64-byte payload chunk | dead | nothing is lost at any hop; the stream was being *inflated* (58u) |
+| `fifoTail`/`fifoOffset` | dead | readback-only, does not buffer packets (58s) |
+| page alignment / `compute_page_rect` straddle | dead | page-aligned `0x3fe0` also writes 2 bytes (58w) |
+| 4-bit pixel format specifically | dead | `DPSM` T4->CT16 with `required_qwords` preserved: still 2 bytes (58x) |
+
+### 4. FIXED — do not regress
+
+- `3e9eccb` **VIF1 pending path forwards the continuation RAW.** It used to wrap it in a synthesised GIFtag while the
+  guest's tag was still open, injecting 16 bytes per chunk into the payload stream (**19,107 tags/run**). That is what
+  produced `NLOOP=0x7FFF`, the empty texture page and a corrupt `SCISSOR_1`.
+- `649c181` **`observeGIF` REGLIST stride 16 -> 8 bytes per register word** (verified: 0 `ourNLOOP/upNLOOP` mismatches
+  over 51 censuses, `ourLoop - upLoop` non-cumulative). Costs ~2x REGLIST iterations.
+- `bf7722c` probe unit fixes + `hwregPreTrxdir`.
+
+### 5. TRAPS THAT COST THIS SESSION REAL TIME
+
+1. **Two of my probes compared different units.** `required_qwords` is in **64-bit words** (`RRW*RRH*bpp/64`); payload
+   is in **GIF qwords = 2 words**. Every "starved transfer" verdict before 58x was this artifact. Check units before
+   believing a SHORT/ENOUGH verdict.
+2. **`rawDbpImage` must increment `m_rawXferGot`** — it did not, so `[GS-xferq]` always reported `received=1`.
+3. **Attribute to the TRXDIR-latched destination, not the last BITBLTBUF.** The guest writes `BITBLTBUF` between
+   individual qwords, and a `BITBLTBUF` write does not retarget a started transfer. Getting this wrong over-counted
+   `0x3ff0` by 2.2x.
+4. **"No IMAGE tag" != "no payload".** The GS feeds a transfer via an IMAGE tag *or* `HWREG` (0x51) writes whose A
+   word is 8 bytes of image data.
+5. **The page watch at `0x3FF000` covers 8 KiB and includes the CLUT at `0x3FF400`.** The "44 bytes at 0x3FF000" quoted
+   in sessions 58g-58l was the *palette*; split the window into 256-byte pages (now done) before quoting a number.
+6. **Boot race:** clean baseline is **2/4**, and it is not caused by probe cost the way 58q claimed (retracted).
+   Failing runs emit 4.0 MB vs 2.6 MB stderr but are identical on the SIF/RPC path. Budget ~2 attempts. `[DIAG-irq]`
+   is already 1-in-240; gating it further does not change the path.
+7. **Census values moved:** the black phase is **593** now, not 600. Transition checks that grep for `"600"`
+   under-report success.
+
+### 6. USEFUL FACTS
+
+| item | value |
+|---|---|
+| loader census | `nzWords=98728` |
+| black phase census | **`nzWords=593`** (~295k would mean the display buffer finally filled) |
+| logo sprite | `tbp0=0x3ff0` T4 64x64, `cbp=0x3ff4`, `TEST=0x5120D` ATE=1 AREF=0x20 |
+| the transfer | `BITBLTBUF(0x3ff0, DBW=1, DPSM=T4)`, `TRXREG 24x16`, `TRXDIR 0`, IMAGE + HWREG |
+| PCSX2 reference | `0x15a37e0`: `[tag NLOOP=4][BITBLTBUF][TRXREG 48x48][HWREG][TRXDIR][tag IMAGE NLOOP=72]` |
+| PCSX2 | DebugServer connected, same disc SLUS-21201; `find_pattern`/`read_memory` safe; no `NLOOP=0x7FFF` tag exists in EE RAM |
+| probe flags | `PS2X_DBP_STATS`, `PS2X_FORCE_TBP=1|ct16`, `PS2X_WATCH_PAGE`, `PS2X_VRAM_SCAN`, `PS2_SIF_VERBOSE`, `PS2X_GS_RENDERER=native` |
+| build | `cmd /c '"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1 && cmake --build PS2Recomp\out\build 2>&1'` |
+
 ## Session 30 - FIRST RENDERED FRAME (verified): "NOW LOADING"; thread 1 dormancy moved to `0x2324A8` and is fixed
 
 **The frame exists and is correct.** `[FB-dump]` at vblank ticks 600/1200/2400
