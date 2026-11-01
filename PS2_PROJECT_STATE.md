@@ -3848,6 +3848,58 @@ a contradiction.
    (`delivered=248142 qw`), the rect (`24x16`), the destination and the CLUT - everything needed.
 3. **Upstream:** this looks like a parallel-gs bug worth reporting rather than working around.
 
+### Session 58x - caveat closed, step 1 run, and three of my own probe bugs found and fixed
+
+**Committed `bf7722c`.** The caveat is resolved, the format discriminator is answered, and the remaining measurement
+is now unambiguous.
+
+**1. CAVEAT CLOSED - the 600 -> 593 census shift is explained and is an improvement.** Full breakdown comparison:
+
+| | pre-fix (600) | post-fix (593) |
+|---|---|---|
+| `range` | `0x14D2D0..0x3FF43C` | `0x3A7000..0x3FF43C` |
+| `dense` | `0x3A0000:520 0x150000:29 0x230000:26` | `0x3A0000:528 0x3F0000:65` |
+| `nzCtx0/1` | 37 / 37 | 0 / 0 |
+| `c0sc` | **`6,0..0,0`** (degenerate) | **`0,0..511,447`** (full screen) |
+
+The desync was corrupting `SCISSOR_1` too - `ctx0`'s scissor is now full-screen instead of degenerate - and the
+scattered garbage at `0x14D2D0`/`0x150000`/`0x230000` is gone, replaced by 65 non-zero words at `0x3F0000` (the
+texture region). So the fix is **confirmed on 4 black-phase runs** with a stable 593, and the "one run" caveat is
+void. (Census 593, not 600, is the new correct value; earlier transition checks that looked for the literal "600" were
+wrong and under-reported success.)
+
+**2. STEP 1 (format discriminator) - NEGATIVE: it is not the 4-bit path.** `PS2X_FORCE_TBP=ct16` patches
+`DPSM 0x14 (T4) -> 0x02 (CT16)` **and** `TRXREG 24x16 -> 24x4`, chosen so `required_qwords` stays 24 words, so the
+flush path is identical and format is the only variable. Result: `pages 0x3ff000: 2 0 0 0 57 ...` - **still 2 bytes**.
+So neither page alignment (58w) nor the 4-bit format (58x) is the cause.
+
+**3. THREE probe bugs of mine, all fixed in `bf7722c`.** These had been producing false conclusions:
+
+- `rawDbpImage` never incremented `m_rawXferGot`, so every transfer reported `received=1` and looked starved;
+- `required_qwords` is in **64-bit words** (`RRW*RRH*bpp/64`) while the receive count is in **GIF qwords** (2 words
+  each) - the two were compared across units. Both 58p's "SHORT" verdicts and the first 58x reading were artifacts.
+- new `hwregPreTrxdir`: a HWREG written **before** TRXDIR lands in parallel-gs's payload buffer while no transfer is
+  active, and `init_transfer()` clears it. Measured **20163 of 20163** HWREGs for `0x3ff0` are pre-TRXDIR.
+
+**Corrected, final numbers for `dbp=0x3ff0`:**
+
+```
+[GS-xferq] rect=24x16 psm=0x14 required=24 words received=13 qw (26 words)  <= ENOUGH
+```
+
+1 of those 13 qw is the pre-TRXDIR HWREG that `init_transfer` discards, leaving **24 words = exactly
+`required_qwords`**, so `check_pending_transfer` fires at precisely the right point.
+
+**So the chain is now provably complete on our side:** the payload arrives (3.97 MB, 20164 transfers), it is correctly
+sized, the discard costs exactly the spare qword, the flush triggers at the exact required count, and `copy_vram`
+runs 41511 times - **and VRAM at `0x3FF000` still holds 2 bytes.** The fault is inside parallel-gs's copy of a
+24x16 destination, for both T4 and CT16, at both a mid-page and a page-aligned address.
+
+**Next (the "rest"):** the workaround is not cheap to do through the vendored tree, but we may not need it. We already
+have a renderer we control - `GSNativeBackend` (`PS2X_GS_RENDERER=native`, working since session 57). The cheapest
+useful test is to run the black phase on the native backend and see whether the upload lands there. If it does, the
+answer is to move the default renderer rather than work around a vendored bug.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
