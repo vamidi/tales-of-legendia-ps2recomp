@@ -1,22 +1,22 @@
 # Shared by the standalone GS dump harness and the game, so paths are
 # relative to this file rather than either caller.
 
-get_filename_component(DQ8_GFX_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
-set(DQ8_GFX_PS2X_RUNTIME "${DQ8_GFX_ROOT}/thirdparty/PS2Recomp/ps2xRuntime")
-include("${DQ8_GFX_ROOT}/cmake/Dq8HostSimd.cmake")
+get_filename_component(TOL_GFX_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+set(TOL_GFX_PS2X_RUNTIME "${TOL_GFX_ROOT}/thirdparty/PS2Recomp/ps2xRuntime")
+include("${TOL_GFX_ROOT}/cmake/TolHostSimd.cmake")
 
-if(NOT EXISTS "${DQ8_GFX_PS2X_RUNTIME}/src/lib/gs/gs_frontend.cpp")
+if(NOT EXISTS "${TOL_GFX_PS2X_RUNTIME}/src/lib/gs/gs_frontend.cpp")
     message(FATAL_ERROR
-        "ps2xRuntime GS sources not found under ${DQ8_GFX_PS2X_RUNTIME}. "
+        "ps2xRuntime GS sources not found under ${TOL_GFX_PS2X_RUNTIME}. "
         "Run: git submodule update --init --recursive")
 endif()
 
 # ---------------------------------------------------------------------------
-# dq8_gfx_gs -- backend-neutral GS support: local memory, swizzled pixel
+# tol_gfx_gs -- backend-neutral GS support: local memory, swizzled pixel
 # access, page tracking and the transfer engine. No graphics API here, so it
 # can be unit-tested against GSCpuBackend with no device present.
 # ---------------------------------------------------------------------------
-set(DQ8_GFX_GS_SOURCES
+set(TOL_GFX_GS_SOURCES
     gs/gs_vram.cpp
     gs/gs_transfer.cpp
     gs/gs_state.cpp
@@ -26,51 +26,51 @@ set(DQ8_GFX_GS_SOURCES
 # here; in the main build ps2_runtime already provides them and compiling them
 # again would duplicate every GSMem symbol at the final link.
 if(NOT TARGET ps2_runtime)
-    list(APPEND DQ8_GFX_GS_SOURCES
-        "${DQ8_GFX_PS2X_RUNTIME}/src/lib/gs/ps2_gs_memory.cpp")
+    list(APPEND TOL_GFX_GS_SOURCES
+        "${TOL_GFX_PS2X_RUNTIME}/src/lib/gs/ps2_gs_memory.cpp")
 endif()
 
-add_library(dq8_gfx_gs STATIC ${DQ8_GFX_GS_SOURCES})
-target_link_libraries(dq8_gfx_gs PUBLIC dq8_host_simd)
+add_library(tol_gfx_gs STATIC ${TOL_GFX_GS_SOURCES})
+target_link_libraries(tol_gfx_gs PUBLIC tol_host_simd)
 
-target_include_directories(dq8_gfx_gs PUBLIC "${DQ8_GFX_ROOT}/src")
-target_include_directories(dq8_gfx_gs SYSTEM PUBLIC
-    "${DQ8_GFX_PS2X_RUNTIME}/include"
-    "${DQ8_GFX_PS2X_RUNTIME}/include/runtime"
+target_include_directories(tol_gfx_gs PUBLIC "${TOL_GFX_ROOT}/src")
+target_include_directories(tol_gfx_gs SYSTEM PUBLIC
+    "${TOL_GFX_PS2X_RUNTIME}/include"
+    "${TOL_GFX_PS2X_RUNTIME}/include/runtime"
 )
 if(NOT TARGET ps2_runtime)
     set_source_files_properties(
-        "${DQ8_GFX_PS2X_RUNTIME}/src/lib/gs/ps2_gs_memory.cpp"
+        "${TOL_GFX_PS2X_RUNTIME}/src/lib/gs/ps2_gs_memory.cpp"
         PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 
 # ---------------------------------------------------------------------------
-# dq8_gfx_sdlgpu -- the SDL3 GPU backend. Optional: without SDL3 the rest of
+# tol_gfx_sdlgpu -- the SDL3 GPU backend. Optional: without SDL3 the rest of
 # the graphics tree, including the dump harness and the software backend,
 # still builds.
 # ---------------------------------------------------------------------------
-option(DQ8_GFX_ENABLE_SDLGPU "Build the SDL3 GPU hardware GS backend" ON)
+option(TOL_GFX_ENABLE_SDLGPU "Build the SDL3 GPU hardware GS backend" ON)
 
-set(DQ8_GFX_SDL_TARGET "")
-if(DQ8_GFX_ENABLE_SDLGPU)
+set(TOL_GFX_SDL_TARGET "")
+if(TOL_GFX_ENABLE_SDLGPU)
     find_package(SDL3 3.2 CONFIG QUIET)
     if(TARGET SDL3::SDL3)
-        set(DQ8_GFX_SDL_TARGET SDL3::SDL3)
+        set(TOL_GFX_SDL_TARGET SDL3::SDL3)
     else()
         find_package(PkgConfig QUIET)
         if(PkgConfig_FOUND)
-            pkg_check_modules(DQ8_GFX_SDL3 QUIET IMPORTED_TARGET sdl3>=3.2)
-            if(TARGET PkgConfig::DQ8_GFX_SDL3)
-                set(DQ8_GFX_SDL_TARGET PkgConfig::DQ8_GFX_SDL3)
+            pkg_check_modules(TOL_GFX_SDL3 QUIET IMPORTED_TARGET sdl3>=3.2)
+            if(TARGET PkgConfig::TOL_GFX_SDL3)
+                set(TOL_GFX_SDL_TARGET PkgConfig::TOL_GFX_SDL3)
             endif()
         endif()
     endif()
 endif()
 
-if(DQ8_GFX_SDL_TARGET)
-    include("${DQ8_GFX_ROOT}/cmake/Dq8Shaders.cmake")
+if(TOL_GFX_SDL_TARGET)
+    include("${TOL_GFX_ROOT}/cmake/TolShaders.cmake")
 
-    add_library(dq8_gfx_sdlgpu STATIC
+    add_library(tol_gfx_sdlgpu STATIC
         backends/sdlgpu/sdlgpu_backend.cpp
         backends/sdlgpu/sdlgpu_device.cpp
         backends/sdlgpu/sdlgpu_display.cpp
@@ -79,40 +79,40 @@ if(DQ8_GFX_SDL_TARGET)
         backends/sdlgpu/sdlgpu_textures.cpp
         backends/sdlgpu/sdlgpu_window_icon.cpp
     )
-    target_link_libraries(dq8_gfx_sdlgpu PUBLIC dq8_gfx_gs ${DQ8_GFX_SDL_TARGET})
-    include("${DQ8_GFX_ROOT}/cmake/Dq8Icon.cmake")
-    dq8_embed_window_icon(dq8_gfx_sdlgpu)
+    target_link_libraries(tol_gfx_sdlgpu PUBLIC tol_gfx_gs ${TOL_GFX_SDL_TARGET})
+    include("${TOL_GFX_ROOT}/cmake/TolIcon.cmake")
+    tol_embed_window_icon(tol_gfx_sdlgpu)
 
-    dq8_add_shader(dq8_gfx_sdlgpu
+    tol_add_shader(tol_gfx_sdlgpu
         SOURCE "${CMAKE_CURRENT_LIST_DIR}/backends/sdlgpu/shaders/gs_draw.vert"
         STAGE vert SYMBOL kGsDrawVertSpirv)
-    dq8_add_shader(dq8_gfx_sdlgpu
+    tol_add_shader(tol_gfx_sdlgpu
         SOURCE "${CMAKE_CURRENT_LIST_DIR}/backends/sdlgpu/shaders/gs_draw.frag"
         STAGE frag SYMBOL kGsDrawFragSpirv)
-    dq8_add_shader(dq8_gfx_sdlgpu
+    tol_add_shader(tol_gfx_sdlgpu
         SOURCE "${CMAKE_CURRENT_LIST_DIR}/backends/sdlgpu/shaders/gs_reinterpret.vert"
         STAGE vert SYMBOL kGsReinterpretVertSpirv)
-    dq8_add_shader(dq8_gfx_sdlgpu
+    tol_add_shader(tol_gfx_sdlgpu
         SOURCE "${CMAKE_CURRENT_LIST_DIR}/backends/sdlgpu/shaders/gs_reinterpret.frag"
         STAGE frag SYMBOL kGsReinterpretFragSpirv)
-    dq8_add_shader(dq8_gfx_sdlgpu MSL_DECORATION_BINDING
+    tol_add_shader(tol_gfx_sdlgpu MSL_DECORATION_BINDING
         SOURCE "${CMAKE_CURRENT_LIST_DIR}/backends/sdlgpu/shaders/gs_display.frag"
         STAGE frag SYMBOL kGsDisplayFragSpirv)
-    dq8_add_shader(dq8_gfx_sdlgpu MSL_DECORATION_BINDING
+    tol_add_shader(tol_gfx_sdlgpu MSL_DECORATION_BINDING
         SOURCE "${CMAKE_CURRENT_LIST_DIR}/backends/sdlgpu/shaders/gs_index8.frag"
         STAGE frag SYMBOL kGsIndex8FragSpirv)
-    dq8_add_shader(dq8_gfx_sdlgpu MSL_DECORATION_BINDING
+    tol_add_shader(tol_gfx_sdlgpu MSL_DECORATION_BINDING
         SOURCE "${CMAKE_CURRENT_LIST_DIR}/backends/sdlgpu/shaders/gs_local_copy.frag"
         STAGE frag SYMBOL kGsLocalCopyFragSpirv)
     if(APPLE)
-        dq8_add_shader(dq8_gfx_sdlgpu FRAMEBUFFER_FETCH
+        tol_add_shader(tol_gfx_sdlgpu FRAMEBUFFER_FETCH
             SOURCE "${CMAKE_CURRENT_LIST_DIR}/backends/sdlgpu/shaders/gs_draw.frag"
             STAGE frag SYMBOL kGsDrawFetchSpirv)
     endif()
 
-    message(STATUS "dq8 gfx: SDL3 GPU backend enabled")
-elseif(DQ8_GFX_ENABLE_SDLGPU)
-    message(STATUS "dq8 gfx: SDL3 >= 3.2 not found -- hardware backend disabled")
+    message(STATUS "tol gfx: SDL3 GPU backend enabled")
+elseif(TOL_GFX_ENABLE_SDLGPU)
+    message(STATUS "tol gfx: SDL3 >= 3.2 not found -- hardware backend disabled")
 endif()
 # The menu (src/ui) links the same SDL.
-set(DQ8_GFX_SDL_TARGET "${DQ8_GFX_SDL_TARGET}" PARENT_SCOPE)
+set(TOL_GFX_SDL_TARGET "${TOL_GFX_SDL_TARGET}" PARENT_SCOPE)
