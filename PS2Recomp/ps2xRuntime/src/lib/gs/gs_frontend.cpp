@@ -57,6 +57,176 @@ namespace
     }
 }
 
+// ---------------------------------------------------------------------------
+// PS2X_GS_FEED=1: what the frontend itself issues, per destination. Every
+// other transfer probe lives inside gs_parallel_backend.cpp, so a CPU or
+// native run could not answer "did the upload reach the backend at all" -
+// this one does, because it sits upstream of all three backends.
+// A BITBLTBUF write does not retarget a started transfer, so the destination
+// is captured when TRXDIR is written, not when data arrives.
+// ---------------------------------------------------------------------------
+namespace
+{
+    struct FeedEntry
+    {
+        uint32_t dbp = 0u, dbw = 0u, dpsm = 0u;
+        uint64_t transfers = 0u, bytes = 0u;
+        uint32_t lastRrw = 0u, lastRrh = 0u;
+    };
+    // One transfer instance, closed when the next TRXDIR arrives. Per-destination totals cannot tell a transfer that
+    // got no payload from a payload credited to the wrong destination, and that difference is the whole question.
+    struct FeedXfer
+    {
+        uint32_t dbp = 0u, dpsm = 0u, rrw = 0u, rrh = 0u, dbw = 0u;
+        uint32_t bytes = 0u;
+    };
+    constexpr uint32_t kFeedRing = 16u;
+    FeedEntry g_feed[8];
+    uint32_t g_feedCount = 0u;
+    FeedXfer g_feedRing[kFeedRing];
+    uint32_t g_feedRingCount = 0u; // total instances seen, so the ring can be printed oldest first
+    FeedXfer g_feedCur;
+    bool g_feedCurOpen = false;
+    // The packet being decoded, for the one-shot dump of the guest's texture-upload command stream.
+    const uint8_t *g_curPktData = nullptr;
+    uint32_t g_curPktSize = 0u;
+    uint32_t g_curPktPath = 0u;
+    uint32_t g_texDumps = 0u;
+    // After the first 4-bit destination setup, trace the packets that follow: the setup packet carries no payload,
+    // so this is what shows where (and whether) the texture's image data is actually delivered.
+    uint32_t g_windowLeft = 0u;
+    // An IMAGE tag can arrive in its own VIF1 chunk with its payload in the next one (measured: a 16-byte packet
+    // holding `nloop=12 flg=IMAGE`, then a 192-byte payload packet). The GS is a stateful tag walker, so the
+    // remainder of an image tag's payload must survive to the next packet; a per-packet walk that clamps it to the
+    // bytes available drops the entire texture and then mis-reads the payload as a tag header.
+    uint32_t g_pendingImageQw = 0u;
+
+    bool FeedEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_GS_FEED") != nullptr;
+        return enabled;
+    }
+
+    FeedEntry &feedEntry(uint32_t dbp, uint32_t dbw, uint32_t dpsm)
+    {
+        for (uint32_t i = 0u; i < g_feedCount; ++i)
+        {
+            if (g_feed[i].dbp == dbp)
+                return g_feed[i];
+        }
+        if (g_feedCount == 8u)
+            return g_feed[0];
+        FeedEntry &entry = g_feed[g_feedCount++];
+        entry.dbp = dbp;
+        entry.dbw = dbw;
+        entry.dpsm = dpsm;
+        return entry;
+    }
+
+    void feedBeginTransfer(uint32_t dbp, uint32_t dbw, uint32_t dpsm, uint32_t rrw, uint32_t rrh)
+    {
+        if (!FeedEnabled())
+            return;
+        if (g_feedCurOpen)
+            g_feedRing[g_feedRingCount++ % kFeedRing] = g_feedCur;
+        FeedEntry &entry = feedEntry(dbp, dbw, dpsm);
+        ++entry.transfers;
+        entry.lastRrw = rrw;
+        entry.lastRrh = rrh;
+        g_feedCur = FeedXfer{};
+        g_feedCur.dbp = dbp;
+        g_feedCur.dbw = dbw;
+        g_feedCur.dpsm = dpsm;
+        g_feedCur.rrw = rrw;
+        g_feedCur.rrh = rrh;
+        g_feedCurOpen = true;
+    }
+
+    void feedCloseTransfer()
+    {
+        if (!g_feedCurOpen)
+            return;
+        g_feedRing[g_feedRingCount++ % kFeedRing] = g_feedCur;
+        g_feedCurOpen = false;
+    }
+
+    void feedData(uint32_t bytes)
+    {
+        if (!FeedEnabled() || !g_feedCurOpen || bytes == 0u)
+            return;
+        g_feedCur.bytes += bytes;
+        for (uint32_t i = 0u; i < g_feedCount; ++i)
+        {
+            if (g_feed[i].dbp == g_feedCur.dbp)
+            {
+                g_feed[i].bytes += bytes;
+                break;
+            }
+        }
+    }
+
+    // PS2X_GS_FEED=1: what the guest actually sends for the 4-bit texture destination. The frontend receives no
+    // payload for those transfers, so the packet holding the setup (TRXDIR dpsm=0x14) is hexdumped once: that shows
+    // whether an IMAGE tag follows in the same packet, or whether the payload is a continuation of a tag opened in an
+    // earlier packet (which a per-packet tag walk cannot follow).
+    void dumpTextureSetupPacket(uint32_t dbp, uint32_t rrw, uint32_t rrh)
+    {
+        if (g_texDumps >= 2u || g_curPktData == nullptr)
+            return;
+        ++g_texDumps;
+        g_windowLeft = 24u;
+        const uint32_t show = g_curPktSize < 320u ? g_curPktSize : 320u;
+        std::fprintf(stderr, "[GS-texx] path=%u size=%u dbp=0x%04X trxreg=%ux%u dpsm=0x14 head:\n", g_curPktPath,
+                     g_curPktSize, dbp, rrw, rrh);
+        for (uint32_t off = 0u; off < show; off += 16u)
+        {
+            std::fprintf(stderr, "[GS-texx]   %04x:", off);
+            for (uint32_t i = 0u; i < 16u; ++i)
+            {
+                if (off + i < show)
+                    std::fprintf(stderr, " %02x", g_curPktData[off + i]);
+                else
+                    std::fprintf(stderr, "   ");
+            }
+            // Tag fields of the qword starting here, if this is a tag header.
+            uint64_t lo = 0u;
+            for (uint32_t k = 0u; k < 8u && off + k < show; ++k)
+                lo |= static_cast<uint64_t>(g_curPktData[off + k]) << (8u * k);
+            std::fprintf(stderr, "  nloop=%u flg=%u nreg=%u\n", static_cast<uint32_t>(lo & 0x7FFFu),
+                         static_cast<uint32_t>((lo >> 58) & 0x3u), static_cast<uint32_t>((lo >> 60) & 0xFu));
+        }
+    }
+
+    void DumpGsFeed(const char *tag)
+    {
+        if (!FeedEnabled() || g_feedCount == 0u)
+            return;
+        std::fprintf(stderr, "[GS-feed] %s destinations=%u:", tag, g_feedCount);
+        for (uint32_t i = 0u; i < g_feedCount; ++i)
+        {
+            const FeedEntry &e = g_feed[i];
+            std::fprintf(stderr, " 0x%04X(dbw=%u dpsm=0x%X x%llu bytes=%llu last=%ux%u)", e.dbp, e.dbw, e.dpsm,
+                         static_cast<unsigned long long>(e.transfers),
+                         static_cast<unsigned long long>(e.bytes), e.lastRrw, e.lastRrh);
+        }
+        std::fputc('\n', stderr);
+        // The last closed instances, then the one in flight, oldest first: dbp/format/rect and the bytes that
+        // actually followed its TRXDIR before the next one.
+        const uint32_t closedShown = g_feedRingCount < kFeedRing ? g_feedRingCount : kFeedRing;
+        std::fprintf(stderr, "[GS-feed] %s last transfers:", tag);
+        for (uint32_t i = 0u; i < closedShown; ++i)
+        {
+            const FeedXfer &x = g_feedRing[(g_feedRingCount - closedShown + i) % kFeedRing];
+            std::fprintf(stderr, " [0x%04X dpsm=0x%X dbw=%u %ux%u bytes=%u]", x.dbp, x.dpsm, x.dbw, x.rrw, x.rrh,
+                         x.bytes);
+        }
+        if (g_feedCurOpen)
+            std::fprintf(stderr, " [0x%04X dpsm=0x%X dbw=%u %ux%u bytes=%u OPEN]", g_feedCur.dbp, g_feedCur.dpsm,
+                         g_feedCur.dbw, g_feedCur.rrw, g_feedCur.rrh, g_feedCur.bytes);
+        std::fputc('\n', stderr);
+    }
+}
+
 namespace
 {
     bool WriteBmp24(const std::filesystem::path &path, uint32_t w, uint32_t h, const std::vector<uint8_t> &bgrBottomUp)
@@ -214,7 +384,39 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
                  static_cast<unsigned>(snap.ctx[1].scissor.x1), static_cast<unsigned>(snap.ctx[1].scissor.y1),
                  snap.ctx[1].frame.fbmsk, static_cast<int>(snap.ctx[1].zbuf.zmask),
                  static_cast<unsigned long long>(snap.ctx[1].test));
+
+    // Backend-agnostic 256-byte page census over the logo destination. The page watch in gs_parallel_backend only
+    // exists for parallel-gs, so a CPU or native run could never answer "did the upload land". 0x3FF000..0x3FF3FF is
+    // the 64x64 PSMT4 texture, 0x3FF400.. its CLUT, and 0x3FE000 the page-aligned destination PS2X_FORCE_TBP used.
+    {
+        struct PageWindow
+        {
+            uint32_t base;
+            uint32_t pages;
+        };
+        const PageWindow windows[2] = {{0x3FE000u, 32u}, {0x3FF000u, 32u}};
+        for (const PageWindow &win : windows)
+        {
+            std::fprintf(stderr, "[FB-dump] %s pages 0x%06x:", tag, win.base);
+            for (uint32_t pg = 0u; pg < win.pages; ++pg)
+            {
+                uint32_t nz = 0u;
+                const uint64_t base = static_cast<uint64_t>(win.base) + static_cast<uint64_t>(pg) * 256ull;
+                if (base + 256ull <= vramSize)
+                {
+                    for (uint64_t i = 0ull; i < 256ull; ++i)
+                    {
+                        if (vram[base + i] != 0u)
+                            ++nz;
+                    }
+                }
+                std::fprintf(stderr, " %u", nz);
+            }
+            std::fputc('\n', stderr);
+        }
+    }
     DumpGsAdHistogram(tag);
+    DumpGsFeed(tag);
 
     // DISPFB shares FRAME_1's packed layout: FBP[0:8] (2048-byte pages),
     // FBW[9:14] (64-pixel units), PSM[15:19], DBX[32:42], DBY[43:53].
@@ -484,6 +686,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    g_pendingImageQw = 0u;
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
     m_primRegister = {};
@@ -1058,6 +1261,30 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
+    g_curPktData = data;
+    g_curPktSize = sizeBytes;
+    g_curPktPath = path;
+
+    if (g_windowLeft > 0u)
+    {
+        --g_windowLeft;
+        uint64_t lo = 0u, hi = 0u;
+        for (uint32_t k = 0u; k < 8u; ++k)
+        {
+            lo |= static_cast<uint64_t>(data[k]) << (8u * k);
+            hi |= static_cast<uint64_t>(data[8u + k]) << (8u * k);
+        }
+        const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+        const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 0x3u);
+        const uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
+        std::fprintf(stderr,
+                     "[GS-win] left=%u path=%u size=%u nloop=%u flg=%u nreg=%u %s (payload %u B, header+payload %llu B)\n",
+                     g_windowLeft, path, sizeBytes, nloop, flg, nreg,
+                     flg == 2u ? "IMAGE" : (flg == 0u ? "PACKED" : (flg == 1u ? "REGLIST" : "?")),
+                     flg == 2u ? nloop * 16u : 0u,
+                     static_cast<unsigned long long>(flg == 2u ? 16ull + nloop * 16ull : 16ull));
+    }
+
     if ((++g_glDbgPkts & 0x3FFu) == 0u)
     {
         std::cerr << "[GS-parse] pkts=" << g_glDbgPkts << " kicks=" << g_glDbgKicks
@@ -1093,6 +1320,17 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
     });
 
     uint32_t offset = 0;
+    // Continue an IMAGE tag whose header arrived in an earlier packet: these leading bytes are its payload, not a
+    // tag header. Consume them before the tag walk so the rest of the packet starts on a real tag boundary.
+    if (g_pendingImageQw > 0u)
+    {
+        uint32_t bytes = g_pendingImageQw * 16u;
+        if (bytes > sizeBytes)
+            bytes = sizeBytes & ~15u; // whole qwords only: an unaligned tail is not a continuation we can place
+        processImageData(data, bytes);
+        offset += bytes;
+        g_pendingImageQw -= bytes / 16u;
+    }
     while (offset + 16 <= sizeBytes)
     {
         uint64_t tagLo = loadLE64(data + offset);
@@ -1151,11 +1389,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
         }
         else if (flg == GIF_FMT_IMAGE)
         {
-            uint32_t imageBytes = nloop * 16;
+            const uint32_t want = nloop * 16u;
+            uint32_t imageBytes = want;
             if (offset + imageBytes > sizeBytes)
                 imageBytes = sizeBytes - offset;
             processImageData(data + offset, imageBytes);
             offset += imageBytes;
+            // The tag was cut short by the packet boundary: the rest of its payload follows in the next packet.
+            if (imageBytes < want)
+                g_pendingImageQw = (want - imageBytes) / 16u;
         }
     }
 }
@@ -1823,6 +2065,19 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
 
+        // PS2X_GS_FEED: latch the destination of a host->local transfer now, since a later BITBLTBUF does not
+        // retarget it, and close the previous instance (a local->local or local->host direction carries no image data).
+        if (m_trxdir == 0u)
+        {
+            feedBeginTransfer(m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxreg.rrw, m_trxreg.rrh);
+            if (m_bitbltbuf.dpsm == 0x14u)
+                dumpTextureSetupPacket(m_bitbltbuf.dbp, m_trxreg.rrw, m_trxreg.rrh);
+        }
+        else
+        {
+            feedCloseTransfer();
+        }
+
         if (m_backend)
         {
             GSTransferCommand command{};
@@ -2099,6 +2354,7 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    feedData(sizeBytes);
     if (m_backend)
         m_backend->UploadImage(data, sizeBytes);
 }

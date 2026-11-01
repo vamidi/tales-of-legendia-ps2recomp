@@ -16,6 +16,80 @@
 # PS2 Recomp â€” Project State
 > Auto-maintained by agent. DO NOT DELETE. Read at session start, update after every major action.
 
+## Session 59 — backend-agnostic measurement: the PSMT4 texture transfer reaches the frontend with ZERO payload
+
+**Why this session started differently.** The stated next action was "run the black phase on `PS2X_GS_RENDERER=native`".
+It was run (200 s, log `logs/nativeB1.err`) and is **not a usable vehicle**: the native backend reaches only **tick 2790
+in 200 s (14 Hz**, vs ~57 Hz baseline; 17 scheduler heartbeats = ~51 s of guest time), because its GL present/sync path
+blocks the executor. It also never reached the logo phase (census 424, nothing at 0x3F0000, `nzCtx0=nzCtx1=0`).
+`PS2X_HAVE_NATIVE_GS=1` **is** compiled in, and `GSNativeBackend::UploadImage` forwards to `GSCpuBackend::UploadImage`,
+so `PS2X_GS_CPU=1` exercises the identical CPU upload path at full speed — that is the correct reference vehicle.
+
+**New probes (all in `gs_frontend.cpp`, env-gated, no header change):**
+| probe | flag | what it prints |
+|---|---|---|
+| `[FB-dump] ... pages 0x3fe000/0x3ff000` | default | non-zero **bytes per 256-byte page** — the old page watch only existed inside `gs_parallel_backend`, so a CPU/native run could not answer "did the upload land" |
+| `[GS-feed]` | `PS2X_GS_FEED=1` | per-destination `transfers`/`bytes`, plus the **last 16 transfer instances** (`dbp/dpsm/dbw/rect/bytes`) |
+| `[GS-texx]` | `PS2X_GS_FEED=1` | one-shot hexdump of the packet that carries `TRXDIR` with `dpsm=0x14` |
+| `[GS-win]` | `PS2X_GS_FEED=1` | the 24 packets that follow it, with tag `nloop/flg/nreg` |
+
+**Measured (CPU backend, black phase reached; `logs/cpuB1/B2/B4/B5`):**
+- palette lands: page `0x3FF400` = **32 non-zero bytes**; texture pages `0x3FF000..0x3FF3FF` = **all zero**;
+  census `nzWords=536` (`0x3A0000:528` + `0x3F0000:8`).
+- `[GS-feed]`: `0x3FF0(dbw=1 dpsm=0x14 x51619 bytes=0 last=24x16)` — **zero payload over 51,619 transfers**,
+  while `0x3FF4(dbw=1 dpsm=0x0 x51301 bytes=1641632)` receives data.
+- the feed **ring** is unambiguous: every texture instance closes with `bytes=0` and is followed by a CLUT instance
+  with `bytes=32`:
+  `[0x3FF0 dpsm=0x14 24x20 bytes=0] [0x3FF4 dpsm=0x0 8x2 bytes=32] [0x3FF0 ... bytes=0] [0x3FF4 ... bytes=32] ...`
+- **`8x2` CT32 should be 64 bytes but only 32 arrive** — the payload is truncated in general, not only for PSMT4.
+- the actual guest setup packet (`[GS-texx]`, `path=2`, **64 bytes**, one complete `PACKED` tag `NLOOP=3 NREG=1`):
+  `BITBLTBUF(DBP=0x3FF0, DBW=1, DPSM=T4)` + `TRXPOS(dsax=4, dsay=1)` + `TRXDIR(0)`.
+  **No `HWREG` write, no IMAGE tag, no payload.** `TRXREG` (24x16) was written earlier, which is why the probe echoes
+  it — the packet itself is self-consistent at 16 + 3*16 = 64 bytes.
+
+**Correction to a state-file fact that has been repeated since session 58r:** `0x51` is **TRXPOS**; `HWREG` is
+**`0x54`** (`gs_types.h`: BITBLTBUF 0x50, TRXPOS 0x51, TRXREG 0x52, TRXDIR 0x53, HWREG 0x54). The note
+"`HWREG` (0x51) writes whose A word is 8 bytes of image data" was reading TRXPOS writes as image data.
+
+**Consequence for the standing theory.** "Everything on our side of the boundary is measured correct" must be
+re-checked: with a non-raw backend, our frontend credits **0 bytes** to this destination and is **short by 2x** on the
+CLUT, so parallel-gs's `20164 transfers / 3.97 MB` attribution for `0x3ff0` may be counting bytes that belong
+elsewhere (the same class of error as trap #1's unit mix-up).
+
+**ROOT CAUSE FOUND (`[GS-win]`, `logs/cpuB7.err`) — our own GIF decode is not stateful across packets.** The 24 packets
+after the first texture setup show the VIF1 handoff splitting an IMAGE tag from its payload:
+
+```
+size=16   nloop=12 flg=2 (IMAGE)      <- the tag header arrives ALONE
+size=192  nloop=0  flg=0 nreg=5       <- the 192 B payload arrives as the NEXT packet
+```
+
+`GS::processGIFPacket` decoded each packet independently, so it computed `imageBytes = 12*16 = 192`, found only 0 bytes
+left in a 16-byte packet, clamped to 0 and called `processImageData(data, 0)` — **dropping the entire texture** — and
+then mis-read the real payload packet as a tag header, writing junk register values. `192 = 24*16*4/8` and the repeats
+at `144 = 24*12*4/8` match the ring's `24x16` / `24x12` rects exactly, so this is the texture, not a coincidence.
+parallel-gs is unaffected (its raw forwarder never runs our decoder), which also *corroborates* its own `3.97 MB`
+measurement.
+
+**FIX (`gs_frontend.cpp`, no header change):** carry the remainder of a split IMAGE tag across packets
+(`g_pendingImageQw`, file-scope static; cleared in `GS::reset`). A packet that opens with a pending image consumes
+those leading whole qwords as payload via `processImageData` before the tag walk, and an IMAGE tag cut short by the
+packet boundary records what is still owed.
+
+**VERIFIED (CPU backend, `logs/cpuB10.err`, black phase reached):** `0x3FF0(... x39501 bytes=7147392)` — **7.1 MB
+delivered where it previously counted 0** — and the 256-byte page census reads `0x3ff000: 57 0 0 0 57 ...` instead of
+all zeros. The logo sprite is genuinely submitted (`[2D]` probes: `tbp=3ff0 psm=14 cbp=3ff4 tw=6 th=6 tcc=1
+TEST=0x5120d alpha=0x44`, 277 of them), so the upload was the missing half of the sampler input.
+
+**Still open after the fix:** with `PS2X_GS_CPU=1` the display buffer stays empty (`nzDisp2=0` at every tick from 3000
+to 6750), so the CPU *software rasteriser* is not a proven reference for the picture even though its upload path is now
+correct. The next measurement is the native backend (GPU draws + the now-correct upload path), which is the only
+renderer that both uses our decoder and is known to rasterise.
+
+**Boot race in this environment:** 3 of 8 CPU-backend runs reached the black phase (`B2/B4/B5/B7/B10/B12` yes,
+`B3/B6/B9/B11` no — the failing ones stay at `nzWords=98728` with `threads=7`), so budget 2 attempts per 130 s run.
+
+
 ## NEXT SESSION — START HERE (written end of session 58x, 2026-11-01)
 
 **Goal unchanged:** get past "NOW LOADING" to the Namco / Project Melfes / Sofdec logos, then the MPG movie.
