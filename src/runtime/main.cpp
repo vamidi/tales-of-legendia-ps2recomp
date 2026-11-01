@@ -127,6 +127,7 @@ namespace
     const BootPoint kBootPoints[] = {
         {0x00100008u, "crt0 entry"},
         {0x0011EA58u, "FUN_0011ea58 libc-init"},
+        {0x0011E900u, "FUN_0011e900 syscall 0x83"},
         {0x0011E808u, "FUN_0011e808"},
         {0x0011E948u, "FUN_0011e948"},
         {0x0011EF38u, "FUN_0011ef38"},

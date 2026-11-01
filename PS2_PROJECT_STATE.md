@@ -287,3 +287,74 @@ not a corrupted frame. **The frame handling was never wrong.**
 **Next:** read `PS2Runtime::dispatchGuestBranch` and enumerate every path that returns false (missing target,
 `ctx->pc == 0` after the call, stop requested, reentry rejection, ...), then log which one fires for this call.
 That is a runtime question now, and the map is out of the picture.
+
+---
+
+## Session 60 (cont.): the real defect — computed jumps into mid-function
+
+After the map fix, the boot no longer stalls on `0x11E900`. The next run (boot paths are interleaving-sensitive, so
+successive runs are not identical) produced:
+
+```
+Error: No exact recompiled function for guest PC 0x13f660 ... codeRegion=yes
+Error: No exact recompiled function for guest PC 0x13f6b0 ...
+```
+
+Diagnosis (all verified, not guessed):
+
+- Both addresses **are** inside a real function: `FUN_0013f4b0`, `0x0013F4B0..0x0013F7C0` (784 bytes). The map is right.
+- `FUN_0013f4b0` **does** emit resume labels for 20+ internal addresses (`case 0x13f4ecu: ... case 0x13f634u:`),
+  and each of those has a table slot.
+- `0x13F660` and `0x13F6B0` are **not** among them: `Select-String "case 0x13f660u"` = 0, `"// 0x13f660"` in
+  `register_functions.cpp` = 0.
+
+So the guest reached a mid-function address the recompiler never enumerated — a **computed branch** (`jalr` through a
+function pointer or a jump table). The map is not at fault; the *entry-point enumeration* is incomplete by construction.
+
+### Why the earlier attempt failed
+
+`function_emitter.cpp` builds its own local `resumeTargets` from `analysisResult.resumeEntryPoints`, which drives only
+the `switch (ctx->pc) { case ...: goto label_...; }` and the `label_` emission. The **function table** is a separate
+pipeline: `function_table_emitter.cpp:124` iterates `cg.m_resumeEntryTargetsByOwner`, which is populated in
+`ps2_recompiler.cpp:1860` from `analysisResult.resumeEntryPoints` / `indirectFallbackEntryPoints`.
+
+Adding every instruction to `resumeTargets` in the emitter therefore produced labels and cases but **no table slots** —
+`lookupFunction()` consults the table first, so dispatch still failed. (That patch has been reverted.)
+
+### Option A implemented (the correct site)
+
+`ps2_recompiler.cpp`, in `discoverAdditionalEntryPoints()`, where the decoded instruction list is in scope:
+
+```cpp
+            // Option A: a computed jump (jalr through a function pointer or a jump table) can enter a function at
+            // ANY decoded instruction, and the guest has no notion of an "entry point". Register a resume slot for
+            // every instruction so such a jump resumes mid-function instead of failing to dispatch. The generated
+            // table is dense per 4 bytes, so this fills existing slots rather than growing the table.
+            for (const Instruction &everyInst : instructions)
+            {
+                ownerTargets.push_back(everyInst.address);
+            }
+```
+
+This feeds `m_resumeEntryTargetsByOwner` -> `setResumeEntryTargets` -> `cg.m_resumeEntryTargetsByOwner`, which is
+consumed by **both** the table emitter and `function_emitter.cpp:60-62` (so labels and cases are emitted for the same
+addresses automatically). Table base/end and slot count are unchanged; only the number of initialised slots grows.
+
+Cost: bigger `register_functions.cpp` and larger TUs (a `case` + `label_` per instruction). Acceptable; clang-cl has
+already proven it handles the large units.
+
+### Verification contract
+
+Regeneration must show, before any boot result is trusted:
+
+- `reg163f660=1` and `reg163f6b0=1` in `data/output_fixed/register_functions.cpp`
+- `corpus_cpp=13520`, 0 decode failures
+- `tol.exe` relinked *after* the corpus (previous run was invalidated by testing a 21:46 binary against a 22:07 corpus)
+
+Then the boot run must show `No exact recompiled function` count = 0.
+
+### Still uncommitted
+
+- `TOL_TRACE_CKPT` (checkpoint-decline counter) and `TOL_TRACE_FINDADDR` (FindAddress args/result) in the submodule
+- `0x11E900` boot point in `src/runtime/main.cpp`
+- `ps2_recompiler.cpp` option-A change + `build/recomp`
