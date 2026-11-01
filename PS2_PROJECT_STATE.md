@@ -60,21 +60,34 @@ void AddDmacHandler_0x1143f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runt
 
 ## 4. What is missing from the pasted skeleton
 
-The root `CMakeLists.txt` references files that were not pasted. Configure will fail until each is either supplied or
-removed:
+Resolved during setup:
 
-| Missing | Referenced by | Notes |
-|---|---|---|
-| `cmake/Dq8Utf8CodePage.cmake` | `src/runtime/CMakeLists.txt:8` | UTF-8 code page on MSVC |
-| `cmake/Dq8Icon.cmake` | `src/runtime/CMakeLists.txt:10` | embeds `res/icon/dq8.icns` |
-| `cmake/Dq8HostSimd.cmake` | `CMakeLists.txt:115` | wires SIMDe for the generated corpus |
-| `res/icon/dq8.icns` | `src/runtime/CMakeLists.txt:137` | macOS app icon only |
-| `tools/runtime` | `CMakeLists.txt:192` (`add_subdirectory ... EXCLUDE_FROM_ALL`) | harness |
-| `config/` | DQ8 regeneration flow | recompiler TOMLs; we have `data/config.toml` from ToL |
-| `setup.py` | DQ8 regeneration flow | drives analyzer + recompiler |
+| Item | Resolution |
+|---|---|
+| `cmake/*.cmake` | pasted; `cmake/Dq8Icon.cmake` now skips when `res/icon` is absent, which is what configure used to fail on |
+| `tools/runtime/render_cadence.h`, `gs_fan_probe.h` | copied from the DQ8 reference so `main.cpp` compiles verbatim; both are env-gated and are DQ8-specific diagnostics, never run by default |
+| `tools/runtime/CMakeLists.txt` (its test executables) | deliberately not added — DQ8-only harness |
+| `res/`, `config/`, `setup.py` | only needed for regeneration or the macOS bundle; not used on this path |
 
-Also note: the skeleton sets `PS2X_VU_PROGRAM_PROFILES`, which the **pinned** PS2Recomp does not define (it is a newer
-feature), so those blocks are inert here.
+## 4b. Runtime lineage: vamidi/PS2Recomp + the DQ8 reference's ps2xRuntime
+
+`vamidi/PS2Recomp` is the pinned submodule, but the DQ8 skeleton is written against a runtime that has
+features upstream lacks. Rather than rewrite `main.cpp` to the older API, `ps2xRuntime` was **synced from the
+local DQ8 reference** (`D:\Personal\C++\DQ8-Recompiled-main\thirdparty\PS2Recomp`): 317 files, 78 new —
+native IOP bridge (`ps2_native_iop`: real IRX modules with SPU2 mixed to the host device), threaded GS
+backend, EE fiber, host pacing, and the VU1 compile pipeline (`ps2_vu1_fmac/region/program/cache/capture`).
+
+Preserved through the sync: the ToL corpus in `ps2xRuntime/src/runner` (53,558 files) and our extra files
+(`includes/ps2_recompiled_*.h`, `ps2_vfs`, `ps2_rom_device`, `gs_texture_page_cache`). The
+`RecompiledFunction` ABI is identical on both sides (`void(*)(uint8_t*, R5900Context*, PS2Runtime*)`), so
+**no regeneration is required**.
+
+The sync is committed *inside* the submodule (`b314e1f`) and the parent records that gitlink. To make it
+permanent it must be pushed to `vamidi/PS2Recomp`, otherwise `git submodule update` restores the old runtime.
+
+Only one line of `main.cpp` differs from the reference: the `--trace-printf` path referenced DQ8's
+`FUN_00119508_0x119508`, which does not exist in ToL's corpus, so that block now reports "no guest printf
+wrapper is mapped for this title yet".
 
 ## 5. Build plan (adapted from the DQ8 wiki)
 
@@ -93,13 +106,20 @@ cmake -S . -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release `
 cmake --build build/game --target dq8
 ```
 
-## 6. Open decisions (asked, not yet answered)
+## 6. Status
 
-1. Link the **existing** `data/output` corpus first, or regenerate with the pinned recompiler?
-2. Keep the corpus in `data/output` (point `DQ8_GENERATED_DIR` at it) or move it under `build/generated/...`?
-3. Supply the missing skeleton files from the DQ8 repo, or replace them with minimal local versions?
-4. Rename the `dq8` target / `DQ8_*` variables to `tol`/`TOL_*`, or keep the DQ8 names?
-5. Toolchain on this machine: MSVC (Visual Studio 18 is installed) or clang/Ninja?
+| Step | State |
+|---|---|
+| commit reset + submodules | done (`580cc0d`, `8b4786f`) |
+| state archived + rewritten | done (`2bb3c88`) |
+| runtime synced from reference | done, submodule commit `b314e1f` |
+| configure | **passes** — `linking 53558 generated translation units` |
+| `ps2_runtime` (incl. native IOP / threaded GS / VU1 pipeline) | **builds clean** |
+| `dq8_gfx_gs` (our GS/gfx layer) | **builds clean** |
+| `main.cpp` | **builds clean** |
+| `dq8_generated` (53,558 corpus TUs) + final link | in progress |
+
+## 7. Open decisions
 
 ## 7. Working rules for this tree
 
