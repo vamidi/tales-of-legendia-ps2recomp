@@ -82,22 +82,30 @@ namespace
         }();
         return v;
     }
-    // PS2X_FORCE_TBP=1 (session 58w): move the T4 texture the logo sprites sample from tbp0 0x3ff0 to 0x3fe0, the
-    // nearest PAGE-ALIGNED 4-bit destination, in BOTH the upload (BITBLTBUF.DBP) and the sampler (TEX0.TBP0).
-    //
-    // Why: with the VIF1 desync fixed the renderer receives 20164 complete 24x16 T4 transfers (3.97 MB) and calls
-    // copy_vram 41511 times, yet 0x3FF000 still holds ~2 non-zero bytes, while the 8x2 CT32 CLUT at 0x3FF400 lands.
-    // Both sit mid-page (0x3FF000 is offset 4096 in page 511). A 4-bit page is 8192 B, so a page-aligned DBP must be
-    // a multiple of 32 in 256-byte units: 0x3ff0 rounds down to 0x3fe0 (= 0x3FE000, the start of page 511).
-    //   - if the texture lands there and the picture changes -> the T4 mid-page/straddle write is the bug;
-    //   - if it still does not land -> T4 destination writes are broken regardless of alignment.
-    bool forceTbpEnabled()
+    // PS2X_FORCE_TBP=<mode> (session 58w/58x). Two discriminators in one opt-in flag:
+    //   "1"    - move the 4-bit texture to a page-aligned destination (BITBLTBUF.DBP and TEX0.TBP0
+    //            0x3ff0 -> 0x3fe0 = 0x3FE000). Result: still 2 bytes, so alignment is exonerated.
+    //   "ct16" - keep the destination and the area but switch the FORMAT away from 4-bit: DPSM T4 -> CT16
+    //            and TRXREG 24x16 -> 24x4. Chosen so required_qwords is unchanged at 24 words
+    //            (24*4*16/64 = 24, same as 24*16*4/64), so the flush path is identical and the ONLY
+    //            variable is the pixel format. Lands -> the 4-bit destination write is the fault;
+    //            still empty -> the destination region/geometry is.
+    const char *forceTbpMode()
     {
-        static const bool v = [] {
+        static const char *const v = []() -> const char * {
             const char *e = std::getenv("PS2X_FORCE_TBP");
-            return e && *e && *e != '0';
+            return (e && *e && *e != '0') ? e : nullptr;
         }();
         return v;
+    }
+    bool forceTbpEnabled()
+    {
+        return forceTbpMode() != nullptr;
+    }
+    bool forceTbpCt16Mode()
+    {
+        const char *m = forceTbpMode();
+        return m != nullptr && m[0] == 'c' && m[1] == 't';
     }
     constexpr uint32_t kForceTbpFrom = 0x3FF0u; // page index the guest uses (mid-page)
     constexpr uint32_t kForceTbpTo = 0x3FE0u;   // 0x3fe0 * 256 = 0x3FE000, page-aligned
@@ -695,6 +703,7 @@ namespace
             uint64_t declaredQw = 0u;                    // sum of those tags' NLOOP
             uint64_t deliveredQw = 0u;                   // qwords actually present in the stream
             uint64_t hwregQw = 0u;                       // qwords delivered as HWREG (0x51) writes
+            uint64_t hwregPreTrxdir = 0u;                // ...of which arrived BEFORE TRXDIR (parallel-gs drops these)
             uint64_t maxTagQw = 0u;                      // largest single tag
             uint64_t nzBytes = 0u;                       // non-zero payload bytes (bounded scan)
             uint64_t scannedBytes = 0u;
@@ -727,6 +736,7 @@ namespace
         bool m_rawXferActive = false;
         uint32_t m_rawLatchedDbp = 0xFFFFFFFFu;
         bool m_rawLatchedActive = false;
+        bool m_sawTrxdirSinceBlt = false;
         const bool m_rawEnabled = (std::getenv("PS2X_DBP_STATS") != nullptr);
 
         // Fed from the same points observeGIF decodes, so the destination is never inferred from a stale mirror.
@@ -738,6 +748,7 @@ namespace
             {
                 const uint32_t dbp = uint32_t((value >> 32) & 0x3FFFu);
                 m_rawDpsm = uint32_t((value >> 56) & 0x3Fu);
+                m_sawTrxdirSinceBlt = false;
                 m_rawDbpCurrent = dbp;
                 m_rawHaveDbp = true;
                 ++m_rawDbp[dbp].bitbltWrites;
@@ -785,6 +796,11 @@ namespace
                     ++d.deliveredQw;
                     ++m_hwregSinceBlt;
                     ++m_rawXferGot;
+                    // A HWREG written BEFORE TRXDIR lands in parallel-gs's payload buffer while no transfer is
+                    // active, and init_transfer() clears that buffer - so this qword is discarded. Counting them
+                    // separately proves whether the guest primes the FIFO ahead of the transfer.
+                    if (!m_sawTrxdirSinceBlt)
+                        ++d.hwregPreTrxdir;
                     if (d.scannedBytes < 1024u)
                     {
                         const auto *bytes = reinterpret_cast<const uint8_t *>(&value);
@@ -828,14 +844,15 @@ namespace
                     if (m_rawXferActive && m_rawXferDbp == 0x3FF0u && m_xferPrints < 24u)
                     {
                         ++m_xferPrints;
-                        const bool enough = m_rawXferGot >= m_rawXferRequired;
-                        std::fprintf(stderr,
-                                     "[GS-xferq] dbp=0x3ff0 latched rect=%ux%u psm=0x%02x required=%u qw "
-                                     "received=%u qw (%u B)%s\n",
-                                     m_rawXferW, m_rawXferH, m_rawXferPsm, m_rawXferRequired, m_rawXferGot,
-                                     m_rawXferGot * 16u,
-                                     enough ? "  <= ENOUGH: backend had the data and did not write it"
-                                            : "  <= SHORT: guest starved the transfer");
+                    // `required` is in 64-bit WORDS (parallel-gs does /64); `received` is GIF qwords = 2 words each.
+                    const bool enough = (m_rawXferGot * 2u) >= m_rawXferRequired;
+                    std::fprintf(stderr,
+                                 "[GS-xferq] dbp=0x3ff0 latched rect=%ux%u psm=0x%02x required=%u words "
+                                 "received=%u qw (%u words)%s\n",
+                                 m_rawXferW, m_rawXferH, m_rawXferPsm, m_rawXferRequired, m_rawXferGot,
+                                 m_rawXferGot * 2u,
+                                 enough ? "  <= ENOUGH"
+                                        : "  <= SHORT");
                     }
                     m_rawXferDbp = m_rawDbpCurrent;
                     m_rawXferW = m_rawRectW;
@@ -848,6 +865,7 @@ namespace
 
                     m_rawLatchedDbp = m_rawDbpCurrent;
                     m_rawLatchedActive = true;
+                    m_sawTrxdirSinceBlt = true;
                     RawDbp &d = m_rawDbp[m_rawDbpCurrent];
                     const uint32_t dir = uint32_t(value & 3u);
                     m_rawDir = dir;
@@ -893,6 +911,7 @@ namespace
                 }
             }
             d.deliveredQw += deliveredBytes / 16u;
+            m_rawXferGot += static_cast<uint32_t>(deliveredBytes / 16u);
             if (m_traceLeft != 0u)
             {
                 --m_traceLeft;
@@ -1037,7 +1056,7 @@ namespace
                     verdict = "   <= below one 32x16 T4 (256 B)";
                 std::fprintf(stderr,
                              "[GS-dbp]   dbp=0x%04x (0x%06x) blt=%llu dir=%llu/%llu/%llu rect=%ux%u tags=%llu "
-                             "declared=%llu qw delivered=%llu qw max=%llu qw hwreg=%llu qw bytes=%llu nz=%llu/%llu%s\n",
+                             "declared=%llu qw delivered=%llu qw max=%llu qw hwreg=%llu qw (pre-TRXDIR=%llu) bytes=%llu nz=%llu/%llu%s\n",
                              kv.first, kv.first * 256u, static_cast<unsigned long long>(d.bitbltWrites),
                              static_cast<unsigned long long>(d.dir0), static_cast<unsigned long long>(d.dir1),
                              static_cast<unsigned long long>(d.dir2), d.lastW, d.lastH,
@@ -1046,6 +1065,7 @@ namespace
                              static_cast<unsigned long long>(d.deliveredQw),
                              static_cast<unsigned long long>(d.maxTagQw),
                              static_cast<unsigned long long>(d.hwregQw),
+                             static_cast<unsigned long long>(d.hwregPreTrxdir),
                              static_cast<unsigned long long>(bytes),
                              static_cast<unsigned long long>(d.nzBytes),
                              static_cast<unsigned long long>(d.scannedBytes), verdict);
@@ -1465,7 +1485,33 @@ namespace
                     // (BITBLTBUF.DBP, bits 32-45) and in the sampler (TEX0.TBP0, bits 0-13).
                     if (forceTbpEnabled())
                     {
-                        if (adReg == 0x50u && ((adValue >> 32) & 0x3FFFu) == kForceTbpFrom)
+                        if (forceTbpCt16Mode())
+                        {
+                            // Switch the destination format away from 4-bit while keeping required_qwords at 24
+                            // words, so the flush path is unchanged and format is the only variable.
+                            if (adReg == 0x50u && ((adValue >> 56) & 0x3Fu) == 0x14u)
+                            {
+                                m_scisPatch.push_back({offset, (adValue & ~(0x3Full << 56)) | (0x02ull << 56)});
+                                static uint32_t s_dpsm = 0u;
+                                if (s_dpsm < 4u)
+                                {
+                                    ++s_dpsm;
+                                    std::cerr << "[GS-tbp] BITBLTBUF dpsm 0x14 (T4) -> 0x02 (CT16)" << std::endl;
+                                }
+                            }
+                            else if (adReg == 0x52u && (adValue & 0xFFFu) == 24u && ((adValue >> 32) & 0xFFFu) == 16u)
+                            {
+                                m_scisPatch.push_back({offset, (adValue & ~(0xFFFull << 32)) | (4ull << 32)});
+                                static uint32_t s_rect = 0u;
+                                if (s_rect < 4u)
+                                {
+                                    ++s_rect;
+                                    std::cerr << "[GS-tbp] TRXREG 24x16 -> 24x4 (keeps required_qwords at 24 words)"
+                                              << std::endl;
+                                }
+                            }
+                        }
+                        else if (adReg == 0x50u && ((adValue >> 32) & 0x3FFFu) == kForceTbpFrom)
                         {
                             m_scisPatch.push_back(
                                 {offset, (adValue & ~(0x3FFFull << 32)) | (static_cast<uint64_t>(kForceTbpTo) << 32)});
