@@ -10,24 +10,24 @@
 #include <cstring>
 #include <limits>
 
-namespace dq8::diagnostics
+namespace tol::diagnostics
 {
 class RenderCadenceProbe
 {
 public:
     // `forCounter`: the in-game frame-rate counter needs the count even when
-    // neither variable asks for it; logging still follows DQ8_RENDER_CADENCE.
+    // neither variable asks for it; logging still follows TOL_RENDER_CADENCE.
     bool configure(PS2Runtime &runtime, bool forCounter = false)
     {
         const auto enabled = [](const char *name) {
             const char *value = std::getenv(name);
             return value && std::strcmp(value, "0") != 0;
         };
-        m_logEnabled = enabled("DQ8_RENDER_CADENCE");
-        if (!m_logEnabled && !enabled("DQ8_GFX_SHOW_FPS") && !forCounter)
+        m_logEnabled = enabled("TOL_RENDER_CADENCE");
+        if (!m_logEnabled && !enabled("TOL_GFX_SHOW_FPS") && !forCounter)
             return false;
-        m_limit = envBounded("DQ8_RENDER_CADENCE_LIMIT", 600u, 10000u);
-        m_intervalMs = envBounded("DQ8_RENDER_CADENCE_INTERVAL_MS", 2000u, 60000u);
+        m_limit = envBounded("TOL_RENDER_CADENCE_LIMIT", 600u, 10000u);
+        m_intervalMs = envBounded("TOL_RENDER_CADENCE_INTERVAL_MS", 2000u, 60000u);
         m_intervalMs = std::max(m_intervalMs, 100u);
         if (!runtime.hasFunction(kEntry))
         {
@@ -190,4 +190,4 @@ inline bool configureRenderCadenceProbe(PS2Runtime &runtime, bool forCounter = f
 {
     return RenderCadenceProbe::instance().configure(runtime, forCounter);
 }
-} // namespace dq8::diagnostics
+} // namespace tol::diagnostics

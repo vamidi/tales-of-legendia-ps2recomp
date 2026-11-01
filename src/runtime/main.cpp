@@ -108,9 +108,11 @@ namespace
     constexpr uint32_t kDebugPrintfWrapper = 0x00146E20u;
     constexpr uint32_t kBattleLogWrapper = 0x00321620u;
 
-    // The ELF header points at a scratchpad-address table at 0x00100008.
-    // Start at the first executable instruction, crt0_start, instead.
-    constexpr uint32_t kDefaultEntryPoint = 0x0010008Cu;
+    // The ELF header points at a scratchpad-address table at 0x00100008. For Dragon Quest 8 the first executable
+    // instruction (crt0_start) sat 0x84 further on, and the reference build started there. Tales of Legendia's
+    // crt0 IS 0x00100008 - the same address the corpus table is based at - and 0x0010008C has no compiled
+    // function, so starting there jumps to an unmapped target and the guest never runs. Override with --entry=.
+    constexpr uint32_t kDefaultEntryPoint = 0x00100008u;
 }
 
 int main(int argc, char **argv)

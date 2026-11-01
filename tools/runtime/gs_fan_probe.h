@@ -13,7 +13,7 @@
 #include <execinfo.h>
 #endif
 
-namespace dq8::diagnostics {
+namespace tol::diagnostics {
 
 // Opt-in observation only: never alter the submitted draw or its ordering.
 class GsFanProbeBackend final : public GSRasterBackend {
@@ -22,9 +22,9 @@ public:
                                const uint8_t *rdram = nullptr,
                                uint32_t ramSize = 0)
         : m_backend(std::move(backend)), m_rdram(rdram), m_ramSize(ramSize),
-          m_start(option("DQ8_GS_FAN_PROBE_START", 0)),
-          m_interval(option("DQ8_GS_FAN_PROBE_INTERVAL", 60)),
-          m_limit(option("DQ8_GS_FAN_PROBE_LIMIT", 16)) {}
+          m_start(option("TOL_GS_FAN_PROBE_START", 0)),
+          m_interval(option("TOL_GS_FAN_PROBE_INTERVAL", 60)),
+          m_limit(option("TOL_GS_FAN_PROBE_LIMIT", 16)) {}
 
     static bool matches(const GSPrimitiveBatch &b) {
         return b.state.prim.type == GS_PRIM_TRIFAN && !b.state.prim.tme &&
@@ -122,7 +122,7 @@ private:
 inline std::unique_ptr<GSRasterBackend> wrapGsFanProbe(
     std::unique_ptr<GSRasterBackend> backend, const uint8_t *rdram = nullptr,
     uint32_t ramSize = 0) {
-    if (!std::getenv("DQ8_GS_FAN_PROBE")) return backend;
+    if (!std::getenv("TOL_GS_FAN_PROBE")) return backend;
     return std::make_unique<GsFanProbeBackend>(std::move(backend), rdram, ramSize);
 }
-} // namespace dq8::diagnostics
+} // namespace tol::diagnostics
