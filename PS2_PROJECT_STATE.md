@@ -3754,6 +3754,62 @@ payload itself is real data, not zeros.
 (the 44/57-byte CLUT), so the difference is specific to the T4 destination - check `compute_page_rect` with
 `DPSM=PSMT4, DBW=1` and `trxreg=24x16`, and whether `copy_cpu` vs `renderer.copy_vram` is taken.
 
+### Session 58v - flush path followed: parallel-gs DOES flush and DOES call copy_vram (41511 times); the unit confusion is resolved and the remaining difference is T4-vs-CT32 at a mid-page destination
+
+**No code change.** Walked one `0x3ff0` transfer through `gs_interface.cpp` end to end and checked each stage against
+the run's own counters.
+
+**1. `required_qwords` is CORRECT - it is in 64-bit words, not GIF qwords.** This nearly got misfiled as an off-by-2
+in parallel-gs. `init_transfer` (`gs_interface.cpp:3214`) computes `RRW*RRH*bpp(DPSM)/64`, and `a_d_HWREG_multi`
+(line 4401) pushes `num_loops * 2` **64-bit** words per IMAGE qword. So:
+
+| transfer | `required_qwords` | payload delivered | verdict |
+|---|---|---|---|
+| 24x16 T4 | 24*16*4/64 = **24** words | 12 GIF qw = **24** words | exact match |
+| 8x2 CT32 | 8*2*32/64 = **8** words | 4 GIF qw = **8** words | exact match |
+
+`check_pending_transfer` (line 2980, `size() >= required_qwords`) therefore **does** fire at the right moment. No
+defect here.
+
+**2. `flush_pending_transfer` reaches its body.** Its guard is `host_to_local_active && payload.size() >
+last_flushed_qwords` (line 2991), and `init_transfer` calls it with `keep_alive=false`, so the payload is cleared and
+`last_flushed_qwords` reset between transfers. A transfer always has fresh data to write.
+
+**3. parallel-gs DOES take the copy path, 41511 times.** From its own `consume_flush_stats()`:
+
+```
+[GSpost] bytes=18351072 prims=23842 passes=447 copies=41511 palettes=656
+```
+
+41511 copies against ~20164 expected `0x3ff0` transfers, so `renderer.copy_vram(transfer_state.copy, dst_rect)` at
+line 3140 is running. The `copy_cpu` fast path (line 3024) is skipped - it additionally requires
+`host_data_size == host_data_size_required` exactly and a single-page rect, and it does not matter here because the
+`!copy_cpu` fallback also writes.
+
+**4. `compute_page_rect` arithmetic for this destination, worked by hand** (`gs_util.cpp:141`): `DBP=0x3ff0` ->
+`base_page = 0x3ff0/32 = 511` (the last page, byte `0x3FF000`), `trxreg 24x16` -> `page_width = page_height = 1`
+(single page, so the straddle branch resolves via `swizzle_block_mask_PS2` with `block_offset = 0x3ff0 % 32 = 16`).
+Nothing degenerate. Note `page_stride = row_length_64 >> 1 = 1 >> 1 = 0` for T4 with `DBW=1` - harmless for a
+single-page rect, but the only value that looks odd.
+
+**5. So the remaining difference is `DPSM`, not geometry.** Both destinations sit mid-page (`0x3FF000` is offset 4096
+in page 511, `0x3FF400` offset 5120) and both are 8x2/24x16-ish single-page rects. The one that lands is **CT32**;
+the one that does not is **T4**. Everything upstream of `copy_vram` is now ruled out: the payload arrives complete
+(3.97 MB, 20164 transfers, `blt == dir == tags`), `required_qwords` matches, the flush fires, and the copy is called.
+
+**Consequence:** the fault is inside parallel-gs's T4 destination write (`compute_page_rect` block mask / `write_mask`
+from `psm_word_write_mask(PSMT4)`, or `copy_vram`'s staging for a 4-bit destination). **The vendored source must not be
+patched** (quick rule 6), so this cannot be fixed in place - it needs either a supported upstream change or a
+workaround on our side.
+
+**Next, cheapest discriminating experiment (no vendored edits):** force the `0x3ff0` upload to a *page-aligned* T4
+destination via the existing `m_scisPatch` byte-patch mechanism (the same tool `PS2X_FORCE_ALPHA` uses) under a new
+opt-in flag, and dump the page split.
+- lands when page-aligned -> the T4 mid-page/straddle write is the bug;
+- still absent -> T4 destination writes are broken regardless of alignment.
+Either result gives a workaround we control (e.g. shadow the texture into a page-aligned staging area and let the
+sampler read from there).
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
