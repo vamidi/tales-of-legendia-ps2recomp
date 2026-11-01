@@ -10,18 +10,18 @@
 #include "runtime/gs/gs_types.h"
 #include "runtime/ps2_memory.h" // struct GSRegisters
 
-#if defined(DQ8_GSDUMP_HAS_SDLGPU)
+#if defined(TOL_GSDUMP_HAS_SDLGPU)
 #include "gfx/backends/sdlgpu/sdlgpu_backend.h"
 #endif
 
-namespace dq8::gfx {
+namespace tol::gfx {
 namespace {
 
 constexpr uint32_t kVramBytes = 4u * 1024u * 1024u;
 // ps2xRuntime's CPU backend renders presentation into a fixed 640x512 buffer
 // (gs_cpu_backend.cpp: kHostFrameWidth/kHostFrameHeight) and clamps the decoded
 // display size to it, so any mode wider than 640 or taller than 512 is silently
-// clipped upstream. DQ8's 512x448 fits.
+// clipped upstream. TOL's 512x448 fits.
 
 uint64_t loadLE64(const uint8_t *p) {
     uint64_t v = 0;
@@ -146,7 +146,7 @@ bool replayDump(const GsDumpFile &dump, const ReplayOptions &options,
                 options.backendTracePath, 1u, UINT32_MAX);
         gs.setRasterBackend(std::move(backend));
     };
-#if defined(DQ8_GSDUMP_HAS_SDLGPU)
+#if defined(TOL_GSDUMP_HAS_SDLGPU)
     SdlGpuBackend *hardware = nullptr;
     if (options.backend == ReplayBackend::SdlGpu) {
         std::string backendError;
@@ -303,7 +303,7 @@ bool replayDump(const GsDumpFile &dump, const ReplayOptions &options,
         }
     }
 
-#if defined(DQ8_GSDUMP_HAS_SDLGPU)
+#if defined(TOL_GSDUMP_HAS_SDLGPU)
     if (hardware) {
         // Resolve every render target into local memory, so --dump-vram shows
         // what the GPU actually drew rather than whatever last happened to be
@@ -369,4 +369,4 @@ bool replayDump(const GsDumpFile &dump, const ReplayOptions &options,
     return true;
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

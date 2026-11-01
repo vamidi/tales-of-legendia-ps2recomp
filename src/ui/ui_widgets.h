@@ -6,7 +6,7 @@
 
 #include <imgui.h>
 
-namespace dq8::ui {
+namespace tol::ui {
 
 // Begin() plus the Dragon Quest window edge and shadow.
 bool beginWindow(const char *name, bool *open, ImGuiWindowFlags flags);
@@ -42,4 +42,4 @@ bool iconButton(const char *label, Icon icon, bool primary = false);
 void keycap(const char *text);
 void mutedText(const char *format, ...) IM_FMTARGS(1);
 
-} // namespace dq8::ui
+} // namespace tol::ui

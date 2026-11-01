@@ -10,7 +10,7 @@
 #include <string>
 #include <type_traits>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 // Local diagnostic format, tied to the GS struct ABI of the producing build.
 enum class GsTraceOp : uint32_t { Submit, Transfer, Upload, Flush, TextureFlush,
@@ -125,4 +125,4 @@ private:
     mutable FILE *m_file = nullptr;
     mutable std::mutex m_mutex;
 };
-} // namespace dq8::gfx
+} // namespace tol::gfx

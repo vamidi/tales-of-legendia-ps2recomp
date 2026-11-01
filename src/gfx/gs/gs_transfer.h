@@ -19,7 +19,7 @@
 #include <functional>
 #include <vector>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 class GsTransferEngine {
 public:
@@ -68,4 +68,4 @@ private:
     size_t m_localToHostReadPos = 0u;
 };
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

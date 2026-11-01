@@ -10,7 +10,7 @@
 #include <cstdlib>
 #include <limits>
 
-namespace dq8 {
+namespace tol {
 namespace {
 using Function = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
 std::array<Function, 3> originals{};
@@ -54,7 +54,7 @@ template <unsigned comparison>
 void compare(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
     originals[comparison](rdram, ctx, runtime);
     repairVuBoundsFlags(*ctx, comparison);
-    static const bool trace = std::getenv("DQ8_TRACE_VU_BOUNDS") != nullptr;
+    static const bool trace = std::getenv("TOL_TRACE_VU_BOUNDS") != nullptr;
     if (trace) {
         static uint64_t calls = 0, rejected = 0;
         ++calls;

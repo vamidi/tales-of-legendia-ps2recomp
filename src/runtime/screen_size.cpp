@@ -4,7 +4,7 @@
 
 #include <atomic>
 
-namespace dq8 {
+namespace tol {
 namespace {
 // The option is a byte at gp-0x7014: 0x168FF0 stores it, and 0x168F90 turns
 // it into the projection's 0.75 or 0.5625. Reading it before the original
@@ -46,4 +46,4 @@ bool installScreenSizeProbe(PS2Runtime &runtime) {
 
 int gameScreenSize() { return g_screenSize.load(std::memory_order_relaxed); }
 
-} // namespace dq8
+} // namespace tol

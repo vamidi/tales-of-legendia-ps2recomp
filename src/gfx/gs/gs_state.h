@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 // TEST: alpha test, destination alpha test, depth test.
 enum GsAlphaTest : uint8_t {
@@ -158,4 +158,4 @@ struct GsDisplaySetup {
 // enabled, which is the normal state before the game programs the CRTC.
 GsDisplaySetup gsDecodeDisplay(uint64_t dispfb, uint64_t display, bool enabled);
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

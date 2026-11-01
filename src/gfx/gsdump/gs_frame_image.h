@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 struct FrameImage {
     uint32_t width = 0;
@@ -68,4 +68,4 @@ DiffResult diffImages(const FrameImage &a, const FrameImage &b, uint32_t toleran
 DiffResult diffImagesRgb(const FrameImage &a, const FrameImage &b, uint32_t tolerance,
                          FrameImage *heatmap);
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

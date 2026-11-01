@@ -5,7 +5,7 @@
 
 #include <imgui.h>
 
-namespace dq8::ui {
+namespace tol::ui {
 
 namespace palette {
 inline constexpr ImU32 kWindow = IM_COL32(9, 13, 36, 232);
@@ -48,4 +48,4 @@ void drawCursor(ImDrawList *list, ImVec2 tip, float size, float alpha = 1.0f);
 // Heights scale with the font: one "unit" is the current font size.
 inline float em(float units = 1.0f) { return ImGui::GetFontSize() * units; }
 
-} // namespace dq8::ui
+} // namespace tol::ui

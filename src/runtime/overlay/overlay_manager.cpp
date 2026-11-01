@@ -16,7 +16,7 @@ namespace ovl_shop { PS2Runtime::FunctionRegion &functionRegion(); }
 namespace ovl_menu { PS2Runtime::FunctionRegion &functionRegion(); }
 namespace ovl_battle { PS2Runtime::FunctionRegion &functionRegion(); }
 
-namespace dq8::overlay
+namespace tol::overlay
 {
 namespace
 {
@@ -114,7 +114,7 @@ bool headerLooksSane(const Mwo3Header &header, uint32_t loadAddress)
 }
 
 // Consulted by PS2Runtime for every guest PC its generated dense table does
-// not cover, which for DQ8 means the overlay arena and nothing else.
+// not cover, which for TOL means the overlay arena and nothing else.
 PS2Runtime::FunctionRegion *resolveRegion(uint32_t address, void *)
 {
     if (address < kArenaStart || address >= kArenaEnd)
@@ -140,7 +140,7 @@ void onImageLoaded(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         if (!readHeader(rdram, loadAddress, header) || !headerLooksSane(header, loadAddress))
         {
             std::fprintf(stderr,
-                         "[dq8-overlay] post-load hook fired but no valid MWo3 image at "
+                         "[tol-overlay] post-load hook fired but no valid MWo3 image at "
                          "0x%08X (magic 0x%08X)\n",
                          loadAddress, header.magic);
             return;
@@ -150,7 +150,7 @@ void onImageLoaded(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const Descriptor *descriptor = descriptorFor(header.id);
     if (!descriptor)
     {
-        std::fprintf(stderr, "[dq8-overlay] unknown MWo3 overlay id %u ('%.*s')\n",
+        std::fprintf(stderr, "[tol-overlay] unknown MWo3 overlay id %u ('%.*s')\n",
                      header.id, static_cast<int>(sizeof(header.name)), header.name);
         return;
     }
@@ -162,7 +162,7 @@ void onImageLoaded(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 
     if (g_verbose.load(std::memory_order_relaxed))
     {
-        std::printf("[dq8-overlay] #%u %s.bin (id %u, slot %d) resident: "
+        std::printf("[tol-overlay] #%u %s.bin (id %u, slot %d) resident: "
                     ".text 0x%08X+0x%X .data +0x%X .bss +0x%X ctors 0x%08X..0x%08X; "
                     "dispatch 0x%08X..0x%08X\n",
                     count, descriptor->slug, header.id, descriptor->loaderSlot,
@@ -177,7 +177,7 @@ void onImageLoaded(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 
 bool install(PS2Runtime &runtime)
 {
-    if (const char *env = std::getenv("DQ8_OVERLAY_VERBOSE"))
+    if (const char *env = std::getenv("TOL_OVERLAY_VERBOSE"))
     {
         if (env[0] != '\0' && env[0] != '0')
         {
@@ -191,7 +191,7 @@ bool install(PS2Runtime &runtime)
     if (!runtime.replaceFunction(kImageLoadedHook, &onImageLoaded))
     {
         std::fprintf(stderr,
-                     "[dq8-overlay] could not hook 0x%08X; overlays will never become "
+                     "[tol-overlay] could not hook 0x%08X; overlays will never become "
                      "active. Is it in the recompiled function table, and was install() "
                      "called after loadELF()?\n",
                      kImageLoadedHook);
@@ -201,7 +201,7 @@ bool install(PS2Runtime &runtime)
 
     if (g_verbose.load(std::memory_order_relaxed))
     {
-        std::printf("[dq8-overlay] arena 0x%08X..0x%08X dispatches through the active "
+        std::printf("[tol-overlay] arena 0x%08X..0x%08X dispatches through the active "
                     "overlay; post-load hook on 0x%08X\n",
                     kArenaStart, kArenaEnd, kImageLoadedHook);
     }
@@ -229,4 +229,4 @@ void setVerbose(bool verbose)
     g_verbose.store(verbose, std::memory_order_relaxed);
 }
 
-} // namespace dq8::overlay
+} // namespace tol::overlay

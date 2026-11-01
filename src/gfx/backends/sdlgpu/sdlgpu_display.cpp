@@ -3,7 +3,7 @@
 
 #include "gs_display.frag.spv.h"
 #include "gs_reinterpret.vert.spv.h"
-#ifdef DQ8_GFX_HAS_MSL
+#ifdef TOL_GFX_HAS_MSL
 #include "gs_display.frag.msl.h"
 #include "gs_reinterpret.vert.msl.h"
 #endif
@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 double sdlGpuDisplayAspect(const SdlGpuDisplayOptions &options, uint32_t sourceWidth,
                            uint32_t sourceHeight, uint32_t windowWidth, uint32_t windowHeight,
@@ -85,7 +85,7 @@ bool SdlGpuDevice::composeDisplay(SDL_GPUTexture *circuit1, SDL_GPUTexture *circ
         fragmentInfo.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
         fragmentInfo.num_samplers = 2u;
         fragmentInfo.num_uniform_buffers = 1u;
-#ifdef DQ8_GFX_HAS_MSL
+#ifdef TOL_GFX_HAS_MSL
         if ((SDL_GetGPUShaderFormats(m_device) & SDL_GPU_SHADERFORMAT_MSL) != 0) {
             vertexInfo.code = reinterpret_cast<const uint8_t *>(kGsReinterpretVertSpirvMsl);
             vertexInfo.code_size = sizeof(kGsReinterpretVertSpirvMsl);
@@ -159,4 +159,4 @@ bool SdlGpuDevice::composeDisplay(SDL_GPUTexture *circuit1, SDL_GPUTexture *circ
     return true;
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

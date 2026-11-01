@@ -4,13 +4,13 @@
 # `extern const unsigned int SYMBOL_size`.
 
 if(NOT DEFINED INPUT OR NOT DEFINED OUTPUT OR NOT DEFINED SYMBOL)
-    message(FATAL_ERROR "Dq8EmbedBinary.cmake requires INPUT, OUTPUT and SYMBOL")
+    message(FATAL_ERROR "TolEmbedBinary.cmake requires INPUT, OUTPUT and SYMBOL")
 endif()
 
 file(READ "${INPUT}" HEX HEX)
 string(LENGTH "${HEX}" HEX_LENGTH)
 if(HEX_LENGTH EQUAL 0)
-    message(FATAL_ERROR "Dq8EmbedBinary.cmake: ${INPUT} is empty")
+    message(FATAL_ERROR "TolEmbedBinary.cmake: ${INPUT} is empty")
 endif()
 math(EXPR SIZE "${HEX_LENGTH} / 2")
 

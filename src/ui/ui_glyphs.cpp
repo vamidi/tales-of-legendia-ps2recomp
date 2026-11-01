@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace dq8::ui {
+namespace tol::ui {
 namespace {
 using gfx::PadBinding;
 using gfx::PadInput;
@@ -767,4 +767,4 @@ void drawPadDiagram(ImDrawList *list, ImVec2 min, ImVec2 size, const gfx::PadSna
     }
 }
 
-} // namespace dq8::ui
+} // namespace tol::ui

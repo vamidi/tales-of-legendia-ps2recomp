@@ -10,7 +10,7 @@
 #include "gs_dump_file.h"
 #include "gs_frame_image.h"
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 enum class ReplayBackend : uint8_t {
     Software,
@@ -77,4 +77,4 @@ bool replayDump(const GsDumpFile &dump, const ReplayOptions &options,
 // software-GS reference. Returns false when the dump carries no screenshot.
 bool extractScreenshot(const GsDumpFile &dump, FrameImage &out);
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

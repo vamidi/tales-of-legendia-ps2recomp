@@ -9,7 +9,7 @@
 #include <fstream>
 #include <sstream>
 
-namespace dq8::ui {
+namespace tol::ui {
 namespace {
 using gfx::ControllerSelection;
 using gfx::PadInput;
@@ -140,7 +140,7 @@ void apply(Settings &s, const std::string &section, const std::string &key, cons
 std::string serializeSettings(const Settings &s) {
     std::ostringstream out;
     const auto flag = [](bool value) { return value ? "1" : "0"; };
-    out << "; DQ8Recomp settings, written by the in-game menu (F1).\n\n"
+    out << "; TOLRecomp settings, written by the in-game menu (F1).\n\n"
         << "[window]\nfullscreen = " << flag(s.fullscreen) << "\nwidth = " << s.windowWidth
         << "\nheight = " << s.windowHeight << "\n\n"
         << "[display]\nscale = " << s.resolutionScale << "\naspect = " << nameOf(kAspects, s.display.aspect)
@@ -196,11 +196,11 @@ void parseSettings(const std::string &text, Settings &settings) {
 }
 
 std::string defaultSettingsPath() {
-    if (const char *path = std::getenv("DQ8_SETTINGS_FILE"); path && *path)
+    if (const char *path = std::getenv("TOL_SETTINGS_FILE"); path && *path)
         return path;
-    char *folder = SDL_GetPrefPath("DQ8Recomp", "DQ8Recomp");
+    char *folder = SDL_GetPrefPath("TOLRecomp", "TOLRecomp");
     if (!folder)
-        return "dq8recomp-settings.ini";
+        return "tolrecomp-settings.ini";
     std::string path = std::string(folder) + "settings.ini";
     SDL_free(folder);
     return path;
@@ -240,4 +240,4 @@ bool saveSettings(const std::string &path, const Settings &settings) {
     return false;
 }
 
-} // namespace dq8::ui
+} // namespace tol::ui

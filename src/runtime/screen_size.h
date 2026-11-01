@@ -2,7 +2,7 @@
 
 class PS2Runtime;
 
-namespace dq8 {
+namespace tol {
 
 // Follows the game's Screen Size option on the executor thread, for the
 // display's Auto aspect. Install after loadELF().
@@ -11,4 +11,4 @@ bool installScreenSizeProbe(PS2Runtime &runtime);
 // game has set or applied it.
 int gameScreenSize();
 
-} // namespace dq8
+} // namespace tol

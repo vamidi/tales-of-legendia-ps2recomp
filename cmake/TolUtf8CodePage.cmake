@@ -7,7 +7,7 @@
 
 include_guard(GLOBAL)
 
-function(dq8_use_utf8_code_page target)
+function(tol_use_utf8_code_page target)
     if(MSVC)
         # Merged into the manifest the linker writes.
         target_sources(${target} PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/utf8.manifest")

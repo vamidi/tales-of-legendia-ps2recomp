@@ -1,7 +1,7 @@
 # Compile GLSL to embedded SPIR-V and, on macOS, cross-compile it to MSL.
 # Require a compiler so shader edits cannot silently use stale bytecode.
 # Compiler search order: system glslc, system glslangValidator/glslang, then a
-# FetchContent build of glslang. Set DQ8_SHADER_COMPILER to force one.
+# FetchContent build of glslang. Set TOL_SHADER_COMPILER to force one.
 
 include_guard(GLOBAL)
 
@@ -9,40 +9,40 @@ include_guard(GLOBAL)
 # cache variables. A fetched glslang is referenced by generator expression, and
 # that target has to be created on every configure -- caching the expression
 # instead would leave later runs pointing at a target nothing defined.
-function(dq8_find_shader_compiler)
-    get_property(ALREADY_RESOLVED GLOBAL PROPERTY DQ8_SHADER_COMPILER_RESOLVED)
+function(tol_find_shader_compiler)
+    get_property(ALREADY_RESOLVED GLOBAL PROPERTY TOL_SHADER_COMPILER_RESOLVED)
     if(ALREADY_RESOLVED)
         return()
     endif()
-    set_property(GLOBAL PROPERTY DQ8_SHADER_COMPILER_RESOLVED ON)
+    set_property(GLOBAL PROPERTY TOL_SHADER_COMPILER_RESOLVED ON)
 
-    if(DQ8_SHADER_COMPILER)
-        set_property(GLOBAL PROPERTY DQ8_SHADER_COMPILER_PATH "${DQ8_SHADER_COMPILER}")
-        if(NOT DQ8_SHADER_COMPILER_KIND)
-            set(DQ8_SHADER_COMPILER_KIND "glslc")
+    if(TOL_SHADER_COMPILER)
+        set_property(GLOBAL PROPERTY TOL_SHADER_COMPILER_PATH "${TOL_SHADER_COMPILER}")
+        if(NOT TOL_SHADER_COMPILER_KIND)
+            set(TOL_SHADER_COMPILER_KIND "glslc")
         endif()
-        set_property(GLOBAL PROPERTY DQ8_SHADER_COMPILER_DIALECT "${DQ8_SHADER_COMPILER_KIND}")
-        message(STATUS "dq8 shaders: using ${DQ8_SHADER_COMPILER} (${DQ8_SHADER_COMPILER_KIND})")
+        set_property(GLOBAL PROPERTY TOL_SHADER_COMPILER_DIALECT "${TOL_SHADER_COMPILER_KIND}")
+        message(STATUS "tol shaders: using ${TOL_SHADER_COMPILER} (${TOL_SHADER_COMPILER_KIND})")
         return()
     endif()
 
-    find_program(DQ8_SYSTEM_GLSLC NAMES glslc)
-    if(DQ8_SYSTEM_GLSLC)
-        set_property(GLOBAL PROPERTY DQ8_SHADER_COMPILER_PATH "${DQ8_SYSTEM_GLSLC}")
-        set_property(GLOBAL PROPERTY DQ8_SHADER_COMPILER_DIALECT "glslc")
-        message(STATUS "dq8 shaders: using system glslc (${DQ8_SYSTEM_GLSLC})")
+    find_program(TOL_SYSTEM_GLSLC NAMES glslc)
+    if(TOL_SYSTEM_GLSLC)
+        set_property(GLOBAL PROPERTY TOL_SHADER_COMPILER_PATH "${TOL_SYSTEM_GLSLC}")
+        set_property(GLOBAL PROPERTY TOL_SHADER_COMPILER_DIALECT "glslc")
+        message(STATUS "tol shaders: using system glslc (${TOL_SYSTEM_GLSLC})")
         return()
     endif()
 
-    find_program(DQ8_SYSTEM_GLSLANG NAMES glslangValidator glslang)
-    if(DQ8_SYSTEM_GLSLANG)
-        set_property(GLOBAL PROPERTY DQ8_SHADER_COMPILER_PATH "${DQ8_SYSTEM_GLSLANG}")
-        set_property(GLOBAL PROPERTY DQ8_SHADER_COMPILER_DIALECT "glslang")
-        message(STATUS "dq8 shaders: using system glslang (${DQ8_SYSTEM_GLSLANG})")
+    find_program(TOL_SYSTEM_GLSLANG NAMES glslangValidator glslang)
+    if(TOL_SYSTEM_GLSLANG)
+        set_property(GLOBAL PROPERTY TOL_SHADER_COMPILER_PATH "${TOL_SYSTEM_GLSLANG}")
+        set_property(GLOBAL PROPERTY TOL_SHADER_COMPILER_DIALECT "glslang")
+        message(STATUS "tol shaders: using system glslang (${TOL_SYSTEM_GLSLANG})")
         return()
     endif()
 
-    message(STATUS "dq8 shaders: no system GLSL compiler found; fetching glslang")
+    message(STATUS "tol shaders: no system GLSL compiler found; fetching glslang")
     include(FetchContent)
     # ENABLE_OPT pulls in SPIRV-Tools; the optimiser is not needed to emit valid
     # SPIR-V and skipping it keeps this to a single dependency.
@@ -58,31 +58,31 @@ function(dq8_find_shader_compiler)
     FetchContent_MakeAvailable(glslang)
     if(NOT TARGET glslang-standalone)
         message(FATAL_ERROR
-            "dq8 shaders: fetched glslang but its standalone compiler target is "
+            "tol shaders: fetched glslang but its standalone compiler target is "
             "missing. Install glslc or glslangValidator and re-run CMake.")
     endif()
-    set_property(GLOBAL PROPERTY DQ8_SHADER_COMPILER_PATH "$<TARGET_FILE:glslang-standalone>")
-    set_property(GLOBAL PROPERTY DQ8_SHADER_COMPILER_DIALECT "glslang")
-    set_property(GLOBAL PROPERTY DQ8_SHADER_COMPILER_TARGET glslang-standalone)
+    set_property(GLOBAL PROPERTY TOL_SHADER_COMPILER_PATH "$<TARGET_FILE:glslang-standalone>")
+    set_property(GLOBAL PROPERTY TOL_SHADER_COMPILER_DIALECT "glslang")
+    set_property(GLOBAL PROPERTY TOL_SHADER_COMPILER_TARGET glslang-standalone)
 endfunction()
 
-# dq8_add_shader(<target> SOURCE <file> STAGE <vert|frag|comp> SYMBOL <c-identifier>)
+# tol_add_shader(<target> SOURCE <file> STAGE <vert|frag|comp> SYMBOL <c-identifier>)
 #
 # Compiles one GLSL file to SPIR-V and embeds it as a constexpr byte array in a
 # generated header, which <target> can then #include. Embedding rather than
 # loading at runtime keeps a backend a single self-contained object.
-function(dq8_add_shader TARGET)
+function(tol_add_shader TARGET)
     cmake_parse_arguments(ARG "FRAMEBUFFER_FETCH;MSL_DECORATION_BINDING" "SOURCE;STAGE;SYMBOL" "" ${ARGN})
     if(NOT ARG_SOURCE OR NOT ARG_STAGE OR NOT ARG_SYMBOL)
-        message(FATAL_ERROR "dq8_add_shader: SOURCE, STAGE and SYMBOL are required")
+        message(FATAL_ERROR "tol_add_shader: SOURCE, STAGE and SYMBOL are required")
     endif()
 
-    dq8_find_shader_compiler()
-    get_property(SHADER_COMPILER GLOBAL PROPERTY DQ8_SHADER_COMPILER_PATH)
-    get_property(SHADER_DIALECT GLOBAL PROPERTY DQ8_SHADER_COMPILER_DIALECT)
-    get_property(SHADER_COMPILER_TARGET GLOBAL PROPERTY DQ8_SHADER_COMPILER_TARGET)
+    tol_find_shader_compiler()
+    get_property(SHADER_COMPILER GLOBAL PROPERTY TOL_SHADER_COMPILER_PATH)
+    get_property(SHADER_DIALECT GLOBAL PROPERTY TOL_SHADER_COMPILER_DIALECT)
+    get_property(SHADER_COMPILER_TARGET GLOBAL PROPERTY TOL_SHADER_COMPILER_TARGET)
     if(NOT SHADER_COMPILER)
-        message(FATAL_ERROR "dq8_add_shader: no GLSL compiler available")
+        message(FATAL_ERROR "tol_add_shader: no GLSL compiler available")
     endif()
 
     get_filename_component(STEM "${ARG_SOURCE}" NAME)
@@ -94,7 +94,7 @@ function(dq8_add_shader TARGET)
     endif()
     if(ARG_FRAMEBUFFER_FETCH)
         string(APPEND STEM ".fetch")
-        list(APPEND SHADER_DEFINES -DDQ8_FRAMEBUFFER_FETCH=1)
+        list(APPEND SHADER_DEFINES -DTOL_FRAMEBUFFER_FETCH=1)
         list(APPEND MSL_OPTIONS --msl-framebuffer-fetch)
         set(MSL_VERSION 20300)
     endif()
@@ -133,8 +133,8 @@ function(dq8_add_shader TARGET)
         OUTPUT "${HEADER}"
         COMMAND "${CMAKE_COMMAND}"
                 "-DINPUT=${SPIRV}" "-DOUTPUT=${HEADER}" "-DSYMBOL=${ARG_SYMBOL}"
-                -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Dq8EmbedSpirv.cmake"
-        DEPENDS "${SPIRV}" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Dq8EmbedSpirv.cmake"
+                -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/TolEmbedSpirv.cmake"
+        DEPENDS "${SPIRV}" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/TolEmbedSpirv.cmake"
         COMMENT "Embedding shader ${STEM}"
         VERBATIM)
 
@@ -142,9 +142,9 @@ function(dq8_add_shader TARGET)
     target_include_directories(${TARGET} PRIVATE "${GENERATED_DIR}")
 
     if(APPLE)
-        find_program(DQ8_SPIRV_CROSS NAMES spirv-cross)
-        if(DQ8_SPIRV_CROSS)
-            set(CROSS_COMMAND "${DQ8_SPIRV_CROSS}")
+        find_program(TOL_SPIRV_CROSS NAMES spirv-cross)
+        if(TOL_SPIRV_CROSS)
+            set(CROSS_COMMAND "${TOL_SPIRV_CROSS}")
             set(CROSS_DEPENDENCY)
         else()
             if(NOT TARGET spirv-cross)
@@ -170,10 +170,10 @@ function(dq8_add_shader TARGET)
         add_custom_command(OUTPUT "${MSL_HEADER}"
             COMMAND "${CMAKE_COMMAND}"
                     "-DINPUT=${MSL}" "-DOUTPUT=${MSL_HEADER}" "-DSYMBOL=${ARG_SYMBOL}Msl"
-                    -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Dq8EmbedText.cmake"
-            DEPENDS "${MSL}" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Dq8EmbedText.cmake"
+                    -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/TolEmbedText.cmake"
+            DEPENDS "${MSL}" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/TolEmbedText.cmake"
             VERBATIM)
         target_sources(${TARGET} PRIVATE "${MSL_HEADER}")
-        target_compile_definitions(${TARGET} PRIVATE DQ8_GFX_HAS_MSL=1)
+        target_compile_definitions(${TARGET} PRIVATE TOL_GFX_HAS_MSL=1)
     endif()
 endfunction()

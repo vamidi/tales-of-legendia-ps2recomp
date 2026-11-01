@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 // GSDumpTypes::GSType (GSLzma.h)
 enum class GsPacketType : uint8_t {
@@ -136,7 +136,7 @@ inline constexpr size_t kTotalSize = kVramOffset + kVramSize + kPathBytes + 4u; 
 class GsDumpFile {
 public:
     // Reads a .gs / .gs.xz / .gs.zst dump. xz and zst support depend on
-    // DQ8_GSDUMP_HAVE_LZMA / DQ8_GSDUMP_HAVE_ZSTD being compiled in; without
+    // TOL_GSDUMP_HAVE_LZMA / TOL_GSDUMP_HAVE_ZSTD being compiled in; without
     // them a compressed dump is reported as an error rather than mis-parsed.
     bool load(const std::string &path, std::string &error);
 
@@ -206,4 +206,4 @@ inline constexpr size_t kSIGLBLID = 0x1080;
 inline constexpr size_t kSize = 0x2000;
 } // namespace privreg
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

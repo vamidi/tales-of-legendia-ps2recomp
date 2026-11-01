@@ -11,7 +11,7 @@
 #include <bitset>
 #include <cstdint>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 // 4 MiB in 8 KiB pages. A page is the GS's own allocation granularity and the
 // finest unit at which two resources can be said not to overlap.
@@ -87,4 +87,4 @@ private:
     uint32_t m_size = 0u;
 };
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

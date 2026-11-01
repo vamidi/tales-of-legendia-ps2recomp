@@ -11,7 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 namespace {
 
@@ -109,10 +109,10 @@ void unpackPsmToColor(uint32_t psm, uint32_t value, uint8_t *rgba) {
 
 // Ownership moves between local memory and the GPU on every transfer, draw and
 // present, and getting that order wrong shows up as a buffer that is correct
-// but blank. DQ8_GFX_TRACE_TARGETS prints the moves.
+// but blank. TOL_GFX_TRACE_TARGETS prints the moves.
 bool traceEnabled() {
     static const bool enabled = [] {
-        const char *value = std::getenv("DQ8_GFX_TRACE_TARGETS");
+        const char *value = std::getenv("TOL_GFX_TRACE_TARGETS");
         return value != nullptr && *value != '\0';
     }();
     return enabled;
@@ -574,7 +574,7 @@ bool GsTargetCache::resolveForHostWrite(const GsPageSet &pages, std::string &err
         // still owns, so only the owned pages the write lands in part of
         // need their contents in local memory: it replaces the rest of
         // what it touches. At a scale above 1 a resolve is a full stall and
-        // a downsample, and DQ8 reuses target memory for texture uploads.
+        // a downsample, and TOL reuses target memory for texture uploads.
         if (nativeCt32(surface, true) && surface.height % 32u == 0u) {
             const GsPageSet partial = pages & ~covered & surface.ownedPages;
             if (partial.none())
@@ -1307,4 +1307,4 @@ bool GsTargetCache::uploadNative(GsSurface &surface,
     return submitted;
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

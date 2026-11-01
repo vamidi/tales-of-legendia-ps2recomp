@@ -12,7 +12,7 @@
 #include <memory>
 #include <string>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 class SdlPadInput;
 
@@ -25,7 +25,7 @@ struct SdlGpuStats {
     uint64_t nativePresents = 0u;
     uint64_t composedPresents = 0u;
     uint64_t gpuComposedPresents = 0u;
-    // Host->local transfers, which is how a movie frame arrives: DQ8 uploads
+    // Host->local transfers, which is how a movie frame arrives: TOL uploads
     // one per 16x16 tile, ~900 per frame.
     uint64_t transfersBegun = 0u;
     uint64_t transferBytes = 0u;
@@ -202,4 +202,4 @@ private:
 // Returns null and fills `error` when SDL cannot create a GPU device.
 std::unique_ptr<SdlGpuBackend> createSdlGpuBackend(std::string &error);
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

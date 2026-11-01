@@ -21,7 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 class SdlGpuDevice;
 class GsTargetCache;
@@ -215,4 +215,4 @@ private:
     GsTextureCacheStats m_stats{};
 };
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

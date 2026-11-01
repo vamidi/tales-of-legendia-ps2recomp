@@ -16,7 +16,7 @@
 #include <ctime>
 #include <filesystem>
 
-namespace dq8::ui {
+namespace tol::ui {
 namespace {
 constexpr double kCaptureSeconds = 6.0;
 #if defined(__APPLE__)
@@ -24,8 +24,8 @@ constexpr const char *kQuitShortcut = "Cmd+Q";
 #else
 constexpr const char *kQuitShortcut = "Alt+F4";
 #endif
-constexpr const char *kProjectUrl = "https://github.com/Sinan-Karakaya/DQ8-Recompiled";
-constexpr const char *kIssuesUrl = "https://github.com/Sinan-Karakaya/DQ8-Recompiled/issues";
+constexpr const char *kProjectUrl = "https://github.com/Sinan-Karakaya/TOL-Recompiled";
+constexpr const char *kIssuesUrl = "https://github.com/Sinan-Karakaya/TOL-Recompiled/issues";
 
 // Function keys the menu owns; binding one would fight the shortcut.
 bool reservedKey(SDL_Scancode scancode) {
@@ -525,8 +525,8 @@ void Overlay::drawMenuBar() {
             }
             return ImGui::BeginMenu(label);
         };
-        if (beginMenu("DQ8Recomp")) {
-            if (menuItem("About DQ8Recomp"))
+        if (beginMenu("TOLRecomp")) {
+            if (menuItem("About TOLRecomp"))
                 m_aboutOpen = true;
             if (menuItem("Keyboard shortcuts"))
                 m_shortcutsOpen = true;
@@ -601,7 +601,7 @@ void Overlay::drawMenuBar() {
             if (menuItem("Report a problem"))
                 SDL_OpenURL(kIssuesUrl);
             ImGui::Separator();
-            if (menuItem("About DQ8Recomp"))
+            if (menuItem("About TOLRecomp"))
                 m_aboutOpen = true;
             ImGui::EndMenu();
         }
@@ -898,9 +898,9 @@ void Overlay::takeScreenshot(bool withMenu) {
         const std::string folder = screenshotFolder();
         std::error_code error;
         std::filesystem::create_directories(folder, error);
-        std::string path = folder + "/DQ8_" + timestamp() + kImageExtension;
+        std::string path = folder + "/TOL_" + timestamp() + kImageExtension;
         for (int copy = 2; std::filesystem::exists(path, error); ++copy)
-            path = folder + "/DQ8_" + timestamp() + "_" + std::to_string(copy) + kImageExtension;
+            path = folder + "/TOL_" + timestamp() + "_" + std::to_string(copy) + kImageExtension;
         // Encoding a PNG takes longer than a frame, so it happens off thread.
         auto done = std::make_shared<std::atomic<bool>>(false);
         std::thread saver([this, capture = std::move(capture), path, done]() mutable {
@@ -1009,4 +1009,4 @@ SDL_GamepadType Overlay::displayedControllerType() const {
     return controllers.empty() ? SDL_GAMEPAD_TYPE_STANDARD : controllers.front().type;
 }
 
-} // namespace dq8::ui
+} // namespace tol::ui

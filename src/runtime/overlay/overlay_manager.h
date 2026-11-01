@@ -1,13 +1,13 @@
 // Six MWo3 overlays share one guest arena. Dispatch arena addresses through
 // the separately translated function table of the currently loaded image.
-#ifndef DQ8_OVERLAY_MANAGER_H
-#define DQ8_OVERLAY_MANAGER_H
+#ifndef TOL_OVERLAY_MANAGER_H
+#define TOL_OVERLAY_MANAGER_H
 
 #include <cstdint>
 
 class PS2Runtime;
 
-namespace dq8::overlay
+namespace tol::overlay
 {
 // MWo3 header ids, from the `id` field at offset 0x04 of each BIN. These are
 // distinct from the loader's path-table order in kOverlays.
@@ -56,9 +56,9 @@ const char *activeName();
 // title screen.
 uint32_t loadCount();
 
-// Per-load logging to stdout. Also enabled by setting DQ8_OVERLAY_VERBOSE=1.
+// Per-load logging to stdout. Also enabled by setting TOL_OVERLAY_VERBOSE=1.
 void setVerbose(bool verbose);
 
-} // namespace dq8::overlay
+} // namespace tol::overlay
 
-#endif // DQ8_OVERLAY_MANAGER_H
+#endif // TOL_OVERLAY_MANAGER_H

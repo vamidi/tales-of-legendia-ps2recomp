@@ -8,7 +8,7 @@
 #include <imgui.h>
 #include <string>
 
-namespace dq8::ui {
+namespace tol::ui {
 
 enum class Icon : uint8_t {
     Display, Sound, SoundOff, Controls, Interface, Crown, Camera, Pause, Play,
@@ -35,4 +35,4 @@ const char *controllerFamilyName(SDL_GamepadType type);
 void drawPadDiagram(ImDrawList *list, ImVec2 min, ImVec2 size, const gfx::PadSnapshot &pad,
                     gfx::PadInput highlight);
 
-} // namespace dq8::ui
+} // namespace tol::ui

@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 // The PS2 pad's inputs, in the order the settings list them.
 enum class PadInput : uint8_t {
@@ -142,4 +142,4 @@ private:
     uint32_t m_sticks = 0x80808080u;
 };
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

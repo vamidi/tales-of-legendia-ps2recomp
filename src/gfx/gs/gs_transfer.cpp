@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <cstring>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 namespace {
 
@@ -214,7 +214,7 @@ void GsTransferEngine::upload(const uint8_t *data, uint32_t sizeBytes) {
 
     // Bulk path for whole 32-bit pixels. The general loop below costs a byte-at-
     // a-time gather, an out-of-line switch on the PSM and two integer divisions
-    // per pixel; DQ8's movie uploads a frame as 896 of these transfers, which
+    // per pixel; TOL's movie uploads a frame as 896 of these transfers, which
     // made it the hottest thing in the runtime once the scheduler stopped
     // throwing. Same writes, same order, just without the per-pixel overhead.
     if ((dpsm == GS_PSM_CT32 || dpsm == GS_PSM_Z32) && m_partialPixelBytes == 0u &&
@@ -314,11 +314,11 @@ void GsTransferEngine::upload(const uint8_t *data, uint32_t sizeBytes) {
     if (wrote && m_invalidate)
         m_invalidate(destinationPages());
 
-    // DQ8_GS_UPLOAD_TRACE=N reports how upload() is actually being fed: the
+    // TOL_GS_UPLOAD_TRACE=N reports how upload() is actually being fed: the
     // per-call payload decides whether the cost is the pixel writes or the
     // per-call bookkeeping around them.
     static const uint64_t traceEvery = [] {
-        const char *value = std::getenv("DQ8_GS_UPLOAD_TRACE");
+        const char *value = std::getenv("TOL_GS_UPLOAD_TRACE");
         const long long parsed = value ? std::atoll(value) : 0;
         return parsed > 0 ? static_cast<uint64_t>(parsed) : 0ull;
     }();
@@ -345,4 +345,4 @@ uint32_t GsTransferEngine::consumeLocalToHost(uint8_t *dst, uint32_t maxBytes) {
     return static_cast<uint32_t>(count);
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

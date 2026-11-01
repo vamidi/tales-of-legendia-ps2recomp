@@ -5,11 +5,11 @@
 #include <cstdio>
 #include <cstring>
 
-#if defined(DQ8_GSDUMP_HAVE_ZLIB)
+#if defined(TOL_GSDUMP_HAVE_ZLIB)
 #include <zlib.h>
 #endif
 
-namespace dq8::gfx {
+namespace tol::gfx {
 namespace {
 
 constexpr char kMagic[8] = {'G', 'S', 'F', 'R', 'A', 'M', 'E', '\0'};
@@ -149,7 +149,7 @@ bool writePng(const std::string &path, const FrameImage &img, std::string &error
     }
 
     std::vector<uint8_t> compressed;
-#if defined(DQ8_GSDUMP_HAVE_ZLIB)
+#if defined(TOL_GSDUMP_HAVE_ZLIB)
     uLongf compressedSize = compressBound(static_cast<uLong>(raw.size()));
     compressed.resize(compressedSize);
     if (compress2(compressed.data(), &compressedSize, raw.data(),
@@ -332,4 +332,4 @@ DiffResult diffImagesRgb(const FrameImage &a, const FrameImage &b, uint32_t tole
     return diffCommon(a, b, tolerance, heatmap, false);
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

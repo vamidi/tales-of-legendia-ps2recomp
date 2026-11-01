@@ -2,11 +2,11 @@
 # at the end of ps2xRecomp's project() call: what the recompiler needs here,
 # with the submodule unchanged.
 
-include("${CMAKE_CURRENT_LIST_DIR}/Dq8Icon.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/TolIcon.cmake")
 
-function(dq8_adjust_recompiler)
+function(tol_adjust_recompiler)
     # The project's icon, like the launcher's and the game's.
-    dq8_add_icon(ps2_recomp)
+    tol_add_icon(ps2_recomp)
     # code_generator.h holds an unordered_map of Symbol, which it only
     # declares; libstdc++ before 13 refuses that, and releases build Linux
     # on Ubuntu 22.04's GCC 11 for its older glibc. types.h defines Symbol.
@@ -17,4 +17,4 @@ function(dq8_adjust_recompiler)
     endif()
 endfunction()
 # The targets are declared further down that file; this runs once it is done.
-cmake_language(DEFER CALL dq8_adjust_recompiler)
+cmake_language(DEFER CALL tol_adjust_recompiler)

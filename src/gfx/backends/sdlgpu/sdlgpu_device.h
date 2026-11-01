@@ -14,7 +14,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 // How a GS ALPHA equation was mapped onto the host blend unit.
 //
@@ -207,4 +207,4 @@ private:
     std::unordered_map<GsPipelineKey, SDL_GPUGraphicsPipeline *, GsPipelineKeyHash> m_pipelines;
 };
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

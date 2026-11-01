@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <string>
 
-namespace dq8::ui {
+namespace tol::ui {
 
 enum class Corner : uint8_t { TopLeft, TopRight, BottomLeft, BottomRight };
 
@@ -48,10 +48,10 @@ std::string serializeSettings(const Settings &settings);
 // Unknown or malformed entries keep their current value in `settings`.
 void parseSettings(const std::string &text, Settings &settings);
 
-// DQ8_SETTINGS_FILE, or settings.ini in SDL's per-user preferences folder.
+// TOL_SETTINGS_FILE, or settings.ini in SDL's per-user preferences folder.
 std::string defaultSettingsPath();
 // A missing file leaves the defaults; returns false only when it cannot be read.
 bool loadSettings(const std::string &path, Settings &settings);
 bool saveSettings(const std::string &path, const Settings &settings);
 
-} // namespace dq8::ui
+} // namespace tol::ui

@@ -6,7 +6,7 @@
 #include "gs_local_copy.frag.spv.h"
 #include "gs_reinterpret.frag.spv.h"
 #include "gs_reinterpret.vert.spv.h"
-#ifdef DQ8_GFX_HAS_MSL
+#ifdef TOL_GFX_HAS_MSL
 #include "gs_draw.frag.msl.h"
 #include "gs_draw.frag.fetch.msl.h"
 #include "gs_draw.vert.msl.h"
@@ -23,7 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 namespace {
 
@@ -171,7 +171,7 @@ SdlGpuDevice::~SdlGpuDevice() {
 
 bool SdlGpuDevice::create(std::string &error) {
     SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV;
-#ifdef DQ8_GFX_HAS_MSL
+#ifdef TOL_GFX_HAS_MSL
     formats |= SDL_GPU_SHADERFORMAT_MSL;
 #endif
     m_device = SDL_CreateGPUDevice(formats, false, nullptr);
@@ -197,7 +197,7 @@ bool SdlGpuDevice::create(std::string &error) {
     vertexInfo.format = SDL_GPU_SHADERFORMAT_SPIRV;
     vertexInfo.stage = SDL_GPU_SHADERSTAGE_VERTEX;
     vertexInfo.num_uniform_buffers = 1u;
-#ifdef DQ8_GFX_HAS_MSL
+#ifdef TOL_GFX_HAS_MSL
     const bool metal = (SDL_GetGPUShaderFormats(m_device) & SDL_GPU_SHADERFORMAT_MSL) != 0;
     if (metal) {
         vertexInfo.code = reinterpret_cast<const uint8_t *>(kGsDrawVertSpirvMsl);
@@ -221,14 +221,14 @@ bool SdlGpuDevice::create(std::string &error) {
     fragmentInfo.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
     fragmentInfo.num_samplers = 1u;
     fragmentInfo.num_uniform_buffers = 1u;
-#ifdef DQ8_GFX_HAS_MSL
+#ifdef TOL_GFX_HAS_MSL
     if (metal) {
         fragmentInfo.code = reinterpret_cast<const uint8_t *>(kGsDrawFragSpirvMsl);
         fragmentInfo.code_size = sizeof(kGsDrawFragSpirvMsl);
         fragmentInfo.entrypoint = "main0";
         fragmentInfo.format = SDL_GPU_SHADERFORMAT_MSL;
 #if defined(__aarch64__)
-        if (!std::getenv("DQ8_GFX_DISABLE_FRAMEBUFFER_FETCH")) {
+        if (!std::getenv("TOL_GFX_DISABLE_FRAMEBUFFER_FETCH")) {
             fragmentInfo.code = reinterpret_cast<const uint8_t *>(kGsDrawFetchSpirvMsl);
             fragmentInfo.code_size = sizeof(kGsDrawFetchSpirvMsl);
             m_framebufferFetch = true;
@@ -318,7 +318,7 @@ bool SdlGpuDevice::reinterpretColor(SDL_GPUTexture *source, SDL_GPUTexture *dest
         fragmentInfo.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
         fragmentInfo.num_samplers = 1u;
         fragmentInfo.num_uniform_buffers = 1u;
-#ifdef DQ8_GFX_HAS_MSL
+#ifdef TOL_GFX_HAS_MSL
         if ((SDL_GetGPUShaderFormats(m_device) & SDL_GPU_SHADERFORMAT_MSL) != 0) {
             vertexInfo.code = reinterpret_cast<const uint8_t *>(kGsReinterpretVertSpirvMsl);
             vertexInfo.code_size = sizeof(kGsReinterpretVertSpirvMsl);
@@ -415,7 +415,7 @@ bool SdlGpuDevice::localCopy(SDL_GPUTexture *source, SDL_GPUTexture *destination
         fragmentInfo.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
         fragmentInfo.num_samplers = 3u;
         fragmentInfo.num_uniform_buffers = 1u;
-#ifdef DQ8_GFX_HAS_MSL
+#ifdef TOL_GFX_HAS_MSL
         if ((SDL_GetGPUShaderFormats(m_device) & SDL_GPU_SHADERFORMAT_MSL) != 0) {
             vertexInfo.code = reinterpret_cast<const uint8_t *>(kGsReinterpretVertSpirvMsl);
             vertexInfo.code_size = sizeof(kGsReinterpretVertSpirvMsl);
@@ -612,7 +612,7 @@ bool SdlGpuDevice::createIndex8(std::string &error) {
     fragmentInfo.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
     fragmentInfo.num_samplers = 3u;
     fragmentInfo.num_uniform_buffers = 1u;
-#ifdef DQ8_GFX_HAS_MSL
+#ifdef TOL_GFX_HAS_MSL
     if ((SDL_GetGPUShaderFormats(m_device) & SDL_GPU_SHADERFORMAT_MSL) != 0) {
         vertexInfo.code = reinterpret_cast<const uint8_t *>(kGsReinterpretVertSpirvMsl);
         vertexInfo.code_size = sizeof(kGsReinterpretVertSpirvMsl);
@@ -930,4 +930,4 @@ bool SdlGpuDevice::downloadTexture(SDL_GPUTexture *texture, uint32_t width, uint
     return true;
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

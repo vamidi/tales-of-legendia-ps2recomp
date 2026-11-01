@@ -1,17 +1,17 @@
 # Wraps a SPIR-V module as a constexpr uint32_t array in a generated header.
-# Run in script mode by dq8_add_shader; expects INPUT, OUTPUT and SYMBOL.
+# Run in script mode by tol_add_shader; expects INPUT, OUTPUT and SYMBOL.
 
 if(NOT DEFINED INPUT OR NOT DEFINED OUTPUT OR NOT DEFINED SYMBOL)
-    message(FATAL_ERROR "Dq8EmbedSpirv.cmake requires INPUT, OUTPUT and SYMBOL")
+    message(FATAL_ERROR "TolEmbedSpirv.cmake requires INPUT, OUTPUT and SYMBOL")
 endif()
 
 file(SIZE "${INPUT}" SPIRV_SIZE)
 if(SPIRV_SIZE EQUAL 0)
-    message(FATAL_ERROR "Dq8EmbedSpirv.cmake: ${INPUT} is empty")
+    message(FATAL_ERROR "TolEmbedSpirv.cmake: ${INPUT} is empty")
 endif()
 math(EXPR SPIRV_REMAINDER "${SPIRV_SIZE} % 4")
 if(NOT SPIRV_REMAINDER EQUAL 0)
-    message(FATAL_ERROR "Dq8EmbedSpirv.cmake: ${INPUT} is ${SPIRV_SIZE} bytes, not a whole number of SPIR-V words")
+    message(FATAL_ERROR "TolEmbedSpirv.cmake: ${INPUT} is ${SPIRV_SIZE} bytes, not a whole number of SPIR-V words")
 endif()
 
 file(READ "${INPUT}" SPIRV_HEX HEX)

@@ -20,7 +20,7 @@
 
 struct ImGuiContext;
 
-namespace dq8::ui {
+namespace tol::ui {
 
 // Screenshots are PNG. SDL_SavePNG arrived in SDL 3.4; with SDL 3.2 they are BMP.
 #if SDL_VERSION_ATLEAST(3, 4, 0)
@@ -42,8 +42,8 @@ struct HostServices {
     // Frames the game has finished drawing, for the counter; presents are
     // counted instead when it is empty.
     std::function<uint64_t()> completedRenders;
-    // The guest's vsync clock, which DQ8_UI_SCRIPT is timed against, as
-    // DQ8_PAD_SCRIPT is; presents are counted instead when it is empty.
+    // The guest's vsync clock, which TOL_UI_SCRIPT is timed against, as
+    // TOL_PAD_SCRIPT is; presents are counted instead when it is empty.
     std::function<uint64_t()> guestFrame;
 };
 
@@ -106,7 +106,7 @@ private:
         bool done = false;
     };
 
-    // DQ8_UI_SCRIPT (ui_script.cpp): menu actions on the guest frame clock,
+    // TOL_UI_SCRIPT (ui_script.cpp): menu actions on the guest frame clock,
     // for tests and screenshots of the menu over the running game.
     void loadScript();
     void runScript();
@@ -227,4 +227,4 @@ private:
     std::vector<Saver> m_savers;
 };
 
-} // namespace dq8::ui
+} // namespace tol::ui

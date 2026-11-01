@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 namespace {
 
@@ -115,4 +115,4 @@ GsDisplaySetup gsDecodeDisplay(uint64_t dispfb, uint64_t display, bool enabled) 
     return setup;
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

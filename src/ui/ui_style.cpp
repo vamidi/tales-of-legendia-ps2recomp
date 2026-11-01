@@ -6,7 +6,7 @@
 extern const unsigned char kUiFontData[];
 extern const unsigned int kUiFontData_size;
 
-namespace dq8::ui {
+namespace tol::ui {
 namespace {
 constexpr float kBaseFontSize = 17.0f;
 
@@ -162,4 +162,4 @@ void drawCursor(ImDrawList *list, ImVec2 tip, float size, float alpha) {
     list->AddTriangleFilled(a, b, c, withAlpha(palette::kText, alpha));
 }
 
-} // namespace dq8::ui
+} // namespace tol::ui

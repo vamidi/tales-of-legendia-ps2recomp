@@ -4,19 +4,19 @@
 
 include_guard(GLOBAL)
 
-function(dq8_add_icon target)
+function(tol_add_icon target)
     set(icons "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../res/icon")
-    # The DQ8 icon assets are not part of this port; skip cleanly so a tree without res/icon configures.
-    if(WIN32 AND EXISTS "${icons}/dq8.rc")
-        # rc.exe and windres find dq8.ico beside the .rc file.
-        target_sources(${target} PRIVATE "${icons}/dq8.rc")
+    # The TOL icon assets are not part of this port; skip cleanly so a tree without res/icon configures.
+    if(WIN32 AND EXISTS "${icons}/tol.rc")
+        # rc.exe and windres find tol.ico beside the .rc file.
+        target_sources(${target} PRIVATE "${icons}/tol.rc")
     elseif(APPLE)
         get_target_property(bundle ${target} MACOSX_BUNDLE)
-        if(bundle AND EXISTS "${icons}/dq8.icns")
-            target_sources(${target} PRIVATE "${icons}/dq8.icns")
-            set_source_files_properties("${icons}/dq8.icns" TARGET_DIRECTORY ${target}
+        if(bundle AND EXISTS "${icons}/tol.icns")
+            target_sources(${target} PRIVATE "${icons}/tol.icns")
+            set_source_files_properties("${icons}/tol.icns" TARGET_DIRECTORY ${target}
                 PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
-            set_target_properties(${target} PROPERTIES MACOSX_BUNDLE_ICON_FILE dq8.icns)
+            set_target_properties(${target} PROPERTIES MACOSX_BUNDLE_ICON_FILE tol.icns)
         endif()
     endif()
 endfunction()
@@ -24,18 +24,18 @@ endfunction()
 # The window icon, as the kWindowIconBmp array sdlgpu_window_icon.cpp hands to
 # SDL_SetWindowIcon. Only Linux needs it: SDL takes Windows' from the
 # executable, and macOS shows the bundle's.
-function(dq8_embed_window_icon target)
+function(tol_embed_window_icon target)
     if(WIN32 OR APPLE)
         return()
     endif()
     set(output "${CMAKE_CURRENT_BINARY_DIR}/generated/${target}_window_icon.cpp")
     add_custom_command(
         OUTPUT "${output}"
-        COMMAND "${CMAKE_COMMAND}" "-DINPUT=${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../res/icon/dq8-window.bmp"
+        COMMAND "${CMAKE_COMMAND}" "-DINPUT=${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../res/icon/tol-window.bmp"
                 "-DOUTPUT=${output}" -DSYMBOL=kWindowIconBmp
-                -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Dq8EmbedBinary.cmake"
-        DEPENDS "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../res/icon/dq8-window.bmp"
-                "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Dq8EmbedBinary.cmake"
+                -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/TolEmbedBinary.cmake"
+        DEPENDS "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../res/icon/tol-window.bmp"
+                "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/TolEmbedBinary.cmake"
         COMMENT "Embedding the window icon"
         VERBATIM)
     target_sources(${target} PRIVATE "${output}")

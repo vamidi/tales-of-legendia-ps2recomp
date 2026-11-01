@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 class SdlGpuDevice;
 
@@ -237,4 +237,4 @@ private:
     GsTargetCacheStats m_stats{};
 };
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

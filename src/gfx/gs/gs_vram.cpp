@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <mutex>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 namespace {
 
@@ -198,4 +198,4 @@ void GsVram::write(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_
     }
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

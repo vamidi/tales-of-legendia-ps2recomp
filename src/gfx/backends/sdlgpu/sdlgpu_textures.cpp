@@ -10,7 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 namespace {
 
@@ -104,14 +104,14 @@ uint32_t resolveClutIndex(uint32_t index, uint32_t cpsm, uint32_t csm, uint32_t 
 }
 
 // Writes an expanded texture as a PPM next to a one-line description, when
-// DQ8_GFX_DUMP_TEXTURES names a directory. Expansion is where PSM, CLUT and
+// TOL_GFX_DUMP_TEXTURES names a directory. Expansion is where PSM, CLUT and
 // TEXA all meet, so "is the texture wrong or is the shader wrong" is the first
 // question every texturing bug asks.
 void dumpTexture(const GsTextureKey &key,
                  const GsTextureIdentity &identity,
                  const std::vector<uint8_t> &rgba,
                  uint64_t index) {
-    const char *directory = std::getenv("DQ8_GFX_DUMP_TEXTURES");
+    const char *directory = std::getenv("TOL_GFX_DUMP_TEXTURES");
     if (!directory || *directory == '\0')
         return;
 
@@ -324,7 +324,7 @@ SDL_GPUTexture *GsTextureCache::acquire(const GSDrawState &state, std::string &e
 // Expands one texel rectangle into m_staging as tightly packed RGBA8 rows of
 // region.width() pixels, and returns the hash of the raw texels it read.
 //
-// Three fast paths carry everything DQ8 draws during boot: CT32/Z32 store
+// Three fast paths carry everything TOL draws during boot: CT32/Z32 store
 // straight into staging (the raw word is the RGBA byte sequence), P8 resolves
 // the palette once and indexes it per texel, and the P8H/P4H* family reads
 // its row through the CT32 layout and shifts the index out of each word. The
@@ -660,7 +660,7 @@ void GsTextureCache::refreshClut(const GsTextureKey &key, Entry &entry) {
 }
 
 // Patches the texels a host write touched, instead of discarding a texture and
-// re-expanding all of it. On the DQ8 movie path the written region is a small
+// re-expanding all of it. On the TOL movie path the written region is a small
 // fraction of a 512x512 texture, and rebuilding it was the dominant cost.
 bool GsTextureCache::resolveSource(const GsTextureKey &key, const GsRegion &region,
                                   std::string &error) {
@@ -752,11 +752,11 @@ bool GsTextureCache::expandFromTarget(const GsTextureKey &key, Entry &entry, GsR
     return true;
 }
 
-// DQ8_GFX_CHECK_GPU_TEXTURES=1 rebuilds every texture expandFromTarget made
+// TOL_GFX_CHECK_GPU_TEXTURES=1 rebuilds every texture expandFromTarget made
 // the old way, reading the target back, and reports texels that differ. It
 // stalls on every readback, so it is for checking changes, not for play.
 void GsTextureCache::checkAgainstCpu(const GsTextureKey &key, Entry &entry, const GsRegion &region) {
-    static const bool enabled = std::getenv("DQ8_GFX_CHECK_GPU_TEXTURES") != nullptr;
+    static const bool enabled = std::getenv("TOL_GFX_CHECK_GPU_TEXTURES") != nullptr;
     if (!enabled)
         return;
     std::vector<uint8_t> gpu;
@@ -836,7 +836,7 @@ bool GsTextureCache::build(const GsTextureKey &key, Entry &entry, std::string &e
     }
 
     // A texture may be sourced from a region a render target still owns --
-    // render-to-texture, which DQ8 uses. Resolving costs the extra detail a
+    // render-to-texture, which TOL uses. Resolving costs the extra detail a
     // scaled target holds; sampling the target directly is the fix, and is not
     // done yet.
     GsPageSet sourcePages;
@@ -947,4 +947,4 @@ bool GsTextureCache::build(const GsTextureKey &key, Entry &entry, std::string &e
     return true;
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

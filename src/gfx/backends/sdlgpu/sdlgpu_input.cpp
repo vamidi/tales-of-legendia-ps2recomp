@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 namespace {
 enum : uint32_t {
     Select = 0x0001u, L3 = 0x0002u, R3 = 0x0004u, Start = 0x0008u,
@@ -442,4 +442,4 @@ void SdlPadInput::read(uint32_t &held, uint32_t &pressed, uint32_t &sticks) {
     sticks = m_sticks;
     m_pressed = 0u;
 }
-} // namespace dq8::gfx
+} // namespace tol::gfx

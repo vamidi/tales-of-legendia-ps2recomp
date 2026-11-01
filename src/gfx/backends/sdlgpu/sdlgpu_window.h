@@ -8,7 +8,7 @@
 #include <functional>
 #include <vector>
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 enum class SdlGpuAspect : uint8_t {
     Auto,     // the game's own Screen Size option: 4:3 or 16:9
@@ -30,7 +30,7 @@ struct SdlGpuDisplayOptions {
     // Whole multiples of the picture's height, so scanlines stay even.
     bool integerScale = false;
     SDL_GPUPresentMode presentMode = SDL_GPU_PRESENTMODE_VSYNC;
-    // Shows both display circuits at one origin, which leaves DQ8's one-line
+    // Shows both display circuits at one origin, which leaves TOL's one-line
     // deflicker blend a no-op. Off is the PS2's own picture.
     bool removeLineBlend = false;
     bool operator==(const SdlGpuDisplayOptions &) const = default;
@@ -78,4 +78,4 @@ using SdlGpuCaptureCallback = std::function<void(SdlGpuCapture capture)>;
 // on Linux. Windows and macOS already show the executable's or the bundle's.
 void setWindowIcon(SDL_Window *window);
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

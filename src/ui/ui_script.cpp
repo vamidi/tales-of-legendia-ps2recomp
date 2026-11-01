@@ -1,4 +1,4 @@
-// DQ8_UI_SCRIPT drives the menu as DQ8_PAD_SCRIPT drives the pad: a file or
+// TOL_UI_SCRIPT drives the menu as TOL_PAD_SCRIPT drives the pad: a file or
 // text of "<guest-frame> <command> [arguments]", '#' comments, ';' between
 // entries. "<seconds>s" times an entry by the wall clock, which pauses do not
 // stop. The commands are the names runStep() matches below.
@@ -12,7 +12,7 @@
 #include <fstream>
 #include <sstream>
 
-namespace dq8::ui {
+namespace tol::ui {
 namespace {
 std::string joined(const std::vector<std::string> &words) {
     std::string text;
@@ -33,7 +33,7 @@ bool pick(const std::string &name, const char *const (&names)[N], const T (&valu
 } // namespace
 
 void Overlay::loadScript() {
-    const char *value = std::getenv("DQ8_UI_SCRIPT");
+    const char *value = std::getenv("TOL_UI_SCRIPT");
     if (!value || !*value)
         return;
     std::string text = value;
@@ -60,7 +60,7 @@ void Overlay::loadScript() {
         m_script.push_back(std::move(step));
     }
     m_scriptStart = now();
-    std::fprintf(stderr, "[ui] DQ8_UI_SCRIPT: %zu steps\n", m_script.size());
+    std::fprintf(stderr, "[ui] TOL_UI_SCRIPT: %zu steps\n", m_script.size());
 }
 
 void Overlay::runScript() {
@@ -158,8 +158,8 @@ void Overlay::runStep(const ScriptStep &step, uint64_t frame) {
         quit.type = SDL_EVENT_QUIT;
         SDL_PushEvent(&quit);
     } else {
-        std::fprintf(stderr, "[ui] DQ8_UI_SCRIPT: cannot do '%s %s'\n", command.c_str(), joined(step.arguments).c_str());
+        std::fprintf(stderr, "[ui] TOL_UI_SCRIPT: cannot do '%s %s'\n", command.c_str(), joined(step.arguments).c_str());
     }
 }
 
-} // namespace dq8::ui
+} // namespace tol::ui

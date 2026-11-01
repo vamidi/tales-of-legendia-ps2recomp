@@ -3,7 +3,7 @@
 struct R5900Context;
 class PS2Runtime;
 
-namespace dq8 {
+namespace tol {
 void repairVuBoundsFlags(R5900Context &ctx, unsigned comparison);
 bool installVuBoundsComparisons(PS2Runtime &runtime);
 }

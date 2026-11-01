@@ -5,14 +5,14 @@
 #include <cstdlib>
 #include <memory>
 
-#if defined(DQ8_GSDUMP_HAVE_ZSTD)
+#if defined(TOL_GSDUMP_HAVE_ZSTD)
 #include <zstd.h>
 #endif
-#if defined(DQ8_GSDUMP_HAVE_LZMA)
+#if defined(TOL_GSDUMP_HAVE_LZMA)
 #include <lzma.h>
 #endif
 
-namespace dq8::gfx {
+namespace tol::gfx {
 namespace {
 
 bool endsWith(const std::string &s, const char *suffix) {
@@ -76,7 +76,7 @@ bool readWholeFile(const std::string &path, std::vector<uint8_t> &out, std::stri
     return true;
 }
 
-#if defined(DQ8_GSDUMP_HAVE_ZSTD)
+#if defined(TOL_GSDUMP_HAVE_ZSTD)
 bool decompressZstd(const std::vector<uint8_t> &in, std::vector<uint8_t> &out, std::string &error) {
     ZSTD_DStream *ds = ZSTD_createDStream();
     if (!ds) {
@@ -106,7 +106,7 @@ bool decompressZstd(const std::vector<uint8_t> &in, std::vector<uint8_t> &out, s
 }
 #endif
 
-#if defined(DQ8_GSDUMP_HAVE_LZMA)
+#if defined(TOL_GSDUMP_HAVE_LZMA)
 bool decompressXz(const std::vector<uint8_t> &in, std::vector<uint8_t> &out, std::string &error) {
     lzma_stream strm = LZMA_STREAM_INIT;
     if (lzma_stream_decoder(&strm, UINT64_MAX, LZMA_CONCATENATED) != LZMA_OK) {
@@ -172,7 +172,7 @@ bool GsDumpFile::load(const std::string &path, std::string &error) {
 
     std::vector<uint8_t> plain;
     if (endsWith(path, ".zst") || endsWith(path, ".zstd")) {
-#if defined(DQ8_GSDUMP_HAVE_ZSTD)
+#if defined(TOL_GSDUMP_HAVE_ZSTD)
         if (!decompressZstd(raw, plain, error))
             return false;
 #else
@@ -180,7 +180,7 @@ bool GsDumpFile::load(const std::string &path, std::string &error) {
             return false;
 #endif
     } else if (endsWith(path, ".xz")) {
-#if defined(DQ8_GSDUMP_HAVE_LZMA)
+#if defined(TOL_GSDUMP_HAVE_LZMA)
         if (!decompressXz(raw, plain, error))
             return false;
 #else
@@ -402,4 +402,4 @@ bool GsDumpFile::decodePackets(std::string &error) {
     return true;
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

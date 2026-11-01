@@ -14,15 +14,15 @@
 #include <cstdio>
 #include <string>
 
-namespace dq8::ui {
+namespace tol::ui {
 namespace {
 using gfx::PadInput;
 
 constexpr const char *kTimes = "\xC3\x97"; // U+00D7, spelled out for compilers without /utf-8
 constexpr const char *kPageNames[] = {"Display", "Sound", "Controls", "Interface"};
 constexpr Icon kPageIcons[] = {Icon::Display, Icon::Sound, Icon::Controls, Icon::Interface};
-constexpr const char *kProjectUrl = "https://github.com/Sinan-Karakaya/DQ8-Recompiled";
-constexpr const char *kIssuesUrl = "https://github.com/Sinan-Karakaya/DQ8-Recompiled/issues";
+constexpr const char *kProjectUrl = "https://github.com/Sinan-Karakaya/TOL-Recompiled";
+constexpr const char *kIssuesUrl = "https://github.com/Sinan-Karakaya/TOL-Recompiled/issues";
 
 constexpr ImGuiWindowFlags kDialogFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
                                           ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
@@ -120,7 +120,7 @@ void Overlay::drawSettingsWindow() {
                                    ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
                                    ImGuiWindowFlags_NoScrollWithMouse;
-    if (beginWindow("Settings##dq8", nullptr, flags)) {
+    if (beginWindow("Settings##tol", nullptr, flags)) {
         dialogHeader(Icon::Crown, "Settings", &m_settingsOpen);
 
         const float navWidth = em(12.5f);
@@ -132,7 +132,7 @@ void Overlay::drawSettingsWindow() {
         if (ImGui::GetContentRegionAvail().y > footer) {
             ImGui::SetCursorPosY(ImGui::GetWindowHeight() - footer);
             ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.84f);
-            mutedText("DQ8Recomp %s", m_host.version.c_str());
+            mutedText("TOLRecomp %s", m_host.version.c_str());
             mutedText("Changes save automatically");
             ImGui::PopFont();
         }
@@ -590,7 +590,7 @@ void Overlay::drawAbout() {
         ImGui::SameLine(0.0f, em(0.9f));
         ImGui::BeginGroup();
         ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.6f);
-        ImGui::TextUnformatted("DQ8Recomp");
+        ImGui::TextUnformatted("TOLRecomp");
         ImGui::PopFont();
         mutedText("Version %s", m_host.version.c_str());
         ImGui::EndGroup();
@@ -745,4 +745,4 @@ void Overlay::drawStats() {
     ImGui::PopStyleVar();
 }
 
-} // namespace dq8::ui
+} // namespace tol::ui

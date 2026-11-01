@@ -63,25 +63,25 @@ extern std::atomic<uint32_t> g_mpegDemuxThreadId;
 extern std::atomic<uint32_t> g_mpegGetPictureThreadId;
 }
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 namespace {
 
-// DQ8_GFX_SCREENSHOT_DIR makes the runtime latch CPU-composed pixels, so the
+// TOL_GFX_SCREENSHOT_DIR makes the runtime latch CPU-composed pixels, so the
 // paths that would skip or discard that compose have to stand down.
 bool gsScreenshotEnabled() {
     static const bool enabled = [] {
-        const char *value = std::getenv("DQ8_GFX_SCREENSHOT_DIR");
+        const char *value = std::getenv("TOL_GFX_SCREENSHOT_DIR");
         return value != nullptr && *value != '\0';
     }();
     return enabled;
 }
 
-// DQ8_GFX_STATS_EVERY=N prints a counter delta every N presented frames; zero
+// TOL_GFX_STATS_EVERY=N prints a counter delta every N presented frames; zero
 // when unset. The timing behind those numbers is only taken when it is set.
 uint32_t statsInterval() {
     static const uint32_t interval = [] {
-        const char *value = std::getenv("DQ8_GFX_STATS_EVERY");
+        const char *value = std::getenv("TOL_GFX_STATS_EVERY");
         const uint32_t every = value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
         g_gsFrontendTiming.store(every != 0u, std::memory_order_relaxed);
         return every;
@@ -418,13 +418,13 @@ bool canSnapshotFeedback(const GSPrimitiveBatch &batch, const GsSurface &surface
     return true;
 }
 
-// DQ8_GFX_TRACE_BATCHES prints one line per draw call: which target, which
+// TOL_GFX_TRACE_BATCHES prints one line per draw call: which target, which
 // pipeline state, how much geometry. The question it answers is "why is this
 // buffer empty" -- either nothing targets it, or something does and is being
 // rejected by a test.
 bool batchTraceEnabled() {
     static const bool enabled = [] {
-        const char *value = std::getenv("DQ8_GFX_TRACE_BATCHES");
+        const char *value = std::getenv("TOL_GFX_TRACE_BATCHES");
         return value != nullptr && *value != '\0';
     }();
     return enabled;
@@ -573,8 +573,8 @@ struct SdlGpuBackend::Impl {
     std::atomic<uint32_t> requestedScale{0u};
     std::atomic<uint32_t> activeScale{1u};
     // Removes the PS2's one-line display blend; read by the composing thread.
-    // DQ8_GFX_REMOVE_LINE_BLEND sets it for the trace replay, which has no menu.
-    std::atomic<bool> removeLineBlend{std::getenv("DQ8_GFX_REMOVE_LINE_BLEND") != nullptr};
+    // TOL_GFX_REMOVE_LINE_BLEND sets it for the trace replay, which has no menu.
+    std::atomic<bool> removeLineBlend{std::getenv("TOL_GFX_REMOVE_LINE_BLEND") != nullptr};
     uint64_t previousPresentDraws = 0u;
     uint64_t previousPresentTransfers = 0u;
     uint64_t titlePresents = 0u;
@@ -668,12 +668,12 @@ struct SdlGpuBackend::Impl {
 
     // A local-to-local transfer between CT32 render targets, done on the GPU.
     // The CPU path reads both targets back -- a stall each, and at a scale
-    // above 1 a downsample -- and DQ8 copies 8-bit texture strips inside its
+    // above 1 a downsample -- and TOL copies 8-bit texture strips inside its
     // character layer for every frame of a dialogue close-up. The swizzle
     // tables say which source byte lands in which destination byte; the GPU
     // applies that per sub-sample plane. Anything else keeps the CPU path.
     bool gpuLocalCopy(const GSTransferCommand &command) {
-        static const bool disabled = std::getenv("DQ8_GFX_CPU_LOCAL_COPY") != nullptr;
+        static const bool disabled = std::getenv("TOL_GFX_CPU_LOCAL_COPY") != nullptr;
         const GSBitBltBuf &blt = command.bitbltbuf;
         const uint32_t psm = blt.spsm & 0x3fu;
         if (disabled || command.direction != 2u || psm != (blt.dpsm & 0x3fu))
@@ -1183,7 +1183,7 @@ struct SdlGpuBackend::Impl {
             ++stats.destinationAlphaFactors;
         const bool scaleAlpha = !framebufferFetch && blend.enabled && alpha.c == kBlendAlphaSource;
         // Those draws still write their alpha on the GS, and games read it
-        // back: DQ8 draws its characters into a layer whose alpha becomes the
+        // back: TOL draws its characters into a layer whose alpha becomes the
         // shadow mask. A second pass over the same primitives stores it.
         const bool alphaPass = scaleAlpha && (writeMask & SDL_GPU_COLORCOMPONENT_A) != 0u;
         if (scaleAlpha) {
@@ -1226,7 +1226,7 @@ struct SdlGpuBackend::Impl {
         // In GS pixels, before the viewport scales them: half a host pixel,
         // so GS pixel p covers exactly host pixels [p*scale, (p+1)*scale) and
         // its sample point lands on the first of them. Half a GS pixel would
-        // be right only at 1x; above it every primitive, and every copy DQ8
+        // be right only at 1x; above it every primitive, and every copy TOL
         // makes of the frame, sat half a native pixel off.
         const float sampleOffset = kSampleOffset / static_cast<float>(std::max(color->scale, 1u));
         draw.vertexUniforms.adjust[0] = sampleOffset;
@@ -1357,7 +1357,7 @@ struct SdlGpuBackend::Impl {
                     control |= kFragFlagTcc;
                 if (state.linearFilter)
                     control |= kFragFlagLinear;
-                // A sprite's UVs can span a texel more than its pixels (DQ8's
+                // A sprite's UVs can span a texel more than its pixels (TOL's
                 // font: 23 texels over 22 pixels), so the GS never reaches the
                 // last one. Sampling between native pixels would, and pull in
                 // the neighbouring glyph as thin lines and dots.
@@ -1782,11 +1782,11 @@ struct SdlGpuBackend::Impl {
             return nativeSource * factor + sub;
         };
 
-        // DQ8_GFX_PRESENT_FROM_MEMORY forces the local-memory path, which is
+        // TOL_GFX_PRESENT_FROM_MEMORY forces the local-memory path, which is
         // what the software backend reads. It answers "is the difference in
         // what was drawn, or in how it was read back for display" in one run.
         static const bool forceMemoryPath = [] {
-            const char *value = std::getenv("DQ8_GFX_PRESENT_FROM_MEMORY");
+            const char *value = std::getenv("TOL_GFX_PRESENT_FROM_MEMORY");
             return value != nullptr && *value != '\0';
         }();
 
@@ -1831,7 +1831,7 @@ struct SdlGpuBackend::Impl {
         }
 
         // Nothing owns the buffer on the GPU -- it was filled by transfers,
-        // which is exactly how DQ8 shows a movie frame. Make sure any target
+        // which is exactly how TOL shows a movie frame. Make sure any target
         // that owns part of it has resolved, then read local memory.
         GsPageSet pages;
         gsMarkPages(pages, sourceBase, sourceWidth, sourcePsm,
@@ -1900,7 +1900,7 @@ struct SdlGpuBackend::Impl {
         return targets->download(surface, out, error);
     }
 
-    // DQ8_GFX_STATS_EVERY=N prints a counter delta every N presented frames.
+    // TOL_GFX_STATS_EVERY=N prints a counter delta every N presented frames.
     // The movie path is transfer-dominated rather than draw-dominated, so
     // "how many transfers per frame and how long did the frame take" is the
     // question a profile of the whole process answers badly.
@@ -1945,7 +1945,7 @@ struct SdlGpuBackend::Impl {
             0.0, static_cast<double>(frontendNanos - previousFrontendNanos) / 1e9 - backendSeconds);
         previousFrontendNanos = frontendNanos;
 
-        // The native image-upload path is where DQ8's movie tiles arrive: one
+        // The native image-upload path is where TOL's movie tiles arrive: one
         // DMA chain per 16x16 tile, never touching processGIFPacket.
         static uint64_t previousUploadNanos = 0u;
         static uint64_t previousUploadCount = 0u;
@@ -2550,8 +2550,8 @@ struct SdlGpuBackend::Impl {
     bool acquireGpuComposition(const GSPresentationRequest &request, const GsPmodeState &pmode,
                                const GsDisplaySetup &circuit1, const GsDisplaySetup &circuit2,
                                bool halfHeightSource, uint32_t factor, PresentStage &stage) {
-        const char *disabled = std::getenv("DQ8_GFX_DISABLE_GPU_COMPOSE");
-        const char *fromMemory = std::getenv("DQ8_GFX_PRESENT_FROM_MEMORY");
+        const char *disabled = std::getenv("TOL_GFX_DISABLE_GPU_COMPOSE");
+        const char *fromMemory = std::getenv("TOL_GFX_PRESENT_FROM_MEMORY");
         if ((disabled && *disabled && std::strcmp(disabled, "0") != 0) ||
             (fromMemory && *fromMemory) || !gsIsColorFramePsm(circuit1.psm) ||
             !gsIsColorFramePsm(circuit2.psm))
@@ -2632,7 +2632,7 @@ struct SdlGpuBackend::Impl {
             gsDecodeDisplay(request.dispfb1, request.display1, pmode.enableCircuit1);
         const GsDisplaySetup circuit2 =
             gsDecodeDisplay(request.dispfb2, request.display2, pmode.enableCircuit2);
-        // DQ8 shows the same buffer on both circuits a line apart and blends
+        // TOL shows the same buffer on both circuits a line apart and blends
         // them 50/50, which hid interlace flicker on a TV. On a progressive
         // display it only blurs, by a native line at every internal scale.
         // Reading both at one origin leaves the blend a no-op.
@@ -2717,7 +2717,7 @@ struct SdlGpuBackend::Impl {
 
     void updatePerformanceTitle(bool gsActive) {
         static const bool enabled = [] {
-            const char *value = std::getenv("DQ8_GFX_SHOW_FPS");
+            const char *value = std::getenv("TOL_GFX_SHOW_FPS");
             return value && std::strcmp(value, "0") != 0;
         }();
         if (!enabled || !window)
@@ -2739,11 +2739,11 @@ struct SdlGpuBackend::Impl {
             const uint64_t completed = completedRenderCounter();
             renders = completed >= titleCompletedStart
                 ? (completed - titleCompletedStart) / seconds : 0.0;
-            std::snprintf(title, sizeof(title), "DQ8Recomp | %.1f render FPS | SDL GPU %.1f presents/s",
+            std::snprintf(title, sizeof(title), "TOLRecomp | %.1f render FPS | SDL GPU %.1f presents/s",
                           renders, titlePresents / seconds);
             titleCompletedStart = completed;
         } else {
-            std::snprintf(title, sizeof(title), "DQ8Recomp | SDL GPU: %.1f presents/s (%.1f active/s)",
+            std::snprintf(title, sizeof(title), "TOLRecomp | SDL GPU: %.1f presents/s (%.1f active/s)",
                           titlePresents / seconds, titleActiveFrames / seconds);
         }
         SDL_SetWindowTitle(window, title);
@@ -2759,8 +2759,8 @@ struct SdlGpuBackend::Impl {
     }
 
     void capturePresentedFrame(const PresentationSlot &slot, uint64_t tick) {
-        static const char *path = std::getenv("DQ8_GFX_NATIVE_CAPTURE");
-        static const bool series = std::getenv("DQ8_GFX_NATIVE_CAPTURE_SERIES") != nullptr;
+        static const char *path = std::getenv("TOL_GFX_NATIVE_CAPTURE");
+        static const bool series = std::getenv("TOL_GFX_NATIVE_CAPTURE_SERIES") != nullptr;
         if (!path || !*path || (nativeCaptureAttempted && !series) || !slot.texture)
             return;
         const std::string trigger = std::string(path) + ".trigger";
@@ -3473,4 +3473,4 @@ std::unique_ptr<SdlGpuBackend> createSdlGpuBackend(std::string &error) {
     return backend;
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx

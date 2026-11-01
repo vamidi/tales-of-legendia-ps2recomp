@@ -9,7 +9,7 @@
 #include <cstdarg>
 #include <string>
 
-namespace dq8::ui {
+namespace tol::ui {
 namespace {
 ImU32 mix(ImU32 a, ImU32 b, float t) {
     const ImVec4 x = ImGui::ColorConvertU32ToFloat4(a), y = ImGui::ColorConvertU32ToFloat4(b);
@@ -288,4 +288,4 @@ void mutedText(const char *format, ...) {
     va_end(args);
 }
 
-} // namespace dq8::ui
+} // namespace tol::ui

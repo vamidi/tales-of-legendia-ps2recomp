@@ -1,12 +1,12 @@
 #include "gfx/backends/sdlgpu/sdlgpu_window.h"
 
 #if !defined(_WIN32) && !defined(__APPLE__)
-// res/icon/dq8-window.bmp, embedded by dq8_embed_window_icon (cmake/Dq8Icon.cmake).
+// res/icon/tol-window.bmp, embedded by tol_embed_window_icon (cmake/TolIcon.cmake).
 extern const unsigned char kWindowIconBmp[];
 extern const unsigned int kWindowIconBmp_size;
 #endif
 
-namespace dq8::gfx {
+namespace tol::gfx {
 
 void setWindowIcon(SDL_Window *window) {
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -20,4 +20,4 @@ void setWindowIcon(SDL_Window *window) {
 #endif
 }
 
-} // namespace dq8::gfx
+} // namespace tol::gfx
