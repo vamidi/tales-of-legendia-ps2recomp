@@ -358,3 +358,81 @@ Then the boot run must show `No exact recompiled function` count = 0.
 - `TOL_TRACE_CKPT` (checkpoint-decline counter) and `TOL_TRACE_FINDADDR` (FindAddress args/result) in the submodule
 - `0x11E900` boot point in `src/runtime/main.cpp`
 - `ps2_recompiler.cpp` option-A change + `build/recomp`
+
+---
+
+## Session 61: path audit + diagnostics hygiene
+
+### 1. The map-lookup caveat is fixed
+
+`tools/map_lookup.ps1` (new) resolves an address to its covering row. Two bugs were behind the blank output
+reported earlier:
+
+- **The original one-liner indexed a single object**: `Select-Object -First 1` returns one `PSCustomObject`, so
+  `$r[1].Name` is `$null`. It must be `$r.Name`.
+- **Then my first script version stayed silent**: (a) `[Convert]::ToInt64("0x00100008", 16)` rejects the `0x`
+  prefix that `map.csv` uses (must strip it), and (b) the `begin`/`process` block form did not run the `process`
+  block when invoked with `-File`, exiting 0 with no output. Rewritten as a plain script body.
+
+Verified: `powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\map_lookup.ps1 0x13F660` ->
+`FUN_0013f4b0 ... (interior +0x1B0)`; comma lists and `-All` work too.
+
+Answers it produced for addresses that previously printed blanks:
+
+| address | owner | relation |
+|---|---|---|
+| `0x109144` | `FUN_00109108` (192 B) | interior +0x3C — where `game-startup` returned to |
+| `0x1450A0` | `FUN_001450a0` (656 B) | **start** |
+| `0x145650` | `FUN_00145640` (168 B) | interior +0x10 — the render edge |
+| `0x11E8C0` | `FUN_0011e878` (136 B) | interior +0x48 — the `ee-park` source |
+| `0x165AD0` | `FUN_00165ad0` (384 B) | **start** — game startup |
+
+### 2. ELF paths: the reference layout differs, and ours was pointing at the wrong directory
+
+The runtime derives `cdRoot` from the ELF's own directory (`PS2Runtime::configureIoPathsFromElf`,
+`ps2_runtime.cpp:1091`: `hostRoot = cdRoot = elfDirectory`, `mcRoot = elfDirectory/mc0`). It is therefore the
+*launch path* that decides where `cdrom0:` resolves.
+
+- **DQ8 reference**: ELF at `config\SLUS_212.07`, no disc tree or ISO in the repo -> `cdRoot = config\`
+  (contains nothing), so DQ8 only works with `--iso=` or `--cd-root=`. Its `main.cpp` is otherwise identical
+  to ours.
+- **This repo**: two byte-identical copies of `SLUS_212.01` (SHA-256 `03E18C8B...C9B6`) - one at `data\` and one
+  at `data\CD\`. The **real disc tree is `data\CD`**: `AFS\{BATTLE,MAP,FIELD}.AFS`, `IRX\*.IRX`, `MBS\`,
+  `CDVD.000` (1.0 GB), `SYSTEM.CNF`.
+
+So launching `data\SLUS_212.01` sets `cdRoot = data\` and every `cdrom0:` read misses the tree. The correct
+invocation is:
+
+```
+build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
+```
+
+which yields `[tol] cd root = ...\data\CD` (now printed unconditionally; `main.cpp` also got its stale
+`SLUS_212.07` usage strings fixed).
+
+**Caveat: today the two layouts behave identically** (both: 0 dispatch errors, boot reaches `game-startup`,
+`draws=0`) because the guest performs **no file I/O at all** yet (0 IRX/cdrom/VFS lines in either run). The path
+defect is latent but real and will bite the moment the guest opens its first IRX or AFS file.
+
+### 3. Side effect of option A, found and fixed: render-cadence probe
+
+`tools/runtime/render_cadence.h` required every registered slot in a hardcoded window `0x145080..0x145658` to
+resolve to one function. `FUN_001450a0` starts at `0x1450a0`, inside that window, so the check was always wrong;
+it only went unnoticed because `hasFunction(0x145080)` used to be false (that address is interior to
+`FUN_00145060`). With dense per-instruction slots the probe finally ran, found the neighbour, and disabled itself:
+`[render-cadence] unavailable: unexpected interior function at 001450a0`.
+
+Fixed by deriving the extent from the table instead of trusting a hardcoded window: walk outward from `kEntry`
+while the slot still resolves to the same function (bounded by +/-32 KB). `kEntry` corrected to `0x145650`, the
+documented render edge, inside `FUN_00145640`. Result:
+
+```
+[render-cadence] enabled: completed guest edge 145650->1439b8; wrapped=42 entries over 00145640..001456e4
+```
+
+### Current blocker (unchanged, next to chase)
+
+No graphics traffic at all: `transfers=0 draws=0 passes=0 presents=0`, and `TOL_TRACE_PARK=1` shows ~17
+thread-returns/second with `ra=0x0` and a fresh `sp=0x01FFFFF0` from `0x11E8C0` (`FUN_0011e878` interior) and
+`0x11EEF0` — thread entries whose bodies return immediately. Until the guest gets past that it never opens a
+file, so the cd-root fix cannot be validated end to end yet.

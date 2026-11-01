@@ -37,26 +37,38 @@ public:
         const auto original = runtime.lookupFunction(kEntry);
         if (original == &executeRenderRoutine)
             return true;
+
+        // The routine's extent is the contiguous run of table slots that resolve to it. A hardcoded window is
+        // not safe: with per-instruction resume slots a neighbour function can start inside it (FUN_001450a0
+        // starts at 0x1450a0, inside the old 0x145080..0x145658 window), and wrapping that neighbour would
+        // replace its entries too. Walking the slots finds the real boundaries.
+        constexpr uint32_t kScanSpan = 0x8000u;
+        const uint32_t scanBegin = kEntry > kScanSpan ? kEntry - kScanSpan : 0u;
+        const uint32_t scanEnd = kEntry + kScanSpan;
+        uint32_t begin = kEntry;
+        while (begin > scanBegin && runtime.hasFunction(begin - 4u) &&
+               runtime.lookupFunction(begin - 4u) == original)
+            begin -= 4u;
+        uint32_t end = kEntry;
+        while (end + 4u < scanEnd && runtime.hasFunction(end + 4u) &&
+               runtime.lookupFunction(end + 4u) == original)
+            end += 4u;
+
         uint32_t entries = 0u;
-        for (uint32_t pc = kEntry; pc < kEnd; pc += 4u)
+        for (uint32_t pc = begin; pc <= end; pc += 4u)
         {
-            if (!runtime.hasFunction(pc))
-                continue;
-            if (runtime.lookupFunction(pc) != original)
-            {
-                std::fprintf(stderr, "[render-cadence] unavailable: unexpected interior function at %08x\n", pc);
-                return false;
-            }
-            ++entries;
+            if (runtime.hasFunction(pc))
+                ++entries;
         }
         m_original = original;
-        for (uint32_t pc = kEntry; pc < kEnd; pc += 4u)
+        for (uint32_t pc = begin; pc <= end; pc += 4u)
             if (runtime.hasFunction(pc))
                 runtime.replaceFunction(pc, &executeRenderRoutine);
         std::fprintf(stderr,
                      "[render-cadence] enabled: completed guest edge 145650->1439b8; "
-                     "wrapped=%u entries, interval=%u ms, limit=%u samples; not a simulation-step counter\n",
-                     entries, m_intervalMs, m_limit);
+                     "wrapped=%u entries over %08x..%08x, interval=%u ms, limit=%u samples; "
+                     "not a simulation-step counter\n",
+                     entries, begin, end, m_intervalMs, m_limit);
         return true;
     }
 
@@ -75,7 +87,7 @@ public:
 
 private:
     using Clock = std::chrono::steady_clock;
-    static constexpr uint32_t kEntry = 0x00145080u, kEnd = 0x00145658u;
+    static constexpr uint32_t kEntry = 0x00145650u;
 
     static void executeRenderRoutine(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {

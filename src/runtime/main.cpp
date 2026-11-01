@@ -210,7 +210,7 @@ int main(int argc, char **argv)
         }
         else if (arg == "-h" || arg == "--help")
         {
-            std::printf("usage: tol <path-to-SLUS_212.07> [options]\n"
+            std::printf("usage: tol <path-to-SLUS_212.01> [options]\n"
                         "  --entry=0xADDR   override the start PC (default 0x%08X = crt0_start)\n"
                         "  --iso=PATH       disc image for sector reads, including HD6 archives\n"
                         "  --cd-root=DIR    cdrom0: directory (default: the ELF's directory)\n"
@@ -233,7 +233,7 @@ int main(int argc, char **argv)
     {
         std::fprintf(stderr,
                      "TOLRecomp %s\n"
-                     "usage: tol <path-to-SLUS_212.07> [--entry=0xADDR]\n",
+                     "usage: tol <path-to-SLUS_212.01> [--entry=0xADDR]\n",
                      TOL_VERSION);
         return 1;
     }
@@ -383,11 +383,20 @@ int main(int argc, char **argv)
             paths.cdRoot = cdRoot;
         }
         PS2Runtime::setIoPaths(paths);
+    }
+
+    // Always report the resolved paths: cdRoot is derived from the ELF's own directory, so which copy of
+    // SLUS_212.01 is launched decides where cdrom0: reads go. For this title the disc tree (AFS/, IRX/,
+    // CDVD.000) lives in data/CD, so the ELF must be launched from there or --cd-root must be passed.
+    {
+        const PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+        std::printf("[tol] elf     = %s\n", paths.elfPath.string().c_str());
         std::printf("[tol] cd root = %s\n", paths.cdRoot.string().c_str());
         if (!paths.cdImage.empty())
         {
             std::printf("[tol] cd image = %s\n", paths.cdImage.string().c_str());
         }
+        std::fflush(stdout);
     }
 
     // Keep the runtime arena above the guest allocator's ceiling to prevent overlap.
