@@ -83,7 +83,7 @@ option(DQ8_LINK_GENERATED
     "Link the locally generated game corpus; enables DQ8_BUILD_PS2RECOMP."
     OFF)
 
-set(DQ8_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/generated/SLUS_212.07"
+set(DQ8_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/PS2Recomp/ps2xRuntime/src/runner"
     CACHE PATH "Directory of recompiled .cpp files produced by ps2_recomp.")
 set(DQ8_VU_PROGRAMS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/generated/SLUS_212.07-vu1"
     CACHE PATH "VU1 programs setup.py rebuilt from the game's ELF, compiled into the runtime.")
@@ -189,4 +189,6 @@ if(DQ8_BUILD_PS2RECOMP)
 endif()
 
 add_subdirectory(src)
-add_subdirectory(tools/runtime EXCLUDE_FROM_ALL)
+# tools/runtime is Dragon Quest 8's diagnostic harness (render cadence and a GS fan probe, both pinned to
+# DQ8 guest addresses). This port has no copy, so it is not added.
+

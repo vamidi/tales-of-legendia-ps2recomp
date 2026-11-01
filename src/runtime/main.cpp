@@ -359,23 +359,9 @@ int main(int argc, char **argv)
 
     if (tracePrintf)
     {
-        // Must come after loadELF(): it is what populates the function table
-        // these addresses are replaced in.
-        const bool redirected =
-            runtime.replaceFunction(kDebugPrintfWrapper, &FUN_00119508_0x119508) &&
-            runtime.replaceFunction(kBattleLogWrapper, &FUN_00119508_0x119508);
-        if (redirected)
-        {
-            std::printf("[dq8] debug-printf tracing on: 0x%08X and 0x%08X -> 0x00119508\n",
-                        kDebugPrintfWrapper, kBattleLogWrapper);
-        }
-        else
-        {
-            std::fprintf(stderr,
-                         "[dq8] --trace-printf: replaceFunction failed; are 0x%08X/0x%08X "
-                         "in the recompiled function table?\n",
-                         kDebugPrintfWrapper, kBattleLogWrapper);
-        }
+        // DQ8 redirected its debug-printf stub onto FUN_00119508_0x119508, which lives in DQ8's corpus. Tales of
+        // Legendia has no mapped equivalent yet, so the flag is accepted and ignored instead of failing the boot.
+        std::fprintf(stderr, "[tol] --trace-printf: no guest printf wrapper is mapped for this title yet\n");
     }
 
 #if defined(DQ8_LINK_OVERLAYS)

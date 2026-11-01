@@ -29,3 +29,4 @@ logs/
 # GS framebuffer dump artifacts (session 25 diagnostic)
 gs_frame*.bmp
 gs_slab*.bmp
+/build/
