@@ -115,6 +115,45 @@ namespace
     constexpr uint32_t kDefaultEntryPoint = 0x00100008u;
 }
 
+// BOOT TRACE (TOL_TRACE_BOOT=1): crt0 returns to ra=0 and the EE thread ends, so log which of its calls is the last
+// one entered. Only ctx->pc is printed, so this does not depend on the R5900Context layout.
+namespace
+{
+    struct BootPoint
+    {
+        uint32_t pc;
+        const char *name;
+    };
+    const BootPoint kBootPoints[] = {
+        {0x00100008u, "crt0 entry"},
+        {0x0011EA58u, "FUN_0011ea58 libc-init"},
+        {0x00165AD0u, "FUN_00165ad0 game-startup"},
+        {0x001072B8u, "FUN_001072b8 game-run"},
+    };
+    constexpr int kBootPointCount = static_cast<int>(sizeof(kBootPoints) / sizeof(kBootPoints[0]));
+    PS2Runtime::RecompiledFunction gBootOriginal[kBootPointCount] = {};
+    uint32_t gBootPc[kBootPointCount] = {};
+    const char *gBootName[kBootPointCount] = {};
+    int gBootCount = 0;
+
+    void bootTraceCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        int idx = -1;
+        for (int i = 0; i < gBootCount; ++i)
+        {
+            if (gBootPc[i] == ctx->pc)
+                idx = i;
+        }
+        if (idx < 0 || gBootOriginal[idx] == nullptr)
+        {
+            std::fprintf(stderr, "[boot] probe dispatch with unknown pc=0x%08X\n", ctx->pc);
+            return;
+        }
+        std::fprintf(stderr, "[boot] enter %s pc=0x%08X\n", gBootName[idx], ctx->pc);
+        gBootOriginal[idx](rdram, ctx, runtime);
+        std::fprintf(stderr, "[boot] exit  %s pc=0x%08X\n", gBootName[idx], ctx->pc);
+    }
+}
 int main(int argc, char **argv)
 {
     std::string elfPath;
@@ -355,6 +394,26 @@ int main(int argc, char **argv)
     // override it with crt0_start (or the caller's --entry) before the
     // scheduler starts executing.
     runtime.cpu().pc = entryPoint;
+    // BOOT TRACE (TOL_TRACE_BOOT=1): wrap crt0 and the three calls it makes, so the last one entered names the stall.
+    if (std::getenv("TOL_TRACE_BOOT") != nullptr)
+    {
+        for (int i = 0; i < kBootPointCount; ++i)
+        {
+            PS2Runtime::RecompiledFunction original = runtime.lookupFunction(kBootPoints[i].pc);
+            if (original == nullptr)
+            {
+                std::fprintf(stderr, "[boot] 0x%08X (%s) is not in the function table\n", kBootPoints[i].pc,
+                             kBootPoints[i].name);
+                continue;
+            }
+            gBootPc[gBootCount] = kBootPoints[i].pc;
+            gBootName[gBootCount] = kBootPoints[i].name;
+            gBootOriginal[gBootCount] = original;
+            runtime.replaceFunction(kBootPoints[i].pc, &bootTraceCall);
+            ++gBootCount;
+        }
+        std::fprintf(stderr, "[boot] tracing %d of %d points\n", gBootCount, kBootPointCount);
+    }
 
     if (!std::getenv("TOL_DISABLE_VU_BOUNDS_FIX") && !tol::installVuBoundsComparisons(runtime))
         std::fprintf(stderr, "[tol] VU bounds comparison repair could not be installed\n");
