@@ -3691,6 +3691,69 @@ that is independent of the race and has never been attributed. Not investigated.
 2. Boot race: treat as an accepted variable with a 2-attempt protocol. Do not chase it before the chunk bug, which is
    deterministic.
 
+### Session 58u - ROOT CAUSE FIXED: the VIF1 pending path was re-tagging a continuation whose guest tag was still open; the path-2 hop counters proved nothing was ever lost
+
+**Committed `3e9eccb`.** The per-hop counters were added as asked and they settled it in the opposite direction from
+where three sessions had been looking: **no payload is lost at any handoff**. The corruption was **injected**.
+
+**The six hops** (`ps2x::gifhop::count`, defined in `gs/ps2_gif_arbiter.cpp`, reported from
+`ParallelBackend::ProcessGIF` every 8 MiB - never per packet):
+
+| hop | site |
+|---|---|
+| 0 | `ps2_vif1_interpreter.cpp` -> `submitGifPacket(Path2)` |
+| 1 | `PS2Memory::submitGifPacket` (funnel) |
+| 2 | `GifArbiter::submit` |
+| 3 | `GifArbiter::drain` -> `processFn` |
+| 4 | `GS::processGIFPacket` raw forward |
+| 5 | `ParallelBackend::ProcessGIF` |
+
+Measured, path 2, one 200 s run: `vif1->submit 79005 pkts / 8388528 B`, then **funnel, arbiter.in, arbiter.out,
+frontend and backend all 79006 pkts / 8388624 B - byte-for-byte identical**. Nothing is dropped anywhere.
+
+**What the counters did expose: `synthTags=19107`.** `ps2_vif1_interpreter.cpp` had two separate paths:
+
+- the DIRECT branch forwards the DMA block **verbatim**, including the guest's IMAGE tag header - so the renderer ends
+  up with that tag **open**, `path.loop < path.tag.NLOOP`, waiting for the rest of the payload;
+- the pending branch, which supplies that rest, **wrapped it in a fresh synthesised GIFtag**
+  (`NLOOP = chunkQw, EOP on the last chunk, FLG = IMAGE`).
+
+So each continuation got **16 bytes prepended to a stream that was inside a tag**, and the renderer consumed that
+header **as payload**. Every tag boundary after it shifted by one qword. That is the mechanism behind `NLOOP=0x7FFF`:
+the palette at offset `0x20` (`0x19ffffff11ffffff`, low 15 bits all ones) read as a tag header.
+
+The old comment claimed raw forwarding "suffered from 16-byte-per-chunk inflation" - the reasoning is inverted;
+raw forwarding is exactly what an open tag expects, and the synthetic tag is what inflates.
+
+**Fix:** the pending branch now submits `data + pos` for `chunkQw * 16` bytes with no synthetic header (and no
+per-chunk `std::vector` allocation).
+
+**Verified (200 s, black phase reached):**
+
+| metric | before | after |
+|---|---|---|
+| `synthTags` | 19,107 | **0** |
+| `NLOOP=0x7FFF` tags | 3 | **0** |
+| `dbp=0x3ff0` tags | 0 | **20,164** |
+| `dbp=0x3ff0` delivered | 4,384 B | **3,970,272 B** |
+| `dbp=0x3ff0` `blt`/`dir`/`tags` | 518/262/0 | **20164/20164/20164** |
+| max tag | 0 | **15 qw** (24x16 T4 = 12) |
+| page split `0x3ff000` | `0 0 0 0 44 0 0 0` | `2 0 0 0 57 0 0 0` |
+
+`blt == dir == tags` means every setup now gets exactly one payload, and the payload sizes match the rect. The census
+is still black (593 vs 600), because the desync was masking a **second** defect.
+
+**REMAINING (now cleanly isolated): the renderer receives 20,164 complete, correctly-sized transfers and VRAM at
+`0x3FF000` still holds only 2 non-zero bytes.** Session 58p had already flagged this as "ENOUGH data, T4 destination,
+nothing written"; it is now the only blocker and no longer entangled with the tag framing. `nz=265/1024` shows the
+payload itself is real data, not zeros.
+
+**Next:** follow one `0x3ff0` transfer through parallel-gs's flush path (`init_transfer` latches
+`bitbltbuf`/`trxreg` at TRXDIR, `check_pending_transfer` flushes at `required_qwords`,
+`flush_pending_transfer` -> `compute_page_rect` -> `vram_upload`). Note the same 8x2 shape at `0x3FF400` **does** land
+(the 44/57-byte CLUT), so the difference is specific to the T4 destination - check `compute_page_rect` with
+`DPSM=PSMT4, DBW=1` and `trxreg=24x16`, and whether `copy_cpu` vs `renderer.copy_vram` is taken.
+
 ### Session 57 - MARKERS AND THE NATIVE BACKEND ARE IN AND RUNNING: first live GSNativeBackend, first present handed over as a texture
 
 **Committed `aa00be8`, tree clean, build green (one full rebuild, ~1740 steps).**
