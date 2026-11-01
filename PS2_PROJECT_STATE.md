@@ -229,3 +229,29 @@ map row for an overlap (`entry_0010012c` nesting inside `entry` is one known ove
 | `TOL_GFX_SHOW_FPS` / `TOL_GFX_STATS_EVERY` | per-frame `[gfx]` counter line (transfers/draws/presents/ee-dispatches) |
 | working build | `build/tol2` (corrected corpus, SDL3) |
 | old corpus | still at `thirdparty/PS2Recomp/ps2xRuntime/src/runner` for A/B |
+
+### Session 60 update — the corrupting frame is FUN_0011e948
+
+Boot trace with all 13 init-chain points wrapped (enter/exit with pc/ra/sp):
+
+```
+[boot] enter crt0            ra=0x00000000 sp=0x01FFFFF0
+[boot] enter FUN_0011ea58    ra=0x001001F0 sp=0x01F00000   <- crt0's return, correct
+[boot] enter FUN_0011e808    ra=0x0011EA68 sp=0x01EFFFF0
+[boot] exit  FUN_0011e808    pc=0x0011EA68 ra=0x0011EA68   <- clean
+[boot] enter FUN_0011e948    ra=0x0011EA70 sp=0x01EFFFF0   <- return address correct
+[boot] exit  FUN_0011e948    pc=0x0011E900 ra=0x0011E9E4 sp=0x01EFFF70   <- CORRUPT
+```
+
+`FUN_0011e948` is the frame that introduces it:
+- entered with `ra = 0x0011EA70` (the instruction after its `jal` in `FUN_0011ea58`) - correct;
+- exits with `ra = 0x0011E9E4` and `pc = 0x0011E900`, `sp` down by 0x80;
+- `0x11E9E4` lies BEFORE `0x11E948`, so it cannot be a return address of any call made inside it: it is a stale
+  stack slot the epilogue restored -> **prologue/epilogue offset mismatch in this function**, not a runtime or map bug;
+- it never unwinds to `0x0011EA70`, so `FUN_0011ea58`'s remaining calls (0x11EF38, 0x11F0B0, 0x11F2F0, 0x1154B8,
+  0x11EB80, 0x11E070, 0x120770) and crt0's `FlushCache`/`main` JALs never run. Window stays black.
+
+**Next:** compare `FUN_0011e948`'s `addiu sp,-N` / `sd $ra,off` with its `ld $ra,off` / `addiu sp,+M` in
+`data/output_fixed/FUN_0011e948_*.cpp`. If they disagree the bug is in the recompiler's prologue/epilogue emission
+(fix belongs in PS2Recomp, benefits every game); if they agree, the row's End is short and the body falls through
+into the next row - then the map is at fault (see the known `entry_0010012c` nested inside `entry`).
