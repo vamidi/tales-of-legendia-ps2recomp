@@ -131,3 +131,22 @@ virtual memory for PCH` / `C1076 internal heap limit` — each `cl.exe` holds th
 - Generated `.cpp` are build inputs, not source: they live under `data/` (gitignored) or `build/`.
 - `data/*` is gitignored (game files); only `data/README.txt` is tracked.
 - Keep the corpus flags (`-fno-strict-aliasing -fwrapv`, `-msse4.1`) — they preserve guest semantics.
+
+## 8. Build toolchain (decided 2026-11-01)
+
+**Build the corpus with clang-cl, not MSVC.** `cl.exe` dies with `C1002` (out of heap, pass 2) on four single
+functions of 8.7-9 MB / ~226k lines (`FUN_00256bc8`, `FUN_00256d58`, `FUN_00256cc0`, `FUN_002578b8`); DQ8's corpus
+caps at 0.8 MB so it never hits this. The `/Od` + no-PCH workaround in `src/runtime/CMakeLists.txt` applies only when
+the compiler is MSVC and did not save those four.
+
+```powershell
+cmd /c '"...\VC\Auxiliary\Build\vcvars64.bat" && cmake -S . -B build/clang -G Ninja `
+      -DCMAKE_BUILD_TYPE=Release -DDQ8_LINK_GENERATED=ON `
+      -DCMAKE_C_COMPILER="...\VC\Tools\Llvm\x64\bin\clang-cl.exe" `
+      -DCMAKE_CXX_COMPILER="...\VC\Tools\Llvm\x64\bin\clang-cl.exe"'
+cmd /c '"...\vcvars64.bat" && ninja -C build/clang -j 12 dq8'
+```
+
+Configure: `Clang 22.1.3`, `linking 53558 generated translation units`, `using lld` for the corpus link (lld matters:
+ld.exe would struggle with 53k objects). clang-cl on Windows uses MSVC's STL and linker, so the DQ8 wiki's libc++/LLVM-23
+caveat does not apply. Job count: 12 is fine for clang (~1 GB/job); MSVC needed 6 and still failed on the giant units.
