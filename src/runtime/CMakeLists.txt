@@ -29,6 +29,25 @@ if(DQ8_LINK_GENERATED)
     file(GLOB DQ8_GENERATED_SOURCES CONFIGURE_DEPENDS
         "${DQ8_GENERATED_DIR}/*.cpp")
 
+    # This corpus has a few translation units far larger than DQ8's (the recompiler emitted single functions of up
+    # to 9 MB / 226k lines, plus register_functions.cpp at 20 MB; DQ8 caps at 0.8 MB). cl.exe exhausts its heap on
+    # them at /O2 even with one job, so they are built without the PCH and without optimisation. They are slow to
+    # compile and to run, but they compile; everything else keeps the fast path.
+    set(DQ8_HEAVY_SOURCES)
+    foreach(DQ8_SRC ${DQ8_GENERATED_SOURCES})
+        file(SIZE "${DQ8_SRC}" DQ8_SRC_SIZE)
+        if(DQ8_SRC_SIZE GREATER 2097152)
+            list(APPEND DQ8_HEAVY_SOURCES "${DQ8_SRC}")
+        endif()
+    endforeach()
+    if(DQ8_HEAVY_SOURCES)
+        list(LENGTH DQ8_HEAVY_SOURCES DQ8_HEAVY_COUNT)
+        message(STATUS "dq8: ${DQ8_HEAVY_COUNT} oversized translation units build without PCH at /Od")
+        set_source_files_properties(${DQ8_HEAVY_SOURCES} PROPERTIES
+            SKIP_PRECOMPILE_HEADERS ON
+            COMPILE_OPTIONS "/Od")
+    endif()
+
     list(LENGTH DQ8_GENERATED_SOURCES DQ8_GENERATED_SOURCE_COUNT)
     if(DQ8_GENERATED_SOURCE_COUNT EQUAL 0)
         message(FATAL_ERROR
