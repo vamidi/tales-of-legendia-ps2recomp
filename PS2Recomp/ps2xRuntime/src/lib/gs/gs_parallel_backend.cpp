@@ -82,6 +82,25 @@ namespace
         }();
         return v;
     }
+    // PS2X_FORCE_TBP=1 (session 58w): move the T4 texture the logo sprites sample from tbp0 0x3ff0 to 0x3fe0, the
+    // nearest PAGE-ALIGNED 4-bit destination, in BOTH the upload (BITBLTBUF.DBP) and the sampler (TEX0.TBP0).
+    //
+    // Why: with the VIF1 desync fixed the renderer receives 20164 complete 24x16 T4 transfers (3.97 MB) and calls
+    // copy_vram 41511 times, yet 0x3FF000 still holds ~2 non-zero bytes, while the 8x2 CT32 CLUT at 0x3FF400 lands.
+    // Both sit mid-page (0x3FF000 is offset 4096 in page 511). A 4-bit page is 8192 B, so a page-aligned DBP must be
+    // a multiple of 32 in 256-byte units: 0x3ff0 rounds down to 0x3fe0 (= 0x3FE000, the start of page 511).
+    //   - if the texture lands there and the picture changes -> the T4 mid-page/straddle write is the bug;
+    //   - if it still does not land -> T4 destination writes are broken regardless of alignment.
+    bool forceTbpEnabled()
+    {
+        static const bool v = [] {
+            const char *e = std::getenv("PS2X_FORCE_TBP");
+            return e && *e && *e != '0';
+        }();
+        return v;
+    }
+    constexpr uint32_t kForceTbpFrom = 0x3FF0u; // page index the guest uses (mid-page)
+    constexpr uint32_t kForceTbpTo = 0x3FE0u;   // 0x3fe0 * 256 = 0x3FE000, page-aligned
     // PS2X_FORCE_TEXA_ONLY=1: pin TEXA.TA0 = 0x80 but leave TCC alone. Separates "TEXA never reaches the sampler"
     // (this alone restores the frame) from "the texture/CLUT alpha really is 0" (this alone changes nothing).
     bool forceTexaOnlyEnabled()
@@ -969,6 +988,23 @@ namespace
             // 256-byte pages: 0x3FF000..0x3FF3FF is the texture, 0x3FF400.. is the CLUT.
             if (const auto *vram = static_cast<const uint8_t *>(gs.map_vram_read(0, VramSize)))
             {
+                // Session 58w: also dump the page-aligned 0x3FE000 destination, so PS2X_FORCE_TBP can be judged.
+                std::fprintf(stderr, "[GS-dbp]   pages 0x3fe000 (32 x 256B, page-aligned target):");
+                for (uint32_t pg = 0u; pg < 32u; ++pg)
+                {
+                    uint32_t nz = 0u;
+                    const uint32_t base = 0x3FE000u + pg * 256u;
+                    if (base + 256u <= VramSize)
+                    {
+                        for (uint32_t i = 0u; i < 256u; ++i)
+                        {
+                            if (vram[base + i] != 0u)
+                                ++nz;
+                        }
+                    }
+                    std::fprintf(stderr, " %u", nz);
+                }
+                std::fputc('\n', stderr);
                 std::fprintf(stderr, "[GS-dbp]   pages 0x3ff000:");
                 for (uint32_t pg = 0u; pg < 8u; ++pg)
                 {
@@ -1425,6 +1461,34 @@ namespace
                         m_scisPatch.push_back({offset, adValue & ~0x10ull}); // clear PRIM.TME
                     if (adReg == 0x01u && forceRgbaqEnabled())
                         m_scisPatch.push_back({offset, kBrightRgbaq});
+                    // PS2X_FORCE_TBP=1: move the 4-bit texture to a page-aligned destination, in the upload
+                    // (BITBLTBUF.DBP, bits 32-45) and in the sampler (TEX0.TBP0, bits 0-13).
+                    if (forceTbpEnabled())
+                    {
+                        if (adReg == 0x50u && ((adValue >> 32) & 0x3FFFu) == kForceTbpFrom)
+                        {
+                            m_scisPatch.push_back(
+                                {offset, (adValue & ~(0x3FFFull << 32)) | (static_cast<uint64_t>(kForceTbpTo) << 32)});
+                            static uint32_t s_tbpBlts = 0u;
+                            if (s_tbpBlts < 4u)
+                            {
+                                ++s_tbpBlts;
+                                std::cerr << "[GS-tbp] BITBLTBUF dbp 0x" << std::hex << kForceTbpFrom << " -> 0x"
+                                          << kForceTbpTo << std::dec << " (page-aligned)" << std::endl;
+                            }
+                        }
+                        else if ((adReg == 0x06u || adReg == 0x07u) && (adValue & 0x3FFFu) == kForceTbpFrom)
+                        {
+                            m_scisPatch.push_back({offset, (adValue & ~0x3FFFull) | kForceTbpTo});
+                            static uint32_t s_tbpTex = 0u;
+                            if (s_tbpTex < 4u)
+                            {
+                                ++s_tbpTex;
+                                std::cerr << "[GS-tbp] TEX0_" << (adReg == 0x06u ? 1 : 2) << " tbp0 0x" << std::hex
+                                          << kForceTbpFrom << " -> 0x" << kForceTbpTo << std::dec << std::endl;
+                            }
+                        }
+                    }
                     // Session 54: does the black-phase sprite sample a real texel?
                     if (uvDumpEnabled() && (adReg == 0x02u || adReg == 0x03u) &&
                         s_scissor1 == 0x100000001ull)
