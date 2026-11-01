@@ -100,6 +100,16 @@ namespace
     // remainder of an image tag's payload must survive to the next packet; a per-packet walk that clamps it to the
     // bytes available drops the entire texture and then mis-reads the payload as a tag header.
     uint32_t g_pendingImageQw = 0u;
+    // SCISSOR_1/2 writes seen: the 2D probe reports a degenerate `1,1-0,0` scissor at draw time in the logo phase
+    // (.1..0,0 clips every fragment, hence empty framebuffers), while the vblank census reads the full-screen value.
+    // Recording the writes shows whether the guest really emits it or our register decode invents it.
+    struct ScissorWrite
+    {
+        uint32_t context = 0u, x0 = 0u, y0 = 0u, x1 = 0u, y1 = 0u;
+    };
+    constexpr uint32_t kScissorLog = 8u;
+    ScissorWrite g_scissorLog[kScissorLog];
+    uint32_t g_scissorWrites = 0u;
 
     bool FeedEnabled()
     {
@@ -417,6 +427,17 @@ bool Ps2DumpFramebufferBmp(GS &frontend, const GSRegisters &regs, const char *ta
     }
     DumpGsAdHistogram(tag);
     DumpGsFeed(tag);
+    if (FeedEnabled() && g_scissorWrites != 0u)
+    {
+        const uint32_t shown = g_scissorWrites < kScissorLog ? g_scissorWrites : kScissorLog;
+        std::fprintf(stderr, "[GS-scissor] %u writes, last %u:", g_scissorWrites, shown);
+        for (uint32_t i = 0u; i < shown; ++i)
+        {
+            const ScissorWrite &w = g_scissorLog[(g_scissorWrites - shown + i) % kScissorLog];
+            std::fprintf(stderr, " ctx%u=%u,%u-%u,%u", w.context, w.x0, w.y0, w.x1, w.y1);
+        }
+        std::fputc('\n', stderr);
+    }
 
     // DISPFB shares FRAME_1's packed layout: FBP[0:8] (2048-byte pages),
     // FBW[9:14] (64-pixel units), PSM[15:19], DBX[32:42], DBY[43:53].
@@ -1994,6 +2015,16 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         m_ctx[ci].scissor.x1 = static_cast<uint16_t>((value >> 16) & 0x7FF);
         m_ctx[ci].scissor.y0 = static_cast<uint16_t>((value >> 32) & 0x7FF);
         m_ctx[ci].scissor.y1 = static_cast<uint16_t>((value >> 48) & 0x7FF);
+        if (g_scissorWrites < 0xFFFFFFFFu)
+        {
+            ScissorWrite &w = g_scissorLog[g_scissorWrites % kScissorLog];
+            w.context = static_cast<uint32_t>(ci);
+            w.x0 = m_ctx[ci].scissor.x0;
+            w.y0 = m_ctx[ci].scissor.y0;
+            w.x1 = m_ctx[ci].scissor.x1;
+            w.y1 = m_ctx[ci].scissor.y1;
+            ++g_scissorWrites;
+        }
         break;
     }
     case GS_REG_ALPHA_1:

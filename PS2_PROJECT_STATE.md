@@ -19,9 +19,11 @@
 ## Session 59 — backend-agnostic measurement: the PSMT4 texture transfer reaches the frontend with ZERO payload
 
 **Why this session started differently.** The stated next action was "run the black phase on `PS2X_GS_RENDERER=native`".
-It was run (200 s, log `logs/nativeB1.err`) and is **not a usable vehicle**: the native backend reaches only **tick 2790
-in 200 s (14 Hz**, vs ~57 Hz baseline; 17 scheduler heartbeats = ~51 s of guest time), because its GL present/sync path
-blocks the executor. It also never reached the logo phase (census 424, nothing at 0x3F0000, `nzCtx0=nzCtx1=0`).
+It was run (200 s, log `logs/nativeB1.err`) and reached only **tick 2790 (14 Hz)** with 17 scheduler heartbeats, never
+the logo phase (census 424, nothing at 0x3F0000, `nzCtx0=nzCtx1=0`). **Correction:** a later native run
+(`logs/nativeB2.err`, 420 s) reached **tick 24900 = 59 Hz**, so native is *not* inherently slow — nativeB1 had landed on
+the boot-race branch (see the last paragraph), where the guest spins and vblank falls to 14 Hz. Do not attribute rate
+to the backend without checking which branch the run took.
 `PS2X_HAVE_NATIVE_GS=1` **is** compiled in, and `GSNativeBackend::UploadImage` forwards to `GSCpuBackend::UploadImage`,
 so `PS2X_GS_CPU=1` exercises the identical CPU upload path at full speed — that is the correct reference vehicle.
 
@@ -76,21 +78,106 @@ measurement.
 those leading whole qwords as payload via `processImageData` before the tag walk, and an IMAGE tag cut short by the
 packet boundary records what is still owed.
 
-**VERIFIED (CPU backend, `logs/cpuB10.err`, black phase reached):** `0x3FF0(... x39501 bytes=7147392)` — **7.1 MB
-delivered where it previously counted 0** — and the 256-byte page census reads `0x3ff000: 57 0 0 0 57 ...` instead of
-all zeros. The logo sprite is genuinely submitted (`[2D]` probes: `tbp=3ff0 psm=14 cbp=3ff4 tw=6 th=6 tcc=1
-TEST=0x5120d alpha=0x44`, 277 of them), so the upload was the missing half of the sampler input.
+**VERIFIED (CPU backend, `logs/cpuB10.err` + `logs/cpuB12.err`, black phase reached):** `0x3FF0(... x39501
+bytes=7147392)` — **7.1 MB delivered where it previously counted 0** — and the 256-byte page census reads
+`0x3ff000: 57 0 0 0 57 ...` instead of all zeros (the 57-byte delta also shows up as census 536 -> 593). The cleanest
+proof is arithmetic: **every** transfer now delivers exactly `rrw*rrh*bpp` per instance —
 
-**Still open after the fix:** with `PS2X_GS_CPU=1` the display buffer stays empty (`nzDisp2=0` at every tick from 3000
-to 6750), so the CPU *software rasteriser* is not a proven reference for the picture even though its upload path is now
-correct. The next measurement is the native backend (GPU draws + the now-correct upload path), which is the only
-renderer that both uses our decoder and is known to rasterise.
+```
+24x16 T4 -> 192 B    24x12 T4 -> 144 B    24x20 T4 -> 240 B
+8x2  CT32 -> 64 B    32x16 CT32 -> 2048 B
+```
+
+— whereas before the fix `0x3FF0` was 0 B for all 51,619 transfers and `0x3FF4` was 32 B for a 64-byte transfer. The
+logo sprite is genuinely submitted (`[2D]` probes: `tbp=3ff0 psm=14 cbp=3ff4 tw=6 th=6 tcc=1 TEST=0x5120d alpha=0x44`,
+277 of them), so the upload was the missing half of the sampler input.
+
+**Still open after the fix (the real black-screen cause, newly isolated):** the framebuffers stay empty on **both** the CPU
+and native backends (`nzDisp2=nzCtx0=nzCtx1=0` at every tick from 3000 on), while the loader phase did fill them
+(`nzDisp2=32768` at ticks 600/2400). The cause is the **clip region, not the texture**: the `[GS-scissor]` ring shows
+the guest writing `SCISSOR_1` alternately as a **degenerate `1,1-0,0`** and as `0,0-511,447`, and the `[2D]` probes show
+**241 of 249 logo draws use the degenerate one** — `x1 < x0` clips every fragment, so nothing can be rasterised.
+`1,1-0,0` is the packed value `x0=1,x1=0,y0=1,y1=0` (`0x00000001_00000001`). Both backends honour it because both take
+the scissor from `currentDrawState` (a literal copy of the live `m_ctx[ctx]`), so this is a decode- or guest-side
+problem, not a backend one. Next question: does parallel-gs decode the same register as valid full-screen at *draw*
+time? If it does, our A+D/REGLIST decode is still misaligned in the logo phase; if it does not, the guest is computing
+a collapsed rect (an EE/VU value that should be non-zero) and the hunt moves to the producer of that rect.
+
+**Also corrected:** the native backend is not inherently slow — `logs/nativeB2.err` reached **tick 24900 = 59 Hz** — but
+in the *logo phase* it runs at ~11 Hz (`logs/nativeB3.err`: tick 3240 in 300 s), i.e. per-frame cost grows with the
+upload/draw volume. Budget accordingly: the logo phase needs ~4x the wall clock of the CPU backend.
 
 **Boot race in this environment:** 3 of 8 CPU-backend runs reached the black phase (`B2/B4/B5/B7/B10/B12` yes,
 `B3/B6/B9/B11` no — the failing ones stay at `nzWords=98728` with `threads=7`), so budget 2 attempts per 130 s run.
 
 
-## NEXT SESSION — START HERE (written end of session 58x, 2026-11-01)
+## NEXT SESSION — START HERE (written end of session 59, 2026-11-01)
+
+**Goal unchanged:** get past "NOW LOADING" to the Namco / Project Melfes / Sofdec logos, then the MPG movie.
+
+**One-paragraph state.** The black screen is **not** a texture-upload problem any more. Session 59 found and fixed a real
+frontend bug (an IMAGE tag split across GIF packets lost its whole payload), verified by exact arithmetic, so the 4-bit
+logo texture now reaches the VRAM of every backend. What remains is that **nothing is rasterised at all**: the
+framebuffers stay empty (`nzDisp2=nzCtx0=nzCtx1=0`) on both the CPU and native backends, because the guest's own
+`SCISSOR_1` is written as a degenerate `1,1-0,0` and 241 of 249 logo draws use it. The upload is fixed; the clip region
+is now the blocker.
+
+### 1. THE NEXT ACTION (do this first, one run)
+
+Answer **"does parallel-gs see the same degenerate scissor at draw time?"**
+
+- Start parallel-gs with `PS2X_GS_FEED=1` (the new `[GS-scissor]` ring prints on every `[FB-dump]`, and `[2D]` does not
+  exist for it, so use the ring + the existing `[GS-m]`/census).
+- If parallel-gs's `SCISSOR_1` is full-screen where ours is `1,1-0,0`, our A+D/REGLIST decode is **still misaligned in
+  the logo phase** (the IMAGE-continuation fix removed one desync; look for another) — that is in `gs_frontend.cpp`.
+- If parallel-gs also shows the degenerate value, the guest computes a collapsed rect and the hunt moves EE-side: who
+  produces the sprite's clip rect (an EE/VU value that should be non-zero, likely a fade/wipe window).
+
+### 2. DO NOT RE-INVESTIGATE (measured out)
+
+| hypothesis | verdict | evidence |
+|---|---|---|
+| texture upload is empty in VRAM | **FIXED, verified** | 0 -> 7.1 MB delivered; 192/144/240/64/2048 bytes per transfer = `rrw*rrh*bpp` |
+| native backend blocks the executor | dead | nativeB2 = tick 24900 in 420 s (59 Hz); only the *logo phase* is slow (~11 Hz) |
+| 2D draws never reach the backend | dead | 277 `[2D]` probes sample `tbp=3ff0 psm=14 cbp=3ff4 tw=6 th=6 tcc=1` |
+| geometry off-screen | dead | all backends subtract XYOFFSET (`ofx/16`); `2074.31-1792 = 282` px is on screen |
+| the loader phase cannot draw | dead | `nzDisp2=32768` at ticks 600/2400; it empties exactly at tick 3000 |
+| `HWREG` is `0x51` | **wrong fact, corrected** | `0x51`=TRXPOS, `0x54`=HWREG (`gs_types.h`) |
+| CPU/software rasteriser as a picture reference | dead | it honours the same degenerate scissor; use it only for upload questions |
+
+### 3. FIXED — do not regress
+
+- **`cd4769c` carries a split IMAGE tag's payload across GIF packets.** The VIF1 handoff delivers a 16-byte packet with
+  `nloop=12 flg=IMAGE` and then the 192-byte payload as the *next* packet. The per-packet walk clamped the payload to
+  the 0 bytes available, dropped the whole texture and then mis-read the payload as a tag header. `g_pendingImageQw`
+  (file-scope static, cleared in `GS::reset`) carries the owed qwords and consumes them before the tag walk.
+- `3e9eccb` VIF1 pending path forwards the continuation RAW; `649c181` `observeGIF` REGLIST stride; `bf7722c` probe units.
+
+### 4. PROBES ADDED THIS SESSION (all env-gated, no header change, in `gs_frontend.cpp`)
+
+| probe | flag | meaning |
+|---|---|---|
+| `[FB-dump] ... pages 0x3fe000/0x3ff000` | — | non-zero **bytes per 256-byte page**; backend-agnostic (the old page watch was parallel-gs only) |
+| `[GS-feed]` | `PS2X_GS_FEED=1` | per-destination totals + the **last 16 transfer instances** with their real byte counts |
+| `[GS-texx]` | `PS2X_GS_FEED=1` | hexdump of the packet carrying `TRXDIR` with `dpsm=0x14` |
+| `[GS-win]` | `PS2X_GS_FEED=1` | the 24 packets that follow it, with `nloop/flg/nreg` |
+| `[GS-scissor]` | `PS2X_GS_FEED=1` | ring of the last 8 `SCISSOR_1/2` writes |
+
+### 5. TRAPS THAT COST THIS SESSION REAL TIME
+
+1. **A run that never leaves `nzWords=98728` is the boot race, not a result.** 5 of 16 runs took it (`threads=7`); it
+   burns the whole window and reaches tick ~25000 while never uploading anything. Check `nzWords` before believing a
+   census, and budget 2 attempts per 130 s.
+2. **Per-destination byte totals mis-attribute.** `bytes=0` for `0x3ff0` looked like "no payload"; the per-transfer
+   ring is what revealed the truth. Always keep an instance-level ring.
+3. **`0x51` is TRXPOS, not `HWREG`.** Reading TRXPOS as image data has been in the notes since 58r.
+4. **Do not read a rate from one run.** nativeB1's 14 Hz was the boot-race branch, not the backend (nativeB2 = 59 Hz).
+5. **`texel=` in `[2D]` samples a single corner texel** (uv of vertex 0) and is `0` for a transparent margin — it is not
+   evidence about the texture as a whole. Use the page census instead.
+6. Measurement arithmetic: a `24x16` PSMT4 tile is **192 bytes** (`24*16*4/8`); `8x2` CT32 is **64 bytes**.
+
+## Session 58x handover (SUPERSEDED by session 59 — kept for its do-not-reinvestigate table and commit list)
+
 
 **Goal unchanged:** get past "NOW LOADING" to the Namco / Project Melfes / Sofdec logos, then the MPG movie.
 
