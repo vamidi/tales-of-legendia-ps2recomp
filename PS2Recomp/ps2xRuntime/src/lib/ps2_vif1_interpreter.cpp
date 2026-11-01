@@ -7,6 +7,13 @@
 #include <iostream>
 #include <set>
 
+// Session 58u: path-2 GIF handoff counters, defined in gs/ps2_gif_arbiter.cpp (hop 0 = this submitter).
+namespace ps2x::gifhop
+{
+    void count(int hop, uint32_t path, uint64_t bytes) noexcept;
+    void countSynthTag() noexcept;
+}
+
 // PS2X_VU1_MPG_LOG=1: every VU1 microprogram the guest uploads, and each distinct one written out as
 // <TEMP>\vu1prog_<hash>.bin. Tales of Legendia never stores to VU1 memory from EE code (the binary contains no
 // reference to 0x11008000), so its microprograms exist only as MPG payloads - all of them at destination 0, which is
@@ -441,26 +448,20 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             }
 
             const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            // Session 38: a pending image transfer means the guest's GIF tag is
-            // still unfulfilled - the VIF1 DMA ended mid-tag, so this data is a
-            // Fork (feature/performance-patch-1): build a proper FLG=IMAGE tag for
-            // the chunk instead of forwarding raw QWs.  NLOOP is the chunk's QW
-            // count, EOP is set only on the final chunk (when it consumes the
-            // outstanding pending count), so the tag boundary is explicit and the
-            // TRXREG transfer can complete without the 16-byte-per-chunk inflation
-            // that the earlier synthesised-tag attempt suffered from.
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(),
-                            static_cast<uint32_t>(imagePacket.size()), true,
-                            m_vif1PendingPath2DirectHl);
+            // Session 58u, ROOT CAUSE: forward the continuation RAW.
+            //
+            // The guest's IMAGE tag header was already forwarded verbatim by the DIRECT branch below, so the renderer
+            // still has that tag OPEN and is waiting for exactly this many payload qwords. Wrapping them in a
+            // synthesised GIFtag - the previous behaviour - prepends 16 bytes per chunk to a stream that is inside a
+            // tag, so the renderer consumes that header AS PAYLOAD. Measured 19107 synthesised tags in one 200 s run;
+            // the counters prove the bytes themselves were never lost (funnel -> backend is byte-identical), which is
+            // why chasing a "dropped chunk" found nothing. The desync it caused is what produced NLOOP=0x7FFF and the
+            // empty 0x3FF000 page.
+            const uint32_t chunkBytes = chunkQw * 16u;
+            ps2x::gifhop::count(0, static_cast<uint32_t>(GifPathId::Path2), chunkBytes);
+            submitGifPacket(GifPathId::Path2, data + pos, chunkBytes, true, m_vif1PendingPath2DirectHl);
 
-            pos += chunkQw * 16u;
+            pos += chunkBytes;
             m_vif1PendingPath2ImageQwc -= chunkQw;
             if (m_vif1PendingPath2ImageQwc == 0u)
             {
@@ -698,6 +699,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     std::cerr << "[VIF1-direct] qwCount=" << qwCount << " hl=" << (directHl ? 1 : 0)
                               << " pos=" << pos << " size=" << sizeBytes << std::endl;
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+                ps2x::gifhop::count(0, static_cast<uint32_t>(GifPathId::Path2),
+                                    static_cast<uint64_t>(qwCount) * 16u);
                 if (ps2xWatchVif1())
                     std::cerr << "[VIF1-direct] submitted qwCount=" << qwCount << std::endl;
 

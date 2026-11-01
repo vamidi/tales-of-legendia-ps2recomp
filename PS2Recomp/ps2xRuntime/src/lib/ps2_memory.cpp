@@ -10,6 +10,12 @@
 // PATH1 GIF bytes the VU1 has kicked, process-wide. Defined here, declared where it is read (ps2_runtime.cpp) rather
 // than in a header, so the counter costs no rebuild of everything that includes ps2_memory.h.
 std::atomic<uint64_t> g_ps2xPath1GifBytes{0};
+
+// Session 58u: path-2 GIF handoff counters, defined in gs/ps2_gif_arbiter.cpp (hop 1 = this funnel).
+namespace ps2x::gifhop
+{
+    void count(int hop, uint32_t path, uint64_t bytes) noexcept;
+}
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
@@ -2101,6 +2107,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     // inventory (PS2X_VU1_MSCAL_LOG) can say which program draws. Deliberately outside any log gate: two atomics.
     if (pathId == GifPathId::Path1)
         g_ps2xPath1GifBytes.fetch_add(sizeBytes, std::memory_order_relaxed);
+    ps2x::gifhop::count(1, static_cast<uint32_t>(pathId), sizeBytes);
     if (!data || sizeBytes < 16)
         return;
 

@@ -18,6 +18,12 @@
 // Defined below, next to GS::ReadVram it samples through; called from vertexKick for every submitted draw.
 static void ps2xProbe2dDraw(const GS &gs, const GSPrimitiveBatch &batch);
 
+// Session 58u: path-2 GIF handoff counters, defined in gs/ps2_gif_arbiter.cpp (hop 4 = this raw forward).
+namespace ps2x::gifhop
+{
+    void count(int hop, uint32_t path, uint64_t bytes) noexcept;
+}
+
 // ---------------------------------------------------------------------------
 // TEMP diagnostic (session 25, first-frame triage): framebuffer BMP dump.
 // The entry runner window has no GS image path, so the frames the guest
@@ -1030,7 +1036,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
     if (m_backend && m_backend->UsesRawCommands())
     {
         if (data && sizeBytes && (sizeBytes & 15u) == 0u)
+        {
+            ps2x::gifhop::count(4, path, sizeBytes);
             m_backend->ProcessGIF(path, data, sizeBytes);
+        }
         else if (data && sizeBytes)
         {
             // An unaligned chunk cannot be expressed as whole GIF qwords, so it used to be dropped here with no

@@ -18,6 +18,14 @@
 #include <utility>
 #include <vector>
 
+// Session 58u: path-2 GIF handoff counters, defined in ps2_gif_arbiter.cpp (hop 5 = this backend).
+namespace ps2x::gifhop
+{
+    void count(int hop, uint32_t path, uint64_t bytes) noexcept;
+    void countSynthTag() noexcept;
+    void reportIfDue() noexcept;
+}
+
 namespace
 {
     constexpr size_t VramSize = 4 * 1024 * 1024;
@@ -1595,6 +1603,8 @@ namespace
 
         void ProcessGIF(uint32_t path, const uint8_t *data, uint32_t size) override
         {
+            ps2x::gifhop::count(5, path, size);
+            ps2x::gifhop::reportIfDue();
             Lock lock(mutex);
             if (path < 1 || path > 3 || size % 16)
                 throw std::invalid_argument("parallel-gs: invalid GIF path or size");
