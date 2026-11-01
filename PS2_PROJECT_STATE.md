@@ -118,9 +118,19 @@ upload/draw volume. Budget accordingly: the logo phase needs ~4x the wall clock 
 **One-paragraph state.** The black screen is **not** a texture-upload problem any more. Session 59 found and fixed a real
 frontend bug (an IMAGE tag split across GIF packets lost its whole payload), verified by exact arithmetic, so the 4-bit
 logo texture now reaches the VRAM of every backend. What remains is that **nothing is rasterised at all**: the
-framebuffers stay empty (`nzDisp2=nzCtx0=nzCtx1=0`) on both the CPU and native backends, because the guest's own
-`SCISSOR_1` is written as a degenerate `1,1-0,0` and 241 of 249 logo draws use it. The upload is fixed; the clip region
-is now the blocker.
+framebuffers stay empty (`nzDisp2=nzCtx0=nzCtx1=0`) on both the CPU and native backends, because the decoder walks each
+GIF packet independently — an A+D tag whose header ends one VIF1 chunk and whose payload is in the next one is read as
+"payload = tag header", writing image bytes into arbitrary register slots (measured: a garbage `nloop=0 nreg=5` packet
+and a live `SCISSOR_1` of `1,1-0,0` that clips every logo draw). Session 59 generalised the walk to carry PACKED /
+REGLIST / IMAGE remainders across packets.
+
+**⚠️ PROJECT DIRECTION (set by the user, session 59) — read before choosing any fix.** This project is a **native port**,
+not a PS2 renderer rebuild. The target is the game drawing into a **Windows window through our own recompiled draw
+path**. GS-exact edge semantics are *not* the goal: where a hardware-faithful reading produces nothing on screen (an
+inverted clip rect is the current example), the port may legitimately treat it as "no clip" and draw. Priority order:
+(a) the game's draws actually reaching a window, (b) our own backend (`GSNativeBackend` / `GSCpuBackend`) over vendored
+parallel-gs, (c) PCSX2 used only to learn *what the game intends*, never as a fidelity target. Do not spend sessions
+reproducing GS quirks that keep the screen black.
 
 ### 1. THE NEXT ACTION (do this first, one run)
 
@@ -143,13 +153,29 @@ register view we have is the backend's own readback, i.e. `c0sc=` in the `[FB-du
 
 | hypothesis | verdict | evidence |
 |---|---|---|
+| our GIF decode mangles the upload list | **dead** (PCSX2 A/B) | PCSX2 EE RAM `0x15a4750` = `[PACKED NLOOP=3] BITBLTBUF(0x3FF0,1,T4) TRXPOS(4,1) TRXDIR(0)`, **byte-identical** to our `[GS-texx]` dump. The guest emits two variants: 4-register with `TRXREG 48x48` at `0x15a37e0` (the only one the notes cited) and this 3-register one our port executes |
+| the `1,1-0,0` scissor is a tag-split artifact | **dead** | unified PACKED/REGLIST/IMAGE continuation changed nothing: `cpuB20` still 4044 writes, `1,1-0,0` alternating, 249/258 logo draws on it |
+| the guest writes a degenerate `SCISSOR_1` | **dead for PCSX2's stream** | PCSX2 RAM has the full-screen A+D (`00 00 ff 01 00 00 bf 01 40 …`) at `0x3EE0E0`/`0x3EF5B0` and **no** `01 00 00 00 01 00 00 00 40` |
+| the upload list is rebuilt per frame | dead | write watchpoint on `0x15a4750` never fired; static template, DMA'd each frame |
 | texture upload is empty in VRAM | **FIXED, verified** | 0 -> 7.1 MB delivered; 192/144/240/64/2048 bytes per transfer = `rrw*rrh*bpp` |
 | native backend blocks the executor | dead | nativeB2 = tick 24900 in 420 s (59 Hz); only the *logo phase* is slow (~11 Hz) |
 | 2D draws never reach the backend | dead | 277 `[2D]` probes sample `tbp=3ff0 psm=14 cbp=3ff4 tw=6 th=6 tcc=1` |
 | geometry off-screen | dead | all backends subtract XYOFFSET (`ofx/16`); `2074.31-1792 = 282` px is on screen |
 | the loader phase cannot draw | dead | `nzDisp2=32768` at ticks 600/2400; it empties exactly at tick 3000 |
-| `HWREG` is `0x51` | **wrong fact, corrected** | `0x51`=TRXPOS, `0x54`=HWREG (`gs_types.h`) |
+| `HWREG` is `0x51` | **wrong fact, corrected** | PCSX2's list decodes `0x51`=TRXPOS, `0x52`=TRXREG, `0x53`=TRXDIR, `0x54`=HWREG |
 | CPU/software rasteriser as a picture reference | dead | it honours the same degenerate scissor; use it only for upload questions |
+
+**PCSX2 ground truth (session 59, DebugServer live, same disc, logo screen up).**
+
+```
+0x15a37e0  [PACKED NLOOP=4 NREG=1 A+D] BITBLTBUF(DBP=0x3FF0 DBW=1 DPSM=T4)
+                                       TRXREG(RRW=48 RRH=48) TRXPOS(0,0) TRXDIR(0)
+0x15a3830  [IMAGE NLOOP=72]            1152 B payload, contiguous
+0x15a4750  [PACKED NLOOP=3 NREG=1 A+D] BITBLTBUF(DBP=0x3FF0 DBW=1 DPSM=T4)
+                                       TRXPOS(dsax=4 dsay=1) TRXDIR(0)   <- what our port executes
+0x3EE0A0   [PACKED NLOOP=8 NREG=1 A+D] state setup incl. SCISSOR_1 = 0,0-511,447
+```
+
 
 ### 3. FIXED — do not regress
 

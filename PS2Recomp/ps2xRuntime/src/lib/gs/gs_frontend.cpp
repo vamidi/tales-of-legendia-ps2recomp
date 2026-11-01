@@ -95,11 +95,18 @@ namespace
     // After the first 4-bit destination setup, trace the packets that follow: the setup packet carries no payload,
     // so this is what shows where (and whether) the texture's image data is actually delivered.
     uint32_t g_windowLeft = 0u;
-    // An IMAGE tag can arrive in its own VIF1 chunk with its payload in the next one (measured: a 16-byte packet
-    // holding `nloop=12 flg=IMAGE`, then a 192-byte payload packet). The GS is a stateful tag walker, so the
-    // remainder of an image tag's payload must survive to the next packet; a per-packet walk that clamps it to the
-    // bytes available drops the entire texture and then mis-reads the payload as a tag header.
-    uint32_t g_pendingImageQw = 0u;
+    // A GIFtag whose header and payload land in different VIF1 chunks: the registers still owed, in order.
+    struct PendingTag
+    {
+        bool active = false;
+        uint8_t flg = 0u;
+        uint32_t nreg = 0u;
+        uint32_t regIndex = 0u;  // next register slot to write
+        uint32_t regsLeft = 0u;  // register writes still owed (PACKED / REGLIST)
+        uint32_t qw = 0u;        // payload qwords still owed (IMAGE)
+        uint8_t regs[16] = {};
+    };
+    PendingTag g_pendingTag;
     // SCISSOR_1/2 writes seen: the 2D probe reports a degenerate `1,1-0,0` scissor at draw time in the logo phase
     // (.1..0,0 clips every fragment, hence empty framebuffers), while the vblank census reads the full-screen value.
     // Recording the writes shows whether the guest really emits it or our register decode invents it.
@@ -110,6 +117,7 @@ namespace
     constexpr uint32_t kScissorLog = 8u;
     ScissorWrite g_scissorLog[kScissorLog];
     uint32_t g_scissorWrites = 0u;
+    uint32_t g_degenerateDumps = 0u;
 
     bool FeedEnabled()
     {
@@ -707,7 +715,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    g_pendingImageQw = 0u;
+    g_pendingTag = PendingTag{};
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
     m_primRegister = {};
@@ -1341,16 +1349,37 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
     });
 
     uint32_t offset = 0;
-    // Continue an IMAGE tag whose header arrived in an earlier packet: these leading bytes are its payload, not a
-    // tag header. Consume them before the tag walk so the rest of the packet starts on a real tag boundary.
-    if (g_pendingImageQw > 0u)
+    // A GIFtag whose header and payload land in different VIF1 chunks must survive the boundary. Every branch below
+    // saves its remainder here instead of returning, and the next packet consumes it before looking for a tag header;
+    // without that, payload bytes are read as a tag header and image data is written into arbitrary register slots.
+    // Measured consequence of the old behaviour: a garbage `nloop=0 nreg=5` packet in `[GS-win]` and a live
+    // `SCISSOR_1` of `1,1-0,0` that clipped every logo draw.
+    while (offset + 8u <= sizeBytes && g_pendingTag.active)
     {
-        uint32_t bytes = g_pendingImageQw * 16u;
-        if (bytes > sizeBytes)
-            bytes = sizeBytes & ~15u; // whole qwords only: an unaligned tail is not a continuation we can place
-        processImageData(data, bytes);
-        offset += bytes;
-        g_pendingImageQw -= bytes / 16u;
+        if (g_pendingTag.flg == GIF_FMT_IMAGE)
+        {
+            const uint32_t bytes = static_cast<uint32_t>(std::min<uint64_t>(g_pendingTag.qw, (sizeBytes - offset) / 16u)) * 16u;
+            if (bytes == 0u)
+                break;
+            processImageData(data + offset, bytes);
+            offset += bytes;
+            g_pendingTag.qw -= bytes / 16u;
+            if (g_pendingTag.qw == 0u)
+                g_pendingTag.active = false;
+            continue;
+        }
+        const uint32_t per = (g_pendingTag.flg == GIF_FMT_PACKED) ? 16u : 8u;
+        if (offset + per > sizeBytes)
+            break;
+        if (per == 16u)
+            writeRegisterPacked(g_pendingTag.regs[g_pendingTag.regIndex], loadLE64(data + offset),
+                                loadLE64(data + offset + 8u));
+        else
+            writeRegisterUnlocked(g_pendingTag.regs[g_pendingTag.regIndex], loadLE64(data + offset));
+        offset += per;
+        g_pendingTag.regIndex = (g_pendingTag.regIndex + 1u) % g_pendingTag.nreg;
+        if (--g_pendingTag.regsLeft == 0u)
+            g_pendingTag.active = false;
     }
     while (offset + 16 <= sizeBytes)
     {
@@ -1378,34 +1407,44 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
         for (uint32_t i = 0; i < nreg; ++i)
             regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
 
-        if (flg == GIF_FMT_PACKED)
+        if (flg == GIF_FMT_PACKED || flg == GIF_FMT_REGLIST)
         {
-            for (uint32_t loop = 0; loop < nloop; ++loop)
+            const uint32_t per = (flg == GIF_FMT_PACKED) ? 16u : 8u;
+            const uint64_t total = static_cast<uint64_t>(nloop) * static_cast<uint64_t>(nreg);
+            uint64_t written = 0u;
+            bool truncated = false;
+            for (uint32_t loop = 0; loop < nloop && !truncated; ++loop)
             {
                 for (uint32_t r = 0; r < nreg; ++r)
                 {
-                    if (offset + 16 > sizeBytes)
-                        return;
-                    uint64_t lo = loadLE64(data + offset);
-                    uint64_t hi = loadLE64(data + offset + 8);
-                    offset += 16;
-                    writeRegisterPacked(regs[r], lo, hi);
+                    if (offset + per > sizeBytes)
+                    {
+                        truncated = true;
+                        break;
+                    }
+                    if (per == 16u)
+                        writeRegisterPacked(regs[r], loadLE64(data + offset), loadLE64(data + offset + 8u));
+                    else
+                        writeRegisterUnlocked(regs[r], loadLE64(data + offset));
+                    offset += per;
+                    ++written;
                 }
             }
-        }
-        else if (flg == GIF_FMT_REGLIST)
-        {
-            for (uint32_t loop = 0; loop < nloop; ++loop)
+            if (truncated)
             {
-                for (uint32_t r = 0; r < nreg; ++r)
-                {
-                    if (offset + 8 > sizeBytes)
-                        return;
-                    writeRegisterUnlocked(regs[r], loadLE64(data + offset));
-                    offset += 8;
-                }
+                // The rest of this tag arrives in the next packet: remember the register order and position.
+                g_pendingTag.active = true;
+                g_pendingTag.flg = flg;
+                g_pendingTag.nreg = nreg;
+                g_pendingTag.regIndex = static_cast<uint32_t>(written % nreg);
+                g_pendingTag.regsLeft = total - written;
+                g_pendingTag.qw = 0u;
+                for (uint32_t i = 0; i < nreg; ++i)
+                    g_pendingTag.regs[i] = regs[i];
+                return;
             }
-            if ((nloop * nreg) & 1)
+            // REGLIST pads an odd register count to a qword, but only when the tag completed inside this packet.
+            if (flg == GIF_FMT_REGLIST && ((nloop * nreg) & 1) != 0)
                 offset += 8;
         }
         else if (flg == GIF_FMT_IMAGE)
@@ -1416,9 +1455,16 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
                 imageBytes = sizeBytes - offset;
             processImageData(data + offset, imageBytes);
             offset += imageBytes;
-            // The tag was cut short by the packet boundary: the rest of its payload follows in the next packet.
             if (imageBytes < want)
-                g_pendingImageQw = (want - imageBytes) / 16u;
+            {
+                g_pendingTag.active = true;
+                g_pendingTag.flg = GIF_FMT_IMAGE;
+                g_pendingTag.nreg = 1u;
+                g_pendingTag.regIndex = 0u;
+                g_pendingTag.regsLeft = 0u;
+                g_pendingTag.qw = (want - imageBytes) / 16u;
+                return;
+            }
         }
     }
 }
@@ -2024,6 +2070,26 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             w.x1 = m_ctx[ci].scissor.x1;
             w.y1 = m_ctx[ci].scissor.y1;
             ++g_scissorWrites;
+            // A clip rect with x1 < x0 cannot rasterise anything, and PCSX2's RAM contains no such write: dump the
+            // packet that carries it once, so its bytes can be searched for in the emulator.
+            if (m_ctx[ci].scissor.x1 < m_ctx[ci].scissor.x0 || m_ctx[ci].scissor.y1 < m_ctx[ci].scissor.y0)
+            {
+                if (g_degenerateDumps < 2u && g_curPktData != nullptr)
+                {
+                    ++g_degenerateDumps;
+                    const uint32_t show = g_curPktSize < 192u ? g_curPktSize : 192u;
+                    std::fprintf(stderr, "[GS-degen] ctx%u=%u,%u-%u,%u path=%u size=%u bytes:\n", ci,
+                                 m_ctx[ci].scissor.x0, m_ctx[ci].scissor.y0, m_ctx[ci].scissor.x1,
+                                 m_ctx[ci].scissor.y1, g_curPktPath, g_curPktSize);
+                    for (uint32_t off = 0u; off < show; off += 16u)
+                    {
+                        std::fprintf(stderr, "[GS-degen]   %04x:", off);
+                        for (uint32_t i = 0u; i < 16u && off + i < show; ++i)
+                            std::fprintf(stderr, " %02x", g_curPktData[off + i]);
+                        std::fputc('\n', stderr);
+                    }
+                }
+            }
         }
         break;
     }
