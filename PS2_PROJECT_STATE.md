@@ -255,3 +255,35 @@ Boot trace with all 13 init-chain points wrapped (enter/exit with pc/ra/sp):
 `data/output_fixed/FUN_0011e948_*.cpp`. If they disagree the bug is in the recompiler's prologue/epilogue emission
 (fix belongs in PS2Recomp, benefits every game); if they agree, the row's End is short and the body falls through
 into the next row - then the map is at fault (see the known `entry_0010012c` nested inside `entry`).
+
+### Session 60 update 2 — the dispatch failure is NOT a missing map entry
+
+Corrected the containment rule (drop a contained row only when it is an `entry_*`; never drop `FUN_*`/named/`thunk_*`).
+My first version deleted real functions, including `FUN_0011e900`, which is exactly the target that fails.
+
+Final map: **13,519 rows** (32,467 labels folded contiguously, 7,235 duplicate labels dropped). Regenerated corpus:
+13,519 functions, 13,464 recompiled, 0 decode failures, 13,520 .cpp. `0x11E900` **is** in the table
+(`register_functions.cpp` has `// 0x11e900`), and the neighbourhood is complete:
+`FUN_0011e900 (16) / FUN_0011e910 (52) / FUN_0011e948 (252)`.
+
+**But the boot trace is byte-identical:**
+
+```
+[boot] enter FUN_0011e948 pc=0x0011E948 ra=0x0011EA70 sp=0x01EFFFF0
+[boot] exit  FUN_0011e948 pc=0x0011E900 ra=0x0011E9E4 sp=0x01EFFF70
+```
+
+So `dispatchGuestBranch(0x11E900, ...)` still returns **false** even though the slot exists. The call site is:
+
+```c
+SET_GPR_U32(ctx, 31, 0x11E9E4u);
+ctx->pc = 0x11E900u;
+if (!runtime->dispatchGuestBranch(rdram, ctx, 0x11E900u, 0x11E9DCu, 0x11E9E4u, DirectCall, "JAL")) return;
+```
+
+`pc == 0x11E900 && ra == 0x11E9E4` on exit is therefore just "the dispatch declined and the function returned",
+not a corrupted frame. **The frame handling was never wrong.**
+
+**Next:** read `PS2Runtime::dispatchGuestBranch` and enumerate every path that returns false (missing target,
+`ctx->pc == 0` after the call, stop requested, reentry rejection, ...), then log which one fires for this call.
+That is a runtime question now, and the map is out of the picture.
