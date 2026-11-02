@@ -228,6 +228,13 @@ namespace
     constexpr uint32_t kIxAudioHandleFunctions[] = {0x002u, 0x400u, 0x422u};
     uint32_t gIxAudioNextHandle = 1u;
 
+    // ioman (sid 0x80000001): the game's sceSifInitIoman (FUN_00119568) binds it and sends fn 0xFF with an
+    // 8-byte request of two pointers, expecting an 8-byte reply. The IOPRP image's IOMAN module does not
+    // register the server here (it wants the real sifman), so the init is answered natively. Reply word 1 is
+    // compared against 2 to enable a newer capability path, which this runtime does not provide.
+    constexpr uint32_t kIomanSid = 0x80000001u;
+    constexpr uint32_t kIomanInitFunction = 0xFFu;
+
     // Bind is per client, and the call only carries the client pointer, so the sid is remembered here.
     constexpr int kMaxRpcClients = 16;
     uint32_t gRpcClientAddr[kMaxRpcClients] = {};
@@ -483,6 +490,41 @@ namespace
                 }
             }
             SET_GPR_S32(ctx, 2, 0);
+            return;
+        }
+
+        // ioman: answer the init so sceSifInitIoman succeeds. Other ioman functions (open/read/...) report
+        // "unsupported" rather than pretending, because the game's own file server (sid 0x80000597) is what
+        // its DVCI layer actually reads through.
+        if (sid == kIomanSid)
+        {
+            if (function == kIomanInitFunction)
+            {
+                if (receiveBuffer != 0u && receiveSize >= 4u)
+                {
+                    runtime->Store32(rdram, ctx, receiveBuffer, 0u);
+                }
+                if (receiveBuffer != 0u && receiveSize >= 8u)
+                {
+                    runtime->Store32(rdram, ctx, receiveBuffer + 4u, 0u);
+                }
+                if (traceRpcEnabled())
+                {
+                    std::fprintf(stderr, "[rpc] ioman init -> ok\n");
+                }
+                SET_GPR_S32(ctx, 2, 0);
+                return;
+            }
+            if (traceRpcEnabled())
+            {
+                static uint32_t sLogs = 0u;
+                if (sLogs < 32u)
+                {
+                    ++sLogs;
+                    std::fprintf(stderr, "[rpc] ioman fn=0x%X -> unsupported\n", function);
+                }
+            }
+            SET_GPR_S32(ctx, 2, -1);
             return;
         }
 
