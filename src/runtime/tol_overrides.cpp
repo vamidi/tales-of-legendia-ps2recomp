@@ -2,6 +2,7 @@
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
+#include "ps2_syscalls.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +10,215 @@
 
 namespace
 {
+    // ---------------------------------------------------------------------------------------------------------
+    // NATIVE SIF RPC (the game's own libsif is statically linked, so its API entry points are guest code)
+    //
+    // Tales of Legendia carries libsif inside SLUS_212.01: sceSifBindRpc at 0x00118448 and sceSifCallRpc at
+    // 0x00118628. Both send a SIF command to the IOP and block on a semaphore that only the IOP's reply would
+    // signal, and this runtime has no IOP command channel behind the register file, so the main thread blocked
+    // there forever (ee-dispatches=44 per 300 frames, transfers=0 draws=0).
+    //
+    // The runtime already implements these two services for titles that *import* libsif (ps2_syscalls::SifBindRpc
+    // / SifCallRpc, which route through PS2IopTransport and the native IOP). Their argument conventions are the
+    // SDK's, so substituting them for the guest's copies keeps every caller above them - the game's loadfile and
+    // iopheap layers - unchanged while making the calls complete synchronously instead of waiting for a reply
+    // that cannot arrive.
+    constexpr uint32_t kGuestSifBindRpc = 0x00118448u;
+    constexpr uint32_t kGuestSifCallRpc = 0x00118628u;
+    // RPC sid of the IOP's loadfile service, which is what the game's module loader talks to.
+    constexpr uint32_t kLoadFileSid = 0x80000006u;
+    // The game's loadfile client requests: 0xFF initialises, anything else names a module to load.
+    constexpr uint32_t kLoadFileInitFunction = 0xFFu;
+    // Version string the game expects back from the loadfile init ("3000", i.e. IOPRP300).
+    constexpr uint32_t kLoadFileVersion3000 = 0x30303033u; // '3','0','0','0' little-endian
+    // Loadfile request layout: { argLen, 0, path[0xFC], args[] }.
+    constexpr uint32_t kLoadFilePathOffset = 8u;
+
+    // Bind is per client, and the call only carries the client pointer, so the sid is remembered here.
+    constexpr int kMaxRpcClients = 16;
+    uint32_t gRpcClientAddr[kMaxRpcClients] = {};
+    uint32_t gRpcClientSid[kMaxRpcClients] = {};
+    int gRpcClientCount = 0;
+
+    void rememberRpcClient(uint32_t client, uint32_t sid)
+    {
+        for (int i = 0; i < gRpcClientCount; ++i)
+        {
+            if (gRpcClientAddr[i] == client)
+            {
+                gRpcClientSid[i] = sid;
+                return;
+            }
+        }
+        if (gRpcClientCount < kMaxRpcClients)
+        {
+            gRpcClientAddr[gRpcClientCount] = client;
+            gRpcClientSid[gRpcClientCount] = sid;
+            ++gRpcClientCount;
+        }
+    }
+
+    uint32_t rpcClientSid(uint32_t client)
+    {
+        for (int i = 0; i < gRpcClientCount; ++i)
+        {
+            if (gRpcClientAddr[i] == client)
+                return gRpcClientSid[i];
+        }
+        return 0u;
+    }
+
+    // Runs the runtime's module loader for a path already sitting in guest memory, leaving the current
+    // context's registers untouched so the RPC caller never sees the synthetic call.
+    int32_t loadModuleFromGuestMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t pathAddress)
+    {
+        const uint32_t savedA0 = GPR_U32(ctx, 4);
+        const uint32_t savedA1 = GPR_U32(ctx, 5);
+        const uint32_t savedA2 = GPR_U32(ctx, 6);
+        const uint32_t savedV0 = GPR_U32(ctx, 2);
+
+        SET_GPR_U32(ctx, 4, pathAddress);
+        SET_GPR_U32(ctx, 5, 0u);
+        SET_GPR_U32(ctx, 6, 0u);
+        ps2_syscalls::SifLoadModule(rdram, ctx, runtime);
+        const int32_t moduleId = static_cast<int32_t>(GPR_U32(ctx, 2));
+
+        SET_GPR_U32(ctx, 4, savedA0);
+        SET_GPR_U32(ctx, 5, savedA1);
+        SET_GPR_U32(ctx, 6, savedA2);
+        SET_GPR_U32(ctx, 2, savedV0);
+        return moduleId;
+    }
+
+    bool traceRpcEnabled()
+    {
+        static const bool enabled = std::getenv("TOL_TRACE_RPC") != nullptr;
+        return enabled;
+    }
+
+    void tolSifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (traceRpcEnabled())
+        {
+            static uint32_t sLogs = 0u;
+            if (sLogs < 64u)
+            {
+                ++sLogs;
+                std::fprintf(stderr, "[rpc] bind client=0x%08X sid=0x%08X mode=0x%X\n", GPR_U32(ctx, 4),
+                             GPR_U32(ctx, 5), GPR_U32(ctx, 6));
+            }
+        }
+        rememberRpcClient(GPR_U32(ctx, 4), GPR_U32(ctx, 5));
+        ps2_syscalls::SifBindRpc(rdram, ctx, runtime);
+    }
+
+    void tolSifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t client = GPR_U32(ctx, 4);
+        const uint32_t function = GPR_U32(ctx, 5);
+        const uint32_t sendBuffer = GPR_U32(ctx, 7);
+        const uint32_t sendSize = GPR_U32(ctx, 8);
+        const uint32_t receiveBuffer = GPR_U32(ctx, 9);
+        const uint32_t receiveSize = GPR_U32(ctx, 10);
+        const uint32_t sid = rpcClientSid(client);
+
+        if (traceRpcEnabled())
+        {
+            static uint32_t sLogs = 0u;
+            if (sLogs < 256u)
+            {
+                ++sLogs;
+                std::fprintf(stderr,
+                             "[rpc] call client=0x%08X sid=0x%08X fn=0x%X mode=0x%X send=0x%08X/%u recv=0x%08X/%u\n",
+                             client, sid, function, GPR_U32(ctx, 6), sendBuffer, sendSize, receiveBuffer,
+                             receiveSize);
+            }
+        }
+
+        // The loadfile service is the one that actually reads from the disc: the game sends a module path in
+        // the send buffer and expects a module id back. No native IOP server answers sid 0x80000006, so the
+        // runtime's own module loader serves it - the same one sceSifLoadModule reaches when a title imports
+        // libsif instead of carrying it.
+        if (sid == kLoadFileSid)
+        {
+            uint32_t status = 0u;
+            uint32_t moduleId = 0u;
+            if (function == kLoadFileInitFunction)
+            {
+                // The game compares this reply against "3000" and "...." and only proceeds when it matches
+                // one, i.e. it wants the version of the IOP image it just loaded (IOPRP300 -> "3000").
+                status = kLoadFileVersion3000;
+            }
+            else if (sendBuffer != 0u && sendSize != 0u)
+            {
+                // The loadfile request is { argLen, 0, path[0xFC], args[] }: the path sits at +8, not at
+                // the start of the send buffer (the game copies it to 0x3E2208 and sends from 0x3E2200).
+                const uint32_t pathAddress = sendBuffer + kLoadFilePathOffset;
+                const int32_t loaded = loadModuleFromGuestMemory(rdram, ctx, runtime, pathAddress);
+                if (loaded > 0)
+                {
+                    moduleId = static_cast<uint32_t>(loaded);
+                }
+                else
+                {
+                    status = 0xFFFEFFFFu;
+                }
+                if (traceRpcEnabled())
+                {
+                    static uint32_t sPathLogs = 0u;
+                    if (sPathLogs < 20u)
+                    {
+                        ++sPathLogs;
+                        std::fprintf(stderr, "[rpc] loadfile path '%.96s'\n",
+                                     reinterpret_cast<const char *>(rdram) + (pathAddress & 0x01FFFFFFu));
+                    }
+                }
+            }
+            if (receiveBuffer != 0u && receiveSize >= 4u)
+            {
+                runtime->Store32(rdram, ctx, receiveBuffer, status);
+            }
+            if (receiveBuffer != 0u && receiveSize >= 8u)
+            {
+                runtime->Store32(rdram, ctx, receiveBuffer + 4u, moduleId);
+            }
+            if (traceRpcEnabled())
+            {
+                std::fprintf(stderr, "[rpc] loadfile fn=0x%X -> status=0x%08X module=%u\n", function, status,
+                             moduleId);
+            }
+            SET_GPR_S32(ctx, 2, 0);
+            return;
+        }
+
+        ps2_syscalls::SifCallRpc(rdram, ctx, runtime);
+    }
+
+    void installSifRpcOverrides(PS2Runtime &runtime)
+    {
+        struct Override
+        {
+            uint32_t pc;
+            const char *name;
+            PS2Runtime::RecompiledFunction replacement;
+        };
+        const Override overrides[] = {
+            {kGuestSifBindRpc, "sceSifBindRpc", &tolSifBindRpc},
+            {kGuestSifCallRpc, "sceSifCallRpc", &tolSifCallRpc},
+        };
+        for (const Override &entry : overrides)
+        {
+            if (runtime.lookupFunction(entry.pc) == nullptr)
+            {
+                std::fprintf(stderr, "[rpc] %s (0x%08X) is not in the function table\n", entry.name, entry.pc);
+                continue;
+            }
+            runtime.replaceFunction(entry.pc, entry.replacement);
+        }
+        std::fprintf(stderr, "[rpc] native SIF bind/call installed (0x%08X, 0x%08X)\n", kGuestSifBindRpc,
+                     kGuestSifCallRpc);
+    }
+
     // ---------------------------------------------------------------------------------------------------------
     // GENERIC PC PROBE (TOL_TRACE_PC=0xADDR[,0xADDR...])
     //
@@ -240,6 +450,7 @@ namespace tol
         // The tick-loop probe wraps rather than replaces: it dumps the dispatcher's queue and then runs the real
         // recompiled body, so nothing about guest behaviour changes while the queue is being observed.
         installPcProbes(runtime);
+        installSifRpcOverrides(runtime);
         if (tickTraceEnabled())
         {
             PS2Runtime::RecompiledFunction original = runtime.lookupFunction(kTickLoopPc);

@@ -13,15 +13,18 @@
 | Guest reaches its own startup | done — `FUN_00165ad0 game-startup` runs |
 | **Guest gets past heap init** | **done this session** (was the blocker) |
 | Guest installs its syscall handlers | done — `FUN_0011e070` now returns; ~32 syscalls flow |
-| Guest creates threads | still no — syscall `0x20` never reached |
-| File I/O | none yet |
-| Graphics | none — `transfers=0 draws=0 passes=0 presents=0` |
+| **SIF RPC answered natively** | **done this session** — bind/call no longer block |
+| **IOP image + nine IRX modules load from `cdrom0:`** | **done this session** — sound library runs on the native IOP |
+| Graphics bring-up (VIF/DMAC reset) | reached |
+| Guest creates threads | not yet — `CreateThread` (0x20) not reached |
+| File I/O | **starts and fails**: `DVCI: Can't read filelist file.(\AFS\FLIST.DIR)` |
+| Graphics | none yet — `transfers=0 draws=0` |
 
-**Current blocker, stated precisely:** `FUN_00118448` is **`sceSifBindRpc`**. It creates a semaphore, sends bind
-command `0x80000009` with `sceSifSendCmd` and `WaitSema()`s for the server's reply; `FUN_0011c990` retries the bind
-forever. Nothing in the runtime answers it - `g_sifCmdHandlers` in `SIF.cpp` is only stored, never invoked - so the
-main thread blocks in the scheduler and the EE runs only the Timer-2 handler (`ee-dispatches=44` per 300 frames,
-`transfers=0 draws=0`).
+**Current blocker, stated precisely:** the game's own file layer. Its data-file initialisation reports
+`DVCI: Can't read filelist file.(\AFS\FLIST.DIR)` and then `SJX_Init can't create DTX` - a disc path with no device
+prefix, opened through the game's fileio RPC rather than the IOP-side opener (no `[fileio]` line for it). Everything
+before it works: the SIF RPC is answered natively, the IOPRP image and all nine IRX modules load from `cdrom0:`, and
+the sound library runs on the native IOP.
 
 (`sceSifInitCmd`'s handshake was unblocked this session by seeding SIF_REG_MSCOM=1; see section 2c.)
 
@@ -79,17 +82,22 @@ Effect: the guest leaves the spin and reaches `sceSifBindRpc` (see section 1).
 
 ## 4. Next step, concretely
 
-Give the SIF command channel an answer. Two routes:
+Serve the game's file I/O. `\AFS\FLIST.DIR` is requested without a device prefix and never reaches the IOP-side
+opener, so the open is going through the game's fileio RPC (`ioman`/`fileio`, sid `0x80000001`/`0x80000005`) or its
+own SIF file service. Trace `tolSifCallRpc` for those sids (`TOL_TRACE_RPC=1` shows the sid for every call), then
+route the open/read/seek onto `PS2Vfs` / `PS2IopHostAdapter` the way the HLE fileio stubs already do. After that the
+AFS archives under `data\CD\AFS` are reachable and the DVCI/SJX init should complete.
 
-- **Minimal:** complete the `sceSifInitCmd` handshake natively - the guest registers command handlers with
-  `sceSifAddCmdHandler` (`FUN_00117828`, table at `0x3E07C0`) and waits on `0x3DEF40`; the packet it sends is 16
-  bytes at `0x3DF000` with the command id in the payload. Answering means writing the reply into EE memory and
-  invoking the registered handler, or simply setting the register/flag the guest polls.
-- **Fuller:** wire up `ps2xIOP`'s LLE emulator (`IopSubsystem` + a ToL profile) instead of the audio-only
-  `ps2_native_iop`; `builtin_profiles.cpp` shows the profile shape for other titles.
+## 4b. What was implemented this session (all measured)
 
-Then re-check `TOL_TRACE_SYSCALL` for `0x71` (`sceSifLoadModule`) and `0x20` (`CreateThread`), and `TOL_GFX_STATS_EVERY`
-for the first draws.
+| layer | where | effect |
+|---|---|---|
+| `sceSifBindRpc` / `sceSifCallRpc` (guest 0x118448 / 0x118628) | `src/runtime/tol_overrides.cpp` | replaced by `ps2_syscalls::SifBindRpc` / `SifCallRpc`; no more semaphore wait |
+| load-module SIF command (cid 0x80000003) | `ps2xRuntime/.../Stubs/SIF.cpp` + `ps2_iop_transport.h` | opens the image through the IOP-side file layer, sets boot-status bit 0x40000 on the next read |
+| loadfile RPC (sid 0x80000006) | `src/runtime/tol_overrides.cpp` | `0xFF` -> `"3000"`; module loads served by the runtime's loader |
+
+Result: first `cdrom0:` open (`IRX\IOPRP300.IMG`, 275,921 bytes), then all nine IRX modules, then the graphics
+bring-up, then the DVCI/SJX failure above.
 
 ## 5. Tooling
 
@@ -108,6 +116,7 @@ Probes (all env-gated, all in `src/runtime/tol_overrides.cpp` unless noted):
 | `TOL_TRACE_BOOT=1` | enter/exit of 14 boot points (`main.cpp`) |
 | `TOL_TRACE_TICK=1` | tick-dispatcher state block + active list (new) |
 | `TOL_TRACE_PC=0xADDR[,0xADDR]` | enter/exit of up to 16 functions with pc/ra/sp + 8 words at `$sp` (new) |
+| `TOL_TRACE_RPC=1` | every SIF bind/call with sid, function, buffers, and the loadfile result (new) |
 | `TOL_TRACE_PARK=1` | every `pc == 0` dormancy with the last 16 top-level dispatch pcs (`EeScheduler.cpp`) |
 | `TOL_TRACE_SYSCALL=1` | first 150 syscalls with args, result, call site |
 | `TOL_TRACE_DISPATCH=1` | first 4000 inter-function transfers |

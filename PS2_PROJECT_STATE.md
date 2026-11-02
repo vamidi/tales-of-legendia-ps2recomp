@@ -564,7 +564,6 @@ finding is superseded.
   symptom of the spin, not of timer emulation.
 
 ### 8. `sceSifInitCmd` unblocked; the blocker moved one layer down to `sceSifBindRpc`
-
 `SIF.cpp::seedDefaultSifRegsLocked()` now seeds `kSifRegMsCom` (0x80000002) to **1** instead of 0. Rationale: a title
 with its own statically linked libsif (ToL carries one - `sceSifInit` at 0x117540, `sceSifInitCmd` at 0x117CA0) polls
 that register, sends a handshake command and then spins on guest flag `0x003DEF40`, which only its own DMA-completion
@@ -586,3 +585,77 @@ only the Timer-2 handler: `ee-dispatches=44` per 300 frames, `transfers=0 draws=
 **Next step:** implement the IOP side of the RPC bind - either dispatch `g_sifCmdHandlers` when a command completes
 (so the guest's own handler signals the semaphore), or answer `sceSifBindRpc` natively. Then watch for
 `sceSifLoadModule` (0x71), the first `cdrom0:` open (`TOL_TRACE_FILEIO=1`) and `CreateThread` (0x20).
+
+---
+
+## Session 63 (cont.) — SIF RPC answered; the guest loads its IOP modules and reaches its first data files
+
+### 9. Native bind/call: the guest's own libsif is replaced at its two blocking entry points
+
+The game carries libsif inside the ELF: `sceSifBindRpc` at `0x00118448`, `sceSifCallRpc` at `0x00118628`. Both send a
+SIF command and `WaitSema()` for a reply only an IOP would send. `src/runtime/tol_overrides.cpp` now installs the
+runtime's HLE implementations (`ps2_syscalls::SifBindRpc` / `SifCallRpc`) in their table slots. Argument conventions
+are the SDK's, so every caller above them - the game's loadfile and iopheap layers - is unchanged, and the calls
+complete synchronously instead of waiting for a reply that cannot arrive. `TOL_TRACE_RPC=1` logs bind/call.
+
+Side effect worth knowing: the guest's `sceSifBindRpc` also allocated its own client record and created the
+semaphore; the HLE bind instead writes the client struct at the runtime's offsets and records
+`g_rpc_clients[clientPtr].sid`. It happens that `client+0x24` - which the game reads as "bound" - is where the HLE
+bind stores `server`, so the guest's `while (!bound) retry-bind` loop terminates on the first pass.
+
+### 10. The load-module SIF command is served, and the first `cdrom0:` open happens
+
+`sceSifLoadModule` (`FUN_0011dc40`) does not use RPC: it builds a packet `{size, dest, cid=0x80000003, ...}` with the
+module path at `+0x18`, DMA's it to the IOP and then polls `sceSifGetReg(4)` for bit `0x40000`. `ps2_stubs::sceSifSetDma`
+now recognises that command, opens the image through the **IOP-side** file layer
+(`PS2IopTransport::readHostFile` -> `PS2IopHostAdapter::translateGuestPath`/`openHostFile`, the same choke point
+`TOL_TRACE_FILEIO` reports on), loads it onto the native IOP when that IOP claims it, and sets the done bit on the
+next boot-status read (after the EE rewrote that register, as the IOP's asynchronous completion does; the bit stays
+set because the guest polls it again later).
+
+The game prefixes the image with the ROM loader that consumes it - `rom0:UDNL cdrom0:\IRX\IOPRP300.IMG;1` (a
+constant in its `.data`, never rewritten) - so the part after the first space is the file.
+
+**First `cdrom0:` open, measured:**
+
+```
+[fileio] iop open '...\data\CD\IRX\IOPRP300.IMG' -> ok, 275921 bytes
+[sif] load-module 'rom0:UDNL cdrom0:\IRX\IOPRP300.IMG;1' -> 'cdrom0:\IRX\IOPRP300.IMG;1' read (275921 bytes)
+```
+
+### 11. The loadfile RPC (sid 0x80000006) is served, and the nine IRX modules load
+
+After the IOPRP, the guest binds `0x80000006` (loadfile) and drives its module loader over RPC. `tolSifCallRpc` now
+answers that sid: `0xFF` returns the version string `"3000"` (the game compares it against `"3000"` and `"...."` and
+only proceeds on a match - that is what `FUN_0011cfe0` checks), anything else is a module load whose request is
+`{argLen, 0, path[0xFC], args[]}` at the send buffer, served by the runtime's own loader (`ps2_syscalls::SifLoadModule`
+with the registers saved and restored).
+
+Measured: all nine modules load and the sound library really starts on the native IOP.
+
+```
+SIO2MAN.IRX -> 1, SIO2D.IRX -> 2, MCMAN.IRX -> 3, MCSERV.IRX -> 4, DBCMAN.IRX -> 5,
+PAD2\DS2U_D.IRX -> 6, LIBSD.IRX -> 7, KORGIVAG.IRX -> 8, IXAUDIO.IRX -> 9
+[fileio] iop open '...\data\CD\IRX\LIBSD.IRX' -> ok, 28661 bytes
+[ps2xIOP] [iop] started Sound_Device_Library at 65536
+INFO: STREAM: Initialized successfully (48000 Hz, 16 bit, Stereo)
+```
+
+### 12. New blocker: the game's own file layer
+
+The guest now runs the graphics bring-up (`FUN_001385d0`: VIF0/VIF1 reset, DMAC reset) and then its data-file
+initialisation, which fails on its own file system:
+
+```
+[Deci2Call:kputs] DVCI: Can't read filelist file.(\AFS\FLIST.DIR)
+[Deci2Call:kputs] DTX_Create: can't create DTX of server
+[Deci2Call:kputs] E0100302: SJX_Init can't create DTX
+```
+
+So the next layer is the **game's file I/O**: `\AFS\FLIST.DIR` is a disc path with no device prefix, resolved by the
+game's own DVCI layer, and no `[fileio]` line appears for it - the open is going through the game's fileio RPC
+(`ioman`/`fileio`, sid `0x80000001`/`0x80000005`) or its own `sceSif` file service, not the IOP-side opener. Serve
+that, and the AFS archives (`data\CD\AFS\{BATTLE,MAP,FIELD}.AFS`) become reachable.
+
+Note: `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 3.20]` is the game's own warning and is not
+fatal - execution continues past it.
