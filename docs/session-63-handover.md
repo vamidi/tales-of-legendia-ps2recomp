@@ -82,11 +82,19 @@ Effect: the guest leaves the spin and reaches `sceSifBindRpc` (see section 1).
 
 ## 4. Next step, concretely
 
-Serve the game's file I/O. `\AFS\FLIST.DIR` is requested without a device prefix and never reaches the IOP-side
-opener, so the open is going through the game's fileio RPC (`ioman`/`fileio`, sid `0x80000001`/`0x80000005`) or its
-own SIF file service. Trace `tolSifCallRpc` for those sids (`TOL_TRACE_RPC=1` shows the sid for every call), then
-route the open/read/seek onto `PS2Vfs` / `PS2IopHostAdapter` the way the HLE fileio stubs already do. After that the
-AFS archives under `data\CD\AFS` are reachable and the DVCI/SJX init should complete.
+Serve the game's file I/O. Measured facts about the failure:
+
+- `data\CD\AFS\FLIST.DIR` **exists** (95 bytes), so this is path/service resolution, not a missing file.
+- No `[fileio] iop open` line for it (the IOP-side opener is instrumented), no `[fileio] open` line
+  (`PS2Vfs::open`), and no `fioOpen error: fopen failed` (`fioOpen` logs every failure) — so the open fails
+  **before** reaching any host file layer.
+- No SIF RPC for `ioman`/`fileio` (`0x80000001` / `0x80000005`) appears in `TOL_TRACE_RPC=1`, and no numeric
+  syscall for it in `TOL_TRACE_SYSCALL=1`.
+
+So the next move is to find the path the game's DVCI open actually takes: the likely candidates are a
+`ps2_stubs::*` call the recompiler emits directly (those bypass `TOL_TRACE_SYSCALL` — `sceSifSetDma` is one), or an
+RPC client whose sid was never seen by `tolSifBindRpc`. Instrumenting `ps2_syscalls::fioOpen` and the fileio stub
+entry points with a one-line trace will name it immediately.
 
 ## 4b. What was implemented this session (all measured)
 

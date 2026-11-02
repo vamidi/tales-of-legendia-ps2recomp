@@ -657,5 +657,11 @@ game's own DVCI layer, and no `[fileio]` line appears for it - the open is going
 (`ioman`/`fileio`, sid `0x80000001`/`0x80000005`) or its own `sceSif` file service, not the IOP-side opener. Serve
 that, and the AFS archives (`data\CD\AFS\{BATTLE,MAP,FIELD}.AFS`) become reachable.
 
+Measured detail (matters for the next session): `data\CD\AFS\FLIST.DIR` **exists** (95 bytes); no `[fileio] iop open`
+line, no `[fileio] open` line (`PS2Vfs::open`), and no `fioOpen error: fopen failed` appear - so the open fails before
+reaching any host file layer; and no RPC for `ioman`/`fileio` and no numeric syscall for it show up either. The open
+path is therefore either a `ps2_stubs::*` call the recompiler emits directly (those bypass `TOL_TRACE_SYSCALL`) or an
+RPC client whose sid `tolSifBindRpc` never saw.
+
 Note: `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 3.20]` is the game's own warning and is not
 fatal - execution continues past it.
