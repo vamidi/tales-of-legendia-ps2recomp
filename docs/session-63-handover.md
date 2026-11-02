@@ -24,34 +24,32 @@
 | **ioman init** | **answered** — `sceSifInitIoman`'s fn 0xFF succeeds natively |
 | **IOP->EE SIF commands** | **delivered** — packet into the guest's own libsif buffer + its receive handler |
 
-**Current blocker, stated precisely:** the game's **ioman RPC is only half implemented**. The loading sequence is
-`FUN_001664d0`, and it is where the guest spins (`[spin] pc=0x1666B4` with `TOL_TRACE_SPIN=1`):
+**Current blocker, stated precisely:** the loading sequence now **runs**. `FUN_001664d0` opens
+`PTN_INFO.BIN`/`PTN_INFO.NAM` through ioman, lseeks, reads, requests its six `.AFS` loads, and the game goes on to
+open individual AFS files:
 
-```c
-lVar3 = FUN_00119a68("cdrom0:\\AFS\\PTN_INFO.BIN;1", 1);   // ioman open, fn 0
-lVar4 = FUN_00119a68("cdrom0:\\AFS\\PTN_INFO.NAM;1", 1);
-if (lVar3 < 0 || lVar4 < 0) for (;;) {}                   // not taken
-uVar5 = FUN_00119e70(lVar3, 0, 2);                        // lseek: size
-FUN_00119e70(lVar3, 0, 0);                                // rewind
-uVar7 = malloc(size); uVar5 = FUN_0011a0b0(lVar3, buf, size);   // read, fn 2
-FUN_00119cf8(lVar3);                                      // close
-... parse PTN_INFO ...
-for (i = 0; i < 6; ++i) {
-    FUN_00196058(i, "<CDV:\\AFS\\...>.AFS", 0, out);
-    while (FUN_00196460(i) != 3) FUN_0019a080();           // <- the spin at 0x1666B4
-}
+```
+[fileio] ioman open 'cdrom0:\AFS\PTN_INFO.BIN;1' -> ...\data\CD\AFS\PTN_INFO.BIN ok (fd 3)
+[fileio] ioman open 'cdrom0:\AFS\PTN_INFO.NAM;1' -> ...\data\CD\AFS\PTN_INFO.NAM ok (fd 4)
+[pc] enter 0x00119E70  x4      (lseek)
+[pc] enter 0x0011A0B0  x2      (read)
+[pc] enter 0x00196058          (load request)
+[Deci2Call:kputs] DVCI: File cache was not hit. "\\AFS\SYS_REG.AFS;1"
 ```
 
-So the loading logic is: read `PTN_INFO.BIN` + `PTN_INFO.NAM` through ioman, then load six `.AFS`/`.MBS` files and wait
-for each to report state 3. Since only `fn 0xFF` of ioman is answered, the opens fail (the retry wrapper burns 100
-attempts and returns a garbage handle), the parse yields nothing, and the six loads never reach state 3.
+Two bugs had gated it (both measured, not guessed):
 
-Decoded ioman protocol (for the next step): the calls are **asynchronous** - the RPC returns a status, then the
-completion arrives as SIF command **0x80000011**, whose handler (`FUN_00119030`) copies the reply into the request
-record at `0x3E14C0 + slot*0x440` and signals the semaphore the caller is waiting on (the packet's `+0xC` carries
-the slot, which is only used when the init reply's second word is 2 - this runtime answers 0, so slot 0 is the only
-one). Request layouts: open = fn 0, 0x418 bytes `{sema, 4, resultPtr, flags, mode, path[0x400]}`; read = fn 2,
-0x20 bytes `{sema, 4, resultPtr, fd, buffer, size}`.
+1. the ioman init reply's first word is a **version**: `FUN_00119770()` memcmps it against `"3000"` and `"...."`
+   and only lets a file call through when it matches one, so answering 0 made every open fail before the RPC;
+2. the request's **result pointer is at +0x04**, not +0x08 (words are `sema, resultPtr, 4, fd, ...`); writing the
+   fd to +0x08 put it at address 4 and the caller read garbage and bailed.
+
+ioman open/close/read/lseek are implemented synchronously in `tolSifCallRpc`: the wrappers are asynchronous by
+design (RPC status, then SIF command 0x80000011 fills the record and signals the semaphore), so the handler does the
+I/O, writes the result where the caller reads it, and signals that semaphore.
+
+Next: the run now spends its time in the loading work (no `[gfx]` frames are reaching the counter in 45 s), so the
+next thing to measure is what `DVCI: File cache was not hit` costs and whether the six `.AFS` loads complete.
 
 Measured chain from one run (`TOL_TRACE_RPC=1`):
 
