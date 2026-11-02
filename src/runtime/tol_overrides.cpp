@@ -31,7 +31,7 @@ namespace
     // register file, so the bit stays exactly as the guest wrote it (0x0F82 / 0x0B82 both carry 0x800), the
     // caller sees "still pending" on every pass and retries forever - which is the boot stall: no file I/O, no
     // draws. The native equivalent of an IOP that accepts immediately is to complete the command here.
-    void tolSifIssueCommand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    [[maybe_unused]] void tolSifIssueCommand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t command = GPR_U32(ctx, 4);
 
@@ -60,15 +60,15 @@ namespace tol
 {
     void installOverrides(PS2Runtime &runtime)
     {
-        // 0x0011F400: the guest's SIF command issuer (see the contract note above).
-        if (runtime.hasFunction(0x0011F400u))
-        {
-            runtime.replaceFunction(0x0011F400u, &tolSifIssueCommand);
-            std::fprintf(stderr, "[tol] override: SIF command issuer 0x0011F400 -> native\n");
-        }
-        else
-        {
-            std::fprintf(stderr, "[tol] override skipped: 0x0011F400 not in the function table\n");
-        }
+        // 0x0011F400 was overridden here as a "SIF command issuer". That reading was wrong: the registers it
+        // touches (0x10001000 / 0x10001010 / 0x10001020) are EE Timer 2's COUNT / MODE / TARGET, per the
+        // hardware map (PCSX2 Hw.h: RCNT2_COUNT 0x10001000, RCNT2_MODE 0x10001010, RCNT2_TARGET 0x10001020),
+        // not SIF MSCOM/SMCOM/MSFLG. The routine is a timer-driven poll, and the stub below wrote timer
+        // registers with made-up values, corrupting the guest's sense of time.
+        //
+        // It is disabled rather than deleted: the same module is where real overrides belong once they are
+        // understood, and this note is the reason the previous attempt must not be reinstated as-is.
+        (void)runtime;
+        std::fprintf(stderr, "[tol] no native overrides installed (the Timer-2 override was withdrawn)\n");
     }
 }
