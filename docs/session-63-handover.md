@@ -51,6 +51,27 @@ I/O, writes the result where the caller reads it, and signals that semaphore.
 Next: the run now spends its time in the loading work (no `[gfx]` frames are reaching the counter in 45 s), so the
 next thing to measure is what `DVCI: File cache was not hit` costs and whether the six `.AFS` loads complete.
 
+### A/B against PCSX2 (same game, real hardware behaviour)
+
+Connected to the PCSX2 DebugServer/Pine and inspected the running game. It has reached its steady state:
+
+```
+TID 0: PC=0x00081fc0 status=1 waitType=0     <- EE kernel park loop (nop sled + b 0x80081FC0)
+TID 1: PC=0x00114608 status=4 waitType=1     <- parked in a syscall stub (jr ra; li v1,0x33; syscall)
+TID 2: PC=0x00114728 status=4 waitType=2
+TID 3: PC=0x00198c90 status=8 waitType=0
+TID 4..7: PC=0x00114608 status=4 waitType=1
+```
+
+So after "NOW LOADING" the real game runs **eight EE threads**, nearly all blocked in kernel waits, with the CPU
+idling in the kernel park loop (`k0 = 0x70030C13`, all GPRs cleared - the idle context). `0x114608` disassembles to
+`jr ra; nop; li v1,0x33; syscall`, i.e. a syscall stub, so those threads are in `SleepThread`/`WaitSema`-class waits.
+
+**This is the structural gap in the port: it has one thread and never calls `CreateThread` (0x20).** The game's
+loader (`FUN_00196058` request + `FUN_00196460` status poll, which `FUN_001664d0` spins on) is asynchronous - on
+hardware it is serviced by the game's own worker threads. With a single thread that status can never reach 3, which
+is why the loading screen does not advance even now that the file I/O underneath it works.
+
 Measured chain from one run (`TOL_TRACE_RPC=1`):
 
 ```
