@@ -234,6 +234,8 @@ namespace
     // compared against 2 to enable a newer capability path, which this runtime does not provide.
     constexpr uint32_t kIomanSid = 0x80000001u;
     constexpr uint32_t kIomanInitFunction = 0xFFu;
+    // Version string the game accepts ("3000", the IOP image it boots); "...." is the other known value.
+    constexpr uint32_t kIomanVersion3000 = 0x30303033u;
 
     // IOP->EE SIF command delivery for this title.
     //
@@ -278,6 +280,170 @@ namespace
                             static_cast<uint8_t>((word >> ((index % 4u) * 8u)) & 0xFFu));
         }
         handler(rdram, ctx, runtime);
+        return true;
+    }
+
+    // ioman file calls (sid 0x80000001), completed synchronously.
+    //
+    // The game's wrappers are asynchronous by design: the RPC returns a status, then the IOP sends SIF command
+    // 0x80000011 whose handler fills the request record and signals the semaphore the caller is about to wait
+    // on. Doing the I/O here, writing the result where the caller reads it and signalling that semaphore gives
+    // the caller exactly the same values without the round trip.
+    //
+    //   fn 0 open   0x418 bytes {sema, 4, resultPtr, flags, mode, path[0x400]}  -> result[0] = fd
+    //   fn 1 close  0x14  bytes {sema, 4, resultPtr, fd}                        -> result[0] = 0
+    //   fn 2 read   0x20  bytes {sema, 4, resultPtr, fd, buffer, size}          -> result[0] = bytes read
+    //   fn 4 lseek  0x1C  bytes {sema, 4, resultPtr, fd, offset, whence}        -> result[0] = position
+    constexpr uint32_t kIomanOpen = 0u;
+    constexpr uint32_t kIomanClose = 1u;
+    constexpr uint32_t kIomanRead = 2u;
+    constexpr uint32_t kIomanLseek = 4u;
+    constexpr uint32_t kIomanResultOffset = 0x08u;
+    constexpr uint32_t kIomanFdOffset = 0x0Cu;
+    constexpr uint32_t kIomanBufferOffset = 0x10u;
+    constexpr uint32_t kIomanSizeOffset = 0x14u;
+    constexpr uint32_t kIomanPathOffset = 0x14u;
+
+    constexpr int kMaxIomanFiles = 16;
+    uint32_t gIomanFd[kMaxIomanFiles] = {};
+    std::FILE *gIomanStream[kMaxIomanFiles] = {};
+    uint64_t gIomanSize[kMaxIomanFiles] = {};
+    uint32_t gIomanNextFd = 3u; // 0..2 are the standard streams
+
+    int iomanSlot(uint32_t fd)
+    {
+        for (int i = 0; i < kMaxIomanFiles; ++i)
+        {
+            if (gIomanFd[i] == fd)
+                return i;
+        }
+        return -1;
+    }
+
+    void signalGuestSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t sema)
+    {
+        if (sema == 0u || sema > 0xFFFFu)
+            return;
+        const uint32_t savedA0 = GPR_U32(ctx, 4);
+        const uint32_t savedV0 = GPR_U32(ctx, 2);
+        SET_GPR_U32(ctx, 4, sema);
+        ps2_syscalls::SignalSema(rdram, ctx, runtime);
+        SET_GPR_U32(ctx, 4, savedA0);
+        SET_GPR_U32(ctx, 2, savedV0);
+    }
+
+    // Runs one ioman call. Returns false when the function is not one of the four above.
+    bool handleIomanFileCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t function,
+                             uint32_t request, uint32_t receiveBuffer, uint32_t receiveSize)
+    {
+        if (request == 0u)
+            return false;
+        const uint32_t sema = runtime->Load32(rdram, ctx, request);
+        const uint32_t resultPtr = runtime->Load32(rdram, ctx, request + kIomanResultOffset);
+        const uint32_t fd = runtime->Load32(rdram, ctx, request + kIomanFdOffset);
+        int32_t result = -1;
+
+        if (function == kIomanOpen)
+        {
+            std::string guestPath;
+            for (uint32_t i = 0; i < 0x400u; ++i)
+            {
+                const uint8_t byte = runtime->Load8(rdram, ctx, request + kIomanPathOffset + i);
+                if (byte == 0u)
+                    break;
+                guestPath.push_back(static_cast<char>(byte));
+            }
+            const std::string hostPath = guestPath.empty() ? std::string() : translatePs2Path(guestPath.c_str());
+            std::FILE *stream = hostPath.empty() ? nullptr : std::fopen(hostPath.c_str(), "rb");
+            if (stream != nullptr)
+            {
+                for (int i = 0; i < kMaxIomanFiles; ++i)
+                {
+                    if (gIomanFd[i] == 0u)
+                    {
+                        gIomanFd[i] = gIomanNextFd++;
+                        gIomanStream[i] = stream;
+                        gIomanSize[i] = 0u;
+                        if (std::fseek(stream, 0, SEEK_END) == 0)
+                        {
+                            const long size = std::ftell(stream);
+                            if (size > 0)
+                                gIomanSize[i] = static_cast<uint64_t>(size);
+                        }
+                        std::fseek(stream, 0, SEEK_SET);
+                        result = static_cast<int32_t>(gIomanFd[i]);
+                        break;
+                    }
+                }
+                if (result < 0)
+                    std::fclose(stream);
+            }
+            if (std::getenv("TOL_TRACE_FILEIO") != nullptr)
+            {
+                std::fprintf(stderr, "[fileio] ioman open '%s' -> '%s' %s (fd %d)\n", guestPath.c_str(),
+                             hostPath.c_str(), result >= 0 ? "ok" : "FAILED", result);
+            }
+        }
+        else if (function == kIomanClose)
+        {
+            const int slot = iomanSlot(fd);
+            if (slot >= 0)
+            {
+                std::fclose(gIomanStream[slot]);
+                gIomanFd[slot] = 0u;
+                gIomanStream[slot] = nullptr;
+                result = 0;
+            }
+        }
+        else if (function == kIomanRead)
+        {
+            const int slot = iomanSlot(fd);
+            const uint32_t buffer = runtime->Load32(rdram, ctx, request + kIomanBufferOffset);
+            const uint32_t size = runtime->Load32(rdram, ctx, request + kIomanSizeOffset);
+            if (slot >= 0 && buffer != 0u && size != 0u)
+            {
+                std::vector<uint8_t> data(size);
+                const size_t read = std::fread(data.data(), 1, size, gIomanStream[slot]);
+                for (size_t i = 0; i < read; ++i)
+                {
+                    runtime->Store8(rdram, ctx, buffer + static_cast<uint32_t>(i), data[i]);
+                }
+                result = static_cast<int32_t>(read);
+            }
+            else if (slot >= 0)
+            {
+                result = 0;
+            }
+        }
+        else if (function == kIomanLseek)
+        {
+            const int slot = iomanSlot(fd);
+            const int32_t offset = static_cast<int32_t>(runtime->Load32(rdram, ctx, request + kIomanBufferOffset));
+            const uint32_t whence = runtime->Load32(rdram, ctx, request + kIomanSizeOffset);
+            if (slot >= 0)
+            {
+                const int origin = whence == 1u ? SEEK_CUR : (whence == 2u ? SEEK_END : SEEK_SET);
+                if (std::fseek(gIomanStream[slot], offset, origin) == 0)
+                {
+                    const long position = std::ftell(gIomanStream[slot]);
+                    result = position < 0 ? -1 : static_cast<int32_t>(position);
+                }
+            }
+        }
+        else
+        {
+            return false;
+        }
+
+        if (resultPtr != 0u)
+        {
+            runtime->Store32(rdram, ctx, resultPtr, static_cast<uint32_t>(result));
+        }
+        if (receiveBuffer != 0u && receiveSize >= 4u)
+        {
+            runtime->Store32(rdram, ctx, receiveBuffer, 1u); // accepted: the caller waits on the semaphore
+        }
+        signalGuestSema(rdram, ctx, runtime, sema);
         return true;
     }
 
@@ -546,12 +712,16 @@ namespace
         {
             if (function == kIomanInitFunction)
             {
+                // The reply's first word is the ioman version, and the game gates every file call on it:
+                // FUN_00119770() memcmps it against "3000" and "...." and only lets a call through when it
+                // matches one. Answering 0 made every open return -0x10004 and the loading sequence hang.
                 if (receiveBuffer != 0u && receiveSize >= 4u)
                 {
-                    runtime->Store32(rdram, ctx, receiveBuffer, 0u);
+                    runtime->Store32(rdram, ctx, receiveBuffer, kIomanVersion3000);
                 }
                 if (receiveBuffer != 0u && receiveSize >= 8u)
                 {
+                    // Second word 2 would enable the slot-indexed completion path; keep the simpler one.
                     runtime->Store32(rdram, ctx, receiveBuffer + 4u, 0u);
                 }
                 if (traceRpcEnabled())
@@ -578,6 +748,12 @@ namespace
                     ++sLogs;
                     std::fprintf(stderr, "[rpc] ioman fn=0x%X -> unsupported\n", function);
                 }
+            }
+            // The game's file wrappers are asynchronous: do the work here and signal their semaphore.
+            if (handleIomanFileCall(rdram, ctx, runtime, function, sendBuffer, receiveBuffer, receiveSize))
+            {
+                SET_GPR_S32(ctx, 2, 0);
+                return;
             }
             SET_GPR_S32(ctx, 2, -1);
             return;
