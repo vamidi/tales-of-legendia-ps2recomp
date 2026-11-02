@@ -24,14 +24,34 @@
 | **ioman init** | **answered** — `sceSifInitIoman`'s fn 0xFF succeeds natively |
 | **IOP->EE SIF commands** | **delivered** — packet into the guest's own libsif buffer + its receive handler |
 
-**Current blocker, stated precisely:** the guest is **not** waiting on an IOP notification. It runs its own code in a
-loop (`0x1482C0 -> 0x1257C8 -> 0x123678 -> 0x1254A8`, and `FUN_00123548` there is `powf`), redraws the loading
-screen 201 times and then stops drawing, with `ee-dispatches` at 8/frame. So the loading gate is inside the game's
-own logic, not a blocked syscall or a missing notification.
+**Current blocker, stated precisely:** the game's **ioman RPC is only half implemented**. The loading sequence is
+`FUN_001664d0`, and it is where the guest spins (`[spin] pc=0x1666B4` with `TOL_TRACE_SPIN=1`):
 
-What that means for the notification work: the channel is now implemented and verified (`deliverSifCommand()` in
-`src/runtime/tol_overrides.cpp` writes a packet into the guest's own libsif receive buffer at `0x3DECC0` and runs its
-DMAC receive handler `0x11717AA8`), but delivering ioman's ready notification does not move the loading screen.
+```c
+lVar3 = FUN_00119a68("cdrom0:\\AFS\\PTN_INFO.BIN;1", 1);   // ioman open, fn 0
+lVar4 = FUN_00119a68("cdrom0:\\AFS\\PTN_INFO.NAM;1", 1);
+if (lVar3 < 0 || lVar4 < 0) for (;;) {}                   // not taken
+uVar5 = FUN_00119e70(lVar3, 0, 2);                        // lseek: size
+FUN_00119e70(lVar3, 0, 0);                                // rewind
+uVar7 = malloc(size); uVar5 = FUN_0011a0b0(lVar3, buf, size);   // read, fn 2
+FUN_00119cf8(lVar3);                                      // close
+... parse PTN_INFO ...
+for (i = 0; i < 6; ++i) {
+    FUN_00196058(i, "<CDV:\\AFS\\...>.AFS", 0, out);
+    while (FUN_00196460(i) != 3) FUN_0019a080();           // <- the spin at 0x1666B4
+}
+```
+
+So the loading logic is: read `PTN_INFO.BIN` + `PTN_INFO.NAM` through ioman, then load six `.AFS`/`.MBS` files and wait
+for each to report state 3. Since only `fn 0xFF` of ioman is answered, the opens fail (the retry wrapper burns 100
+attempts and returns a garbage handle), the parse yields nothing, and the six loads never reach state 3.
+
+Decoded ioman protocol (for the next step): the calls are **asynchronous** - the RPC returns a status, then the
+completion arrives as SIF command **0x80000011**, whose handler (`FUN_00119030`) copies the reply into the request
+record at `0x3E14C0 + slot*0x440` and signals the semaphore the caller is waiting on (the packet's `+0xC` carries
+the slot, which is only used when the init reply's second word is 2 - this runtime answers 0, so slot 0 is the only
+one). Request layouts: open = fn 0, 0x418 bytes `{sema, 4, resultPtr, flags, mode, path[0x400]}`; read = fn 2,
+0x20 bytes `{sema, 4, resultPtr, fd, buffer, size}`.
 
 Measured chain from one run (`TOL_TRACE_RPC=1`):
 
