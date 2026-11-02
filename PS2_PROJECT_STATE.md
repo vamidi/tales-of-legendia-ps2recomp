@@ -641,28 +641,47 @@ PAD2\DS2U_D.IRX -> 6, LIBSD.IRX -> 7, KORGIVAG.IRX -> 8, IXAUDIO.IRX -> 9
 INFO: STREAM: Initialized successfully (48000 Hz, 16 bit, Stereo)
 ```
 
-### 12. New blocker: the game's own file layer
+### 12. The game's file layer, now working
 
-The guest now runs the graphics bring-up (`FUN_001385d0`: VIF0/VIF1 reset, DMAC reset) and then its data-file
-initialisation, which fails on its own file system:
+The guest runs the graphics bring-up (`FUN_001385d0`: VIF0/VIF1 reset, DMAC reset) and then its data-file
+initialisation, which used to fail on its own file system. Both services are now implemented in
+`src/runtime/tol_overrides.cpp`:
+
+- **open** - sid `0x80000597`, fn 0, client `0x3DBA80` (`FUN_00101a60`): a 300-byte request with the path at
+  `+0x24`, and a 4-byte reply that must be **1** on success (the handle goes into the request's first word;
+  `FUN_001ae288` tests the reply against exactly 1).
+- **read** - sid `0x80000595`, fn 0xE (state) and fn 1 (read), client `0x3863D0` (`FUN_001029a8`): a 24-byte
+  request `{handle, blocks, buffer, info[3], desc, countOut}`. The bytes are written straight into the caller's
+  buffer, the count-out word is filled, the busy flag `0x385234` is cleared, and the I/O semaphore `0x385228` -
+  which the read path leaves held for its completion - is released.
+
+Measured result:
 
 ```
-[Deci2Call:kputs] DVCI: Can't read filelist file.(\AFS\FLIST.DIR)
+[fileio] gamefile open '\\AFS\FLIST.DIR;1' -> ...\data\CD\AFS\FLIST.DIR ok, 95 bytes (handle 1)
+[fileio] gamefile read handle 1 95/95 bytes at 0x0049A440
+[fileio] gamefile open '\\AFS\SYS_REG.AFS;1' -> ... ok, 1830912 bytes   (and FIELD/SND/MAP/BATTLE/MOVIE)
+[Deci2Call:kputs] DVCI: Total 6 files.
+```
+
+The path question is settled: `translatePs2Path` already maps `\AFS\X.AFS;1` to `cdRoot + AFS/X.AFS` with the ISO
+version suffix stripped, so no per-file mapping is needed.
+
+### 13. Next blocker: the sound library's DTX
+
+With the file layer working, `SJX_Init` is what stops the guest:
+
+```
+[IOP/RPC trace:unhandled] sid=0x90000200 rpc=0x2 ... sendBytes=[00 00 00 00 80 6A 3B 00 00 09 00 00 80 08 00 00]
 [Deci2Call:kputs] DTX_Create: can't create DTX of server
 [Deci2Call:kputs] E0100302: SJX_Init can't create DTX
 ```
 
-So the next layer is the **game's file I/O**: `\AFS\FLIST.DIR` is a disc path with no device prefix, resolved by the
-game's own DVCI layer, and no `[fileio]` line appears for it - the open is going through the game's fileio RPC
-(`ioman`/`fileio`, sid `0x80000001`/`0x80000005`) or its own `sceSif` file service, not the IOP-side opener. Serve
-that, and the AFS archives (`data\CD\AFS\{BATTLE,MAP,FIELD}.AFS`) become reachable.
-
-Measured detail (matters for the next session): `data\CD\AFS\FLIST.DIR` **exists** (95 bytes) and the path
-translation already resolves it correctly - the open was an RPC to the game's own file server, **sid 0x80000597**,
-which had no implementation and came back `[IOP/RPC trace:unhandled]`. `tolSifCallRpc` now implements fn 0 of that
-service, and the open succeeds. The remaining gap is the data path: reads use **sid 0x80000595** (`fn 0xE` init,
-`fn 0x1` read, 24-byte request `{handle, blocks, buffer, info}`, `mode = 1` asynchronous with an end callback at
-`0x1016D0`), and the completion has to be delivered through that callback.
+KORG and IxAudio now run on the native IOP (`[iop] started KORG IOP Sound Driver`, `[iop] started IxAudio`,
+`[iop] RPC server 2415919872/2415919873 registered` = `0x90000200`/`0x90000201`). `IopSubsystem::handleRpc` reports
+`handled = native.call(...)` once `native.server(sid, ...)` matches; `NativeIop::call` returns false only for
+`!hasServer(sid)` or a failed `host.readGuest(...)`, and it logs `[iop] RPC to N timed out` when it submits and the
+IOP never finishes. No timeout warning appears, so the call returns early at one of those two checks.
 
 Note: `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 3.20]` is the game's own warning and is not
 fatal - execution continues past it.

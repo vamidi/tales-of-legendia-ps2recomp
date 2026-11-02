@@ -17,14 +17,21 @@
 | **IOP image + nine IRX modules load from `cdrom0:`** | **done this session** — sound library runs on the native IOP |
 | Graphics bring-up (VIF/DMAC reset) | reached |
 | Guest creates threads | not yet — `CreateThread` (0x20) not reached |
-| File I/O | **starts and fails**: `DVCI: Can't read filelist file.(\AFS\FLIST.DIR)` |
+| **File I/O** | **done this session** — DVCI indexes all six AFS archives |
 | Graphics | none yet — `transfers=0 draws=0` |
 
 **Current blocker, stated precisely:** the sound library. DVCI now indexes all six AFS archives
-(`DVCI: Total 6 files.`), KORG and IxAudio start on the native IOP, but `SJX_Init` fails:
-`DTX_Create: can't create DTX of server` after `[IOP/RPC trace:unhandled] sid=0x90000200 rpc=0x2`. The native IOP
-registers servers `0x90000200`/`0x90000201`, so the likely cause is that `SifBindRpc`'s dummy server shadows the
-native one (see the handover).
+(`DVCI: Total 6 files.`), and KORG + IxAudio start on the native IOP, but `SJX_Init` fails:
+`DTX_Create: can't create DTX of server` after `[IOP/RPC trace:unhandled] sid=0x90000200 rpc=0x2`.
+
+Where to look (checked, not guessed): `IopSubsystem::handleRpc` prefers a native server
+(`native.server(sid, record, buffer)`) and, if found, reports `handled = native.call(...)`. The LLE kernel does log
+`[iop] RPC server 2415919872 registered` (= `0x90000200`) before the failing call, and `NativeIop::call` logs a
+`[iop] RPC to N timed out` warning when it submits and the IOP does not finish - **no such warning appears**, so the
+call is returning early: either `server()` reports no server for the sid, or `host.readGuest(sendAddress, ...)` fails.
+Both are single-line checks in `ps2xIOP/src/native_iop.cpp`.
+
+(`sceSifInitCmd`'s handshake was unblocked this session by seeding SIF_REG_MSCOM=1; see section 2c.)
 
 (`sceSifInitCmd`'s handshake was unblocked this session by seeding SIF_REG_MSCOM=1; see section 2c.)
 
@@ -92,12 +99,13 @@ The DVCI/file layer is done. The guest now indexes its six AFS archives and move
 [Deci2Call:kputs] E0100302: SJX_Init can't create DTX
 ```
 
-KORG and IxAudio now start on the native IOP (`[iop] started KORG IOP Sound Driver`, `[iop] started IxAudio`,
-`[iop] RPC server 2415919872/2415919873 registered` = `0x90000200`/`0x90000201`), yet the call is still reported
-unhandled. The likely cause is ordering in the HLE bind: `ps2_syscalls::SifBindRpc` (RPC.cpp) allocates a **dummy
-server** when `g_rpc_servers` has no entry, stores it, and points `client->server` at it; `SifCallRpc` then sends
-`request.serverAddress`/`serverFunction` from that dummy, so the native IOP's real server for the sid is shadowed.
-Prefer `PS2IopTransport::native(runtime)->server(sid, record, buffer)` in `SifBindRpc` when it succeeds.
+KORG and IxAudio do start on the native IOP (`[iop] started KORG IOP Sound Driver`, `[iop] started IxAudio`,
+`[iop] RPC server 2415919872/2415919873 registered` = `0x90000200`/`0x90000201`), so the next step is inside the
+native IOP call path. `IopSubsystem::handleRpc` reports `handled = native.call(...)` when `native.server(sid, ...)`
+finds a server; `NativeIop::call` returns false only for `!hasServer(sid)` or a failed `host.readGuest(...)`, and it
+logs `[iop] RPC to N timed out` when it submits and the IOP never finishes. **No timeout warning appears**, so the
+call is returning early at one of those two checks - both are one line each in `ps2xIOP/src/native_iop.cpp`.
+Instrumenting them (or the request's function number 2) is the way in.
 
 ## 4b. What was implemented this session (all measured)
 
