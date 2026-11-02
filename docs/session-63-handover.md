@@ -109,13 +109,19 @@ With `TOL_TRACE_IOP_THREADS=1`, LIBSD and IxAudio both finish their entries and 
 threads (ids 4,5 and 8,9,12), but neither registers `0x90000200`, and ~170 ms of extra IOP time does not change it.
 So the provider's init never reaches `sceSifRegisterRpc`.
 
-The strongest remaining lead is LIBSD itself: it is the module that imports `ioman` (#4/#5/#6/#8) and `cdvdman`
-(#6/#8/#11/#84), i.e. it loads data through the IOP's file services, and this runtime resolves both to
-`unknownImport` (return 0). That is exactly the kind of failure that would stop LIBSD before it registers its
-server. Implementing `ioman` open/close/read/lseek on the host file layer (the `IopHost` interface already has
-`openHostFile`/`readHostFile`/`closeHostFile`; `lle::Iop` only has `EeLink&`, so a small accessor has to be added)
-is the next concrete step. `IxAudio`'s two unimplemented imports (`sysclib #19`, `vblank #5`) are the other
-candidate.
+### The ioman hypothesis was tested and disproven
+
+`ioman` open/close/read/lseek/write are now implemented (`EeLink::hostFiles()` -> `IopHost`, so an IOP module
+opening `cdrom0:\...` resolves like the EE side does) and the `no kernel service for ioman` warnings are gone - but
+LIBSD **never calls them** (`TOL_TRACE_IOP_FILEIO=1` logs nothing), so its init is not stopping at a file open.
+
+What that run did expose is a real stall: with `TOL_TRACE_IOP_IMPORTS=1`, IxAudio polled `vblank #5` in a tight loop
+from `0x4826C` and a constant 0 meant it never advanced. `vblank #5` now returns a 60 Hz counter off the IOP clock,
+and the loop is gone (no unbound-import calls at all any more). `sysclib #19` is imported but never called, so it is
+not the blocker either.
+
+`0x90000200` still has no provider. Next step: find which module registers it - disassemble `IXAUDIO.IRX` /
+`KORGIVAG.IRX` (both contain the constant) around their `sceSifRegisterRpc` call.
 
 ## 4b. What was implemented this session (all measured)
 
@@ -127,6 +133,9 @@ candidate.
 | game file open (sid 0x80000597, fn 0) | `src/runtime/tol_overrides.cpp` | path -> `translatePs2Path` -> `fopen`; reply must be `1`, handle goes in the request |
 | game file read (sid 0x80000595, fn 1) | `src/runtime/tol_overrides.cpp` | bytes go straight into the caller's buffer; also clears the busy flag and releases the I/O semaphore the read leaves held |
 | ToL IOP module list | `src/runtime/main.cpp` | `LIBSD.IRX`, `KORGIVAG.IRX`, `IXAUDIO.IRX` instead of DQ8's sound set |
+| IOP ioman file services | `ps2xIOP/src/lle/kernel.cpp` + `iop.h` + `native_iop.cpp` | open/close/read/lseek/write through `IopHost` (bound; LIBSD never calls them) |
+| IOP `vblank #5` | `ps2xIOP/src/lle/kernel.cpp` | 60 Hz counter off the IOP clock; removes IxAudio's tight poll loop |
+| IOP import tracing | `ps2xIOP/src/lle/kernel.cpp` | `TOL_TRACE_IOP_IMPORTS` names each unbound import and prints a0/a1/a2 |
 
 Result: `DVCI: Total 6 files.` - all six AFS archives indexed - then the sound library's `SJX_Init` (see section 1).
 
@@ -151,6 +160,10 @@ Probes (all env-gated, all in `src/runtime/tol_overrides.cpp` unless noted):
 | `TOL_TRACE_TICK=1` | tick-dispatcher state block + active list (new) |
 | `TOL_TRACE_PC=0xADDR[,0xADDR]` | enter/exit of up to 16 functions with pc/ra/sp + 8 words at `$sp` (new) |
 | `TOL_TRACE_RPC=1` | every SIF bind/call with sid, function, buffers, and the loadfile result (new) |
+| `TOL_TRACE_IOP_RPC=1` | which rejection applies to an IOP RPC: no native server / call declined / no route (new) |
+| `TOL_TRACE_IOP_THREADS=1` | IOP thread create/start (new) |
+| `TOL_TRACE_IOP_IMPORTS=1` | every call to an unbound IOP import, named, with a0/a1/a2 (new) |
+| `TOL_TRACE_IOP_FILEIO=1` | `ioman` opens performed by IOP modules (new) |
 | `TOL_TRACE_PARK=1` | every `pc == 0` dormancy with the last 16 top-level dispatch pcs (`EeScheduler.cpp`) |
 | `TOL_TRACE_SYSCALL=1` | first 150 syscalls with args, result, call site |
 | `TOL_TRACE_DISPATCH=1` | first 4000 inter-function transfers |

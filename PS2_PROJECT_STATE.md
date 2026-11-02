@@ -690,9 +690,18 @@ Only two servers are ever registered: `0x90000300` and `0x90000301` (KORG). (An 
 
 With `TOL_TRACE_IOP_THREADS=1`, LIBSD and IxAudio both finish their entries and create and start their worker threads
 (ids 4,5 and 8,9,12), but neither registers `0x90000200`, and ~170 ms of extra IOP time does not change it - so the
-provider's init never reaches `sceSifRegisterRpc`. Strongest lead: LIBSD is the module that imports `ioman`
-(#4/#5/#6/#8) and `cdvdman` (#6/#8/#11/#84) - it loads data through the IOP's file services, which this runtime
-resolves to `unknownImport` (return 0).
+provider's init never reaches `sceSifRegisterRpc`.
+
+Tested and disproven: the `ioman` file services. They are now implemented (`EeLink::hostFiles()` -> `IopHost`, so an
+IOP module opening `cdrom0:\...` resolves like the EE side), and the `no kernel service for ioman` warnings are gone,
+but LIBSD never calls them (`TOL_TRACE_IOP_FILEIO=1` logs nothing).
+
+Found and fixed on the way: `TOL_TRACE_IOP_IMPORTS=1` showed IxAudio polling `vblank #5` in a tight loop from
+`0x4826C`, where a constant 0 meant it never advanced. `vblank #5` now returns a 60 Hz counter off the IOP clock and
+the loop is gone (no unbound-import calls at all any more). `sysclib #19` is imported but never called.
+
+Still open: which module registers `0x90000200`. Next step is to disassemble `IXAUDIO.IRX` / `KORGIVAG.IRX` (both
+contain the constant) around their `sceSifRegisterRpc` call.
 
 Note: `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 3.20]` is the game's own warning and is not
 fatal - execution continues past it.
