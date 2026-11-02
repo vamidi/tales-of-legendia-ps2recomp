@@ -290,15 +290,17 @@ namespace
     // on. Doing the I/O here, writing the result where the caller reads it and signalling that semaphore gives
     // the caller exactly the same values without the round trip.
     //
-    //   fn 0 open   0x418 bytes {sema, 4, resultPtr, flags, mode, path[0x400]}  -> result[0] = fd
-    //   fn 1 close  0x14  bytes {sema, 4, resultPtr, fd}                        -> result[0] = 0
-    //   fn 2 read   0x20  bytes {sema, 4, resultPtr, fd, buffer, size}          -> result[0] = bytes read
-    //   fn 4 lseek  0x1C  bytes {sema, 4, resultPtr, fd, offset, whence}        -> result[0] = position
+    //   fn 0 open   0x418 bytes {sema, resultPtr, 4, flags, mode, path[0x400]}  -> result[0] = fd
+    //   fn 1 close  0x14  bytes {sema, resultPtr, 4, fd}                        -> result[0] = 0
+    //   fn 2 read   0x20  bytes {sema, resultPtr, 4, fd, buffer, size}          -> result[0] = bytes read
+    //   fn 4 lseek  0x1C  bytes {sema, resultPtr, 4, fd, offset, whence}        -> result[0] = position
     constexpr uint32_t kIomanOpen = 0u;
     constexpr uint32_t kIomanClose = 1u;
     constexpr uint32_t kIomanRead = 2u;
     constexpr uint32_t kIomanLseek = 4u;
-    constexpr uint32_t kIomanResultOffset = 0x08u;
+    // The result pointer sits at +0x04 (the request words are sema, resultPtr, 4, fd, ...); writing it to
+    // +0x08 instead put the fd at address 4 and the caller read garbage from its own stack.
+    constexpr uint32_t kIomanResultOffset = 0x04u;
     constexpr uint32_t kIomanFdOffset = 0x0Cu;
     constexpr uint32_t kIomanBufferOffset = 0x10u;
     constexpr uint32_t kIomanSizeOffset = 0x14u;
