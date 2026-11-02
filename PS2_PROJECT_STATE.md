@@ -705,3 +705,25 @@ contain the constant) around their `sceSifRegisterRpc` call.
 
 Note: `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 3.20]` is the game's own warning and is not
 fatal - execution continues past it.
+
+---
+
+## Session 63/64 summary (2026-11-02) — from "black screen" to "NOW LOADING" rendering
+
+**Read `docs/session-64-handover.md` first; it is the current state.** Short version:
+
+- Boot now runs: crt0 -> libc init -> main -> game init -> IOPRP boot image -> 9 IRX modules -> DVCI indexes all six
+  AFS archives -> audio init completes -> ioman init -> the loading sequence's file I/O works.
+- **The port renders**: 201 draws / 81 GIF packets, the game's own "NOW LOADING" screen (512x448), captured with
+  `TOL_GFX_SCREENSHOT_DIR`.
+- **Current blocker: threads.** The guest never calls `CreateThread` (0x20); the port runs one EE thread. PCSX2 (same
+  game) runs **eight** after loading, so the game's asynchronous loader (`FUN_00196058` request /
+  `FUN_00196460` status poll inside `FUN_001664d0`) can never report state 3. That is why the loading screen does not
+  advance even though every file operation under it succeeds.
+- Biggest single fix: `InitMainThread` (syscall 0x3C) returned the *bottom* of the stack area, putting the main
+  thread's frames inside its own heap; the next `memset` zeroed a saved `$ra` and the thread died. It now returns the
+  end of RDRAM and reserves the top 256 KiB for invocation stacks.
+- New probes worth knowing: `TOL_TRACE_SPIN` (finds a within-function spin by sampling the guest pc at backward
+  branches), `TOL_TRACE_RPC`, `TOL_TRACE_FILEIO`, `TOL_TRACE_IOP_RPC/THREADS/IMPORTS/SEMA`.
+- PCSX2 MCP is connected and is the reference: `pcsx2_get_threads`, `pcsx2_disassemble`, `pcsx2_read_registers`,
+  `pcsx2_set_breakpoint`.
