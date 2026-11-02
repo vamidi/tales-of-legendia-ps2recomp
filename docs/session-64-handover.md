@@ -11,14 +11,14 @@
 |---|---|
 | Recompile + launch | done — clang-cl + SDL3, 13,520 units, 0 decode failures, 0 dispatch errors |
 | Guest reaches its own startup | done — `FUN_00165ad0 game-startup` runs |
-| Guest gets past heap init | done — syscall 0x3C stack fix (§3.1) |
+| Guest gets past heap init | done — syscall 0x3C stack fix (section 3.1) |
 | SIF RPC answered | done — the game's own libsif bind/call replaced by the runtime's HLE |
-| IOP image + IRX modules load from `cdrom0:` | done — IOPRP boot image (§3.8) + 9 modules |
+| IOP image + IRX modules load from `cdrom0:` | done — IOPRP boot image (section 3.8) + 9 modules |
 | File I/O | **done** — DVCI indexes all six AFS archives; ioman open/read work |
-| Audio init | **completes** — `SJX_Init` + `ps2rna_init_psj` succeed (§3.9) |
+| Audio init | **completes** — `SJX_Init` + `ps2rna_init_psj` succeed (section 3.9) |
 | Graphics | **renders** — 201 draws, 81 GIF packets, the game's "NOW LOADING" screen (512x448) |
 | **Guest threads** | **not yet — `CreateThread` (0x20) is never called; the port has 1 thread** |
-| Loading screen advances | no — see §2 |
+| Loading screen advances | no — see section 2 |
 
 ## 2. Current blocker, stated precisely
 
@@ -39,11 +39,11 @@ for (i = 0; i < 6; ++i) {
 }
 ```
 
-All of the file I/O in that sequence now **works** (§3.11): the two `PTN_INFO` files open, four lseeks and two reads
+All of the file I/O in that sequence now **works** (section 3.11): the two `PTN_INFO` files open, four lseeks and two reads
 run, the six load requests are issued, and the game goes on to open individual AFS files
 (`DVCI: File cache was not hit. "\AFS\SYS_REG.AFS;1"`).
 
-**What is still missing is threads.** Measured against PCSX2 (§4): after loading, the real game runs **eight EE
+**What is still missing is threads.** Measured against PCSX2 (section 4): after loading, the real game runs **eight EE
 threads**, nearly all blocked in kernel waits. This port runs one. `FUN_00196460(i)` reports the progress of the
 game's *own* asynchronous loader, which on hardware is serviced by worker threads — with a single thread that state
 can never reach 3, so the loading screen cannot advance no matter how correct the file layer is.
