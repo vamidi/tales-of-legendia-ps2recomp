@@ -34,6 +34,82 @@ namespace
     // Loadfile request layout: { argLen, 0, path[0xFC], args[] }.
     constexpr uint32_t kLoadFilePathOffset = 8u;
 
+    // The game's own IOP file server (sid 0x80000597), used by its DVCI/HTCI layer.
+    //
+    // FUN_00101a60 opens through it: client 0x3DBA80, fn 0, a 300-byte request whose path sits at +0x24,
+    // and a 4-byte reply. The IOP writes the file handle into the request's first word as well as
+    // returning it, and fills stat words at +0x08/+0x10/+0x18/+0x20 (unused by the caller on the DVCI
+    // path). Reads are asynchronous calls on a second client (fn 1, mode 1), so they are not handled here
+    // yet - an unsupported function answers "not found" rather than pretending to succeed.
+    constexpr uint32_t kGameFileSid = 0x80000597u;
+    constexpr uint32_t kGameFileOpenFunction = 0u;
+    constexpr uint32_t kGameFilePathOffset = 0x24u;
+
+    constexpr int kMaxGameFiles = 32;
+    uint32_t gGameFileHandle[kMaxGameFiles] = {};
+    std::FILE *gGameFileStream[kMaxGameFiles] = {};
+    uint64_t gGameFileSize[kMaxGameFiles] = {};
+    uint32_t gGameFileNextHandle = 1u;
+
+    // Opens through the same path translation the runtime's fileio stubs use, so "\AFS\FLIST.DIR;1"
+    // lands on cdRoot + AFS/FLIST.DIR with the ISO version suffix stripped. The path was never the
+    // problem: the open used to fail because this service had no implementation at all.
+    uint32_t openGameFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t pathAddress)
+    {
+        std::string guestPath;
+        for (uint32_t i = 0; i < 256u; ++i)
+        {
+            const uint8_t byte = runtime->Load8(rdram, ctx, pathAddress + i);
+            if (byte == 0u)
+                break;
+            guestPath.push_back(static_cast<char>(byte));
+        }
+        if (guestPath.empty())
+            return 0u;
+
+        const std::string hostPath = translatePs2Path(guestPath.c_str());
+        const bool trace = std::getenv("TOL_TRACE_FILEIO") != nullptr;
+        if (hostPath.empty())
+        {
+            if (trace)
+                std::fprintf(stderr, "[fileio] gamefile open '%s' -> FAILED (no translation)\n", guestPath.c_str());
+            return 0u;
+        }
+
+        std::FILE *stream = std::fopen(hostPath.c_str(), "rb");
+        if (stream == nullptr)
+        {
+            if (trace)
+                std::fprintf(stderr, "[fileio] gamefile open '%s' -> '%s' FAILED (missing)\n", guestPath.c_str(),
+                             hostPath.c_str());
+            return 0u;
+        }
+
+        for (int i = 0; i < kMaxGameFiles; ++i)
+        {
+            if (gGameFileHandle[i] == 0u)
+            {
+                gGameFileHandle[i] = gGameFileNextHandle++;
+                gGameFileStream[i] = stream;
+                gGameFileSize[i] = 0u;
+                if (std::fseek(stream, 0, SEEK_END) == 0)
+                {
+                    const long size = std::ftell(stream);
+                    if (size > 0)
+                        gGameFileSize[i] = static_cast<uint64_t>(size);
+                }
+                std::fseek(stream, 0, SEEK_SET);
+                if (trace)
+                    std::fprintf(stderr, "[fileio] gamefile open '%s' -> '%s' ok, %llu bytes (handle %u)\n",
+                                 guestPath.c_str(), hostPath.c_str(),
+                                 static_cast<unsigned long long>(gGameFileSize[i]), gGameFileHandle[i]);
+                return gGameFileHandle[i];
+            }
+        }
+        std::fclose(stream);
+        return 0u;
+    }
+
     // Bind is per client, and the call only carries the client pointer, so the sid is remembered here.
     constexpr int kMaxRpcClients = 16;
     uint32_t gRpcClientAddr[kMaxRpcClients] = {};
@@ -140,8 +216,7 @@ namespace
         // runtime's own module loader serves it - the same one sceSifLoadModule reaches when a title imports
         // libsif instead of carrying it.
         if (sid == kLoadFileSid)
-        {
-            uint32_t status = 0u;
+        {            uint32_t status = 0u;
             uint32_t moduleId = 0u;
             if (function == kLoadFileInitFunction)
             {
@@ -189,6 +264,46 @@ namespace
             }
             SET_GPR_S32(ctx, 2, 0);
             return;
+        }
+
+        // The game's own file server: fn 0 opens a path and answers with the handle. This is the call
+        // behind "DVCI: Can't read filelist file.(\AFS\FLIST.DIR)" - the path was never the problem.
+        if (sid == kGameFileSid)
+        {
+            if (function == kGameFileOpenFunction)
+            {
+                const uint32_t handle =
+                    (sendBuffer != 0u) ? openGameFile(rdram, ctx, runtime, sendBuffer + kGameFilePathOffset) : 0u;
+                if (traceRpcEnabled())
+                {
+                    static uint32_t sOpenLogs = 0u;
+                    if (sOpenLogs < 64u)
+                    {
+                        ++sOpenLogs;
+                        std::fprintf(stderr, "[rpc] gamefile open '%.96s' -> handle %u\n",
+                                     reinterpret_cast<const char *>(rdram) +
+                                         ((sendBuffer + kGameFilePathOffset) & 0x01FFFFFFu),
+                                     handle);
+                    }
+                }
+                if (handle != 0u)
+                {
+                    // The IOP also writes the handle into the request's first word.
+                    runtime->Store32(rdram, ctx, sendBuffer, handle);
+                    if (receiveBuffer != 0u && receiveSize >= 4u)
+                    {
+                        runtime->Store32(rdram, ctx, receiveBuffer, handle);
+                    }
+                    SET_GPR_S32(ctx, 2, 0);
+                    return;
+                }
+            }
+            // Anything else is an unsupported function of this service.
+            if (receiveBuffer != 0u && receiveSize >= 4u)
+            {
+                runtime->Store32(rdram, ctx, receiveBuffer, 0u);
+            }
+            SET_GPR_S32(ctx, 2, -1);            return;
         }
 
         ps2_syscalls::SifCallRpc(rdram, ctx, runtime);

@@ -82,19 +82,22 @@ Effect: the guest leaves the spin and reaches `sceSifBindRpc` (see section 1).
 
 ## 4. Next step, concretely
 
-Serve the game's file I/O. Measured facts about the failure:
+Serve the game's own file I/O. It is **not** a path problem - that was checked and disproved:
 
-- `data\CD\AFS\FLIST.DIR` **exists** (95 bytes), so this is path/service resolution, not a missing file.
-- No `[fileio] iop open` line for it (the IOP-side opener is instrumented), no `[fileio] open` line
-  (`PS2Vfs::open`), and no `fioOpen error: fopen failed` (`fioOpen` logs every failure) — so the open fails
-  **before** reaching any host file layer.
-- No SIF RPC for `ioman`/`fileio` (`0x80000001` / `0x80000005`) appears in `TOL_TRACE_RPC=1`, and no numeric
-  syscall for it in `TOL_TRACE_SYSCALL=1`.
+- `translatePs2Path("\AFS\FLIST.DIR;1")` -> `cdRoot + AFS/FLIST.DIR` with the ISO version suffix stripped, i.e.
+  `data\CD\AFS\FLIST.DIR` (the file exists, 95 bytes). Nothing needs remapping.
+- The open is an RPC: `FUN_00101a60` uses client `0x3DBA80`, **sid `0x80000597`**, fn 0, a 300-byte request whose
+  path sits at `+0x24`, and a 4-byte reply. It used to come back `[IOP/RPC trace:unhandled]`, which is why DVCI
+  reported "Can't read filelist file".
 
-So the next move is to find the path the game's DVCI open actually takes: the likely candidates are a
-`ps2_stubs::*` call the recompiler emits directly (those bypass `TOL_TRACE_SYSCALL` — `sceSifSetDma` is one), or an
-RPC client whose sid was never seen by `tolSifBindRpc`. Instrumenting `ps2_syscalls::fioOpen` and the fileio stub
-entry points with a one-line trace will name it immediately.
+`tolSifCallRpc` now implements fn 0 of that service (`[fileio] gamefile open '\\AFS\FLIST.DIR;1' -> ... ok, 95
+bytes (handle 1)`), so the open succeeds.
+
+**Remaining work is the data path:** reads go to a second client, `0x3863D0`, **sid `0x80000595`**:
+`fn 0xE` (init, no payload) and `fn 0x1` (read) with a 24-byte request `{handle, blocks, buffer, info}` and
+`mode = 1` (asynchronous) plus an end callback at `0x1016D0`; there is no reply buffer, so the completion must be
+delivered through that callback (the game's `DAT_00385234` busy flag at `0x385234` is what its poll loop watches).
+Implement fn 1 (and whatever seek/close follow) the same way, then invoke the end callback through the scheduler.
 
 ## 4b. What was implemented this session (all measured)
 
@@ -103,6 +106,7 @@ entry points with a one-line trace will name it immediately.
 | `sceSifBindRpc` / `sceSifCallRpc` (guest 0x118448 / 0x118628) | `src/runtime/tol_overrides.cpp` | replaced by `ps2_syscalls::SifBindRpc` / `SifCallRpc`; no more semaphore wait |
 | load-module SIF command (cid 0x80000003) | `ps2xRuntime/.../Stubs/SIF.cpp` + `ps2_iop_transport.h` | opens the image through the IOP-side file layer, sets boot-status bit 0x40000 on the next read |
 | loadfile RPC (sid 0x80000006) | `src/runtime/tol_overrides.cpp` | `0xFF` -> `"3000"`; module loads served by the runtime's loader |
+| game file open (sid 0x80000597, fn 0) | `src/runtime/tol_overrides.cpp` | path -> `translatePs2Path` -> `fopen`; `\AFS\FLIST.DIR;1` opens (`data\CD\AFS\FLIST.DIR`, 95 bytes) |
 
 Result: first `cdrom0:` open (`IRX\IOPRP300.IMG`, 275,921 bytes), then all nine IRX modules, then the graphics
 bring-up, then the DVCI/SJX failure above.
