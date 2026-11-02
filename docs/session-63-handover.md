@@ -105,11 +105,17 @@ the next step is inside the native IOP. Traced with `TOL_TRACE_IOP_RPC=1`: the r
 `0x90000300`/`0x90000301` (KORG) are ever registered; `2415919872` is `0x90000300`, not `0x90000200` (earlier hex
 conversion error).
 
-With `TOL_TRACE_IOP_THREADS=1` both LIBSD and IxAudio finish their entries and create worker threads (4,5 and
-8,9,12) but never register `0x90000200`, and ~170 ms of extra IOP time does not change it. So the provider's init
-never reaches `sceSifRegisterRpc`. Next probe: trace thread scheduling (`startThread`/`reschedule`) for those worker
-threads, and check the two imports IxAudio resolves to nothing - `sysclib #19` and `vblank #5` - both of which
-currently hit `unknownImport` and return 0.
+With `TOL_TRACE_IOP_THREADS=1`, LIBSD and IxAudio both finish their entries and create **and start** their worker
+threads (ids 4,5 and 8,9,12), but neither registers `0x90000200`, and ~170 ms of extra IOP time does not change it.
+So the provider's init never reaches `sceSifRegisterRpc`.
+
+The strongest remaining lead is LIBSD itself: it is the module that imports `ioman` (#4/#5/#6/#8) and `cdvdman`
+(#6/#8/#11/#84), i.e. it loads data through the IOP's file services, and this runtime resolves both to
+`unknownImport` (return 0). That is exactly the kind of failure that would stop LIBSD before it registers its
+server. Implementing `ioman` open/close/read/lseek on the host file layer (the `IopHost` interface already has
+`openHostFile`/`readHostFile`/`closeHostFile`; `lle::Iop` only has `EeLink&`, so a small accessor has to be added)
+is the next concrete step. `IxAudio`'s two unimplemented imports (`sysclib #19`, `vblank #5`) are the other
+candidate.
 
 ## 4b. What was implemented this session (all measured)
 

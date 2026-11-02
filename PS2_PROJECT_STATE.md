@@ -688,10 +688,11 @@ returning false** - `NativeIop::call` is never reached, so `host.readGuest(...)`
 Only two servers are ever registered: `0x90000300` and `0x90000301` (KORG). (An earlier note here claimed
 `2415919872 = 0x90000200`; that was a bad hex conversion - it is `0x90000300`.)
 
-With `TOL_TRACE_IOP_THREADS=1`, LIBSD and IxAudio both finish their entries and create worker threads (ids 4,5 and
-8,9,12), but neither registers `0x90000200`. Giving the IOP up to ~170 ms of extra time (8 x 1024 frames, driven by
-the EE call because it is the only clock) does not produce the registration, so the provider is not merely late -
-its init never gets there.
+With `TOL_TRACE_IOP_THREADS=1`, LIBSD and IxAudio both finish their entries and create and start their worker threads
+(ids 4,5 and 8,9,12), but neither registers `0x90000200`, and ~170 ms of extra IOP time does not change it - so the
+provider's init never reaches `sceSifRegisterRpc`. Strongest lead: LIBSD is the module that imports `ioman`
+(#4/#5/#6/#8) and `cdvdman` (#6/#8/#11/#84) - it loads data through the IOP's file services, which this runtime
+resolves to `unknownImport` (return 0).
 
 Note: `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 3.20]` is the game's own warning and is not
 fatal - execution continues past it.
