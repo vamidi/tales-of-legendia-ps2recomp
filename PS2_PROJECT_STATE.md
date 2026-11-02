@@ -467,3 +467,99 @@ remain observationally identical.
 
 Interpretation detail: because no IRX is ever loaded, the failure is **not** "the IOP module files are missing" -
 the guest never gets far enough to request them.
+
+---
+
+## Session 63 (2026-11-02) — the tick queue is empty because the main thread died in heap init; fixed
+
+### 1. Assignment step 1-2 answered: the tick loop is the Timer-2 interrupt handler, and its queue is empty
+
+`FUN_0011F650` is registered with `AddIntcHandler(0xb, 0x11F650, 0, 0)` in `FUN_0011f0b0` (0x11F150) - cause 0xb is
+EE **Timer 2**, not SIF. Its state block is `s5 - 0x7308` with `s5 = 0x00390000` (`lui $s5, 0x39` at 0x11F690), so
+state = `0x00388CF8` and the active list head is `0x00388D10` (state+0x18). `$s5` is **0 on entry** - the function
+loads it itself, so the handover's "log s5 on entry" always prints 0; take the address from the code, not the register.
+
+Layout (from `FUN_0011F650` / `FUN_0011F590` insert / `FUN_0011F618` remove):
+
+| offset | meaning |
+|---|---|
+| +0x00 | Timer-2 overflow counter (high half of the time base) |
+| +0x10 | node count |
+| +0x14 | free-list head |
+| +0x18 | **active-list head** |
+| +0x1C | currently running handle (0xFFFFFFFF = idle) |
+
+Node = 0x40 bytes, pool at `0x3E3700` (128 nodes), `+0x00` next, `+0x08` id, `+0x0C` flags (bit 1 = periodic),
+`+0x10` interval, `+0x18` last, `+0x20` start, `+0x28` callback, `+0x30` arg.
+
+**Measured with `TOL_TRACE_TICK=1`: `count=0`, `free=0x003E3700` (untouched), `active=0x00000000` on every tick.**
+So startup never enqueues: the queue is empty because the code that would create timers never ran. The timer
+subsystem itself is fine (handler registered, Timer 2 ticking at ~16 Hz).
+
+### 2. Root cause: `InitMainThread` (syscall 0x3C) returned the BOTTOM of the stack area
+
+`crt0` at 0x1001C4 does `li v1,0x3c; syscall; move sp,v0` with `a1 = -1` (stack at end of RDRAM) and
+`a2 = 0x100000`. `ps2_syscalls::SetupThread` computed `initialStack = PS2_RAM_SIZE - 0x100000 = 0x01F00000`
+(the *bottom*) and returned that as `$sp` whenever `asyncCallbackStackTop() <= initialStack` was false - which is the
+normal state, since the invocation pool top starts at `PS2_RAM_SIZE`. Only a caller passing `stack_size == 0`
+(DQ8) got `PS2_RAM_SIZE`.
+
+With `sp = 0x01F00000` the main thread's frames sat **inside the guest's own heap** (`0x4E9B80..0x1F00000`), and the
+heap init that immediately follows (`0x100230`: `memset(0x4E9B80, 0, 0x1A16480)`) zeroed them. Evidence chain:
+
+```
+[pc] enter 0x00131BE0 ra=0x0010024C sp=0x01FFFF80
+[pc]   frame ... +30=00165C74          <- FUN_00100230 saved $ra at sp+0x30
+[pc] exit  0x00101390 pc=0x00109144    <- memset preempted by a checkpoint (returns mid-loop)
+[pc] enter 0x00100270 ... sp=0x01FFFF80
+[pc]   frame ... +30=00165C74          <- resume: frame still intact, jr $ra -> 0x165C74  (correct)
+```
+versus the same resume when the frame was below `0x1F00000`: `+30=00000000` -> `pc=0` -> thread dormant.
+
+### 3. Second defect, exposed by the first fix: the Timer-2 handler ran on the guest stack
+
+`[tick] #1 sp=0x01FFFFF0` - the interrupt invocation got the *first* pool stack (`PS2_RAM_SIZE - 0x10`), because
+`reserveGuestStackFromAsyncPool(0x1F00000)` refuses (`guestStackBase > floor` is false when both are `0x1F00000`),
+so the pool stayed at the top of RDRAM, on top of the guest stack. Its frame zeroed `FUN_00100230`'s saved `$ra`
+again. Fixed by splitting the top of RDRAM in `SetupThread`:
+
+- `kInvocationStackReserve = 0x40000` (256 KiB = 16 x 16 KiB invocation stacks) taken off the top,
+- guest `$sp = PS2_RAM_SIZE`, guest stack bottom = `0x1FC0000` (so 256 KiB of guest stack),
+- `setupCurrentThread()` is called with that bottom, so the pool is `[0x1F00000, 0x1FC0000)`.
+
+Verified: `[tick] #1 sp=0x01FBFFF0` (pool), guest `sp=0x02000000`, heap init frame survives.
+
+### 4. What the guest does now (measured)
+
+- Syscalls start flowing: `0x3c -> v0=0x2000000`, `0x3d -> v0=0x4e9b80`, `0x74` (SetSyscall) x ~30,
+  `0x5b` (GetEntryAddress) probes. `FUN_0011e070` (the syscall-handler installer) now **returns**.
+- The guest runs real init code: `0x165cb4 -> 0x11e7a0 -> 0x117aa8 -> 0x1174f8 -> 0x117cf8`.
+- It then reaches `FUN_00117ca0` = **`sceSifInitCmd`** and stops in its wait loop
+  (`0x117DF8: jal 0x1174f8; beq v0,zero,0x117DF8`, i.e. spin on guest flag `0x003DEF40`).
+
+### 5. Current blocker: the SIF command channel has no IOP to answer it
+
+`sceSifInitCmd` reads `sceSifGetReg(0x80000002)` (`kSifRegMsCom`, seeded to 0), sends a 16-byte SIF command packet
+(`sceSifSetDma` -> `ps2_stubs::sceSifSetDma`, which copies EE->native IOP and fires DMAC cause 5) and waits for the
+guest flag `0x3DEF40`. Nothing sets it: `g_sifCmdHandlers` in `SIF.cpp` is only stored, never invoked, and the
+audio-only `ps2_native_iop` has no `sifcmd`. The richer `ps2xIOP` LLE emulator + plugin profiles exist but are not
+wired up for this title (main.cpp only calls `ps2_native_iop::setModules` with DQ8's sound module list).
+
+So the next workstream is the IOP/SIF command channel: either answer the `sceSifInitCmd` handshake natively, or wire
+up the `IopSubsystem` with a ToL profile. This is *real* SIF traffic - the earlier "the guest does no SIF DMA"
+finding is superseded.
+
+### 6. Probes added this session (`src/runtime/tol_overrides.cpp`)
+
+- `TOL_TRACE_TICK=1` - dumps the tick dispatcher's state block and active list (first 6 ticks, then every 64th).
+- `TOL_TRACE_PC=0xADDR[,0xADDR...]` - wraps up to 16 guest functions and prints enter/exit with pc/ra/sp plus the
+  eight words at `$sp`, which is what made the lost `$ra` visible.
+
+### 7. Land mines reconfirmed
+
+- `$s5` is not valid at entry to `FUN_0011F650`; the state address must come from the code.
+- Preemption at a backward edge inside a *called* function unwinds the C++ stack; the resume is a fresh top-level
+  dispatch of `ctx->pc`. That works only while the guest frame is intact - so anything that scribbles on the guest
+  stack turns a preemption into a lost return address.
+- The tick rate drops from ~16/s to ~4/s while the guest spins in the SIF wait loop, so a "slower" tick log is a
+  symptom of the spin, not of timer emulation.
