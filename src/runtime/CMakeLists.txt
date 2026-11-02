@@ -2,6 +2,7 @@
 
 add_executable(tol
     main.cpp
+    tol_overrides.cpp
 )
 
 # The ELF, the disc image, saves and settings are opened by narrow paths.

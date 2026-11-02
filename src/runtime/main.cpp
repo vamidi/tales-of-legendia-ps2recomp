@@ -21,6 +21,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_threaded_backend.h"
 #include "screen_size.h"
+#include "tol_overrides.h"
 #include "vu_bounds.h"
 #include "../../tools/runtime/render_cadence.h"
 
@@ -398,6 +399,10 @@ int main(int argc, char **argv)
         }
         std::fflush(stdout);
     }
+
+    // Native overrides for guest system code with no host counterpart (IOP/SIF services the game drives
+    // directly). Must come after loadELF(): the function table is only populated then.
+    tol::installOverrides(runtime);
 
     // Keep the runtime arena above the guest allocator's ceiling to prevent overlap.
     {
