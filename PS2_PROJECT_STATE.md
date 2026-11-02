@@ -538,7 +538,6 @@ Verified: `[tick] #1 sp=0x01FBFFF0` (pool), guest `sp=0x02000000`, heap init fra
   (`0x117DF8: jal 0x1174f8; beq v0,zero,0x117DF8`, i.e. spin on guest flag `0x003DEF40`).
 
 ### 5. Current blocker: the SIF command channel has no IOP to answer it
-
 `sceSifInitCmd` reads `sceSifGetReg(0x80000002)` (`kSifRegMsCom`, seeded to 0), sends a 16-byte SIF command packet
 (`sceSifSetDma` -> `ps2_stubs::sceSifSetDma`, which copies EE->native IOP and fires DMAC cause 5) and waits for the
 guest flag `0x3DEF40`. Nothing sets it: `g_sifCmdHandlers` in `SIF.cpp` is only stored, never invoked, and the
@@ -563,3 +562,27 @@ finding is superseded.
   stack turns a preemption into a lost return address.
 - The tick rate drops from ~16/s to ~4/s while the guest spins in the SIF wait loop, so a "slower" tick log is a
   symptom of the spin, not of timer emulation.
+
+### 8. `sceSifInitCmd` unblocked; the blocker moved one layer down to `sceSifBindRpc`
+
+`SIF.cpp::seedDefaultSifRegsLocked()` now seeds `kSifRegMsCom` (0x80000002) to **1** instead of 0. Rationale: a title
+with its own statically linked libsif (ToL carries one - `sceSifInit` at 0x117540, `sceSifInitCmd` at 0x117CA0) polls
+that register, sends a handshake command and then spins on guest flag `0x003DEF40`, which only its own DMA-completion
+bookkeeping could set. The runtime's SIF DMA path completes synchronously and there is no IOP behind the register file,
+so "the command channel is already up" is the honest native state. (The runtime's HLE `sceSifInitCmd` stub exists but
+is only reached by games that *import* libsif, not by this one.)
+
+Measured effect: the guest leaves the spin and walks further into libsif -
+
+```
+0x166298 -> 0x11c990 -> 0x118448 (sceSifBindRpc) -> 0x117e68 -> 0x1184fc -> sceSifSetDma -> FlushCache(0x114720)
+```
+
+and then stops: `FUN_00118448` is **`sceSifBindRpc`** - it creates a semaphore, sends bind command `0x80000009` with
+`sceSifSendCmd` and `WaitSema()`s for the server's reply. `FUN_0011c990` retries that bind forever. Nothing in the
+runtime answers it (`g_sifCmdHandlers` is never invoked), so the main thread blocks in the scheduler and the EE runs
+only the Timer-2 handler: `ee-dispatches=44` per 300 frames, `transfers=0 draws=0`.
+
+**Next step:** implement the IOP side of the RPC bind - either dispatch `g_sifCmdHandlers` when a command completes
+(so the guest's own handler signals the semaphore), or answer `sceSifBindRpc` natively. Then watch for
+`sceSifLoadModule` (0x71), the first `cdrom0:` open (`TOL_TRACE_FILEIO=1`) and `CreateThread` (0x20).

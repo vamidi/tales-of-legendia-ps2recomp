@@ -17,12 +17,15 @@
 | File I/O | none yet |
 | Graphics | none — `transfers=0 draws=0 passes=0 presents=0` |
 
-**Current blocker, stated precisely:** the guest reaches `FUN_00117ca0` = `sceSifInitCmd`, sends a 16-byte SIF
-command to the IOP with `sceSifSetDma`, and spins on the guest flag `0x003DEF40` (`0x117DF8: jal 0x1174f8;
-beq v0,zero,0x117DF8`). Nothing can set that flag: the runtime never delivers an IOP->EE SIF command
-(`g_sifCmdHandlers` in `SIF.cpp` is only stored, never invoked), and the audio-only `ps2_native_iop` has no `sifcmd`.
+**Current blocker, stated precisely:** `FUN_00118448` is **`sceSifBindRpc`**. It creates a semaphore, sends bind
+command `0x80000009` with `sceSifSendCmd` and `WaitSema()`s for the server's reply; `FUN_0011c990` retries the bind
+forever. Nothing in the runtime answers it - `g_sifCmdHandlers` in `SIF.cpp` is only stored, never invoked - so the
+main thread blocks in the scheduler and the EE runs only the Timer-2 handler (`ee-dispatches=44` per 300 frames,
+`transfers=0 draws=0`).
 
-## 2. What was fixed (two defects, in order)
+(`sceSifInitCmd`'s handshake was unblocked this session by seeding SIF_REG_MSCOM=1; see section 2c.)
+
+## 2. What was fixed (three defects, in order)
 
 ### 2a. `InitMainThread` (syscall 0x3C) returned the bottom of the stack area
 
@@ -50,6 +53,16 @@ Fix (both in `ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp`, submodule):
   `[0x1F00000, 0x1FC0000)` and the guest stack is `[0x1FC0000, 0x2000000)` (256 KiB).
 
 Verified: `[tick] #1 sp=0x01FBFFF0`, guest `sp=0x02000000`, heap-init frame survives, `FUN_0011e070` returns.
+
+### 2c. `sceSifInitCmd` reported as already initialised
+
+`SIF.cpp::seedDefaultSifRegsLocked()` now seeds `kSifRegMsCom` (`0x80000002`) to **1**. A title with its own statically
+linked libsif (ToL: `sceSifInit` at `0x117540`, `sceSifInitCmd` at `0x117CA0`) polls that register, sends a handshake
+and then spins on guest flag `0x003DEF40`, which only its own DMA-completion bookkeeping could set. The runtime's SIF
+DMA path completes synchronously and there is no IOP behind the register file, so "the channel is already up" is the
+honest native state. The runtime's HLE `sceSifInitCmd` stub is only reached by games that *import* libsif.
+
+Effect: the guest leaves the spin and reaches `sceSifBindRpc` (see section 1).
 
 ## 3. Assignment answers (session 62's list)
 
