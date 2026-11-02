@@ -299,9 +299,12 @@ int main(int argc, char **argv)
     // The sound drivers from the disc run unmodified on an emulated IOP, and
     // the game's libsdr and Sound Kit reach them over SIF. Audio output starts
     // when sceSifLoadModule loads the first of them.
-    ps2_native_iop::setModules(runtime, {"LIBSD.IRX", "SDRDRV.IRX", "MODHSYN.IRX", "MODMIDI.IRX",
-                                         "MODMSIN.IRX", "SKSOUND.IRX", "SKHSYNTH.IRX", "SKMIDI.IRX",
-                                         "SKMSIN.IRX", "PCMPLAY.IRX"});
+    //
+    // Tales of Legendia's own set: LIBSD plus its KORG synth driver and the
+    // IXAUDIO adapter (its module table at 0x3C0980 loads these after the
+    // IOPRP image). The pad and memory-card modules are left to the stubs for
+    // now - they need host HID/mc0 support this port does not have yet.
+    ps2_native_iop::setModules(runtime, {"LIBSD.IRX", "KORGIVAG.IRX", "IXAUDIO.IRX"});
     if (!sound)
         ps2_native_iop::setVolume(0.0f);
 

@@ -49,6 +49,7 @@ namespace
     uint32_t gGameFileHandle[kMaxGameFiles] = {};
     std::FILE *gGameFileStream[kMaxGameFiles] = {};
     uint64_t gGameFileSize[kMaxGameFiles] = {};
+    uint64_t gGameFileOffset[kMaxGameFiles] = {};
     uint32_t gGameFileNextHandle = 1u;
 
     // Opens through the same path translation the runtime's fileio stubs use, so "\AFS\FLIST.DIR;1"
@@ -108,6 +109,109 @@ namespace
         }
         std::fclose(stream);
         return 0u;
+    }
+
+    // The game's file *data* service (sid 0x80000595, client 0x3863D0): FUN_00101d80 binds it and waits
+    // for its bound flag, FUN_00101ed8 asks it for state (fn 0xE), and FUN_001029a8 reads through it
+    // (fn 1, mode 1, request {handle, blocks, buffer, info[3], desc, countOut}).
+    //
+    // The real service answers asynchronously through an end callback whose reply descriptor layout is not
+    // derivable from this side, so the read is completed in place instead: the bytes land directly in the
+    // caller's cached buffer (where DVCI parses from), the count-out word the request points at is filled,
+    // and the busy flag the poll loop watches is cleared - the state the completion would leave behind.
+    constexpr uint32_t kGameDataSid = 0x80000595u;
+    constexpr uint32_t kGameDataStateFunction = 0x0Eu;
+    constexpr uint32_t kGameDataReadFunction = 0x1u;
+    constexpr uint32_t kGameDataBusyFlag = 0x00385234u;
+    // The I/O mutex the open and read paths take with PollSema. FUN_001029a8 takes it and leaves it held
+    // for the completion to release, so a read that never completes also never unlocks the file layer.
+    constexpr uint32_t kGameIoSema = 0x00385228u;
+    constexpr uint32_t kGameDataBlockShift = 11u;  // blocks << 11 for info[2] == 0
+    constexpr uint32_t kGameDataBlockStrideA = 0x918u;
+    constexpr uint32_t kGameDataBlockStrideB = 0x924u;
+
+    int gameFileSlot(uint32_t handle)
+    {
+        for (int i = 0; i < kMaxGameFiles; ++i)
+        {
+            if (gGameFileHandle[i] == handle)
+                return i;
+        }
+        return -1;
+    }
+
+    void completeGameIo(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t countOut, uint32_t bytes)
+    {
+        if (countOut != 0u)
+        {
+            runtime->Store32(rdram, ctx, countOut, bytes);
+        }
+        runtime->Store32(rdram, ctx, kGameDataBusyFlag, 0u);
+    }
+
+    // Releases the I/O mutex the read path left held, the way its completion callback would.
+    void releaseGameIoLock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sema = runtime->Load32(rdram, ctx, kGameIoSema);
+        if (sema == 0u)
+            return;
+        const uint32_t savedA0 = GPR_U32(ctx, 4);
+        const uint32_t savedV0 = GPR_U32(ctx, 2);
+        SET_GPR_U32(ctx, 4, sema);
+        ps2_syscalls::SignalSema(rdram, ctx, runtime);
+        SET_GPR_U32(ctx, 4, savedA0);
+        SET_GPR_U32(ctx, 2, savedV0);
+    }
+
+    // fn 1: {handle, blocks, buffer, info[0], info[1], info[2], desc, countOut}
+    bool gameFileRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t request)
+    {
+        if (request == 0u)
+            return false;
+        const uint32_t handle = runtime->Load32(rdram, ctx, request + 0x00u);
+        const uint32_t blocks = runtime->Load32(rdram, ctx, request + 0x04u);
+        const uint32_t buffer = runtime->Load32(rdram, ctx, request + 0x08u);
+        const uint8_t blockMode = runtime->Load8(rdram, ctx, request + 0x0Eu);
+        const uint32_t countOut = runtime->Load32(rdram, ctx, request + 0x14u);
+
+        const int slot = gameFileSlot(handle);
+        if (slot < 0 || buffer == 0u)
+            return false;
+
+        uint32_t size = blocks << kGameDataBlockShift;
+        if (blockMode == 1u)
+            size = blocks * kGameDataBlockStrideA;
+        else if (blockMode >= 2u)
+            size = blocks * kGameDataBlockStrideB;
+
+        const uint32_t remaining =
+            gGameFileSize[slot] > gGameFileOffset[slot]
+                ? static_cast<uint32_t>(gGameFileSize[slot] - gGameFileOffset[slot])
+                : 0u;
+        if (size > remaining)
+            size = remaining;
+
+        std::vector<uint8_t> data(size);
+        size_t read = 0u;
+        if (size != 0u)
+        {
+            if (std::fseek(gGameFileStream[slot], static_cast<long>(gGameFileOffset[slot]), SEEK_SET) != 0)
+                return false;
+            read = std::fread(data.data(), 1, size, gGameFileStream[slot]);
+        }
+        for (size_t i = 0; i < read; ++i)
+        {
+            runtime->Store8(rdram, ctx, buffer + static_cast<uint32_t>(i), data[i]);
+        }
+        gGameFileOffset[slot] += read;
+        completeGameIo(runtime, rdram, ctx, countOut, static_cast<uint32_t>(read));
+        releaseGameIoLock(rdram, ctx, runtime);
+        if (std::getenv("TOL_TRACE_FILEIO") != nullptr)
+        {
+            std::fprintf(stderr, "[fileio] gamefile read handle %u %zu/%u bytes at 0x%08X\n", handle, read, size,
+                         buffer);
+        }
+        return true;
     }
 
     // Bind is per client, and the call only carries the client pointer, so the sid is remembered here.
@@ -268,8 +372,7 @@ namespace
 
         // The game's own file server: fn 0 opens a path and answers with the handle. This is the call
         // behind "DVCI: Can't read filelist file.(\AFS\FLIST.DIR)" - the path was never the problem.
-        if (sid == kGameFileSid)
-        {
+        if (sid == kGameFileSid)        {
             if (function == kGameFileOpenFunction)
             {
                 const uint32_t handle =
@@ -288,11 +391,13 @@ namespace
                 }
                 if (handle != 0u)
                 {
-                    // The IOP also writes the handle into the request's first word.
+                    // The IOP writes the handle into the request's first word and answers 1 for success -
+                    // the caller tests the reply against exactly 1 (FUN_001ae288), which is why the first
+                    // file opened "by accident" when its handle happened to be 1.
                     runtime->Store32(rdram, ctx, sendBuffer, handle);
                     if (receiveBuffer != 0u && receiveSize >= 4u)
                     {
-                        runtime->Store32(rdram, ctx, receiveBuffer, handle);
+                        runtime->Store32(rdram, ctx, receiveBuffer, 1u);
                     }
                     SET_GPR_S32(ctx, 2, 0);
                     return;
@@ -303,7 +408,31 @@ namespace
             {
                 runtime->Store32(rdram, ctx, receiveBuffer, 0u);
             }
-            SET_GPR_S32(ctx, 2, -1);            return;
+            SET_GPR_S32(ctx, 2, -1);
+            return;
+        }
+
+        // The game's file data service: state query and reads.
+        if (sid == kGameDataSid)
+        {
+            if (function == kGameDataStateFunction)
+            {
+                if (receiveBuffer != 0u && receiveSize >= 4u)
+                {
+                    runtime->Store32(rdram, ctx, receiveBuffer, 0u);
+                }
+                SET_GPR_S32(ctx, 2, 0);
+                return;
+            }
+            if (function == kGameDataReadFunction && gameFileRead(rdram, ctx, runtime, sendBuffer))
+            {
+                SET_GPR_S32(ctx, 2, 0);
+                return;
+            }
+            // Unsupported: leave the caller's state consistent rather than half-done.
+            completeGameIo(runtime, rdram, ctx, 0u, 0u);
+            SET_GPR_S32(ctx, 2, -1);
+            return;
         }
 
         ps2_syscalls::SifCallRpc(rdram, ctx, runtime);

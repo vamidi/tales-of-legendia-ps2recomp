@@ -20,11 +20,11 @@
 | File I/O | **starts and fails**: `DVCI: Can't read filelist file.(\AFS\FLIST.DIR)` |
 | Graphics | none yet — `transfers=0 draws=0` |
 
-**Current blocker, stated precisely:** the game's own file layer. Its data-file initialisation reports
-`DVCI: Can't read filelist file.(\AFS\FLIST.DIR)` and then `SJX_Init can't create DTX` - a disc path with no device
-prefix, opened through the game's fileio RPC rather than the IOP-side opener (no `[fileio]` line for it). Everything
-before it works: the SIF RPC is answered natively, the IOPRP image and all nine IRX modules load from `cdrom0:`, and
-the sound library runs on the native IOP.
+**Current blocker, stated precisely:** the sound library. DVCI now indexes all six AFS archives
+(`DVCI: Total 6 files.`), KORG and IxAudio start on the native IOP, but `SJX_Init` fails:
+`DTX_Create: can't create DTX of server` after `[IOP/RPC trace:unhandled] sid=0x90000200 rpc=0x2`. The native IOP
+registers servers `0x90000200`/`0x90000201`, so the likely cause is that `SifBindRpc`'s dummy server shadows the
+native one (see the handover).
 
 (`sceSifInitCmd`'s handshake was unblocked this session by seeding SIF_REG_MSCOM=1; see section 2c.)
 
@@ -82,22 +82,22 @@ Effect: the guest leaves the spin and reaches `sceSifBindRpc` (see section 1).
 
 ## 4. Next step, concretely
 
-Serve the game's own file I/O. It is **not** a path problem - that was checked and disproved:
+The DVCI/file layer is done. The guest now indexes its six AFS archives and moves on to the **sound library**:
 
-- `translatePs2Path("\AFS\FLIST.DIR;1")` -> `cdRoot + AFS/FLIST.DIR` with the ISO version suffix stripped, i.e.
-  `data\CD\AFS\FLIST.DIR` (the file exists, 95 bytes). Nothing needs remapping.
-- The open is an RPC: `FUN_00101a60` uses client `0x3DBA80`, **sid `0x80000597`**, fn 0, a 300-byte request whose
-  path sits at `+0x24`, and a 4-byte reply. It used to come back `[IOP/RPC trace:unhandled]`, which is why DVCI
-  reported "Can't read filelist file".
+```
+[Deci2Call:kputs] DVCI: "\AFS\SYS_REG.AFS" found.   (x6)
+[Deci2Call:kputs] DVCI: Total 6 files.
+[IOP/RPC trace:unhandled] sid=0x90000200 rpc=0x2 ... sendBytes=[00 00 00 00 80 6A 3B 00 00 09 00 00 80 08 00 00]
+[Deci2Call:kputs] DTX_Create: can't create DTX of server
+[Deci2Call:kputs] E0100302: SJX_Init can't create DTX
+```
 
-`tolSifCallRpc` now implements fn 0 of that service (`[fileio] gamefile open '\\AFS\FLIST.DIR;1' -> ... ok, 95
-bytes (handle 1)`), so the open succeeds.
-
-**Remaining work is the data path:** reads go to a second client, `0x3863D0`, **sid `0x80000595`**:
-`fn 0xE` (init, no payload) and `fn 0x1` (read) with a 24-byte request `{handle, blocks, buffer, info}` and
-`mode = 1` (asynchronous) plus an end callback at `0x1016D0`; there is no reply buffer, so the completion must be
-delivered through that callback (the game's `DAT_00385234` busy flag at `0x385234` is what its poll loop watches).
-Implement fn 1 (and whatever seek/close follow) the same way, then invoke the end callback through the scheduler.
+KORG and IxAudio now start on the native IOP (`[iop] started KORG IOP Sound Driver`, `[iop] started IxAudio`,
+`[iop] RPC server 2415919872/2415919873 registered` = `0x90000200`/`0x90000201`), yet the call is still reported
+unhandled. The likely cause is ordering in the HLE bind: `ps2_syscalls::SifBindRpc` (RPC.cpp) allocates a **dummy
+server** when `g_rpc_servers` has no entry, stores it, and points `client->server` at it; `SifCallRpc` then sends
+`request.serverAddress`/`serverFunction` from that dummy, so the native IOP's real server for the sid is shadowed.
+Prefer `PS2IopTransport::native(runtime)->server(sid, record, buffer)` in `SifBindRpc` when it succeeds.
 
 ## 4b. What was implemented this session (all measured)
 
@@ -106,7 +106,11 @@ Implement fn 1 (and whatever seek/close follow) the same way, then invoke the en
 | `sceSifBindRpc` / `sceSifCallRpc` (guest 0x118448 / 0x118628) | `src/runtime/tol_overrides.cpp` | replaced by `ps2_syscalls::SifBindRpc` / `SifCallRpc`; no more semaphore wait |
 | load-module SIF command (cid 0x80000003) | `ps2xRuntime/.../Stubs/SIF.cpp` + `ps2_iop_transport.h` | opens the image through the IOP-side file layer, sets boot-status bit 0x40000 on the next read |
 | loadfile RPC (sid 0x80000006) | `src/runtime/tol_overrides.cpp` | `0xFF` -> `"3000"`; module loads served by the runtime's loader |
-| game file open (sid 0x80000597, fn 0) | `src/runtime/tol_overrides.cpp` | path -> `translatePs2Path` -> `fopen`; `\AFS\FLIST.DIR;1` opens (`data\CD\AFS\FLIST.DIR`, 95 bytes) |
+| game file open (sid 0x80000597, fn 0) | `src/runtime/tol_overrides.cpp` | path -> `translatePs2Path` -> `fopen`; reply must be `1`, handle goes in the request |
+| game file read (sid 0x80000595, fn 1) | `src/runtime/tol_overrides.cpp` | bytes go straight into the caller's buffer; also clears the busy flag and releases the I/O semaphore the read leaves held |
+| ToL IOP module list | `src/runtime/main.cpp` | `LIBSD.IRX`, `KORGIVAG.IRX`, `IXAUDIO.IRX` instead of DQ8's sound set |
+
+Result: `DVCI: Total 6 files.` - all six AFS archives indexed - then the sound library's `SJX_Init` (see section 1).
 
 Result: first `cdrom0:` open (`IRX\IOPRP300.IMG`, 275,921 bytes), then all nine IRX modules, then the graphics
 bring-up, then the DVCI/SJX failure above.
