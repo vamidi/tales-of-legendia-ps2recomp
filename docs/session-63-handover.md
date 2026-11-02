@@ -149,6 +149,32 @@ Also fixed on the way: the loadfile RPC was dropping the module **arguments** (r
 Next step: find who signals semaphore 10 (trace semaphore create/signal/wait with owners), since that is what
 IxAudio's init thread is waiting for before it registers `0x90000200`.
 
+### Sync-object trace: the wait is healthy, and the provider is the IOPRP image
+
+`TOL_TRACE_IOP_SEMA=1` traces every `create`/`wait`/`wait-block`/`wait-ok`/`set`/`clear`/`delete` on semaphores and
+event flags with the calling thread and pc. The earlier "semaphore 10" reading was my own off-by-one: the `Wait` enum
+is `None, Sleep, Delay, Semaphore, EventFlag, Mailbox, Rpc`, so kind 4 is **EventFlag**, not Semaphore.
+
+Event flag 10 is not a deadlock - it is a healthy self-signalled tick loop in thread 9:
+
+```
+evflag 10 create     by thread 9 at 0x144FC
+evflag 10 clear      by thread 9 at 0x11994
+evflag 10 wait-block by thread 9 at 0x11B84
+evflag 10 set        by thread 9 at 0x1295C  waiters=1
+... repeats forever
+```
+
+Counting sifcmd calls over a whole run: `sifCheckInit` 2, `sifRegisterRpc` 2, `sifSetRpcQueue` 2, `sifRpcLoop` 2 -
+i.e. **only KORG's two servers**. IxAudio never calls any of them, so `0x90000200` is not registered by anything the
+runtime runs.
+
+The provider has to be the IOP image the game reboots into. `IOPRP300.IMG` is a romdir container with 18 modules
+(SYSMEM, LOADCORE, SIFCMD, SIFMAN, THREADMAN, IOMAN, MODLOAD, FILEIO, CDVDMAN, CDVDFSV, LOADFILE, TIMEMANI, ROMDRV,
+EESYNC, SYSCLIB, STDIO), but its entries are a **compressed boot image**: the recorded sizes do not match the data
+layout (the slices are not ELF and their sum exceeds the file), so running it is a decompression + loader subsystem,
+not a tweak. That is the real gap behind the sound failure.
+
 ## 4b. What was implemented this session (all measured)
 
 | layer | where | effect |
