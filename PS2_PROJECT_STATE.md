@@ -37,10 +37,10 @@ e5636981  thirdparty/PS2Recomp   main
 
 The generated corpus is **not** included by hand anywhere. It is picked up through one CMake variable:
 
-- `DQ8_GENERATED_DIR` (root `CMakeLists.txt:86`, `CACHE PATH`) — default
+- `TOL_GENERATED_DIR` (root `CMakeLists.txt:86`, `CACHE PATH`) — default
   `build/generated/SLUS_212.07`; the ToL value must become our corpus directory.
-- `src/runtime/CMakeLists.txt:29` — `file(GLOB DQ8_GENERATED_SOURCES CONFIGURE_DEPENDS "${DQ8_GENERATED_DIR}/*.cpp")`
-  builds the static library `dq8_generated` from every `.cpp` there, and refuses to configure if it finds none.
+- `src/runtime/CMakeLists.txt:29` — `file(GLOB TOL_GENERATED_SOURCES CONFIGURE_DEPENDS "${TOL_GENERATED_DIR}/*.cpp")`
+  builds the static library `tol_generated` from every `.cpp` there, and refuses to configure if it finds none.
 - `src/runtime/CMakeLists.txt:64-70` and `:118` — the same directory goes on the include path, which is how
   `ps2_recompiled_functions.h`, `ps2_recompiled_stubs.h`, `ps2_syscalls.h` and `ps2_stubs.h` resolve (PCH list at
   `:74-77`). `main.cpp` includes `ps2_recompiled_functions.h` to name individual functions.
@@ -102,7 +102,7 @@ cmake --build build/ps2recomp-standalone --target ps2_recomp
 
 # 3. the port
 cmake -S . -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release `
-      -DDQ8_LINK_GENERATED=ON -DDQ8_GENERATED_DIR=<corpus> -DDQ8_GFX_ENABLE_SDLGPU=ON
+      -DTOL_LINK_GENERATED=ON -DTOL_GENERATED_DIR=<corpus> -DTOL_GFX_ENABLE_SDLGPU=ON
 cmake --build build/game --target dq8
 ```
 
@@ -115,9 +115,9 @@ cmake --build build/game --target dq8
 | runtime synced from reference | done, submodule commit `b314e1f` |
 | configure | **passes** — `linking 53558 generated translation units` |
 | `ps2_runtime` (incl. native IOP / threaded GS / VU1 pipeline) | **builds clean** |
-| `dq8_gfx_gs` (our GS/gfx layer) | **builds clean** |
+| `tol_gfx_gs` (our GS/gfx layer) | **builds clean** |
 | `main.cpp` | **builds clean** |
-| `dq8_generated` (53,558 corpus TUs) + final link | **compiling** — no code errors; run with `-j 6` |
+| `tol_generated` (53,558 corpus TUs) + final link | **compiling** — no code errors; run with `-j 6` |
 
 **Build note (this machine):** `-j 12` fails with `C1002 compiler is out of heap space` / `C3859 Failed to create
 virtual memory for PCH` / `C1076 internal heap limit` — each `cl.exe` holds the PCH, which includes the 4.6 MB
@@ -141,7 +141,7 @@ the compiler is MSVC and did not save those four.
 
 ```powershell
 cmd /c '"...\VC\Auxiliary\Build\vcvars64.bat" && cmake -S . -B build/clang -G Ninja `
-      -DCMAKE_BUILD_TYPE=Release -DDQ8_LINK_GENERATED=ON `
+      -DCMAKE_BUILD_TYPE=Release -DTOL_LINK_GENERATED=ON `
       -DCMAKE_C_COMPILER="...\VC\Tools\Llvm\x64\bin\clang-cl.exe" `
       -DCMAKE_CXX_COMPILER="...\VC\Tools\Llvm\x64\bin\clang-cl.exe"'
 cmd /c '"...\vcvars64.bat" && ninja -C build/clang -j 12 dq8'
@@ -184,7 +184,7 @@ Corpus shims needed afterwards, each verified against git history rather than gu
 ### Rename
 `DQ8 -> tol` everywhere: project `ToLRecomp`, target `tol`, `TOL_*` CMake vars/macros/namespaces/env vars,
 `cmake/Tol*.cmake`. 0 references remain. Env switches are now `TOL_GFX_*`, `TOL_GS_*`, `TOL_TRACE_*` (28 of them) —
-commands copied from the DQ8 wiki using `DQ8_*` silently do nothing.
+debug knobs are `TOL_*` (renamed from the inherited DQ8 names); a command written for the DQ8 wiki using `DQ8_*` now does nothing.
 
 ### ROOT CAUSE of the black screen: the function map, not the runtime
 `data/map.csv` (Ghidra export) treated **every secondary entry point as a function**: 40,253 of 53,221 rows were
