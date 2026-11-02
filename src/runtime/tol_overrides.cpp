@@ -33,6 +33,7 @@ namespace
     constexpr uint32_t kLoadFileVersion3000 = 0x30303033u; // '3','0','0','0' little-endian
     // Loadfile request layout: { argLen, 0, path[0xFC], args[] }.
     constexpr uint32_t kLoadFilePathOffset = 8u;
+    constexpr uint32_t kLoadFileArgsOffset = 8u + 0xFCu;
 
     // The game's own IOP file server (sid 0x80000597), used by its DVCI/HTCI layer.
     //
@@ -250,7 +251,12 @@ namespace
 
     // Runs the runtime's module loader for a path already sitting in guest memory, leaving the current
     // context's registers untouched so the RPC caller never sees the synthetic call.
-    int32_t loadModuleFromGuestMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t pathAddress)
+    int32_t loadModuleFromGuestMemory(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      PS2Runtime *runtime,
+                                      uint32_t pathAddress,
+                                      uint32_t argLength,
+                                      uint32_t argsAddress)
     {
         const uint32_t savedA0 = GPR_U32(ctx, 4);
         const uint32_t savedA1 = GPR_U32(ctx, 5);
@@ -258,8 +264,8 @@ namespace
         const uint32_t savedV0 = GPR_U32(ctx, 2);
 
         SET_GPR_U32(ctx, 4, pathAddress);
-        SET_GPR_U32(ctx, 5, 0u);
-        SET_GPR_U32(ctx, 6, 0u);
+        SET_GPR_U32(ctx, 5, argLength);
+        SET_GPR_U32(ctx, 6, argsAddress);
         ps2_syscalls::SifLoadModule(rdram, ctx, runtime);
         const int32_t moduleId = static_cast<int32_t>(GPR_U32(ctx, 2));
 
@@ -331,9 +337,13 @@ namespace
             else if (sendBuffer != 0u && sendSize != 0u)
             {
                 // The loadfile request is { argLen, 0, path[0xFC], args[] }: the path sits at +8, not at
-                // the start of the send buffer (the game copies it to 0x3E2208 and sends from 0x3E2200).
+                // the start of the send buffer (the game copies it to 0x3E2208 and sends from 0x3E2200),
+                // and the module arguments follow the path. Dropping them loads modules unconfigured.
                 const uint32_t pathAddress = sendBuffer + kLoadFilePathOffset;
-                const int32_t loaded = loadModuleFromGuestMemory(rdram, ctx, runtime, pathAddress);
+                const uint32_t argLength = runtime->Load32(rdram, ctx, sendBuffer);
+                const uint32_t argsAddress = sendBuffer + kLoadFileArgsOffset;
+                const int32_t loaded =
+                    loadModuleFromGuestMemory(rdram, ctx, runtime, pathAddress, argLength, argsAddress);
                 if (loaded > 0)
                 {
                     moduleId = static_cast<uint32_t>(loaded);

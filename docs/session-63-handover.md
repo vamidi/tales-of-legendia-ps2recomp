@@ -120,8 +120,34 @@ from `0x4826C` and a constant 0 meant it never advanced. `vblank #5` now returns
 and the loop is gone (no unbound-import calls at all any more). `sysclib #19` is imported but never called, so it is
 not the blocker either.
 
-`0x90000200` still has no provider. Next step: find which module registers it - disassemble `IXAUDIO.IRX` /
-`KORGIVAG.IRX` (both contain the constant) around their `sceSifRegisterRpc` call.
+### Static analysis of IXAUDIO.IRX / KORGIVAG.IRX
+
+`IXAUDIO.IRX` is a stripped ELF32 (one PT_LOAD, `p_vaddr 0`, entry `0x2674`) containing a complete, statically
+initialised server record for the sid at link vaddr **`0xD180`**:
+
+```
++0x00 = 0x0000C420   (server function)      +0x14 = 0x90000200  (sid)
++0x10 = 0x0000C9E0   (second handler)       +0x1C = 1
++0x20 = 0x30         (size)                 +0x2C = 0
+```
+
+referenced from a table of `{pointer, 2}` pairs at `0x117B8`. So the module is built to register `0x90000200`; the
+record simply never reaches `sceSifRegisterRpc`.
+
+Measured with `TOL_TRACE_IOP_PC=1` (per-thread syscall trace, `sceSifRegisterRpc` is handler index 74): **exactly two
+calls in a whole run**, and both are KORG's (`0x90000300`, `0x90000301`). `sifSetRpcQueue`/`sifRpcLoop` are called
+twice as well. LIBSD's threads 4/5 park on event flags (normal driver idle); IxAudio's thread 9 parks on **semaphore
+10** and threads 8/12 never reach another syscall - so IxAudio's init blocks before the registration.
+
+The provider is not a module we forgot to load: `0x90000200` does not occur anywhere in `IOPRP300.IMG` (nor do
+`0x90000300`/`0x90000301`, `SDRDRV`, `LIBSD`, `KORG`, `IXAUDIO`).
+
+Also fixed on the way: the loadfile RPC was dropping the module **arguments** (request is
+`{argLen, 0, path[0xFC], args[]}`); they now reach the loader, which visibly changed IxAudio's load base
+(`0x45C00` -> `0xADB00`).
+
+Next step: find who signals semaphore 10 (trace semaphore create/signal/wait with owners), since that is what
+IxAudio's init thread is waiting for before it registers `0x90000200`.
 
 ## 4b. What was implemented this session (all measured)
 
