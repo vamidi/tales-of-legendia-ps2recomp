@@ -18,18 +18,23 @@
 | Graphics bring-up (VIF/DMAC reset) | reached |
 | Guest creates threads | not yet — `CreateThread` (0x20) not reached |
 | **File I/O** | **done this session** — DVCI indexes all six AFS archives |
-| Graphics | none yet — `transfers=0 draws=0` |
+| **Graphics** | **renders** — `draws=201 passes=23 gif packets=81`, the game's "NOW LOADING" screen |
 
-**Current blocker, stated precisely:** the sound library. DVCI now indexes all six AFS archives
-(`DVCI: Total 6 files.`), and KORG + IxAudio start on the native IOP, but `SJX_Init` fails:
-`DTX_Create: can't create DTX of server` after `[IOP/RPC trace:unhandled] sid=0x90000200 rpc=0x2`.
+**Current blocker, stated precisely:** the sound library cannot reach `sceSifRegisterRpc`, so `SJX_Init` reports
+`DTX_Create: can't create DTX of server` — but it is **no longer fatal**: the guest proceeds and renders.
 
-Where to look (checked, not guessed): `IopSubsystem::handleRpc` prefers a native server
-(`native.server(sid, record, buffer)`) and, if found, reports `handled = native.call(...)`. The LLE kernel does log
-`[iop] RPC server 2415919872 registered` (= `0x90000200`) before the failing call, and `NativeIop::call` logs a
-`[iop] RPC to N timed out` warning when it submits and the IOP does not finish - **no such warning appears**, so the
-call is returning early: either `server()` reports no server for the sid, or `host.readGuest(sendAddress, ...)` fails.
-Both are single-line checks in `ps2xIOP/src/native_iop.cpp`.
+```
+[gfx] 52.5 fps over 600 frames | transfers=10 (80 KiB) draws=201 passes=23 gif packets=81
+      presents composed=588 | ee-dispatches=3121 (5/frame)
+```
+
+A captured frame (`TOL_GFX_SCREENSHOT_DIR`) is the game's "NOW LOADING" screen (512x448, off-white on black), so the
+port draws real game output; the missing sound server only breaks audio initialisation.
+
+Where the sound gap is: `sifRegisterRpc` is called exactly twice per run and both are KORG's (`0x90000300`,
+`0x90000301`). IxAudio never calls any sifcmd function, so `0x90000200`'s provider is inside the `IOPRP300.IMG` the
+game reboots into — a **compressed boot image** (its romdir sizes do not match the data layout), i.e. running it is a
+subsystem of its own.
 
 (`sceSifInitCmd`'s handshake was unblocked this session by seeding SIF_REG_MSCOM=1; see section 2c.)
 
@@ -150,7 +155,6 @@ Next step: find who signals semaphore 10 (trace semaphore create/signal/wait wit
 IxAudio's init thread is waiting for before it registers `0x90000200`.
 
 ### Sync-object trace: the wait is healthy, and the provider is the IOPRP image
-
 `TOL_TRACE_IOP_SEMA=1` traces every `create`/`wait`/`wait-block`/`wait-ok`/`set`/`clear`/`delete` on semaphores and
 event flags with the calling thread and pc. The earlier "semaphore 10" reading was my own off-by-one: the `Wait` enum
 is `None, Sleep, Delay, Semaphore, EventFlag, Mailbox, Rpc`, so kind 4 is **EventFlag**, not Semaphore.
@@ -174,6 +178,26 @@ The provider has to be the IOP image the game reboots into. `IOPRP300.IMG` is a 
 EESYNC, SYSCLIB, STDIO), but its entries are a **compressed boot image**: the recorded sizes do not match the data
 layout (the slices are not ELF and their sum exceeds the file), so running it is a decompression + loader subsystem,
 not a tweak. That is the real gap behind the sound failure.
+
+### What that means for the port (measured)
+
+The sound failure is **not fatal**. With the module arguments now passed and `vblank #5` ticking, the guest walks
+past `SJX_Init` and renders:
+
+```
+[gfx] 52.5 fps over 600 frames | transfers=10 (80 KiB) draws=201 passes=23 gif packets=81
+      presents composed=588 | ee-dispatches=3121 (5/frame)
+```
+
+`TOL_GFX_SCREENSHOT_DIR=<dir>` writes `frame_NNNNNN.ppm`; the captured frame is the game's **"NOW LOADING"** screen
+(512x448, off-white text on black). So the port produces real game output, and only audio initialisation is blocked.
+
+Next workstream, in priority order:
+
+1. **Graphics fidelity** - 201 draws for a static loading screen; check `TOL_GFX_TRACE_BATCHES`/`TOL_GFX_STATS_EVERY`
+   and whether the screen ever advances (it is the first thing the game shows).
+2. **Sound**: run `IOPRP300.IMG` (decompression + module loader), which is also what the game's own `sceSifLoadModule`
+   reboot path expects.
 
 ## 4b. What was implemented this session (all measured)
 
