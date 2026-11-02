@@ -22,12 +22,16 @@
 | **IOPRP boot image** | **booted** — 8 of its 16 modules started (IOMAN, MODLOAD, FILEIO, CDVDMAN, CDVDFSV, LOADFILE, ROMDRV, EESYNC) |
 | **Audio init** | **completes** — `SJX_Init` and `ps2rna_init_psj` succeed (16 SJUNI remotes) |
 | **ioman init** | **answered** — `sceSifInitIoman`'s fn 0xFF succeeds natively |
+| **IOP->EE SIF commands** | **delivered** — packet into the guest's own libsif buffer + its receive handler |
 
-**Current blocker, stated precisely:** after the ioman init is answered the guest goes **quiet** — no further RPCs,
-no errors, still 201 draws on the "NOW LOADING" screen (`ee-dispatches` drops to 8/frame, i.e. only the timer ISR).
-`sceSifInitIoman` (`FUN_00119568`) also registers two **IOP->EE command handlers**
-(`sceSifAddCmdHandler(0x80000011, 0x119030, ...)` and `0x80000013, 0x119520, ...`), and this runtime never delivers
-IOP->EE commands, so that is the next thing to implement or rule out.
+**Current blocker, stated precisely:** the guest is **not** waiting on an IOP notification. It runs its own code in a
+loop (`0x1482C0 -> 0x1257C8 -> 0x123678 -> 0x1254A8`, and `FUN_00123548` there is `powf`), redraws the loading
+screen 201 times and then stops drawing, with `ee-dispatches` at 8/frame. So the loading gate is inside the game's
+own logic, not a blocked syscall or a missing notification.
+
+What that means for the notification work: the channel is now implemented and verified (`deliverSifCommand()` in
+`src/runtime/tol_overrides.cpp` writes a packet into the guest's own libsif receive buffer at `0x3DECC0` and runs its
+DMAC receive handler `0x11717AA8`), but delivering ioman's ready notification does not move the loading screen.
 
 Measured chain from one run (`TOL_TRACE_RPC=1`):
 
