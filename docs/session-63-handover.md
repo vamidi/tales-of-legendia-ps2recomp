@@ -99,13 +99,17 @@ The DVCI/file layer is done. The guest now indexes its six AFS archives and move
 [Deci2Call:kputs] E0100302: SJX_Init can't create DTX
 ```
 
-KORG and IxAudio do start on the native IOP (`[iop] started KORG IOP Sound Driver`, `[iop] started IxAudio`,
-`[iop] RPC server 2415919872/2415919873 registered` = `0x90000200`/`0x90000201`), so the next step is inside the
-native IOP call path. `IopSubsystem::handleRpc` reports `handled = native.call(...)` when `native.server(sid, ...)`
-finds a server; `NativeIop::call` returns false only for `!hasServer(sid)` or a failed `host.readGuest(...)`, and it
-logs `[iop] RPC to N timed out` when it submits and the IOP never finishes. **No timeout warning appears**, so the
-call is returning early at one of those two checks - both are one line each in `ps2xIOP/src/native_iop.cpp`.
-Instrumenting them (or the request's function number 2) is the way in.
+KORG and IxAudio do start on the native IOP (`[iop] started KORG IOP Sound Driver`, `[iop] started IxAudio`), so
+the next step is inside the native IOP. Traced with `TOL_TRACE_IOP_RPC=1`: the rejection is
+**`native.server(sid, ...)` returning false**, not the guest read - `NativeIop::call` is never reached. Only
+`0x90000300`/`0x90000301` (KORG) are ever registered; `2415919872` is `0x90000300`, not `0x90000200` (earlier hex
+conversion error).
+
+With `TOL_TRACE_IOP_THREADS=1` both LIBSD and IxAudio finish their entries and create worker threads (4,5 and
+8,9,12) but never register `0x90000200`, and ~170 ms of extra IOP time does not change it. So the provider's init
+never reaches `sceSifRegisterRpc`. Next probe: trace thread scheduling (`startThread`/`reschedule`) for those worker
+threads, and check the two imports IxAudio resolves to nothing - `sysclib #19` and `vblank #5` - both of which
+currently hit `unknownImport` and return 0.
 
 ## 4b. What was implemented this session (all measured)
 

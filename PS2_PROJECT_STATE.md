@@ -677,11 +677,21 @@ With the file layer working, `SJX_Init` is what stops the guest:
 [Deci2Call:kputs] E0100302: SJX_Init can't create DTX
 ```
 
-KORG and IxAudio now run on the native IOP (`[iop] started KORG IOP Sound Driver`, `[iop] started IxAudio`,
-`[iop] RPC server 2415919872/2415919873 registered` = `0x90000200`/`0x90000201`). `IopSubsystem::handleRpc` reports
-`handled = native.call(...)` once `native.server(sid, ...)` matches; `NativeIop::call` returns false only for
-`!hasServer(sid)` or a failed `host.readGuest(...)`, and it logs `[iop] RPC to N timed out` when it submits and the
-IOP never finishes. No timeout warning appears, so the call returns early at one of those two checks.
+KORG and IxAudio now run on the native IOP (`[iop] started KORG IOP Sound Driver`, `[iop] started IxAudio`).
+Traced with `TOL_TRACE_IOP_RPC=1` (in `IopSubsystem::handleRpc`), the rejection is **`native.server(sid, ...)`
+returning false** - `NativeIop::call` is never reached, so `host.readGuest(...)` is not involved:
+
+```
+[iop-rpc] sid=0x90000200 fn=0x2 -> NO native server and no route (unhandled)
+```
+
+Only two servers are ever registered: `0x90000300` and `0x90000301` (KORG). (An earlier note here claimed
+`2415919872 = 0x90000200`; that was a bad hex conversion - it is `0x90000300`.)
+
+With `TOL_TRACE_IOP_THREADS=1`, LIBSD and IxAudio both finish their entries and create worker threads (ids 4,5 and
+8,9,12), but neither registers `0x90000200`. Giving the IOP up to ~170 ms of extra time (8 x 1024 frames, driven by
+the EE call because it is the only clock) does not produce the registration, so the provider is not merely late -
+its init never gets there.
 
 Note: `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 3.20]` is the game's own warning and is not
 fatal - execution continues past it.
