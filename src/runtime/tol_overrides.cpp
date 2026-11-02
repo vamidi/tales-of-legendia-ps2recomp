@@ -215,6 +215,19 @@ namespace
         return true;
     }
 
+    // IxAudio's server, sid 0x90000200: the module carries a complete server record for it (link vaddr
+    // 0xD180 in IXAUDIO.IRX) but never calls sceSifRegisterRpc, and no other module does either, so the
+    // game's SJX_Init fails and the boot stalls on its loading screen.
+    //
+    // The functions the game drives are thin wrappers that use the reply as an object handle:
+    //   fn 0x002  DTX create      (FUN_001acac8 stores the non-zero reply as the DTX handle)
+    //   fn 0x422  SJUNI remote    (FUN_001b6400 -> ps2rna_init_psj loops forever on a zero reply)
+    // Both are answered with a fresh handle; the rest reply 0. Audio is not produced - the module that would
+    // stream it never registers - but the game's initialisation no longer dead-ends.
+    constexpr uint32_t kIxAudioSid = 0x90000200u;
+    constexpr uint32_t kIxAudioHandleFunctions[] = {0x002u, 0x400u, 0x422u};
+    uint32_t gIxAudioNextHandle = 1u;
+
     // Bind is per client, and the call only carries the client pointer, so the sid is remembered here.
     constexpr int kMaxRpcClients = 16;
     uint32_t gRpcClientAddr[kMaxRpcClients] = {};
@@ -423,8 +436,7 @@ namespace
         }
 
         // The game's file data service: state query and reads.
-        if (sid == kGameDataSid)
-        {
+        if (sid == kGameDataSid)        {
             if (function == kGameDataStateFunction)
             {
                 if (receiveBuffer != 0u && receiveSize >= 4u)
@@ -442,6 +454,35 @@ namespace
             // Unsupported: leave the caller's state consistent rather than half-done.
             completeGameIo(runtime, rdram, ctx, 0u, 0u);
             SET_GPR_S32(ctx, 2, -1);
+            return;
+        }
+
+        // IxAudio: answer the DTX lifecycle so the game's SJX_Init completes. Audio itself is not produced -
+        // the module that would stream it never registers - but the boot no longer stops on the failure.
+        if (sid == kIxAudioSid)
+        {
+            uint32_t reply = 0u;
+            for (const uint32_t handleFunction : kIxAudioHandleFunctions)
+            {
+                if (function == handleFunction)
+                {
+                    reply = gIxAudioNextHandle++;
+                }
+            }
+            if (receiveBuffer != 0u && receiveSize >= 4u)
+            {
+                runtime->Store32(rdram, ctx, receiveBuffer, reply);
+            }
+            if (traceRpcEnabled())
+            {
+                static uint32_t sLogs = 0u;
+                if (sLogs < 32u)
+                {
+                    ++sLogs;
+                    std::fprintf(stderr, "[rpc] ixaudio fn=0x%X -> reply=0x%08X\n", function, reply);
+                }
+            }
+            SET_GPR_S32(ctx, 2, 0);
             return;
         }
 

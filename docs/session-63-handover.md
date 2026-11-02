@@ -19,17 +19,26 @@
 | Guest creates threads | not yet — `CreateThread` (0x20) not reached |
 | **File I/O** | **done this session** — DVCI indexes all six AFS archives |
 | **Graphics** | **renders** — `draws=201 passes=23 gif packets=81`, the game's "NOW LOADING" screen |
+| **IOPRP boot image** | **booted** — 6 of its 16 modules started (MODLOAD, CDVDMAN, CDVDFSV, LOADFILE, ROMDRV, EESYNC) |
+| **Audio init** | **completes** — `SJX_Init` and `ps2rna_init_psj` succeed (16 SJUNI remotes) |
 
-**Current blocker, stated precisely:** the sound library cannot reach `sceSifRegisterRpc`, so `SJX_Init` reports
-`DTX_Create: can't create DTX of server` — but it is **no longer fatal**: the guest proceeds and renders.
+**Current blocker, stated precisely:** the game's **ioman file service** (`sid 0x80000001`). Audio is no longer the
+gate: with the IOPRP image booted and IxAudio's create functions answered, `SJX_Init` succeeds,
+`ps2rna_init_psj` completes (16 SJUNI remotes created, IOP heap allocated) and the guest moves on to
+`sid=0x80000001 fn=0xFF`, which comes back unhandled.
+
+Measured chain (all from one run, `TOL_TRACE_RPC=1`):
 
 ```
-[gfx] 52.5 fps over 600 frames | transfers=10 (80 KiB) draws=201 passes=23 gif packets=81
-      presents composed=588 | ee-dispatches=3121 (5/frame)
+[rpc] ixaudio fn=0x2   -> reply=0x00000001   (DTX create)
+[rpc] ixaudio fn=0x422 -> reply=0x00000002   (SJUNI remote create)  x16 with fn 0x400
+PS2RNA: sceSifAllocIopHeap(2256) ret=0x000008d0
+[rpc] ixaudio fn=0x40A -> reply=0x00000000   (audio init done)
+[rpc] bind client=0x003E1F40 sid=0x80000001  <- ioman, next blocker
 ```
 
-A captured frame (`TOL_GFX_SCREENSHOT_DIR`) is the game's "NOW LOADING" screen (512x448, off-white on black), so the
-port draws real game output; the missing sound server only breaks audio initialisation.
+The guest still renders (201 draws, 81 GIF packets, the "NOW LOADING" screen) - the file-service call is what it is
+waiting on now.
 
 Where the sound gap is: `sifRegisterRpc` is called exactly twice per run and both are KORG's (`0x90000300`,
 `0x90000301`). IxAudio never calls any sifcmd function, so `0x90000200`'s provider is inside the `IOPRP300.IMG` the
@@ -211,6 +220,8 @@ Next workstream, in priority order:
 | ToL IOP module list | `src/runtime/main.cpp` | `LIBSD.IRX`, `KORGIVAG.IRX`, `IXAUDIO.IRX` instead of DQ8's sound set |
 | IOP ioman file services | `ps2xIOP/src/lle/kernel.cpp` + `iop.h` + `native_iop.cpp` | open/close/read/lseek/write through `IopHost` (bound; LIBSD never calls them) |
 | IOP `vblank #5` | `ps2xIOP/src/lle/kernel.cpp` | 60 Hz counter off the IOP clock; removes IxAudio's tight poll loop |
+| IOPRP boot image | `ps2xRuntime/src/lib/ps2_iop_host.cpp` + `native_iop.cpp` | parses the romdir container, starts the 6 modules the LLE kernel does not emulate |
+| IxAudio server (sid 0x90000200) | `src/runtime/tol_overrides.cpp` | fn `0x2` (DTX), `0x400`/`0x422` (SJX/remote) return handles, so `SJX_Init` completes |
 | IOP import tracing | `ps2xIOP/src/lle/kernel.cpp` | `TOL_TRACE_IOP_IMPORTS` names each unbound import and prints a0/a1/a2 |
 
 Result: `DVCI: Total 6 files.` - all six AFS archives indexed - then the sound library's `SJX_Init` (see section 1).
