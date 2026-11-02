@@ -235,6 +235,52 @@ namespace
     constexpr uint32_t kIomanSid = 0x80000001u;
     constexpr uint32_t kIomanInitFunction = 0xFFu;
 
+    // IOP->EE SIF command delivery for this title.
+    //
+    // The game carries its own libsif: sceSifInit (FUN_00117540) sets up a receive buffer whose first byte is
+    // the packet size and registers FUN_00117AA8 as the DMAC channel-5 handler that drains it and dispatches
+    // by cid through the table at 0x3DEDC0. Nothing in this runtime ever produced such a command, so every
+    // handler the game registers through its own sceSifAddCmdHandler was dead code - including ioman's
+    // 0x80000011 (request completion) and 0x80000013 (registered callback dispatch).
+    constexpr uint32_t kSifRxBuffer = 0x003DECC0u;
+    constexpr uint32_t kSifRxHandler = 0x00117AA8u;
+    constexpr uint32_t kSifCmdHeaderSize = 0x10u;
+
+    // Builds one SIF command packet in the guest's receive buffer and runs the guest's receive handler, the
+    // way the DMAC interrupt would. Returns false when the title's SIF layer is not up yet.
+    bool deliverSifCommand(uint8_t *rdram,
+                           R5900Context *ctx,
+                           PS2Runtime *runtime,
+                           uint32_t cid,
+                           const uint32_t *payload,
+                           uint32_t payloadBytes)
+    {
+        PS2Runtime::RecompiledFunction handler = runtime->lookupFunction(kSifRxHandler);
+        if (handler == nullptr)
+        {
+            return false;
+        }
+        // The buffer pointer lives at 0x3DED98; sceSifInit writes it. Zero means the layer is not up.
+        const uint32_t buffer = runtime->Load32(rdram, ctx, 0x003DED98u);
+        if (buffer == 0u)
+        {
+            return false;
+        }
+        const uint32_t total = kSifCmdHeaderSize + payloadBytes;
+        runtime->Store32(rdram, ctx, buffer + 0x00u, total); // size; the low byte is what the handler reads
+        runtime->Store32(rdram, ctx, buffer + 0x04u, 0u);    // dest
+        runtime->Store32(rdram, ctx, buffer + 0x08u, cid);
+        runtime->Store32(rdram, ctx, buffer + 0x0Cu, 0u);
+        for (uint32_t index = 0; index < payloadBytes; ++index)
+        {
+            const uint32_t word = payload[index / 4u];
+            runtime->Store8(rdram, ctx, buffer + kSifCmdHeaderSize + index,
+                            static_cast<uint8_t>((word >> ((index % 4u) * 8u)) & 0xFFu));
+        }
+        handler(rdram, ctx, runtime);
+        return true;
+    }
+
     // Bind is per client, and the call only carries the client pointer, so the sid is remembered here.
     constexpr int kMaxRpcClients = 16;
     uint32_t gRpcClientAddr[kMaxRpcClients] = {};
@@ -511,6 +557,15 @@ namespace
                 if (traceRpcEnabled())
                 {
                     std::fprintf(stderr, "[rpc] ioman init -> ok\n");
+                }
+                // The IOP's file layer signals readiness with command 0x80000013, whose handler calls the
+                // callback the game registered (FUN_00119520 -> (*(code*)arg[0])(arg[1])). Deliver it so the
+                // game's own notification path runs at least once.
+                const bool delivered = deliverSifCommand(rdram, ctx, runtime, 0x80000013u, nullptr, 0u);
+                if (traceRpcEnabled())
+                {
+                    std::fprintf(stderr, "[rpc] ioman ready notification -> %s\n",
+                                 delivered ? "delivered" : "no SIF layer");
                 }
                 SET_GPR_S32(ctx, 2, 0);
                 return;
