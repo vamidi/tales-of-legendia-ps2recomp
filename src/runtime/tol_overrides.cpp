@@ -1,4 +1,4 @@
-﻿#include "tol_overrides.h"
+#include "tol_overrides.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -893,21 +893,25 @@ namespace
             std::fprintf(stderr, "[pc] probe dispatch with unknown pc=0x%08X\n", ctx->pc);
             return;
         }
-        std::fprintf(stderr, "[pc] enter 0x%08X pc=0x%08X ra=0x%08X sp=0x%08X\n", gPcProbeAddr[idx], ctx->pc,
-                     GPR_U32(ctx, 31), GPR_U32(ctx, 29));
+        // Count calls and report the argument registers: for a routine like memset(0x109108) that is what says
+        // whether the guest is clearing a sane buffer, and the exit line says whether it came back at all.
+        static uint32_t sCalls[kMaxPcProbes] = {};
+        const uint32_t call = ++sCalls[idx];
+        const bool log = call <= 40u || (call % 500u) == 0u;
+
+        if (log)
         {
-            const uint32_t sp = GPR_U32(ctx, 29);
-            if (sp != 0u && sp < 0x02000000u)
-            {
-                std::fprintf(stderr, "[pc]   frame");
-                for (uint32_t off = 0u; off <= 0x38u; off += 8u)
-                    std::fprintf(stderr, " +%02X=%08X", off, runtime->Load32(rdram, ctx, sp + off));
-                std::fprintf(stderr, "\n");
-            }
+            std::fprintf(stderr,
+                         "[pc] enter 0x%08X #%u a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X ra=0x%08X sp=0x%08X\n",
+                         gPcProbeAddr[idx], call, GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6),
+                         GPR_U32(ctx, 7), GPR_U32(ctx, 31), GPR_U32(ctx, 29));
         }
         gPcProbeOriginal[idx](rdram, ctx, runtime);
-        std::fprintf(stderr, "[pc] exit  0x%08X pc=0x%08X ra=0x%08X sp=0x%08X\n", gPcProbeAddr[idx], ctx->pc,
-                     GPR_U32(ctx, 31), GPR_U32(ctx, 29));
+        if (log)
+        {
+            std::fprintf(stderr, "[pc] exit  0x%08X #%u pc=0x%08X v0=0x%08X\n", gPcProbeAddr[idx], call, ctx->pc,
+                         GPR_U32(ctx, 2));
+        }
     }
 
     void installPcProbes(PS2Runtime &runtime)
@@ -1527,7 +1531,7 @@ namespace
     // ---------------------------------------------------------------------------------------------------------
     // CRI I/O LATENCY (TOL_CRI_IO_LATENCY=1) - diagnostic.
     //
-    // FUN_00197940 pumps as `FUN_0019f468(); â€¦ FUN_0019f468(); FUN_001973a8();` and the tick FUN_001973a8 (which
+    // FUN_00197940 pumps as `FUN_0019f468(); … FUN_0019f468(); FUN_001973a8();` and the tick FUN_001973a8 (which
     // credits the DVCI handle) therefore samples the ADXF stream AFTER two stream pumps. Our file RPCs complete
     // synchronously, so a read goes 2 (reading) -> 3 (done) -> 2 (next read armed) inside one cycle and the tick
     // almost never observes 3: measured 1 observation in 148k polls, which is why the 430-entry AFS table freezes at
