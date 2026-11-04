@@ -258,6 +258,11 @@ namespace
     constexpr uint32_t kIxAudioHandleFunctions[] = {0x002u, 0x400u, 0x422u};
     uint32_t gIxAudioNextHandle = 1u;
 
+    // The pad/memory-card service the init step polls. Its reply word is the step's state: 0, -1 and 0x20 all
+    // mean "still pending", so the answer must be something else for the step to move on.
+    constexpr uint32_t kPadServiceSid = 0x80000593u;
+    constexpr uint32_t kPadServiceReply = 1u;
+
     // ioman (sid 0x80000001): the game's sceSifInitIoman (FUN_00119568) binds it and sends fn 0xFF with an
     // 8-byte request of two pointers, expecting an 8-byte reply. The IOPRP image's IOMAN module does not
     // register the server here (it wants the real sifman), so the init is answered natively. Reply word 1 is
@@ -856,6 +861,21 @@ namespace
                 return;
             }
             SET_GPR_S32(ctx, 2, -1);
+            return;
+        }
+
+        // Pad / memory-card service (sid 0x80000593). The game's init step (the function at 0x001AB490) calls
+        // this with fn 4, takes the call's return as its state, and retries while that value is 0, -1 or 0x20.
+        // Nothing in the IOP image registers a server for the sid, so the unhandled reply of 0 left the step
+        // permanently "pending" and the EE span on it ~220 times a second. Answering with a value outside that
+        // set lets the step advance.
+        if (sid == kPadServiceSid)
+        {
+            if (receiveBuffer != 0u && receiveSize >= 4u)
+            {
+                runtime->Store32(rdram, ctx, receiveBuffer, kPadServiceReply);
+            }
+            SET_GPR_S32(ctx, 2, 0);
             return;
         }
 
