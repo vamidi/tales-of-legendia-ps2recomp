@@ -727,3 +727,70 @@ fatal - execution continues past it.
   branches), `TOL_TRACE_RPC`, `TOL_TRACE_FILEIO`, `TOL_TRACE_IOP_RPC/THREADS/IMPORTS/SEMA`.
 - PCSX2 MCP is connected and is the reference: `pcsx2_get_threads`, `pcsx2_disassemble`, `pcsx2_read_registers`,
   `pcsx2_set_breakpoint`.
+
+---
+
+## Session 65 (2026-11-03) — the loading stall is `ADXF_GetPtStat` failing the AFS header check
+
+**Read `docs/session-65-handover.md`; it is the current state.** Short version:
+
+- **Resolved to a single wrong input**: the CRI file device holds the file size in **2048-byte sectors** at
+  `handle+0x08` (position at `+0x0C`); `seek(END)`+`tell` feed `FUN_0019f298`, which stores the count into the ADXF
+  stream's `stream+0x14` and the byte window into `stream+0x10 = count << 11`. That count was 0, so `FUN_00196db0`
+  saw "0 sectors remaining" and marked the partition DONE **without issuing a read**.
+- **Supplying it works**: with `TOL_DVCI_SIZE_SHIM=1` (wraps the device seek `FUN_001AD780`) the port really loads —
+  `[fileio] gamefile read handle 8 2048/2048 bytes at 0x00391140`, the 430-entry `SYS_REG.AFS` extent table starts
+  parsing (DVCI progress 0 → 255, one block's worth of 8-byte entries), the poll returns 2 instead of garbage and
+  returns *normally* to the loading loop, and `E0040701: Illigal format(not AFS)` disappears.
+- **Remaining gap**: the *second* block read never completes. Block 0 completed only because `FUN_00196db0`'s
+  blocking wait (`FUN_0019eec8` → `FUN_00197940`) pumped it inline; later reads have no wait and depend on the SJRBF
+  pump `FUN_001b0d00` walking the device table at `0x003A7FB0`, which is all zero because `FUN_001b0870` (the only
+  slot registrar) is never called for this stream.
+- Device chain verified at runtime: `reader 0x39EE48` → file object `0x00499DC0` → device `0x003A6A98`
+  (open `0x1AD5A0`, seek `0x1AD780`, tell `0x1AD818`, read `0x1AD850`), handle `0x003A75F8`. All slots populated.
+- **Threads are not the axis — they already work.** `CreateThread` is a TOML stub (`CreateThread_0x1144e0.cpp`), so it
+  is a direct C++ call, not a syscall (an earlier "zero thread syscalls" reading in this session was measuring the
+  wrong thing). The middleware's own init (`FUN_001997a8` → `FUN_00199428`) creates a worker thread (entry
+  `FUN_00198d50`, ends in `ExitDeleteThread()`); it runs and pumps the CRI slots 17× in 8 s. **No `CreateThread` or
+  `EeScheduler` extension is needed**, and the threaded pump registration is correct for this title.
+- **With the size shim the read chain works**: stream state 1 → 2 → 3, `+24=0x00391140` (buffer armed),
+  `+28=0x800`, zero errors. **The remaining blocker is DVCI request retirement**: the stream reaches 3 but the DVCI
+  handle stays at state 2 and `handle[+0x14]` (consumed) never advances, so the poll keeps returning 2, the 430-entry
+  parse freezes at 255 (one block) and the stream re-reads block 1 forever.
+- Land mine: a probe that does `Load32` on an unaligned guest address raises a real guest address-error exception and
+  vectors the guest to the kernel at `0x80000080` (not recompiled), which looks exactly like a game bug. Use `Load8`.
+
+### Active Runner Command
+
+```
+build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
+```
+
+Run it from the repo root (the runtime derives `cdRoot` from the ELF's own directory, so the ELF must be the one under
+`data\CD`). `tools\run_game_agent.bat <seconds> <logname>` wraps that with a timeout and split stdout/stderr logs.
+
+---
+
+## Session 66 (2026-11-04) — the loading stall was the file server's address model
+
+**Read `docs/session-66-handover.md`; it is the current state.** Short version:
+
+- **Root cause**: the game's own file server (sid `0x80000597` open / `0x80000595` read) is **sector-addressed**.
+  `open` replies `{base, sizeInBytes}` inside the 300-byte request buffer (`+0x00` base, `+0x04` size), and a read
+  names an **absolute sector**: `FUN_001AD850` computes `entry[+0x20] + entry[+0x0C]` (base + position) and
+  `FUN_001ab4f8` passes that to `FUN_001029a8`. Our old consecutive handles `1,2,3…` made `base + pos` walk into
+  the *next file's* handle, so block 1 of an archive was served from another archive and block 3 named a handle
+  that did not exist -> `FUN_001ab4f8` state 9 -> `FUN_001ad220` device state 3 -> `FUN_0019EF58` discard branch ->
+  the ADXF stream never completes -> the loading poll never returns 3.
+- **Fixed** in `src/runtime/tol_overrides.cpp`: `openGameFile` hands out `base = (slot + 1) * 0x100000` (stride
+  larger than MOVIE.AFS's 436,462 sectors) and the RPC writes the byte size at `sendBuffer + 0x04`; `gameFileRead`
+  resolves the absolute sector to `(slot, sector - base)`.
+- **Measured**: all six archives `found`, `DVCI: Total 6 files.`, extent parsing to **6143** entries, loading loop
+  advanced from index 0 to **2** (3 with `TOL_CRI_WINDOW_FIX=1`), **zero** `E0xxxxxx` error prints, no unknown
+  handle. Screen still `NOW LOADING`.
+- `TOL_DVCI_SIZE_SHIM` is obsolete (real sizes now arrive through the open reply).
+- **Remaining blocker**: the DVCI handle keeps consuming but the poll sees stream state 2 while the credit tick
+  sees 3; the ADXF stream falls back to idle (`state 1`, `+34=0x800`, `+5C=1`). Same family as session 65's
+  synchronous-completion race, now with correct data.
+- New tool: `tools/disasm_guest.py` (capstone MIPS64) for the code Ghidra skips - the CRI device vtable at
+  `0x003A6A98` points at `0x1AD5A0` (open) which is not in Ghidra's function list.

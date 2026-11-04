@@ -1,4 +1,4 @@
-#include "tol_overrides.h"
+﻿#include "tol_overrides.h"
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -47,11 +47,23 @@ namespace
     constexpr uint32_t kGameFilePathOffset = 0x24u;
 
     constexpr int kMaxGameFiles = 32;
+    // The server is SECTOR-addressed, not handle-addressed. Its open returns a BASE SECTOR (word 0 of the
+    // reply) and every read names an absolute sector, `base + position`; the ADXF/CRI file device does exactly
+    // that arithmetic itself (FUN_001AD850: `offset = entry[+0x20] + entry[+0xC]`, then FUN_001ab4f8 passes it
+    // as the first argument of FUN_001029a8). Handing out consecutive small handles made `base + position`
+    // walk into the NEXT file's handle (2 -> 3 -> 4 ...), so block 1 of an archive was served from another
+    // archive and block 3 fell off the table entirely, which the SJRBF request machine reports as state 9 and
+    // the DVCI completion poll latches as device state 3 - the "stream never completes" wall.
+    //
+    // Bases are therefore one stride apart. The stride must exceed the largest archive in sectors
+    // (MOVIE.AFS = 436,462), so 0x100000 sectors (2 GiB) is comfortable and 32 slots cannot overflow.
+    constexpr uint32_t kGameFileBaseStride = 0x00100000u;
     uint32_t gGameFileHandle[kMaxGameFiles] = {};
     std::FILE *gGameFileStream[kMaxGameFiles] = {};
     uint64_t gGameFileSize[kMaxGameFiles] = {};
-    uint64_t gGameFileOffset[kMaxGameFiles] = {};
-    uint32_t gGameFileNextHandle = 1u;
+    // Diagnostic for the DVCI/ADXF size bootstrap (TOL_DVCI_SIZE_SHIM): the size of the most recently opened
+    // game file, i.e. the file the CRI file device is about to seek/tell on.
+    uint64_t gLastGameFileSize = 0u;
 
     // Opens through the same path translation the runtime's fileio stubs use, so "\AFS\FLIST.DIR;1"
     // lands on cdRoot + AFS/FLIST.DIR with the ISO version suffix stripped. The path was never the
@@ -91,7 +103,7 @@ namespace
         {
             if (gGameFileHandle[i] == 0u)
             {
-                gGameFileHandle[i] = gGameFileNextHandle++;
+                gGameFileHandle[i] = static_cast<uint32_t>(i + 1) * kGameFileBaseStride;
                 gGameFileStream[i] = stream;
                 gGameFileSize[i] = 0u;
                 if (std::fseek(stream, 0, SEEK_END) == 0)
@@ -101,8 +113,9 @@ namespace
                         gGameFileSize[i] = static_cast<uint64_t>(size);
                 }
                 std::fseek(stream, 0, SEEK_SET);
+                gLastGameFileSize = gGameFileSize[i];
                 if (trace)
-                    std::fprintf(stderr, "[fileio] gamefile open '%s' -> '%s' ok, %llu bytes (handle %u)\n",
+                    std::fprintf(stderr, "[fileio] gamefile open '%s' -> '%s' ok, %llu bytes (base sector 0x%X)\n",
                                  guestPath.c_str(), hostPath.c_str(),
                                  static_cast<unsigned long long>(gGameFileSize[i]), gGameFileHandle[i]);
                 return gGameFileHandle[i];
@@ -169,15 +182,38 @@ namespace
     {
         if (request == 0u)
             return false;
-        const uint32_t handle = runtime->Load32(rdram, ctx, request + 0x00u);
+        const uint32_t sector = runtime->Load32(rdram, ctx, request + 0x00u);
         const uint32_t blocks = runtime->Load32(rdram, ctx, request + 0x04u);
         const uint32_t buffer = runtime->Load32(rdram, ctx, request + 0x08u);
         const uint8_t blockMode = runtime->Load8(rdram, ctx, request + 0x0Eu);
         const uint32_t countOut = runtime->Load32(rdram, ctx, request + 0x14u);
 
-        const int slot = gameFileSlot(handle);
+        // The first word is an absolute sector: the open's base plus the caller's position. Resolve it to the
+        // file whose [base, base + size) contains it, and read from that sector onward.
+        int slot = -1;
+        uint32_t sectorOffset = 0u;
+        for (int i = 0; i < kMaxGameFiles; ++i)
+        {
+            if (gGameFileHandle[i] == 0u)
+                continue;
+            const uint32_t base = gGameFileHandle[i];
+            const uint64_t sectors = (gGameFileSize[i] + 0x7FFu) >> 11;
+            if (sector >= base && static_cast<uint64_t>(sector - base) < (sectors == 0u ? 1u : sectors))
+            {
+                slot = i;
+                sectorOffset = sector - base;
+                break;
+            }
+        }
         if (slot < 0 || buffer == 0u)
+        {
+            if (std::getenv("TOL_TRACE_DVCI") != nullptr || std::getenv("TOL_TRACE_FILEIO") != nullptr)
+            {
+                std::fprintf(stderr, "[fileio] gamefile read sector 0x%X REJECTED (no file, buffer=0x%08X)\n", sector,
+                             buffer);
+            }
             return false;
+        }
 
         uint32_t size = blocks << kGameDataBlockShift;
         if (blockMode == 1u)
@@ -185,10 +221,9 @@ namespace
         else if (blockMode >= 2u)
             size = blocks * kGameDataBlockStrideB;
 
+        const uint64_t offset = static_cast<uint64_t>(sectorOffset) << kGameDataBlockShift;
         const uint32_t remaining =
-            gGameFileSize[slot] > gGameFileOffset[slot]
-                ? static_cast<uint32_t>(gGameFileSize[slot] - gGameFileOffset[slot])
-                : 0u;
+            gGameFileSize[slot] > offset ? static_cast<uint32_t>(gGameFileSize[slot] - offset) : 0u;
         if (size > remaining)
             size = remaining;
 
@@ -196,7 +231,7 @@ namespace
         size_t read = 0u;
         if (size != 0u)
         {
-            if (std::fseek(gGameFileStream[slot], static_cast<long>(gGameFileOffset[slot]), SEEK_SET) != 0)
+            if (std::fseek(gGameFileStream[slot], static_cast<long>(offset), SEEK_SET) != 0)
                 return false;
             read = std::fread(data.data(), 1, size, gGameFileStream[slot]);
         }
@@ -204,13 +239,12 @@ namespace
         {
             runtime->Store8(rdram, ctx, buffer + static_cast<uint32_t>(i), data[i]);
         }
-        gGameFileOffset[slot] += read;
         completeGameIo(runtime, rdram, ctx, countOut, static_cast<uint32_t>(read));
         releaseGameIoLock(rdram, ctx, runtime);
         if (std::getenv("TOL_TRACE_FILEIO") != nullptr)
         {
-            std::fprintf(stderr, "[fileio] gamefile read handle %u %zu/%u bytes at 0x%08X\n", handle, read, size,
-                         buffer);
+            std::fprintf(stderr, "[fileio] gamefile read sector 0x%X (file slot %d +%u) %zu/%u bytes at 0x%08X\n",
+                         sector, slot, sectorOffset, read, size, buffer);
         }
         return true;
     }
@@ -411,10 +445,32 @@ namespace
                     runtime->Store8(rdram, ctx, buffer + static_cast<uint32_t>(i), data[i]);
                 }
                 result = static_cast<int32_t>(read);
+                if (std::getenv("TOL_TRACE_FILEIO") != nullptr)
+                {
+                    static uint32_t sReads = 0u;
+                    if (sReads < 32u)
+                    {
+                        ++sReads;
+                        std::fprintf(stderr, "[fileio] ioman read fd=%u buf=0x%08X size=%u -> %zu\n", fd, buffer,
+                                     size, read);
+                    }
+                }
             }
             else if (slot >= 0)
             {
                 result = 0;
+            }
+            else if (std::getenv("TOL_TRACE_FILEIO") != nullptr)
+            {
+                // A read on a handle this table never issued: the ADXF/CRI reader opens through the game's own
+                // file server (sid 0x80000597), whose handles live in a different table, so answering -1 here
+                // makes the container read return no bytes and the AFS header check fail downstream.
+                static uint32_t sUnknown = 0u;
+                if (sUnknown < 32u)
+                {
+                    ++sUnknown;
+                    std::fprintf(stderr, "[fileio] ioman read fd=%u -> unknown fd (not opened here)\n", fd);
+                }
             }
         }
         else if (function == kIomanLseek)
@@ -429,6 +485,16 @@ namespace
                 {
                     const long position = std::ftell(gIomanStream[slot]);
                     result = position < 0 ? -1 : static_cast<int32_t>(position);
+                }
+            }
+            if (std::getenv("TOL_TRACE_FILEIO") != nullptr)
+            {
+                static uint32_t sSeeks = 0u;
+                if (sSeeks < 32u)
+                {
+                    ++sSeeks;
+                    std::fprintf(stderr, "[fileio] ioman lseek fd=%d off=%d whence=%u -> %d%s\n", static_cast<int>(fd),
+                                 static_cast<int>(offset), whence, result, slot >= 0 ? "" : " (unknown fd)");
                 }
             }
         }
@@ -638,7 +704,20 @@ namespace
                     // The IOP writes the handle into the request's first word and answers 1 for success -
                     // the caller tests the reply against exactly 1 (FUN_001ae288), which is why the first
                     // file opened "by accident" when its handle happened to be 1.
+                    //
+                    // The response is a {handle, size} pair: FUN_00101a60 copies response+0x00..0x07 into
+                    // the caller's first 8-byte word, and the CRI file device open (0x1AD5A0) reads
+                    // `s0+0x24` - i.e. response+0x04 - as the file size in BYTES and stores
+                    // `(size + 0x7FF) >> 11` as the handle's sector count. Leaving it zero is what made
+                    // every AFS read see "0 sectors remaining" (session 65's seek(END) shim).
+                    // dvCiGetFile (FUN_001ae288) likewise returns {handle, size} to its caller.
                     runtime->Store32(rdram, ctx, sendBuffer, handle);
+                    const int sizeSlot = gameFileSlot(handle);
+                    if (sizeSlot >= 0)
+                    {
+                        runtime->Store32(rdram, ctx, sendBuffer + 4u,
+                                         static_cast<uint32_t>(gGameFileSize[sizeSlot]));
+                    }
                     if (receiveBuffer != 0u && receiveSize >= 4u)
                     {
                         runtime->Store32(rdram, ctx, receiveBuffer, 1u);
@@ -1003,6 +1082,658 @@ namespace
 
         SET_GPR_U32(ctx, 2, 0u);
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // DVCI / CRI ASYNC-LOAD PROBE (TOL_TRACE_DVCI=1)
+    //
+    // The loading sequence FUN_001664d0 starts six AFS loads and then waits on
+    //
+    //     while (FUN_00196460(i) != 3) FUN_0019a080();     // FUN_0019a080 is the CRI I/O pump
+    //
+    // so the whole screen advance depends on that poll reaching 3. This probe wraps the poll and dumps the state
+    // block it reads. Every address below is taken from the disassembly of FUN_001961a8 (request), FUN_00196460
+    // (poll) and FUN_00196f58 (read step), not from guesses:
+    //
+    //   0x3910A4 u32   progress: entry index inside the current request
+    //   0x3910A8 u32   CRI handle record serving the request (a 0x238-byte slot in the table at 0x3A7FB0)
+    //   0x3910AC s32   load index i in flight (-1 = idle)
+    //   0x3910B0 u32   read buffer, malloc'd by the caller (the AFS path was memcpy'd to +4)
+    //   0x3910B4 u32   block count (request size >> 11)
+    //   0x390B78 u32[] per-index request records
+    //
+    // Handle record layout, from FUN_001b1690 / FUN_001b0d00: +0x01 u8 state (2 = read in flight, 3 = done),
+    // +0x04 u8 flags, +0x08 u32 entry count, +0x20 u32 queue cursor, +0x24 u32 size, +0x28 u32 byte offset.
+    // The addresses were confirmed against the disassembly of FUN_00196460 (`lui v0,0x39; lw v1,0x10ac(v0)`).
+    constexpr uint32_t kDvciPollPc = 0x00196460u;
+    constexpr uint32_t kDvciProgress = 0x003910A4u;
+    constexpr uint32_t kDvciHandlePtr = 0x003910A8u;
+    constexpr uint32_t kDvciLoadIndex = 0x003910ACu;
+    constexpr uint32_t kDvciBuffer = 0x003910B0u;
+    constexpr uint32_t kDvciBlocks = 0x003910B4u;
+    constexpr uint32_t kDvciRequestTable = 0x00390B78u;
+    constexpr uint32_t kCriHandleTable = 0x003A7FB0u;
+    constexpr uint32_t kCriHandleStride = 0x238u;
+    constexpr int kCriHandleCount = 32;
+    constexpr uint32_t kCriDispatchTable = 0x0049C6A0u;
+    constexpr uint32_t kCriDispatchStride = 0x30u;
+    constexpr uint32_t kCriRequestPool = 0x003B1998u;
+    constexpr uint32_t kCriRequestInUse = 0x003B199Cu;
+
+    PS2Runtime::RecompiledFunction gDvciPollOriginal = nullptr;
+
+    bool dvciTraceEnabled()
+    {
+        static const bool enabled = std::getenv("TOL_TRACE_DVCI") != nullptr;
+        return enabled;
+    }
+
+    void dumpDvci(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t call, int32_t result)
+    {
+        const uint32_t loadIndex = runtime->Load32(rdram, ctx, kDvciLoadIndex);
+        const uint32_t progress = runtime->Load32(rdram, ctx, kDvciProgress);
+        const uint32_t handle = runtime->Load32(rdram, ctx, kDvciHandlePtr);
+        const uint32_t buffer = runtime->Load32(rdram, ctx, kDvciBuffer);
+        const uint32_t blocks = runtime->Load32(rdram, ctx, kDvciBlocks);
+
+        std::fprintf(stderr,
+                     "[dvci] #%u poll(i=%u) -> %d | pc=0x%08X ra=0x%08X | load=%d progress=%u handle=0x%08X "
+                     "buf=0x%08X blocks=%u\n",
+                     call, GPR_U32(ctx, 4), result, ctx->pc, GPR_U32(ctx, 31),
+                     static_cast<int32_t>(loadIndex), progress, handle, buffer, blocks);
+
+        if (handle >= 0x00100000u && handle < 0x02000000u)
+        {
+            std::fprintf(stderr, "[dvci]   handle:");
+            for (uint32_t off = 0u; off <= 0x2Cu; off += 4u)
+                std::fprintf(stderr, " +%02X=%08X", off, runtime->Load32(rdram, ctx, handle + off));
+            std::fprintf(stderr, "\n");
+            std::fprintf(stderr, "[dvci]   state=%u flags=%u type=%u\n",
+                         static_cast<unsigned>(runtime->Load8(rdram, ctx, handle + 1u)),
+                         static_cast<unsigned>(runtime->Load8(rdram, ctx, handle + 4u)),
+                         static_cast<unsigned>(runtime->Load8(rdram, ctx, handle + 0x0Fu)));
+        }
+
+        if (buffer >= 0x00100000u && buffer < 0x02000000u)
+        {
+            char path[0x40] = {};
+            for (uint32_t i = 0u; i < sizeof(path) - 1u; ++i)
+            {
+                const uint8_t byte = runtime->Load8(rdram, ctx, buffer + 4u + i);
+                if (byte == 0u)
+                    break;
+                path[i] = static_cast<char>(byte);
+            }
+            std::fprintf(stderr, "[dvci]   request: +00=%08X +04=%08X +08=%08X +0C=%08X +110=%08X +114=%08X path='%s'\n",
+                         runtime->Load32(rdram, ctx, buffer + 0x00u),
+                         runtime->Load32(rdram, ctx, buffer + 0x04u),
+                         runtime->Load32(rdram, ctx, buffer + 0x08u),
+                         runtime->Load32(rdram, ctx, buffer + 0x0Cu),
+                         runtime->Load32(rdram, ctx, buffer + 0x110u),
+                         runtime->Load32(rdram, ctx, buffer + 0x114u), path);
+        }
+
+        // The 32 slots of the CRI handle table; only slots that look live are worth printing.
+        for (int slot = 0; slot < kCriHandleCount; ++slot)
+        {
+            const uint32_t record = kCriHandleTable + static_cast<uint32_t>(slot) * kCriHandleStride;
+            const uint32_t state = runtime->Load8(rdram, ctx, record + 1u);
+            const uint32_t flags = runtime->Load8(rdram, ctx, record + 4u);
+            const uint32_t size = runtime->Load32(rdram, ctx, record + 0x24u);
+            if (state == 0u && flags == 0u && size == 0u)
+                continue;
+            std::fprintf(stderr,
+                         "[dvci]   slot[%d] state=%u flags=%u entries=%u cursor=%u size=%u\n", slot,
+                         static_cast<unsigned>(state), static_cast<unsigned>(flags),
+                         runtime->Load32(rdram, ctx, record + 0x08u),
+                         runtime->Load32(rdram, ctx, record + 0x20u), size);
+        }
+
+        // Raw heads: the device slot table the ADXF pump walks (0x3A7FB0, 0x238 per slot, live when byte 0
+        // is 1), the six dispatch callbacks of pump slot 5 (0x49C6A0 + 5*0x30), and the CRI request pool at
+        // 0x3B1998 (0x40 per record, in-use flag at 0x3B199C + i*0x10).
+        if (call == 1u || call == 20000u)
+        {
+            for (int slot = 0; slot < 3; ++slot)
+            {
+                const uint32_t record = kCriHandleTable + static_cast<uint32_t>(slot) * kCriHandleStride;
+                std::fprintf(stderr, "[dvci]   za7fb0[%d]:", slot);
+                for (uint32_t off = 0u; off <= 0x1Cu; off += 4u)
+                    std::fprintf(stderr, " +%02X=%08X", off, runtime->Load32(rdram, ctx, record + off));
+                std::fprintf(stderr, "\n");
+            }
+            std::fprintf(stderr, "[dvci]   pump5 callbacks:");
+            for (uint32_t i = 0u; i < 6u; ++i)
+                std::fprintf(stderr, " %u=0x%08X", i,
+                             runtime->Load32(rdram, ctx, kCriDispatchTable + 5u * kCriDispatchStride + i * 8u));
+            std::fprintf(stderr, "\n");
+            std::fprintf(stderr, "[dvci]   adxf pump: gate=0x%08X\n", runtime->Load32(rdram, ctx, 0x0039E838u));
+            for (int slot = 0; slot < 6; ++slot)
+            {
+                const uint32_t record =
+                    runtime->Load32(rdram, ctx, kDvciRequestTable + static_cast<uint32_t>(slot) * 4u);
+                if (record < 0x00100000u || record >= 0x02000000u)
+                {
+                    std::fprintf(stderr, " [dvci]   reqrec[%d]=0x%08X (not a pointer)\n", slot, record);
+                    continue;
+                }
+                std::fprintf(stderr, " [dvci]   reqrec[%d]=0x%08X:", slot, record);
+                for (uint32_t off = 0u; off <= 0x1Cu; off += 4u)
+                    std::fprintf(stderr, " +%02X=%08X", off, runtime->Load32(rdram, ctx, record + off));
+                std::fprintf(stderr, " type=%u\n", runtime->Load8(rdram, ctx, record + 0x0Fu));
+                std::fprintf(stderr, " [dvci]     extents[%d]:", slot);
+                for (uint32_t off = 0x100u; off <= 0x128u; off += 4u)
+                    std::fprintf(stderr, " +%03X=%08X", off, runtime->Load32(rdram, ctx, record + off));
+                std::fprintf(stderr, "\n");
+            }
+            for (int slot = 0; slot < 4; ++slot)
+            {
+                const uint32_t record = 0x0039E848u + static_cast<uint32_t>(slot) * 0x60u;
+                std::fprintf(stderr, " [dvci]   adxf[%d] active=%u:", slot, runtime->Load8(rdram, ctx, record));
+                for (uint32_t off = 0u; off <= 0x1Cu; off += 4u)
+                    std::fprintf(stderr, " +%02X=%08X", off, runtime->Load32(rdram, ctx, record + off));
+                std::fprintf(stderr, "\n");
+            }
+            {
+                // The reader the DVCI handle points at (handle + 4) is slot 16 of the same table.
+                const uint32_t handle = runtime->Load32(rdram, ctx, kDvciHandlePtr);
+                const uint32_t reader = handle >= 0x00100000u && handle < 0x02000000u
+                                            ? runtime->Load32(rdram, ctx, handle + 4u)
+                                            : 0u;
+                if (reader >= 0x00100000u && reader < 0x02000000u)
+                {
+                    std::fprintf(stderr, "[dvci]   reader slot=0x%08X:", reader);
+                    for (uint32_t off = 0u; off <= 0x2Cu; off += 4u)
+                        std::fprintf(stderr, " +%02X=%08X", off, runtime->Load32(rdram, ctx, reader + off));
+                    std::fprintf(stderr, " active=%u\n", runtime->Load8(rdram, ctx, reader));
+                    std::fprintf(stderr, "[dvci]   reader tail:");
+                    for (uint32_t off = 0x30u; off <= 0x5Cu; off += 4u)
+                        std::fprintf(stderr, " +%02X=%08X", off, runtime->Load32(rdram, ctx, reader + off));
+                    std::fprintf(stderr, "\n[dvci]   reader flags: 44=%u 45=%u 46=%u 47=%u 48=%u 49=%u\n",
+                                 runtime->Load8(rdram, ctx, reader + 0x44u),
+                                 runtime->Load8(rdram, ctx, reader + 0x45u),
+                                 runtime->Load8(rdram, ctx, reader + 0x46u),
+                                 runtime->Load8(rdram, ctx, reader + 0x47u),
+                                 runtime->Load8(rdram, ctx, reader + 0x48u),
+                                 runtime->Load8(rdram, ctx, reader + 0x49u));
+                    // reader+8 is the CRI file object: [0] = device object with inline slots
+                    // (+0x10 open, +0x18 seek, +0x1C tell, +0x20 read submit, +0x2C status), [1] = device handle.
+                    const uint32_t fileObject = runtime->Load32(rdram, ctx, reader + 8u);
+                    if (fileObject >= 0x00100000u && fileObject < 0x02000000u)
+                    {
+                        const uint32_t device = runtime->Load32(rdram, ctx, fileObject);
+                        std::fprintf(stderr, "[dvci]   fileobj=0x%08X dev=0x%08X handle=0x%08X\n", fileObject, device,
+                                     runtime->Load32(rdram, ctx, fileObject + 4u));
+                        if (device >= 0x00100000u && device < 0x02000000u)
+                        {
+                            std::fprintf(stderr, "[dvci]     dev slots:");
+                            for (uint32_t off = 0u; off <= 0x2Cu; off += 4u)
+                                std::fprintf(stderr, " +%02X=%08X", off, runtime->Load32(rdram, ctx, device + off));
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                }
+            }
+            for (int slot = 0; slot < 4; ++slot)
+            {
+                const uint32_t record = kCriRequestPool + static_cast<uint32_t>(slot) * 0x40u;
+                std::fprintf(stderr, " [dvci]   req[%d] used=%u:", slot,
+                             runtime->Load32(rdram, ctx, kCriRequestInUse + static_cast<uint32_t>(slot) * 0x40u));
+                for (uint32_t off = 0u; off <= 0x1Cu; off += 4u)
+                    std::fprintf(stderr, " +%02X=%08X", off, runtime->Load32(rdram, ctx, record + off));
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
+
+    // The poll reports failures through FUN_00195A18, which formats the message with the library's own sprintf;
+    // wrapping it and dumping its string argument is what names the failing branch instead of guessing from the
+    // decompiler's shape.
+    constexpr uint32_t kDvciErrorPrintPc = 0x00195A18u;
+    PS2Runtime::RecompiledFunction gDvciErrorPrintOriginal = nullptr;
+
+    std::string guestString(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        std::string text;
+        if (address < 0x00100000u || address >= 0x02000000u)
+            return text;
+        for (uint32_t i = 0u; i < 160u; ++i)
+        {
+            const uint8_t byte = runtime->Load8(rdram, ctx, address + i);
+            if (byte == 0u)
+                break;
+            text.push_back(static_cast<char>(byte < 0x20u || byte > 0x7Eu ? '.' : byte));
+        }
+        return text;
+    }
+
+    void dvciErrorPrintProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sPrints = 0u;
+        if (++sPrints <= 24u)
+        {
+            std::fprintf(stderr, "[dvci] error print ra=0x%08X text='%s'\n", GPR_U32(ctx, 31),
+                         guestString(rdram, ctx, runtime, GPR_U32(ctx, 4)).c_str());
+        }
+        if (gDvciErrorPrintOriginal != nullptr)
+            gDvciErrorPrintOriginal(rdram, ctx, runtime);
+    }
+
+    constexpr uint32_t kDvciStartPc = 0x00196058u;
+    PS2Runtime::RecompiledFunction gDvciStartOriginal = nullptr;
+
+    void dvciStartProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sStarts = 0u;
+        const uint32_t call = ++sStarts;
+        const uint32_t index = GPR_U32(ctx, 4);
+
+        if (gDvciStartOriginal != nullptr)
+            gDvciStartOriginal(rdram, ctx, runtime);
+
+        if (call <= 24u)
+        {
+            std::fprintf(stderr, "[dvci] start(i=%u) #%u -> %d | ptid=%d handle=0x%08X\n", index, call,
+                         static_cast<int32_t>(GPR_U32(ctx, 2)),
+                         static_cast<int32_t>(runtime->Load32(rdram, ctx, kDvciLoadIndex)),
+                         runtime->Load32(rdram, ctx, kDvciHandlePtr));
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // DVCI SIZE BOOTSTRAP SHIM (TOL_DVCI_SIZE_SHIM=1) - diagnostic, and proof of the mechanism.
+    //
+    // The CRI file device keeps the file size at device-handle+0x08 and the current position at +0x0C, both counted
+    // in 2048-byte SECTORS; its seek slot (FUN_001AD780) computes position = [+0x08] + offset for SEEK_END and its
+    // tell slot (FUN_001AD818) returns [+0x0C]. The device never learns the size in this port, so seek(END)+tell
+    // yields 0, FUN_0019f298 stores that into the ADXF stream's sector count (stream+0x14) and bytes (stream+0x10
+    // = count << 11), FUN_00196960 copies it into the DVCI handle's +0x0C, and FUN_00196db0 then sees
+    // "0 sectors remaining" and marks the partition DONE without issuing a read - the whole "not AFS" failure.
+    //
+    // With this shim in place the port really does load: `gamefile read handle 8 2048/2048 bytes at 0x00391140`
+    // appears, the 430-entry SYS_REG.AFS extent table starts parsing (DVCI progress advances 0 -> 255, which is
+    // one 2048-byte block's worth of 8-byte entries) and the "Illegal format(not AFS)" error disappears.
+    //
+    // It is not the final fix, and it is not enough on its own: the remaining gap is that the SECOND block read
+    // never completes. FUN_001970e8 issues it without a blocking wait, so it depends on the SJRBF pump
+    // (FUN_001b0d00) walking the device table at 0x003A7FB0 - and that table is empty because FUN_001b0870 (the
+    // only slot registrar) is never called for this stream. The first block completed only because FUN_00196db0's
+    // own blocking wait (FUN_0019eec8 -> FUN_00197940) pumped it inline.
+    constexpr uint32_t kCriDeviceSeekPc = 0x001AD780u;
+    PS2Runtime::RecompiledFunction gCriSeekOriginal = nullptr;
+
+    void criSeekProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t handle = GPR_U32(ctx, 4);
+        const uint32_t offset = GPR_U32(ctx, 5);
+        const uint32_t whence = GPR_U32(ctx, 6);
+
+        if (gCriSeekOriginal != nullptr)
+            gCriSeekOriginal(rdram, ctx, runtime);
+
+        if (whence == 2u && offset == 0u && gLastGameFileSize != 0u && handle >= 0x00100000u &&
+            handle < 0x02000000u)
+        {
+            // The device counts in 2048-byte sectors, not bytes: FUN_0019f298 stores this value straight into
+            // the ADXF stream's sector count (stream+0x14) and derives the byte window as count << 11, and the
+            // DVCI handle's +0x0C is that same sector count. Patching bytes makes the byte window overflow
+            // (0xDF800000) and nothing reads.
+            const uint32_t sectors = static_cast<uint32_t>((gLastGameFileSize + 0x7FFu) >> 11);
+            runtime->Store32(rdram, ctx, handle + 0x08u, sectors);
+            runtime->Store32(rdram, ctx, handle + 0x0Cu, sectors);
+            static uint32_t sPatched = 0u;
+            if (++sPatched <= 12u)
+            {
+                std::fprintf(stderr, "[dvci] seek(END) handle=0x%08X -> %u sectors (%llu bytes) patched\n", handle,
+                             sectors, static_cast<unsigned long long>(gLastGameFileSize));
+            }
+        }
+    }
+
+    // The ADXF stream step (FUN_0019F298) is what should advance a stream: it opens the file, computes the window
+    // and, at its tail, calls the read step FUN_0019EF58 when (`state == 2 && stream[0x49] == 1`). Probing the step
+    // itself (rather than the DVCI handle from the main thread) shows the flags at the exact moment the worker pumps.
+    constexpr uint32_t kAdxfStepPc = 0x0019F298u;
+    PS2Runtime::RecompiledFunction gAdxfStepOriginal = nullptr;
+
+    void dumpStream(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t stream, const char *when)
+    {
+        if (stream < 0x00100000u || stream >= 0x02000000u)
+        {
+            std::fprintf(stderr, "[adxf] %s stream=0x%08X (not a pointer)\n", when, stream);
+            return;
+        }
+        // stream+0x08 is the file object created by the ADXF open; its second word is the device handle the
+        // CRI file driver uses (0x003A6B00 + index*0x48), whose byte +2 is the transfer state (1 = done).
+        uint32_t devHandle = 0u;
+        const uint32_t fileObject = runtime->Load32(rdram, ctx, stream + 8u);
+        if (fileObject >= 0x00100000u && fileObject < 0x02000000u && (fileObject & 3u) == 0u)
+        {
+            devHandle = runtime->Load32(rdram, ctx, fileObject + 4u);
+        }
+        std::fprintf(stderr,
+                     "[adxf] %s stream=0x%08X state=%u | 44=%u 45=%u 46=%u 47=%u 48=%u 49=%u"
+                     " | +10=%08X +14=%08X +18=%08X +1C=%08X +20=%08X +24=%08X +28=%08X"
+                     " | +2C=%08X +30=%08X +34=%08X +40=%08X +50=%08X +54=%08X +58=%08X +5C=%08X"
+                     " | dev=%08X devState=%u sync=%u\n",
+                     when, stream, runtime->Load8(rdram, ctx, stream + 1u),
+                     runtime->Load8(rdram, ctx, stream + 0x44u), runtime->Load8(rdram, ctx, stream + 0x45u),
+                     runtime->Load8(rdram, ctx, stream + 0x46u), runtime->Load8(rdram, ctx, stream + 0x47u),
+                     runtime->Load8(rdram, ctx, stream + 0x48u), runtime->Load8(rdram, ctx, stream + 0x49u),
+                     runtime->Load32(rdram, ctx, stream + 0x10u), runtime->Load32(rdram, ctx, stream + 0x14u),
+                     runtime->Load32(rdram, ctx, stream + 0x18u), runtime->Load32(rdram, ctx, stream + 0x1Cu),
+                     runtime->Load32(rdram, ctx, stream + 0x20u), runtime->Load32(rdram, ctx, stream + 0x24u),
+                     runtime->Load32(rdram, ctx, stream + 0x28u), runtime->Load32(rdram, ctx, stream + 0x2Cu),
+                     runtime->Load32(rdram, ctx, stream + 0x30u), runtime->Load32(rdram, ctx, stream + 0x34u),
+                     runtime->Load32(rdram, ctx, stream + 0x40u),
+                     runtime->Load32(rdram, ctx, stream + 0x50u), runtime->Load32(rdram, ctx, stream + 0x54u),
+                     runtime->Load32(rdram, ctx, stream + 0x58u), runtime->Load32(rdram, ctx, stream + 0x5Cu),
+                     devHandle,
+                     (devHandle >= 0x00100000u && devHandle < 0x02000000u)
+                         ? runtime->Load8(rdram, ctx, devHandle + 2u)
+                         : 0u,
+                     runtime->Load32(rdram, ctx, 0x003A7784u));
+    }
+
+    void adxfStepProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t call = ++sCalls;
+        const uint32_t stream = GPR_U32(ctx, 4);
+        const bool log = call <= 40u;
+
+        if (log)
+            dumpStream(rdram, ctx, runtime, stream, "step-in ");
+
+        if (gAdxfStepOriginal != nullptr)
+            gAdxfStepOriginal(rdram, ctx, runtime);
+
+        if (log)
+        {
+            dumpStream(rdram, ctx, runtime, stream, "step-out");
+            std::fprintf(stderr, "[adxf] step #%u done pc=0x%08X\n", call, ctx->pc);
+        }
+    }
+
+    // FUN_001973A8 is the DVCI progress tick: it walks 16 handles at 0x00390738 (stride 0x44) and calls the credit
+    // routine FUN_001972E0 for every handle whose byte 0 is 1. The pump runs it ~35x per run but the credit routine
+    // is entered once, so the active flag the iterator sees is not the one the poll reports - this probe prints the
+    // flags from inside the pump to settle it.
+    constexpr uint32_t kDvciTickPc = 0x001973A8u;
+    constexpr uint32_t kDvciHandleTable = 0x00390738u;
+    constexpr uint32_t kDvciHandleStride = 0x44u;
+    PS2Runtime::RecompiledFunction gDvciTickOriginal = nullptr;
+
+    void dvciTickProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sTicks = 0u;
+        const uint32_t tick = ++sTicks;
+        if (tick <= 10u || (tick % 8u) == 0u)
+        {
+            std::fprintf(stderr, "[dvci] tick #%u flags:", tick);
+            for (int slot = 0; slot < 16; ++slot)
+            {
+                const uint32_t record = kDvciHandleTable + static_cast<uint32_t>(slot) * kDvciHandleStride;
+                const uint32_t b0 = runtime->Load8(rdram, ctx, record);
+                if (b0 == 0u)
+                    continue;
+                std::fprintf(stderr, " [%d]0x%08X b0=%u b1=%u", slot, record, b0,
+                             runtime->Load8(rdram, ctx, record + 1u));
+            }
+            std::fprintf(stderr, " | dvci handle=0x%08X\n", runtime->Load32(rdram, ctx, kDvciHandlePtr));
+
+            // The done-vs-total question, read from inside the tick: FUN_0019EF58 only sets stream[+1] = 3 when
+            // blocksDone (stream+0x58) reaches totalSectors (stream+0x14); until then it keeps arming blocks.
+            const uint32_t handlePtr = runtime->Load32(rdram, ctx, kDvciHandlePtr);
+            if (handlePtr >= 0x00100000u && handlePtr < 0x02000000u)
+            {
+                const uint32_t reader = runtime->Load32(rdram, ctx, handlePtr + 4u);
+                if (reader >= 0x00100000u && reader < 0x02000000u)
+                {
+                    std::fprintf(stderr,
+                                 "[dvci]   credit: handleState=%u consumed=%u transfer=%u | streamState=%u"
+                                 " blocksDone=%u totalSectors=%u totalBytes=%08X doneBytes=%u pending=%u\n",
+                                 runtime->Load8(rdram, ctx, handlePtr + 1u),
+                                 runtime->Load32(rdram, ctx, handlePtr + 0x14u),
+                                 runtime->Load32(rdram, ctx, handlePtr + 0x1Cu),
+                                 runtime->Load8(rdram, ctx, reader + 1u), runtime->Load32(rdram, ctx, reader + 0x58u),
+                                 runtime->Load32(rdram, ctx, reader + 0x14u),
+                                 runtime->Load32(rdram, ctx, reader + 0x10u),
+                                 runtime->Load32(rdram, ctx, reader + 0x34u), runtime->Load32(rdram, ctx, reader + 0x20u));
+                }
+            }
+        }
+        if (gDvciTickOriginal != nullptr)
+            gDvciTickOriginal(rdram, ctx, runtime);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // CRI I/O LATENCY (TOL_CRI_IO_LATENCY=1) - diagnostic.
+    //
+    // FUN_00197940 pumps as `FUN_0019f468(); â€¦ FUN_0019f468(); FUN_001973a8();` and the tick FUN_001973a8 (which
+    // credits the DVCI handle) therefore samples the ADXF stream AFTER two stream pumps. Our file RPCs complete
+    // synchronously, so a read goes 2 (reading) -> 3 (done) -> 2 (next read armed) inside one cycle and the tick
+    // almost never observes 3: measured 1 observation in 148k polls, which is why the 430-entry AFS table freezes at
+    // 255 entries. Real hardware takes milliseconds, so state 3 survives many pump cycles.
+    //
+    // This wrapper gives every completed device read one extra poll of latency (reports "busy" once, then "done"),
+    // restoring the window the guest's state machine expects.
+    constexpr uint32_t kCriDeviceStatusPc = 0x001ADAF8u;
+    PS2Runtime::RecompiledFunction gCriStatusOriginal = nullptr;
+
+    struct CriStatusDefer
+    {
+        uint32_t handle = 0u;
+        bool deferred = false;
+    };
+    CriStatusDefer gCriStatusDefer[8] = {};
+
+    void criStatusLatencyProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t handle = GPR_U32(ctx, 4);
+
+        if (gCriStatusOriginal != nullptr)
+            gCriStatusOriginal(rdram, ctx, runtime);
+
+        const uint32_t status = GPR_U32(ctx, 2);
+        if (status != 1u || handle == 0u)
+            return;
+
+        CriStatusDefer *slot = nullptr;
+        for (CriStatusDefer &entry : gCriStatusDefer)
+        {
+            if (entry.handle == handle)
+            {
+                slot = &entry;
+                break;
+            }
+            if (slot == nullptr && entry.handle == 0u)
+                slot = &entry;
+        }
+        if (slot == nullptr)
+            return;
+        slot->handle = handle;
+
+        if (!slot->deferred)
+        {
+            // First observation of "done": hold it one pump so the tick can still see state 3.
+            slot->deferred = true;
+            SET_GPR_U32(ctx, 2, 0u);
+        }
+        else
+        {
+            // Second observation: let the completion through.
+            slot->deferred = false;
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // CRI DEVICE READ PROBE (TOL_TRACE_DVCI=1) - diagnostic.
+    //
+    // The DVCI device runs in ASYNCHRONOUS mode (DAT_003A7784 == 0): the read slot FUN_001ad850 starts a transfer,
+    // stores handle[+2] = 2 (busy) and expects a completion to raise it to 1. The stream step FUN_0019ef58 only
+    // credits blocks/bytes when the status it samples is exactly 1; status 3 is its discard branch. Logging the
+    // entry state, the return value and the exit state shows whether a read was refused (busy) or accepted.
+    constexpr uint32_t kCriDeviceReadPc = 0x001AD850u;
+    PS2Runtime::RecompiledFunction gCriReadOriginal = nullptr;
+
+    void criReadProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t handle = GPR_U32(ctx, 4);
+        const uint32_t blocks = GPR_U32(ctx, 5);
+        const uint32_t buffer = GPR_U32(ctx, 6);
+        const bool valid = handle >= 0x00100000u && handle < 0x02000000u;
+        const uint8_t before = valid ? runtime->Load8(rdram, ctx, handle + 2u) : 0u;
+
+        if (gCriReadOriginal != nullptr)
+            gCriReadOriginal(rdram, ctx, runtime);
+
+        const uint32_t ret = GPR_U32(ctx, 2);
+        const uint8_t after = valid ? runtime->Load8(rdram, ctx, handle + 2u) : 0u;
+        static uint32_t sReads = 0u;
+        if (++sReads <= 40u)
+        {
+            std::fprintf(stderr,
+                         "[cri] read handle=0x%08X blocks=%u buf=0x%08X state=%u->%u ret=%u | pos=%u/%u mode=%u"
+                         " | 18=%08X 1C=%08X 20=%08X 24=%08X\n",
+                         handle, blocks, buffer, before, after, ret,
+                         valid ? runtime->Load32(rdram, ctx, handle + 0x0Cu) : 0u,
+                         valid ? runtime->Load32(rdram, ctx, handle + 0x08u) : 0u,
+                         valid ? runtime->Load8(rdram, ctx, handle + 0x44u) : 0u,
+                         valid ? runtime->Load32(rdram, ctx, handle + 0x18u) : 0u,
+                         valid ? runtime->Load32(rdram, ctx, handle + 0x1Cu) : 0u,
+                         valid ? runtime->Load32(rdram, ctx, handle + 0x20u) : 0u,
+                         valid ? runtime->Load32(rdram, ctx, handle + 0x24u) : 0u);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // GAME READ CLIENT PROBE (TOL_TRACE_DVCI=1) - diagnostic.
+    //
+    // FUN_001029a8 is the game's block-read client (sid 0x80000595 fn 1). The SJRBF request machine
+    // FUN_001ab4f8 turns state 1 into state 9 (device error) exactly when this returns anything but 1, and the
+    // DVCI completion poll FUN_001ad220 then latches the entry to 3, which is the ADXF "discard" branch.
+    constexpr uint32_t kGameReadPc = 0x001029A8u;
+    PS2Runtime::RecompiledFunction gGameReadOriginal = nullptr;
+
+    void gameReadProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t handle = GPR_U32(ctx, 4);
+        const uint32_t blocks = GPR_U32(ctx, 5);
+        const uint32_t buffer = GPR_U32(ctx, 6);
+        const uint32_t desc = GPR_U32(ctx, 7);
+        const uint32_t ra = GPR_U32(ctx, 31);
+
+        if (gGameReadOriginal != nullptr)
+            gGameReadOriginal(rdram, ctx, runtime);
+
+        const uint32_t ret = GPR_U32(ctx, 2);
+        static uint32_t sReads = 0u;
+        if (++sReads <= 60u)
+        {
+            const uint8_t mode = (desc >= 0x00100000u && desc < 0x02000000u)
+                                     ? runtime->Load8(rdram, ctx, desc + 2u)
+                                     : 0u;
+            std::fprintf(stderr, "[cri] gameread handle=%u blocks=%u buf=0x%08X mode=%u ra=0x%08X -> %u\n", handle,
+                         blocks, buffer, mode, ra, ret);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // PER-REQUEST STREAM WINDOW (TOL_CRI_WINDOW_FIX=1)
+    //
+    // FUN_00196960 opens the cache-miss stream with the hardcoded "whole file" sentinel (FUN_0019ec90(stream, fd,
+    // size, 0, 0xFFFFF)); FUN_0019f298 then resolves that to the file size, so stream[+0x14] (total sectors) becomes
+    // 894 for SYS_REG.AFS. FUN_0019EF58 only sets stream[+1] = 3 when stream[+0x58] (blocks done) reaches
+    // stream[+0x14], but the DVCI layer arms ONE sector per request - so after the first completion the window is 1
+    // of 894 and can never be satisfied again. Measured: handleState went 3 once (consumed 1) and then stayed 2.
+    //
+    // The window belongs to the request, not the file: FUN_00196DB0 ends its arming sequence with
+    // FUN_0019ee18(stream, handle[+0x1c]) where handle[+0x1c] is the transfer size in sectors. Setting the window
+    // from that argument makes one request equal one window, which is what the DVCI state machine expects.
+    constexpr uint32_t kAdxfArmPc = 0x0019EE18u;
+    PS2Runtime::RecompiledFunction gAdxfArmOriginal = nullptr;
+
+    void adxfArmProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t stream = GPR_U32(ctx, 4);
+        const uint32_t sectors = GPR_U32(ctx, 5);
+
+        if (gAdxfArmOriginal != nullptr)
+            gAdxfArmOriginal(rdram, ctx, runtime);
+
+        if (sectors == 0u || stream < 0x00100000u || stream >= 0x02000000u)
+            return;
+
+        runtime->Store32(rdram, ctx, stream + 0x14u, sectors);              // total sectors = this request
+        runtime->Store32(rdram, ctx, stream + 0x58u, 0u);                  // blocks done in this window
+        runtime->Store32(rdram, ctx, stream + 0x10u, sectors << 11);       // total bytes
+
+        static uint32_t sArms = 0u;
+        if (std::getenv("TOL_TRACE_DVCI") != nullptr && ++sArms <= 60u)
+        {
+            std::fprintf(stderr,
+                         "[dvci] window #%u: stream=0x%08X -> %u sector(s); now total=%u done=%u bytes=%08X\n", sArms,
+                         stream, sectors, runtime->Load32(rdram, ctx, stream + 0x14u),
+                         runtime->Load32(rdram, ctx, stream + 0x58u), runtime->Load32(rdram, ctx, stream + 0x10u));
+        }
+    }
+
+    void dvciPollProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        static uint32_t sSawThree = 0u;
+        static uint32_t sSawCount = 0u;
+        static uint32_t sLoadFive = 0u;
+        const uint32_t call = ++sCalls;
+
+        // Entry state, before the original runs: this is exactly what the poll's own ptid/state checks see.
+        const uint32_t indexAtEntry = GPR_U32(ctx, 4);
+        const uint32_t handleAtEntry = runtime->Load32(rdram, ctx, kDvciHandlePtr);
+        uint32_t stateAtEntry = 0xFFu;
+        if (handleAtEntry >= 0x00100000u && handleAtEntry < 0x02000000u)
+            stateAtEntry = runtime->Load8(rdram, ctx, handleAtEntry + 1u);
+        uint32_t countAtEntry = 0u;
+        if (indexAtEntry < 16u)
+        {
+            const uint32_t rec = runtime->Load32(rdram, ctx, kDvciRequestTable + indexAtEntry * 4u);
+            if (rec >= 0x00100000u && rec < 0x02000000u)
+                countAtEntry = runtime->Load32(rdram, ctx, rec + 8u);
+        }
+        uint32_t totalAtEntry = 0u;
+        uint32_t transferAtEntry = 0u;
+        uint32_t consumedAtEntry = 0u;
+        if (handleAtEntry >= 0x00100000u && handleAtEntry < 0x02000000u)
+        {
+            totalAtEntry = runtime->Load32(rdram, ctx, handleAtEntry + 0x0Cu);
+            transferAtEntry = runtime->Load32(rdram, ctx, handleAtEntry + 0x1Cu);
+            consumedAtEntry = runtime->Load32(rdram, ctx, handleAtEntry + 0x14u);
+        }
+        const uint32_t progressAtEntry = runtime->Load32(rdram, ctx, kDvciProgress);
+        const uint32_t ptidAtEntry = runtime->Load32(rdram, ctx, kDvciLoadIndex);
+
+        if (stateAtEntry == 3u)
+            ++sSawThree;
+        if (countAtEntry != 0u)
+            ++sSawCount;
+
+        if (call <= 6u || (stateAtEntry == 3u && sSawThree <= 20u) || (indexAtEntry == 5u && sLoadFive++ < 10u))
+        {
+            std::fprintf(stderr,
+                         "[poll-in] #%u i=%u ptid=%d state=%u count=%u progress=%u total=%u consumed=%u transfer=%u"
+                         " | saw3=%u sawCount=%u\n",
+                         call, indexAtEntry, static_cast<int32_t>(ptidAtEntry), stateAtEntry, countAtEntry,
+                         progressAtEntry, totalAtEntry, consumedAtEntry, transferAtEntry, sSawThree, sSawCount);
+        }
+
+        const bool log = call <= 16u || (call % 512u) == 0u;
+        if (gDvciPollOriginal != nullptr)
+            gDvciPollOriginal(rdram, ctx, runtime);
+
+        if (log)
+        {
+            dumpDvci(rdram, ctx, runtime, call, static_cast<int32_t>(GPR_U32(ctx, 2)));
+        }
+    }
 }
 
 namespace tol
@@ -1035,6 +1766,99 @@ namespace tol
                 std::fprintf(stderr, "[tick] probe installed on 0x%08X (state 0x%08X)\n", kTickLoopPc, kTickState);
             }
         }
+        if (dvciTraceEnabled())
+        {
+            PS2Runtime::RecompiledFunction original = runtime.lookupFunction(kDvciPollPc);
+            if (original == nullptr)
+            {
+                std::fprintf(stderr, "[dvci] 0x%08X is not in the function table\n", kDvciPollPc);
+            }
+            else
+            {
+                gDvciPollOriginal = original;
+                runtime.replaceFunction(kDvciPollPc, &dvciPollProbe);
+                std::fprintf(stderr, "[dvci] probe installed on 0x%08X\n", kDvciPollPc);
+            }
+            PS2Runtime::RecompiledFunction errorPrint = runtime.lookupFunction(kDvciErrorPrintPc);
+            if (errorPrint != nullptr)
+            {
+                gDvciErrorPrintOriginal = errorPrint;
+                runtime.replaceFunction(kDvciErrorPrintPc, &dvciErrorPrintProbe);
+                std::fprintf(stderr, "[dvci] error-print probe installed on 0x%08X\n", kDvciErrorPrintPc);
+            }
+            PS2Runtime::RecompiledFunction start = runtime.lookupFunction(kDvciStartPc);
+            if (start != nullptr)
+            {
+                gDvciStartOriginal = start;
+                runtime.replaceFunction(kDvciStartPc, &dvciStartProbe);
+                std::fprintf(stderr, "[dvci] start probe installed on 0x%08X\n", kDvciStartPc);
+            }
+            PS2Runtime::RecompiledFunction step = runtime.lookupFunction(kAdxfStepPc);
+            if (step != nullptr)
+            {
+                gAdxfStepOriginal = step;
+                runtime.replaceFunction(kAdxfStepPc, &adxfStepProbe);
+                std::fprintf(stderr, "[adxf] step probe installed on 0x%08X\n", kAdxfStepPc);
+            }
+            PS2Runtime::RecompiledFunction tick = runtime.lookupFunction(kDvciTickPc);
+            if (tick != nullptr)
+            {
+                gDvciTickOriginal = tick;
+                runtime.replaceFunction(kDvciTickPc, &dvciTickProbe);
+                std::fprintf(stderr, "[dvci] tick probe installed on 0x%08X\n", kDvciTickPc);
+            }
+            PS2Runtime::RecompiledFunction read = runtime.lookupFunction(kCriDeviceReadPc);
+            if (read != nullptr)
+            {
+                gCriReadOriginal = read;
+                runtime.replaceFunction(kCriDeviceReadPc, &criReadProbe);
+                std::fprintf(stderr, "[dvci] device read probe installed on 0x%08X\n", kCriDeviceReadPc);
+            }
+            PS2Runtime::RecompiledFunction gameRead = runtime.lookupFunction(kGameReadPc);
+            if (gameRead != nullptr)
+            {
+                gGameReadOriginal = gameRead;
+                runtime.replaceFunction(kGameReadPc, &gameReadProbe);
+                std::fprintf(stderr, "[dvci] game read probe installed on 0x%08X\n", kGameReadPc);
+            }
+        }
+
+        // Behaviour-changing replacements live OUTSIDE the TOL_TRACE_DVCI gate; each is enabled by its own variable.
+        // Gating them behind the trace made the window fix look timing-dependent - it was simply never installed
+        // unless the probes were on.
+        if (std::getenv("TOL_DVCI_SIZE_SHIM") != nullptr)
+        {
+            PS2Runtime::RecompiledFunction seek = runtime.lookupFunction(kCriDeviceSeekPc);
+            if (seek != nullptr)
+            {
+                gCriSeekOriginal = seek;
+                runtime.replaceFunction(kCriDeviceSeekPc, &criSeekProbe);
+                std::fprintf(stderr, "[dvci] size shim installed on 0x%08X\n", kCriDeviceSeekPc);
+            }
+        }
+        if (std::getenv("TOL_CRI_IO_LATENCY") != nullptr)
+        {
+            PS2Runtime::RecompiledFunction status = runtime.lookupFunction(kCriDeviceStatusPc);
+            if (status != nullptr)
+            {
+                gCriStatusOriginal = status;
+                runtime.replaceFunction(kCriDeviceStatusPc, &criStatusLatencyProbe);
+                std::fprintf(stderr, "[dvci] io-latency shim installed on 0x%08X\n", kCriDeviceStatusPc);
+            }
+        }
+        if (std::getenv("TOL_CRI_WINDOW_FIX") != nullptr)
+        {
+            PS2Runtime::RecompiledFunction arm = runtime.lookupFunction(kAdxfArmPc);
+            if (arm != nullptr)
+            {
+                gAdxfArmOriginal = arm;
+                runtime.replaceFunction(kAdxfArmPc, &adxfArmProbe);
+                std::fprintf(stderr, "[dvci] per-request window installed on 0x%08X\n", kAdxfArmPc);
+            }
+        }
         std::fprintf(stderr, "[tol] no native overrides installed (the Timer-2 override was withdrawn)\n");
     }
 }
+
+
+
