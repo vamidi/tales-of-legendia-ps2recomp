@@ -61,9 +61,6 @@ namespace
     uint32_t gGameFileHandle[kMaxGameFiles] = {};
     std::FILE *gGameFileStream[kMaxGameFiles] = {};
     uint64_t gGameFileSize[kMaxGameFiles] = {};
-    // Diagnostic for the DVCI/ADXF size bootstrap (TOL_DVCI_SIZE_SHIM): the size of the most recently opened
-    // game file, i.e. the file the CRI file device is about to seek/tell on.
-    uint64_t gLastGameFileSize = 0u;
 
     // Opens through the same path translation the runtime's fileio stubs use, so "\AFS\FLIST.DIR;1"
     // lands on cdRoot + AFS/FLIST.DIR with the ISO version suffix stripped. The path was never the
@@ -113,7 +110,6 @@ namespace
                         gGameFileSize[i] = static_cast<uint64_t>(size);
                 }
                 std::fseek(stream, 0, SEEK_SET);
-                gLastGameFileSize = gGameFileSize[i];
                 if (trace)
                     std::fprintf(stderr, "[fileio] gamefile open '%s' -> '%s' ok, %llu bytes (base sector 0x%X)\n",
                                  guestPath.c_str(), hostPath.c_str(),
@@ -1340,60 +1336,26 @@ namespace
     }
 
     // ---------------------------------------------------------------------------------------------------------
-    // DVCI SIZE BOOTSTRAP SHIM (TOL_DVCI_SIZE_SHIM=1) - diagnostic, and proof of the mechanism.
+    // The CRI file device keeps the file size at device-handle+0x08 and the current position at +0x0C, both
+    // counted in 2048-byte SECTORS; its seek slot FUN_001AD780 computes position = [+0x08] + offset for SEEK_END
+    // and its tell slot FUN_001AD818 returns [+0x0C]. FUN_0019f298 turns that into the ADXF stream's sector
+    // count (stream+0x14) and byte window (stream+0x10 = count << 11), and FUN_00196960 copies it into the DVCI
+    // handle's +0x0C.
     //
-    // The CRI file device keeps the file size at device-handle+0x08 and the current position at +0x0C, both counted
-    // in 2048-byte SECTORS; its seek slot (FUN_001AD780) computes position = [+0x08] + offset for SEEK_END and its
-    // tell slot (FUN_001AD818) returns [+0x0C]. The device never learns the size in this port, so seek(END)+tell
-    // yields 0, FUN_0019f298 stores that into the ADXF stream's sector count (stream+0x14) and bytes (stream+0x10
-    // = count << 11), FUN_00196960 copies it into the DVCI handle's +0x0C, and FUN_00196db0 then sees
-    // "0 sectors remaining" and marks the partition DONE without issuing a read - the whole "not AFS" failure.
-    //
-    // With this shim in place the port really does load: `gamefile read handle 8 2048/2048 bytes at 0x00391140`
-    // appears, the 430-entry SYS_REG.AFS extent table starts parsing (DVCI progress advances 0 -> 255, which is
-    // one 2048-byte block's worth of 8-byte entries) and the "Illegal format(not AFS)" error disappears.
-    //
-    // It is not the final fix, and it is not enough on its own: the remaining gap is that the SECOND block read
-    // never completes. FUN_001970e8 issues it without a blocking wait, so it depends on the SJRBF pump
-    // (FUN_001b0d00) walking the device table at 0x003A7FB0 - and that table is empty because FUN_001b0870 (the
-    // only slot registrar) is never called for this stream. The first block completed only because FUN_00196db0's
-    // own blocking wait (FUN_0019eec8 -> FUN_00197940) pumped it inline.
-    constexpr uint32_t kCriDeviceSeekPc = 0x001AD780u;
-    PS2Runtime::RecompiledFunction gCriSeekOriginal = nullptr;
-
-    void criSeekProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        const uint32_t handle = GPR_U32(ctx, 4);
-        const uint32_t offset = GPR_U32(ctx, 5);
-        const uint32_t whence = GPR_U32(ctx, 6);
-
-        if (gCriSeekOriginal != nullptr)
-            gCriSeekOriginal(rdram, ctx, runtime);
-
-        if (whence == 2u && offset == 0u && gLastGameFileSize != 0u && handle >= 0x00100000u &&
-            handle < 0x02000000u)
-        {
-            // The device counts in 2048-byte sectors, not bytes: FUN_0019f298 stores this value straight into
-            // the ADXF stream's sector count (stream+0x14) and derives the byte window as count << 11, and the
-            // DVCI handle's +0x0C is that same sector count. Patching bytes makes the byte window overflow
-            // (0xDF800000) and nothing reads.
-            const uint32_t sectors = static_cast<uint32_t>((gLastGameFileSize + 0x7FFu) >> 11);
-            runtime->Store32(rdram, ctx, handle + 0x08u, sectors);
-            runtime->Store32(rdram, ctx, handle + 0x0Cu, sectors);
-            static uint32_t sPatched = 0u;
-            if (++sPatched <= 12u)
-            {
-                std::fprintf(stderr, "[dvci] seek(END) handle=0x%08X -> %u sectors (%llu bytes) patched\n", handle,
-                             sectors, static_cast<unsigned long long>(gLastGameFileSize));
-            }
-        }
-    }
+    // This used to need a shim (TOL_DVCI_SIZE_SHIM) that answered seek(END) from the host file size, because
+    // the device never learned the size: the open reply is {base, sizeInBytes} and only the base was filled.
+    // The file server now returns the real size at request+0x04 (see openGameFile), so the guest computes the
+    // sector count itself and the shim is gone. Do not reintroduce it - if the size reads 0 again, the open
+    // reply is the place to look.
 
     // The ADXF stream step (FUN_0019F298) is what should advance a stream: it opens the file, computes the window
     // and, at its tail, calls the read step FUN_0019EF58 when (`state == 2 && stream[0x49] == 1`). Probing the step
     // itself (rather than the DVCI handle from the main thread) shows the flags at the exact moment the worker pumps.
     constexpr uint32_t kAdxfStepPc = 0x0019F298u;
     PS2Runtime::RecompiledFunction gAdxfStepOriginal = nullptr;
+    // Shared counter: the poll freeze is really the question "is anyone still pumping the ADXF streams?", so
+    // the poll line reports how many times the stream step has run so far.
+    uint32_t gAdxfStepCalls = 0u;
 
     void dumpStream(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t stream, const char *when)
     {
@@ -1437,15 +1399,71 @@ namespace
     void adxfStepProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         static uint32_t sCalls = 0u;
+        static uint32_t sSame = 0u;
+        static uint32_t sLastTuple = 0xFFFFFFFFu;
         const uint32_t call = ++sCalls;
         const uint32_t stream = GPR_U32(ctx, 4);
         const bool log = call <= 40u;
+        ++gAdxfStepCalls;
 
         if (log)
             dumpStream(rdram, ctx, runtime, stream, "step-in ");
 
         if (gAdxfStepOriginal != nullptr)
             gAdxfStepOriginal(rdram, ctx, runtime);
+
+        // Stall detector: the stream step FUN_0019F298 is a no-op unless it decides to call the read/completion
+        // state machine FUN_0019EF58, and the whole DVCI load waits on that. When it stops changing anything the
+        // poll can never see handle state 3, so print the fields the decision uses instead of guessing.
+        if (stream >= 0x00100000u && stream < 0x02000000u && (stream & 3u) == 0u)
+        {
+            const uint32_t state = runtime->Load8(rdram, ctx, stream + 1u);
+            const uint32_t busy = runtime->Load8(rdram, ctx, stream + 2u);
+            const uint32_t f45 = runtime->Load8(rdram, ctx, stream + 0x45u);
+            const uint32_t f48 = runtime->Load8(rdram, ctx, stream + 0x48u);
+            const uint32_t f49 = runtime->Load8(rdram, ctx, stream + 0x49u);
+            const uint32_t buf = runtime->Load32(rdram, ctx, stream + 0x24u);
+            const uint32_t doneBytes = runtime->Load32(rdram, ctx, stream + 0x34u);
+            const uint32_t blocks = runtime->Load32(rdram, ctx, stream + 0x58u);
+            const uint32_t window = runtime->Load32(rdram, ctx, stream + 0x5Cu);
+            uint32_t devState = 0u;
+            uint32_t devBase = 0u;
+            const uint32_t fileObject = runtime->Load32(rdram, ctx, stream + 8u);
+            if (fileObject >= 0x00100000u && fileObject < 0x02000000u && (fileObject & 3u) == 0u)
+            {
+                const uint32_t dev = runtime->Load32(rdram, ctx, fileObject + 4u);
+                if (dev >= 0x00100000u && dev < 0x02000000u)
+                {
+                    devState = runtime->Load8(rdram, ctx, dev + 2u);
+                    devBase = runtime->Load32(rdram, ctx, dev + 0x20u);
+                }
+            }
+
+            uint32_t tuple = state | (busy << 8) | (f45 << 16) | (f48 << 24);
+            tuple = tuple * 16777619u ^ (f49 + 0x9E3779B9u);
+            tuple = tuple * 16777619u ^ buf;
+            tuple = tuple * 16777619u ^ doneBytes;
+            tuple = tuple * 16777619u ^ (blocks + 0x85EBCA6Bu);
+            tuple = tuple * 16777619u ^ (window + 0xC2B2AE35u);
+            tuple = tuple * 16777619u ^ devState;
+            if (tuple == sLastTuple)
+            {
+                ++sSame;
+                if ((sSame % 400u) == 0u)
+                {
+                    std::fprintf(stderr,
+                                 "[adxf-stall] step #%u unchanged x%u | state=%u busy=%u 45=%u 48=%u 49=%u"
+                                 " buf=0x%08X done=%u blocks=%u win=%u dev=%u devBase=0x%X\n",
+                                 call, sSame, state, busy, f45, f48, f49, buf, doneBytes, blocks, window, devState,
+                                 devBase);
+                }
+            }
+            else
+            {
+                sSame = 0u;
+                sLastTuple = tuple;
+            }
+        }
 
         if (log)
         {
@@ -1639,6 +1657,51 @@ namespace
     }
 
     // ---------------------------------------------------------------------------------------------------------
+    // CRI PUMP PLACEMENT - the main-thread pump must also service the CRI server.
+    //
+    // FUN_001982a0 (the ADXT/CRI init) registers the pumps that FUN_001b7688 dispatches when the game calls
+    // FUN_0019a080 from inside a wait loop:
+    //
+    //   single-threaded  slot 5 = FUN_00198230 = FUN_00198260 + FUN_00198280 (CRI server) + FUN_00198210 (SJRBF)
+    //   with a worker    slot 5 = FUN_00198210 (SJRBF only), slot 4 = FUN_00198280 (CRI server, on the worker)
+    //
+    // This title takes the threaded path (FUN_00199428 really creates the worker and it pumps ~310 times), but
+    // the loading sequence busy-waits: `while (FUN_00196460(i) != 3) FUN_0019a080();` never yields, and once the
+    // worker stops the stream step FUN_0019F298 is never called again. Measured at the stall: the step counter
+    // frozen at 310 across 268,000 polls, DAT_0039E838 (the ABXR gate) = 0, the file device idle, the ADXF
+    // stream left at state 2 with 0 bytes done - so the DVCI handle can never be credited to 3 and the poll can
+    // never return 3. It is the same wall as "the second block never completes", one layer up.
+    //
+    // The library already contains the single-threaded pump, so use it: slot 5 is registered with the full
+    // FUN_00198230 instead of the SJRBF-only FUN_00198210. FUN_00197940 has a re-entrancy guard
+    // (DAT_00393208), so a worker that is still alive cannot be corrupted by the main thread pumping too.
+    constexpr uint32_t kPumpRegisterPc = 0x001B7378u;
+    constexpr uint32_t kSjrbfOnlyPump = 0x00198210u;
+    constexpr uint32_t kFullMainThreadPump = 0x00198230u;
+    PS2Runtime::RecompiledFunction gPumpRegisterOriginal = nullptr;
+
+    void pumpRegisterProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t slot = GPR_U32(ctx, 4);
+        const uint32_t function = GPR_U32(ctx, 5);
+        if (slot == 5u && function == kSjrbfOnlyPump)
+        {
+            SET_GPR_U32(ctx, 5, kFullMainThreadPump);
+            static bool sLogged = false;
+            if (!sLogged)
+            {
+                sLogged = true;
+                std::fprintf(stderr,
+                             "[cri] main-thread pump slot 5: 0x%08X -> 0x%08X (the full CRI server pump; this "
+                             "port's main thread never yields to the worker)\n",
+                             kSjrbfOnlyPump, kFullMainThreadPump);
+            }
+        }
+        if (gPumpRegisterOriginal != nullptr)
+            gPumpRegisterOriginal(rdram, ctx, runtime);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
     // PER-REQUEST STREAM WINDOW (TOL_CRI_WINDOW_FIX=1)
     //
     // FUN_00196960 opens the cache-miss stream with the hardcoded "whole file" sentinel (FUN_0019ec90(stream, fd,
@@ -1711,6 +1774,42 @@ namespace
         const uint32_t progressAtEntry = runtime->Load32(rdram, ctx, kDvciProgress);
         const uint32_t ptidAtEntry = runtime->Load32(rdram, ctx, kDvciLoadIndex);
 
+        // The other half of the comparison the guest makes: FUN_00197668 returns handle[+1], which the credit
+        // tick FUN_001972E0 copies from the ADXF stream (handle[+4], stream[+1]). Reading the stream here - at
+        // the exact instant the poll samples the handle - is what separates "the poll is early" from "the
+        // stream is not where the handle says it is". devBase names the file the stream is really opened on
+        // (open hands out slot+1 * 0x100000), so a mismatch is visible immediately.
+        uint32_t streamPtr = 0u;
+        uint32_t streamState = 0u;
+        uint32_t streamTotal = 0u;
+        uint32_t streamDoneBytes = 0u;
+        uint32_t streamBlocks = 0u;
+        uint32_t streamWindow = 0u;
+        uint32_t streamDeviceBase = 0u;
+        uint32_t streamDeviceState = 0u;
+        if (handleAtEntry >= 0x00100000u && handleAtEntry < 0x02000000u)
+        {
+            streamPtr = runtime->Load32(rdram, ctx, handleAtEntry + 4u);
+            if (streamPtr >= 0x00100000u && streamPtr < 0x02000000u && (streamPtr & 3u) == 0u)
+            {
+                streamState = runtime->Load8(rdram, ctx, streamPtr + 1u);
+                streamTotal = runtime->Load32(rdram, ctx, streamPtr + 0x14u);
+                streamDoneBytes = runtime->Load32(rdram, ctx, streamPtr + 0x34u);
+                streamBlocks = runtime->Load32(rdram, ctx, streamPtr + 0x58u);
+                streamWindow = runtime->Load32(rdram, ctx, streamPtr + 0x5Cu);
+                const uint32_t fileObject = runtime->Load32(rdram, ctx, streamPtr + 8u);
+                if (fileObject >= 0x00100000u && fileObject < 0x02000000u && (fileObject & 3u) == 0u)
+                {
+                    const uint32_t deviceHandle = runtime->Load32(rdram, ctx, fileObject + 4u);
+                    if (deviceHandle >= 0x00100000u && deviceHandle < 0x02000000u)
+                    {
+                        streamDeviceBase = runtime->Load32(rdram, ctx, deviceHandle + 0x20u);
+                        streamDeviceState = runtime->Load8(rdram, ctx, deviceHandle + 2u);
+                    }
+                }
+            }
+        }
+
         if (stateAtEntry == 3u)
             ++sSawThree;
         if (countAtEntry != 0u)
@@ -1720,9 +1819,39 @@ namespace
         {
             std::fprintf(stderr,
                          "[poll-in] #%u i=%u ptid=%d state=%u count=%u progress=%u total=%u consumed=%u transfer=%u"
+                         " | sState=%u sStream=0x%08X sTotal=%u sDone=%u sBlocks=%u sWin=%u sDevBase=0x%X sDev=%u"
                          " | saw3=%u sawCount=%u\n",
                          call, indexAtEntry, static_cast<int32_t>(ptidAtEntry), stateAtEntry, countAtEntry,
-                         progressAtEntry, totalAtEntry, consumedAtEntry, transferAtEntry, sSawThree, sSawCount);
+                         progressAtEntry, totalAtEntry, consumedAtEntry, transferAtEntry, streamState, streamPtr,
+                         streamTotal, streamDoneBytes, streamBlocks, streamWindow, streamDeviceBase,
+                         streamDeviceState, sSawThree, sSawCount);
+        }
+        // Periodic line: the freeze happens with state != 3, so the lines above never fire once it sticks.
+        if ((call % 512u) == 0u)
+        {
+            const uint32_t streamBusy = (streamPtr >= 0x00100000u && streamPtr < 0x02000000u)
+                                            ? runtime->Load8(rdram, ctx, streamPtr + 2u)
+                                            : 0u;
+            const uint32_t streamOpen = (streamPtr >= 0x00100000u && streamPtr < 0x02000000u)
+                                            ? runtime->Load8(rdram, ctx, streamPtr + 0x45u)
+                                            : 0u;
+            const uint32_t streamActive = (streamPtr >= 0x00100000u && streamPtr < 0x02000000u)
+                                              ? runtime->Load8(rdram, ctx, streamPtr + 0x49u)
+                                              : 0u;
+            // FUN_0019F468 refuses to walk the stream table while DAT_0039E838 is held, and the main-thread pump
+            // slot 5 only runs FUN_00198210 (SJRBF) when the guest took its threaded path. Both make the step
+            // counter stand still, so report the gate and the registered pump entry points.
+            const uint32_t abxrGate = runtime->Load32(rdram, ctx, 0x0039E838u);
+            const uint32_t slot5Pump = runtime->Load32(rdram, ctx, 0x0049C6A0u + 5u * 0x30u);
+            const uint32_t slot4Pump = runtime->Load32(rdram, ctx, 0x0049C6A0u + 4u * 0x30u);
+            std::fprintf(stderr,
+                         "[poll-stuck] #%u i=%u ptid=%d state=%u count=%u progress=%u total=%u consumed=%u"
+                         " | sState=%u sTotal=%u sDone=%u sBlocks=%u sWin=%u sDevBase=0x%X sDev=%u"
+                         " | sBusy=%u sOpen=%u sAct=%u steps=%u gate=%u slot5=0x%08X slot4=0x%08X\n",
+                         call, indexAtEntry, static_cast<int32_t>(ptidAtEntry), stateAtEntry, countAtEntry,
+                         progressAtEntry, totalAtEntry, consumedAtEntry, streamState, streamTotal, streamDoneBytes,
+                         streamBlocks, streamWindow, streamDeviceBase, streamDeviceState, streamBusy, streamOpen,
+                         streamActive, gAdxfStepCalls, abxrGate, slot5Pump, slot4Pump);
         }
 
         const bool log = call <= 16u || (call % 512u) == 0u;
@@ -1825,17 +1954,8 @@ namespace tol
 
         // Behaviour-changing replacements live OUTSIDE the TOL_TRACE_DVCI gate; each is enabled by its own variable.
         // Gating them behind the trace made the window fix look timing-dependent - it was simply never installed
-        // unless the probes were on.
-        if (std::getenv("TOL_DVCI_SIZE_SHIM") != nullptr)
-        {
-            PS2Runtime::RecompiledFunction seek = runtime.lookupFunction(kCriDeviceSeekPc);
-            if (seek != nullptr)
-            {
-                gCriSeekOriginal = seek;
-                runtime.replaceFunction(kCriDeviceSeekPc, &criSeekProbe);
-                std::fprintf(stderr, "[dvci] size shim installed on 0x%08X\n", kCriDeviceSeekPc);
-            }
-        }
+        // unless the probes were on. The DVCI size shim that used to live here is gone: the file server's open
+        // reply carries the byte size now, so the guest derives the sector count itself.
         if (std::getenv("TOL_CRI_IO_LATENCY") != nullptr)
         {
             PS2Runtime::RecompiledFunction status = runtime.lookupFunction(kCriDeviceStatusPc);
@@ -1854,6 +1974,21 @@ namespace tol
                 gAdxfArmOriginal = arm;
                 runtime.replaceFunction(kAdxfArmPc, &adxfArmProbe);
                 std::fprintf(stderr, "[dvci] per-request window installed on 0x%08X\n", kAdxfArmPc);
+            }
+        }
+        // CRI pump placement: slot 5 gets the full main-thread pump (FUN_00198230) instead of the SJRBF-only
+        // FUN_00198210. Unconditional - this is a fix, not a probe (see the block comment at the definition).
+        {
+            PS2Runtime::RecompiledFunction registrar = runtime.lookupFunction(kPumpRegisterPc);
+            if (registrar != nullptr)
+            {
+                gPumpRegisterOriginal = registrar;
+                runtime.replaceFunction(kPumpRegisterPc, &pumpRegisterProbe);
+            }
+            else
+            {
+                std::fprintf(stderr, "[cri] 0x%08X (pump registrar) is not in the function table\n",
+                             kPumpRegisterPc);
             }
         }
         std::fprintf(stderr, "[tol] no native overrides installed (the Timer-2 override was withdrawn)\n");

@@ -794,3 +794,24 @@ Run it from the repo root (the runtime derives `cdRoot` from the ELF's own direc
   synchronous-completion race, now with correct data.
 - New tool: `tools/disasm_guest.py` (capstone MIPS64) for the code Ghidra skips - the CRI device vtable at
   `0x003A6A98` points at `0x1AD5A0` (open) which is not in Ghidra's function list.
+
+### Session 66, second pass — the loading loop was never pumped (fixed)
+
+- **Traced `FUN_00197668` against the ADXF stream at poll time.** It is just `return handle[+1]`; at the freeze
+  handle=2, stream=2, `sDone=0`, device idle. The decisive field was the new `steps=` counter: the stream step
+  `FUN_0019F298` had been called **310 times and then never again** across 268k polls, with the ABXR gate
+  `DAT_0039E838 = 0` (free). So the poll was not racing anything - nobody was pumping.
+- **Cause**: `FUN_001982a0` registers slot 5 = `FUN_00198210` (SJRBF only) when a worker thread exists, and
+  puts the CRI server pump `FUN_00198280` on slot 4 (the worker). `FUN_001664d0` busy-waits on
+  `FUN_0019a080()` without yielding, so when the worker stops, the CRI streams stop with it.
+- **Fix**: wrap the pump registrar `FUN_001b7378`; slot 5 registered with the SJRBF-only `0x00198210` gets
+  `0x00198230`, the library's own full main-thread pump (`0x198260 + CRI server + SJRBF`). The worker keeps
+  slot 4 and `FUN_00197940` is re-entrancy guarded.
+- **Measured**: all six archives load in **74 polls** (was 268k+ and stuck), tick ends with no active handle,
+  guest advances to its next phase; still 0 `E0xxxxxx`, 0 missing functions.
+- **Next wall**: KORG `sid 0x90000300 fn 0x0A` (client `FUN_002158a8`, 4-byte in/out buffer at `0x4B3800`)
+  never completes on the IOP, so every call burns the 2 s deadline. Note `2415919872 = 0x90000300`, not
+  `0x90000200` - session 65's "IxAudio" conclusion was that hex mistake, which is why the IOP-side IxAudio
+  short-circuit never matched these calls.
+- **`TOL_DVCI_SIZE_SHIM` deleted** (the open reply carries the size now). `TOL_CRI_WINDOW_FIX` is redundant
+  too - it now only overwrites the correct stream total (1 instead of 436,462) - kept, off by default.
