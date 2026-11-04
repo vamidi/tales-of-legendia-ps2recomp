@@ -11,8 +11,10 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <string>
+#include <system_error>
 
 #include "ps2_runtime.h"
 #include "ps2_recompiled_functions.h"
@@ -387,6 +389,43 @@ int main(int argc, char **argv)
             paths.cdRoot = cdRoot;
         }
         PS2Runtime::setIoPaths(paths);
+    }
+
+    // Disc image for the raw sector layer. Streaming readers (SRD and friends) call sceCdRead with an LSN,
+    // which needs the real image; the synthetic ISO built from cdRoot does not match the retail layout, so
+    // every such read fails and the guest reports a drive error. An extracted tree normally carries the
+    // image beside the ELF, so pick it up automatically unless --iso already named one.
+    if (PS2Runtime::getIoPaths().cdImage.empty())
+    {
+        PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+        std::error_code ec;
+        static const char *const kCandidates[] = {"CDVD.000", "cdvd.000", "disc.iso", "game.iso"};
+        for (const char *name : kCandidates)
+        {
+            const std::filesystem::path candidate = paths.cdRoot / name;
+            if (std::filesystem::exists(candidate, ec) && !ec)
+            {
+                paths.cdImage = candidate;
+                break;
+            }
+        }
+        if (paths.cdImage.empty())
+        {
+            for (const auto &entry : std::filesystem::directory_iterator(paths.cdRoot, ec))
+            {
+                const std::string extension = entry.path().extension().string();
+                if (extension == ".iso" || extension == ".ISO" || extension == ".bin" || extension == ".BIN")
+                {
+                    paths.cdImage = entry.path();
+                    break;
+                }
+            }
+        }
+        if (!paths.cdImage.empty())
+        {
+            PS2Runtime::setIoPaths(paths);
+            std::fprintf(stderr, "[tol] disc image = %s\n", paths.cdImage.string().c_str());
+        }
     }
 
     // Always report the resolved paths: cdRoot is derived from the ELF's own directory, so which copy of
