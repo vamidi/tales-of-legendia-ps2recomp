@@ -778,6 +778,29 @@ namespace
                     std::fprintf(stderr, "[rpc] ixaudio fn=0x%X -> reply=0x%08X\n", function, reply);
                 }
             }
+            // The 0x400/0x422 pair is re-issued every few seconds. Dump what the game actually sends (it is
+            // the only description of the request we have) together with the reply and the guest return path,
+            // so the pair can be matched against the SJX remote semantics instead of guessed at.
+            if (std::getenv("TOL_TRACE_IXAUDIO") != nullptr)
+            {
+                static uint32_t sDetail = 0u;
+                if (sDetail < 40u)
+                {
+                    ++sDetail;
+                    std::string sent;
+                    for (uint32_t index = 0u; index < sendSize && index < 32u; index += 4u)
+                    {
+                        char word[16];
+                        std::snprintf(word, sizeof(word), " %08X",
+                                      runtime->Load32(rdram, ctx, sendBuffer + index));
+                        sent += word;
+                    }
+                    std::fprintf(stderr,
+                                 "[ixaudio] fn=0x%X send=0x%08X/%u [%s ] reply=0x%08X pc=0x%08X ra=0x%08X\n",
+                                 function, sendBuffer, sendSize, sent.c_str(), reply, ctx->pc,
+                                 GPR_U32(ctx, 31));
+                }
+            }
             SET_GPR_S32(ctx, 2, 0);
             return;
         }
