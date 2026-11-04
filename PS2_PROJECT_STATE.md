@@ -813,5 +813,11 @@ Run it from the repo root (the runtime derives `cdRoot` from the ELF's own direc
   never completes on the IOP, so every call burns the 2 s deadline. Note `2415919872 = 0x90000300`, not
   `0x90000200` - session 65's "IxAudio" conclusion was that hex mistake, which is why the IOP-side IxAudio
   short-circuit never matched these calls.
-- **`TOL_DVCI_SIZE_SHIM` deleted** (the open reply carries the size now). `TOL_CRI_WINDOW_FIX` is redundant
-  too - it now only overwrites the correct stream total (1 instead of 436,462) - kept, off by default.
+- **`TOL_DVCI_SIZE_SHIM` deleted** (the open reply carries the size now). **`TOL_CRI_WINDOW_FIX` also deleted**:
+  with the pump fixed all six loads complete either way (74 polls), and the shim only overwrote the correct
+  stream total (1 instead of 436,462 sectors).
+- **Audio wall narrowed**: KORG `0x90000300 fn 0x0A` is `FUN_002158a8(0x33)` from `FUN_001eeda0` (sound init).
+  In `KORGIVAG.IRX` it registers handler `0xB5B0` (jump table at `0xDCCC`, fn `0x0A` -> `0xA070` ->
+  `0x6960`, the SPU2/voice config). The call has `hasServer=1` but the handler shows no import activity, so the
+  LLE IOP queues it and never invokes it - next thing to check is `sceSifRegisterRpc`'s stored record and who
+  calls it.

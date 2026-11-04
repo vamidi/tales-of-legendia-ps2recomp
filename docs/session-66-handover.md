@@ -132,9 +132,24 @@ The shim answered `seek(END)` from the host size because the open reply only car
 carries the byte size at `+0x04`, so the guest computes the sector count itself and the shim (probe, install
 branch and `gLastGameFileSize`) is deleted; a comment at the old site says why it must not come back.
 
-`TOL_CRI_WINDOW_FIX` is now *also* redundant - with the pump fixed the six loads complete either way, and with
-the shim on the stream's total shows 1 instead of the real 436,462 sectors, so it degrades correct state. It is
-left in place (off by default) pending a decision to remove it.
+`TOL_CRI_WINDOW_FIX` was also removed (verified: all six loads complete with 74 polls and the stream total now
+reports the real 436,462 sectors for MOVIE.AFS instead of the forced 1). Only the diagnostic probes remain
+behind `TOL_TRACE_DVCI`.
+
+## 8. The audio wall, narrowed
+
+`KORG 0x90000300 fn 0x0A` is called once from `FUN_001eeda0` (the sound-system init, `FUN_002158a8(0x33)`) and
+retried by it. In `KORGIVAG.IRX` (PT_LOAD offset 0xB0, link vaddr 0, module base `0x43900`):
+
+* registration at VA `0xB5F8`: `sceSifRegisterRpc(<stack record>, 0x90000300, 0xB5B0, 0xDDF0, ...)`
+* `0xB5B0` is the dispatcher: `if (fn < 0x47) jalr *(0xDCCC + fn*4)` — jump table at `0xDCCC`
+* fn `0x0A` -> `0xA070`: `*arg = FUN_0x6960(*arg)`, i.e. KORG's SPU2/voice configuration routine
+  (`0x6960` writes 0x1D00/0x1D01 and 0xB80/0xC80/0xB81 through its import stubs 0xBD6C/0xBD84/0xBD94/0xBDB4`)
+
+The timeout has `hasServer=1` but **no import activity from the handler afterwards** (no new
+`no kernel service` lines), so the LLE IOP queues the request and never invokes the registered handler. That is
+the next thing to check in `ps2xIOP`: what `sceSifRegisterRpc` stores and who is supposed to call it, and whether
+KORG's 6-argument registration path is parsed correctly.
 
 ## 3. Land mines confirmed this session
 

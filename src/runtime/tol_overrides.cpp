@@ -1701,45 +1701,12 @@ namespace
             gPumpRegisterOriginal(rdram, ctx, runtime);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
-    // PER-REQUEST STREAM WINDOW (TOL_CRI_WINDOW_FIX=1)
-    //
-    // FUN_00196960 opens the cache-miss stream with the hardcoded "whole file" sentinel (FUN_0019ec90(stream, fd,
-    // size, 0, 0xFFFFF)); FUN_0019f298 then resolves that to the file size, so stream[+0x14] (total sectors) becomes
-    // 894 for SYS_REG.AFS. FUN_0019EF58 only sets stream[+1] = 3 when stream[+0x58] (blocks done) reaches
-    // stream[+0x14], but the DVCI layer arms ONE sector per request - so after the first completion the window is 1
-    // of 894 and can never be satisfied again. Measured: handleState went 3 once (consumed 1) and then stayed 2.
-    //
-    // The window belongs to the request, not the file: FUN_00196DB0 ends its arming sequence with
-    // FUN_0019ee18(stream, handle[+0x1c]) where handle[+0x1c] is the transfer size in sectors. Setting the window
-    // from that argument makes one request equal one window, which is what the DVCI state machine expects.
-    constexpr uint32_t kAdxfArmPc = 0x0019EE18u;
-    PS2Runtime::RecompiledFunction gAdxfArmOriginal = nullptr;
-
-    void adxfArmProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        const uint32_t stream = GPR_U32(ctx, 4);
-        const uint32_t sectors = GPR_U32(ctx, 5);
-
-        if (gAdxfArmOriginal != nullptr)
-            gAdxfArmOriginal(rdram, ctx, runtime);
-
-        if (sectors == 0u || stream < 0x00100000u || stream >= 0x02000000u)
-            return;
-
-        runtime->Store32(rdram, ctx, stream + 0x14u, sectors);              // total sectors = this request
-        runtime->Store32(rdram, ctx, stream + 0x58u, 0u);                  // blocks done in this window
-        runtime->Store32(rdram, ctx, stream + 0x10u, sectors << 11);       // total bytes
-
-        static uint32_t sArms = 0u;
-        if (std::getenv("TOL_TRACE_DVCI") != nullptr && ++sArms <= 60u)
-        {
-            std::fprintf(stderr,
-                         "[dvci] window #%u: stream=0x%08X -> %u sector(s); now total=%u done=%u bytes=%08X\n", sArms,
-                         stream, sectors, runtime->Load32(rdram, ctx, stream + 0x14u),
-                         runtime->Load32(rdram, ctx, stream + 0x58u), runtime->Load32(rdram, ctx, stream + 0x10u));
-        }
-    }
+    // NOTE: FUN_0019EE18(stream, sectors) used to be wrapped here (TOL_CRI_WINDOW_FIX) to force the stream
+    // window to one request, because stream[+0x14] stayed 0 and FUN_0019EF58 could never see its window
+    // satisfied. That window value was a symptom of the size bug (the open reply did not carry the file size)
+    // and of the pump bug fixed above. With both fixed the guest sets the window itself and all six archives
+    // load without the shim; forcing it instead overwrote the real total (1 sector instead of 436,462 for
+    // MOVIE.AFS), i.e. it made correct state wrong. Removed.
 
     void dvciPollProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -1964,16 +1931,6 @@ namespace tol
                 gCriStatusOriginal = status;
                 runtime.replaceFunction(kCriDeviceStatusPc, &criStatusLatencyProbe);
                 std::fprintf(stderr, "[dvci] io-latency shim installed on 0x%08X\n", kCriDeviceStatusPc);
-            }
-        }
-        if (std::getenv("TOL_CRI_WINDOW_FIX") != nullptr)
-        {
-            PS2Runtime::RecompiledFunction arm = runtime.lookupFunction(kAdxfArmPc);
-            if (arm != nullptr)
-            {
-                gAdxfArmOriginal = arm;
-                runtime.replaceFunction(kAdxfArmPc, &adxfArmProbe);
-                std::fprintf(stderr, "[dvci] per-request window installed on 0x%08X\n", kAdxfArmPc);
             }
         }
         // CRI pump placement: slot 5 gets the full main-thread pump (FUN_00198230) instead of the SJRBF-only
