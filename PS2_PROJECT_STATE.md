@@ -821,3 +821,1031 @@ Run it from the repo root (the runtime derives `cdRoot` from the ELF's own direc
   `0x6960`, the SPU2/voice config). The call has `hasServer=1` but the handler shows no import activity, so the
   LLE IOP queues it and never invokes it - next thing to check is `sceSifRegisterRpc`'s stored record and who
   calls it.
+
+---
+
+## Session 68 (2026-11-04) - the LLE cdvdman handlers, and why the IOP modules never ran
+
+**Result: the CDVD drive error is gone (`SRD: Drive Error` 245 -> 0). The LLE now serves `sceCdRead` from the
+detected `CDVD.000`; `[cdvd] read lsn=16 ... pvd=014344303031` is the verified ISO9660 PVD.**
+
+### 1. Two foundational LLE defects had to be fixed first
+
+- **IOPRP module slices dropped every relocation table.** `PS2IopHostAdapter` sized each module from its
+  `PT_LOAD` segment only, so `IRX` section headers and `SHT_REL` tables (which sit after the load image) were
+  cut off. `parseIrx` then saw no relocations, loaded every module unrelocated, and each module's init thread
+  jumped to a module offset instead of `base + offset` (the `pc=0x0001000C word=0x0001001C` fault on every
+  module). Fix in `ps2xRuntime/src/lib/ps2_iop_host.cpp`: extend the slice through `e_shoff + e_shnum * e_shentsize`
+  and every section's `sh_offset + sh_size`. cdvdfsv/`cdvd_ee_driver` now initialise and register all six RPC
+  servers (sids `0x80000592/59a/593/59c/597/595`).
+- **`registerLibraryEntries` registered zero functions.** The real export table starts with reserved zero
+  slots (ordinals 0..3), followed by the function list and a zero terminator. The handler stopped at the first
+  zero, so no module exports ever linked and every import fell back to the kernel. It now keeps leading zeros as
+  reserved slots and stops at the first zero *after* a real function.
+
+### 2. The LLE cdvdman device
+
+`ps2xIOP/src/lle/kernel.cpp` + `kernel_handlers.inc` now implement the real cdvdman exports (ordinals verified
+against the `CDVDMAN` module in `IOPRP300.IMG` and the CDVDMAN interface docs):
+
+| ordinals | behaviour |
+|---|---|
+| `#4` init, `#5` standby, `#7` seek, `#15` stop, `#38` pause | success, clear the error |
+| `#6` `sceCdRead`, `#114` `_sceCdRE` | 2048-byte sectors from `IoPaths::cdImage`, into IOP RAM; partial/past-EOF reads zero-fill and still succeed |
+| `#8` `sceCdGetError` | last error (0 or `0x30`) |
+| `#9` `sceCdGetToc` | zero the 1024-byte buffer |
+| `#10` `sceCdSearchFile`, `#84` `sceCdLayerSearchFile` | live ISO9660 walk of the image (PVD at LSN 16) |
+| `#11` sync, `#13` disk ready, `#28` status, `#12` disk type | completed / `0x14` PS2 DVD |
+| `#14` tray, `#16/#17` pos conversions, `#22` iLink id, `#24/#37` callback, `#39` break, `#50` `_sceCdSC`, `#75` mmode, `#83` dual info | synchronous equivalents |
+
+`linkImports` resolves `cdvdman` to the kernel deliberately (the real module drives Mechacon registers the LLE
+does not emulate) and also resolves `ioman` to the kernel so IOP `cdrom0:` opens map to the extracted disc tree.
+`tol_overrides.cpp` no longer answers sid `0x80000593` natively: that sid is the game's CDVD service, and the
+native reply was masking cdvdfsv (session 67 had labelled it "pad").
+
+### 3. Verification
+
+```
+TOL_CDVD_SELFTEST=1 TOL_TRACE_CDVD=1 build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
+[cdvd] image '...\data\CD\CDVD.000' -> 1073676288 bytes
+[cdvd] read lsn=16 sectors=1 dest=0x00010000 image=1073676288 bytes ok=1 reason=image
+[cdvd] selftest read lsn=16 sectors=1 -> ret=1 pvd=014344303031     # \x01CD001
+[cdvd] search '\SYSTEM.CNF;1' -> lsn=690 size=57
+SRD: Drive Error = 0,  "no kernel service for cdvdman" = 0
+```
+
+`TOL_CDVD_SELFTEST=1` is the new env switch; it runs the two handlers on the first module load. The guest has
+not issued a raw read in a normal run because the AFS path still goes through the EE gamefile RPC (sids
+`0x80000597/595`, served in `tol_overrides.cpp`); the handler itself is proven by the selftest.
+
+### 4. Remaining wall (not CDVD)
+
+The screen still stops at `NOW LOADING`. With CDVD fixed, the visible activity is the KORG RPC (`sid
+0x90000300 fn 0x0A`) repeating every 2-9 ms; round trips now complete (they burned the 2 s deadline before the
+relocation fix). That audio/stream wall is the next session's work; it is no longer a disc error.
+
+### Session 68, continuation - async SIF RPC callbacks must be deferred
+
+`SifCallRpc` invoked the caller's `endFunction` inline (`eeScheduler().invokeCurrent(RpcCallback)`) before returning
+to the guest. For the KORG sound sequence that turned `FUN_002158A8`'s completion semaphore into a busy spin:
+`WaitSema` at entry always found the semaphore already signalled, so the main thread re-sent `sid 0x90000300 fn
+0x0A` ~485 times/s and starved the sound thread (`tid=6`, Ready at `0x218908`).
+
+Fix: in `ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp`, queue the RPC end function with
+`eeScheduler().queueInvocation(...)` instead of invoking it inline. The scheduler runs it once the caller has
+actually yielded (the caller blocks in `WaitSema`), which is the hardware order.
+
+Measured effect (15 s run):
+
+| metric | before | after |
+|---|---|---|
+| EE turns/s | 485 (99% at `sceSifCallRpc`) | 189, mean 0.36 ms |
+| screenshots | 1 (frame 12) | frame 12, 72, ... 492 (~33 fps) |
+| `SRD: Drive Error` | 0 | 0 |
+| AFS/DVCI | 6 archives found | 6 archives found |
+
+The main thread then goes dormant at `0x139690` and the next blocker appears:
+`E0100401: can't create PS2RNA of IOP`, repeating. `FUN_001b3a20` asks IxAudio
+(`sid 0x90000200`, client `0x3A66F0`) via `FUN_001acfb0(8, ...)` and gets 0, so CRI's PS2RNA
+creation fails. That is the next workstream; it is not an RPC-timing problem (`FUN_001acfb0` passes
+`endFunction = 0`, so it is unaffected by the deferral).
+
+### Session 68, continuation 2 - E0100401 (CRI PS2RNA) cleared
+
+`FUN_001b3a20` creates the CRI PS2RNA object: it allocates IOP heap blocks, then asks IxAudio
+(`sid 0x90000200`, client `0x3A66F0`) with `FUN_001acfb0(8, ...)` -> function **0x408** and uses the
+reply as the object handle. A zero reply prints `E0100401: can't create PS2RNA of IOP`.
+
+The IxAudio native handler only returned handles for `{0x002, 0x400, 0x422}`, so 0x408 got 0. Routing
+IxAudio to the real IOP server now that it registers was tried: it clears E0100401, but the real
+`IXAUDIO.IRX` DTX create (fn 0x002) also returns 0 in this environment, which brings back
+`E0100302: SJX_Init can't create DTX`. The working form is the native handle reply for both lifecycle
+calls: `{0x002, 0x400, 0x408, 0x422}` all return a fresh nonzero handle.
+
+Verification (20 s):
+
+```text
+E0100401 = 0, E0100302 = 0, SRD: Drive Error = 0
+screenshots through frame 792 (~40 fps)
+```
+
+### Next stall
+
+The loading screen still stops at `NOW LOADING`. The main EE thread ends up **Dormant** at
+`0x139690` (the return of GS setup `FUN_00139620`, caller `FUN_0027A1F0`), while the CRI worker
+threads (tid 3/4, entries `0x198D50`/`0x198E58`) sit in their sleep loops at `0x198E14`/`0x198EF8`
+and tid 5 is suspended. No further AFS reads are issued. So the next workstream is the CRI/DVCI
+loading pump: find which thread is supposed to drive the next read after the DVCI table and why the
+main thread is no longer in the `FUN_001664d0` poll loop.
+
+### Session 68, continuation 3 - the CRI/DVCI pump is working; the main loop exits
+
+`FUN_001664d0` loads the six AFS archives sequentially:
+
+```c
+for (i = 0; i < 6; ++i) {
+    FUN_00196058(i, name, 0, buf);          // start
+    while (FUN_00196460(i) != 3)           // poll
+        FUN_0019a080();                     // pump (slot 5 -> FUN_00198230)
+}
+```
+
+`TOL_TRACE_DVCI=1` shows it running to the end: poll #73/#74 are `i=5` (`MOVIE.AFS`, total
+436462 sectors), and #74 reports `state=3` with `sDone=2048 sBlocks=1` (`sDevBase=0x700000`,
+`devState=1`). The earlier loads processed their extent blocks (`i=0..4`, progress 255..3327).
+So the pump/registrar fix from session 66 is still correct; the six extent loads complete.
+
+The stall is immediately after: the main loop `FUN_00165AD0` (an infinite `do { ... } while(true)`)
+is entered once with `ra=0x00100210 sp=0x02000000`, and later the main thread is **Dormant** at
+`0x00139690` (a `jr $ra`, `ra=0x0027A210`, inside GS setup `FUN_00139620` called from
+`FUN_0027A1F0`). `FUN_00165AD0` should never return, so this is a lost/changed control flow in the
+EE scheduler or a preemption resume, not the CRI pump. The `[pc]` probe also shows `FUN_00165AD0`
+"exiting" to `0x00109144` (interior of `memset`), another sign the return path is being diverted.
+
+Next workstream: trace the preemption at the `jr $ra` in the render path (`0x139690` ->
+`0x27A210`) and why `FUN_00165AD0`'s loop ends. The CRI/DVCI pump itself needs no change.
+
+### Session 68, continuation 4 - trace toolbox results (pump complete, game loop alive)
+
+Trace evidence gathered with the existing probes:
+
+| trace | what it showed |
+|---|---|
+| `TOL_TRACE_DVCI=1` | six AFS extent loads complete: `#73/#74 i=5` (`MOVIE.AFS`, 436462 sectors) reaches `state=3`, `sDone=2048 sBlocks=1`; `i=0..4` advanced progress 255..3327 |
+| `TOL_TRACE_PARK=1` | 649 parks, almost all `invocations=1` with `ra=0` and `sp=0x1fbfff0` - normal RPC-invocation returns, not a dead main thread |
+| `TOL_TRACE_PC=0x165AD0` | main loop entered once (`ra=0x100210 sp=0x02000000`); its "exit" to `0x109144` is a call target, not a return |
+| `TOL_TRACE_EE_DISPATCH=1` | 1386 turns/s on tid=1; buckets `0x165E48`, `0x166794`, `0x1AB5CC` (13%), `0x1A152C`, `0x1979B0` - the frame/CRI loop is alive |
+| `TOL_TRACE_PC=0x165E70/0x166010/0x166120` | no hits, but these addresses are folded into larger map rows (`0x165E48` is the real dispatch entry), so the probe is a false negative |
+
+Conclusion: the CRI/DVCI pump is not the blocker and the EE main loop is running at full rate. The game simply never leaves the
+`NOW LOADING` state. The next trace target is the loading-state transition itself: `FUN_00166120` (event queue: codes 0x25,
+0x24, 0x23, 0x21, 0) and `FUN_00166010`'s callback wait at `0x1660A0`, plus the CRI/ADXF stream that should read the actual
+game data after the six extent tables. Use `TOL_TRACE_EE_DISPATCH` buckets (not single-address probes) for these addresses.
+
+### Session 68, continuation 5 - 0x1660A0 / FUN_00166120 are downstream of a blocked CRI update
+
+30 s trace with `TOL_TRACE_PC=0x1660A0,0x166120,0x166010,0x165E70`:
+
+- `0x1660A0` (callback), `0x166120` (event queue) and `0x166010` (waiter): **0 hits**.
+- `0x165E70` (frame update): 1 hit, `ra=0x165B14`, exits to `0x19BD20` and never returns.
+
+`0x19BD20` is interior to `FUN_001978f0` (the CRI/ADXF library, 32 KB). The main loop is therefore stuck in
+the CRI/ADXF update on its first frame; `FUN_00166010`'s wait on the `0x1660A0` GS/VU1 callback and
+`FUN_00166120`'s event queue are never reached.
+
+Causal chain: main loop -> `FUN_00165E70` -> CRI/ADXF (`0x19BD20`, also the `0x1AB5CC` 13% and
+`0x1A152C` buckets) -> never returns -> `FUN_00166010`/`0x1660A0` never run -> no state transition out of
+`NOW LOADING`.
+
+Next trace target: the containing CRI function `FUN_001978f0` (`0x1978f0`) and the ADXF stream state at
+`0x19BD20`; single-address probes on interior addresses are unreliable, so wrap the containing row start.
+
+### Session 68, continuation 6 - the frame update is not stuck; the CRI data load is throughput-limited
+
+The `0x19BD20` target was a false lead: it is a tiny setter (`jr ra; sw a1,0x9c(a0)`), and the
+`TOL_TRACE_PC` "exit" only records the first call handoff, not the function's later control flow.
+
+Measured the CRI read path instead:
+
+```text
+[fileio] gamefile read ... 2048/2048 bytes   (one block per RPC)
+reads=69 in 8 s, bytes=139359  ->  8.6 reads/s, ~17 KB/s
+[cri] read handle=0x003A75F8 blocks=1 buf=0x00391140 state=0->2 ret=1 | pos=0/894 ...
+```
+
+Each ADXF stream read submits **1 sector** and takes ~116 ms to complete; the CRI pump is called
+~68 times/s (`0x166794` bucket), so each block needs ~8 pump cycles. The six extent tables complete,
+but the remaining data load is orders of magnitude slower than the real DVD (a 2 KB sector is ~1 ms
+on hardware). `TOL_CRI_IO_LATENCY=1` (the one-poll deferral shim) did **not** change the rate
+(69 reads / 17 KB/s), so the limiter is the per-block handshake/stream window, not status timing.
+
+Next target: the ADXF stream read window. The stream carries `+28=2048` bytes of buffer and
+`+2C=512` (sector size); `FUN_00196058`'s request size is turned into blocks by `param_8 >> 11`.
+The read is always `blocks=1`, so raising the request/window (or making the stream issue a multi-block
+read) is the way to lift 17 KB/s. Also check the `stream[0x49]` completion flag: the step reads only
+when `state==2 && +49==1`, and the per-block handshake is what costs the eight pump cycles.
+
+### Session 68, continuation 7 - CRI read block count traced to the device tell/seek
+
+`FUN_0019EF58` computes the read block count as:
+
+```c
+iVar2 = tell(handle);                                  // position in sectors
+seek(handle, 0, stream[0x18], &uStack40);
+iVar6 = stream[0x30] - iVar2;
+iVar5 = stream[0x14] - iVar2;
+if ((tellBytes >> 11) < iVar6) iVar6 = tellBytes >> 11;
+if (iVar6 < iVar5) iVar5 = iVar6;
+iVar4 = stream[0x2c];                                  // 0x200 (512)
+if (iVar5 < stream[0x2c]) iVar4 = iVar5;
+read(handle, iVar4, buffer);
+```
+
+Device slots:
+
+- `FUN_001AD780` (seek) returns the clamped **position in sectors** (894 for SEEK_END, 0/1/2 for seeks).
+- `FUN_001AD818` (tell) returns `handle+0x0C`, the position in sectors.
+
+The room is `stream[0x14]=894` sectors and the max is `stream[0x2c]=512`, yet the read is
+`blocks=1`. The limiting value is the tell/seek output treated as bytes (`>> 11`), i.e. one
+2048-byte buffer. The stream's buffer/window (`+0x18=0x800`, `+0x28=0x800`) is one sector.
+
+The per-read cost is also the issue: the gamefile read wrapper `caseD_0` (`0x1AB5C8`) runs ~68 times/s
+at ~5.9 ms each (`0x1AB5CC` bucket 402 ms/s = 13%). A 2 KB host read is microseconds, so the
+5.9 ms is the RPC/state-machine round trip, not the file I/O.
+
+Next: measure `gameFileRead` host time vs RPC overhead, and/or raise the ADXF stream buffer so the
+read step issues `blocks > 1`. The `0x1660A0` callback remains downstream; it is not the cause.
+
+### Session 68, continuation 8 - gameFileRead measured: host I/O is ~10 us, not the bottleneck
+
+Added `TOL_TRACE_FILEIO_TIME=1` to `gameFileRead` and replaced the per-byte `Store8` copy with a
+bulk `memcpy` into EE RAM (plus a reused `thread_local` buffer instead of a fresh vector per 2 KiB
+block).
+
+Measured (8 s):
+
+```text
+[fileio-time] sector=0x200000 bytes=2048 read=20.6us copy=0.2us total=22.3us
+[fileio-time] sector=0x500001 bytes=2048 read=2.4us  copy=0.1us total=2.6us
+reads=69, bytes=139359, ~17 KB/s   (unchanged)
+```
+
+So the entire HLE read handler is 2-39 us. The ~5.9 ms per CRI read is in the **caller/state
+machine**, not the file I/O. Optimizing the host read cannot raise the throughput; the limiter is the
+CRI/ADXF handshake (~8 pump steps per 2 KiB block) and/or the main-thread frame scheduling.
+
+The bulk copy is kept (it removes 2048 `Store8` calls per block); the timing switch is diagnostic.
+Next target: the CRI read caller `caseD_0` (`0x1AB5C8`) and the ~8-step handshake between
+`state=2` and `state=3`, or raising the ADXF stream buffer so a read covers several sectors at once.
+
+### Session 68, continuation 9 - multi-block window experiment (negative result)
+
+Tried raising the ADXF stream window to 8 blocks (`TOL_CRI_RAISE_WINDOW=1`): patched the stream's
+`+0x24` buffer to a 16 KiB `guestMalloc`, and `+0x18`/`+0x28` to `0x4000`. Measured result:
+
+```text
+[cri] window raised: buffer 0x00000000 -> 0x01EF0000, size 0x4000
+[cri] read handle=0x003A75F8 blocks=1 buf=0x00391140 state=0->2 ...
+reads=69, bytes=139359, ~17 KB/s   (unchanged)
+```
+
+The read still used `buf=0x00391140` and `blocks=1`; the patched stream's `+0x24` was `0`, so this is
+not the buffer the DVCI read path uses. The actual 2 KiB buffer is the DVCI read buffer `0x391140`, and
+the block count is pinned by the seek/tell output, not the stream window. The experiment was reverted.
+
+Kept from the measurement pass: the bulk `memcpy` copy and `TOL_TRACE_FILEIO_TIME`. Next target is the
+CRI handshake/scheduler latency (the `caseD_0` 5.9 ms wall time with a 10 us handler), or patching the
+actual DVCI request (`blocks`) rather than the stream window.
+
+### Session 68, continuation 10 - CRI caller traced; completion poll is not blocking
+
+Traced `FUN_001029A8` (game read client) and the CRI state machine `FUN_001AB4F8`:
+
+- `FUN_001029A8` calls `FUN_00101d80(4)` (PollSema on the I/O sema, then `FUN_00101F70(1)` busy check) and
+  issues the mode=1 read RPC.
+- `FUN_00118828` returned **0** in every sampled call, `FUN_00101F70` returned 0, and the
+  `FUN_00115758` DelayThread wrapper was **never entered**. So the completion poll is not sleeping.
+- Added `clearGuestRpcBusy` to clear `client[0]->header[0x10]` bit 0 after the game-data RPC (the guest's
+  own libsif busy bit, which the native override previously left set). Re-measured: still 69 reads / 8 s,
+  ~17 KB/s, so it was not the limiter (but it is the correct completion state).
+
+The 5.9 ms `caseD_0` bucket is therefore **wall time/preemption**, not a blocking call inside the handler:
+the read handler is 2-39 us and the completion checks return immediately. The rate is set by the CRI
+state machine's step count per 2 KiB block and the main-thread scheduling, not by one wait.
+
+Next: measure CPU time vs wall time for `caseD_0`/`FUN_001AB4F8`, or count `FUN_0019F298` steps per
+completed block to see whether the state machine itself is the 8-step cost.
+
+### Session 68, continuation 11 - CRI step CPU/wall + steps per read
+
+Added `[adxf-time]` (inside the ADXF step probe) using `GetThreadTimes` + `steady_clock`:
+
+```text
+[adxf-time] steps=100  wall=11.5ms cpu=0.0ms  cpu/wall=0.000 reads=22 steps/read=4.55
+[adxf-time] steps=300  wall=30.6ms cpu=78.1ms cpu/wall=2.556 reads=68 steps/read=4.41
+[adxf-time] steps=400  wall=33.8ms cpu=78.1ms cpu/wall=2.311 reads=69 steps/read=5.80
+[adxf-time] steps=1500 wall=58.2ms cpu=78.1ms cpu/wall=1.343 reads=69 steps/read=21.74
+```
+
+Interpretation:
+
+- During the extent-table loads it is **~4.4 ADXF steps per completed 2 KiB read**.
+- After 69 reads (the six extent tables) the step pump keeps running to 1500+ steps, but
+  `gGameFileReadCount` stops at 69: **no further reads are requested**.
+- `cpu/wall > 1` is cooperative-fiber preemption: the step yields, the same OS thread runs other
+  guest turns, and `GetThreadTimes` counts their CPU too. The step's own CPU cost is small; it is not
+  CPU-bound.
+
+So the CRI pump is not the throughput limiter after the extent tables: the game simply stops issuing
+data reads. The next blocker is again the loading-state transition (`FUN_00166010` -> `0x1660A0`),
+which is why the data-load phase is never entered.
+
+### Session 69 - loading-state transition unblocked: missing function-table slot 0x139690
+
+The frame update (`FUN_00165E70`) was previously entered once and never returned. TOL_TRACE_PC on
+its callees showed it stopped inside `FUN_001EDC20` -> sound init -> `FUN_0027A140` -> `FUN_0027a1f0`,
+which ends with `j 0x139690`. `0x139690` is a shared clamp-setter epilogue
+(`jr ra; sw a0, -0x7b44(gp)`). Ghidra folded it into its callers, so the dense function table has
+null slots at indices 0x139684..0x13969c (`0x139690` included). The DirectJump therefore reported a
+missing target (silently - only the first missing target is logged), and the runtime spun forever on
+the missing-PC stub. That was the real reason the first frame never finished.
+
+Fix (src/runtime/tol_overrides.cpp): re-express the two instructions natively with
+`replaceFunction(0x139690, ...)`. With that, the frame update completes its whole callee list and the
+main loop reaches `FUN_00166010` and the callback `0x1660A0` for the first time.
+
+Second fix in the same file: `0x1F8150` is the GS/VU1 worker loop
+`do { FUN_001f8000(); FUN_0015231c(); } while (true)`. On hardware it is a separate thread; run
+inline it never returns to `FUN_00166010`. The override replaces every slot in
+`[0x1F8150,0x1F8170)` (the loop resumes at interior 0x1F8168) and runs one iteration per dispatch,
+returning to `$ra`.
+
+New blocker (GS/VIF1 transfer bookkeeping): `FUN_00166010` waits on a stack flag (`iStack_4` at
+`sp+0x2C`) that `0x1660A0` sets only after its `while (FUN_001f8480(handle) != 0)` loop exits. The
+transfer record lives in the guest table at `0x4A72C0` (0x2c-byte records); `FUN_001f82f0` submits a
+packet via `FUN_001f8be0`, and `FUN_001f8dd0` reads `record[2]` as the status. With TOL_TRACE_GS the
+flag pointer is correct (`0x01FFFFCC`) but stays 0: the record is never marked complete. The callback
+runs, spins on the busy status, and the wait loop never sees the flag. Next: make the VIF1/GS packet
+submission (`FUN_001f8be0`/the 0x4A72C0 records) complete, or emulate the VIF1/GS completion so the
+record status goes to 0.
+
+Diagnostics added: `TOL_TRACE_GS` logs worker steps and the flag pointer/value. `tools/find_missing_targets.py`
+scans the corpus for direct dispatch targets absent from the function table (found 0x139690; most of
+the other 500 are out-of-range mis-disassembled data in `entry_003a3198` and friends).
+
+### Session 70 - memory-card prompt is BIOS-only; HLE mcserv version fixed
+
+Asked about the "Checking memory card" screen shown before the logos. Findings:
+
+- The prompt text ("Checking memory card (8MB)", "Do not remove", "MEMORY CARD") is **nowhere on
+  the disc** (scanned SLUS_212.01, all IRX, and the full 1 GB CDVD.000, ASCII and UTF-16). It is the
+  **BIOS** memory-card manager screen, so a direct-ELF port never runs it. The game's own strings are
+  only `libmc: too old release of mcserv.irx` / `mcman.irx` and `SRV_CMEMCARD::*` (in-game save UI).
+- The port does render: at 3 s the window is black, at 6 s the game's own `NOW LOADING` is drawn
+  (text comes from a game asset, not the runtime). It then stays frozen there because
+  `FUN_00166010` still waits on the GS/VIF1 transfer record at `0x4A72C0`.
+- Real bug found in `ps2xIOP/src/modules/mcserv.cpp`: the HLE reported `kMcservVersion = 0x0205`
+  and `kMcmanVersion = 0x0206`. The game's libmc `FUN_001257f8` requires `mcserv >= 0x20a` and
+  `mcman >= 0x20e` (disassembly: `slti v0, mcman, 0x20e; beq v0, zero, success`), so it aborted
+  with "too old release of mcserv.irx" and skipped the memory-card path. Changed to
+  `0x020A`/`0x020E`; "too old release" is gone and `[mc] Init -> 0` succeeds.
+- New warning after the fix: `libdbc: Module version mismatch [libdbc.a = 3.10, dbcman.irx = 3.20]`
+  (controller/DB manager). Non-fatal so far but the next version-check to look at.
+- The memory-card prompt itself is BIOS; showing it would mean emulating the BIOS memory-card
+  manager (or drawing a native prompt), not fixing the game. The game still needs the GS/VIF1
+  transfer to complete to leave `NOW LOADING`.
+
+### Session 71 - GS/VIF1 loading gate fixed
+
+The `FUN_00166010` wait was finally traced to its real status source:
+
+- `FUN_00166010` waits on `iStack_4` (sp+0x2C). `0x1660A0` sets it after
+  `while (FUN_001f8480(handle) != 0)`. `FUN_001f8480` reads `record[2]` from the VIF1 transfer
+  table at `0x4A72C0` (0x2C-byte records). `FUN_001f82f0` builds a packet into it; `FUN_001f8be0`
+  queues it. The runtime never retires the record (VIF1 DMA packet not executed to completion), so
+  the status stays 2 and the callback spins.
+- The callback dispatches to **thunk `0x1F7310`**, whose generated body calls
+  `FUN_001f8480_0x1f8480` **directly**, bypassing the function table. Replacing only `0x1F8480` had
+  no effect; replacing **`0x1F7310`** (and `0x1F8480`) with a "status = 0" stub makes the callback
+  set the flag. With that, `FUN_00166010` returns and the main loop reaches `FUN_00166120` for the
+  first time; the load/render loop (`FUN_0019a080` CRI pump) then runs.
+- This is unconditional now (host GS backend consumes packets synchronously); the comment in
+  `tol_overrides.cpp` explains why the thunk slot is the one that must be patched.
+- Also fixed in `iop_cdvd.cpp`: `sceCdStatus` (ordinal 28) returned `kCdvdStatusPause` (0x0A)
+  unconditionally; now returns ready (1). `signalCommandComplete()` now creates the CD interrupt
+  event flag on demand instead of silently dropping the completion when the flag did not exist yet.
+- The screen is still `NOW LOADING` because the **DVCI/CRI data load** is now the limiter again:
+  `[cri] gameread` stops around 60-69 and `[dvci] load=5 (MOVIE.AFS) poll -> 0 progress=22`. That is
+  the pre-existing read-stop blocker, separate from the GS/VIF1 gate.
+- The only missing-target left is the harmless `jr ra` no-op at `0x231E80`.
+
+### Session 72 - MOVIE.AFS DVCI read stop fixed
+
+`FUN_001664D0` loads the six AFS extent tables with
+`while (FUN_00196460(i) != 3) FUN_0019a080();`. For MOVIE.AFS (i=5) the poll never
+returned 3, so the loop hung at i=5.
+
+Trace (`TOL_TRACE_DVCI`): for i=5 the stream reported state 2 then 0, and the poll
+parsed all 22 header entries (`progress` 0 -> 22) but **fell through** to the
+next-read path (`FUN_001970e8`) instead of taking the `handle[8] <= progress` ->
+`FUN_001963a8()` -> `return 3` branch. The recompiled flow only reaches the
+completion path for larger tables; the 22-entry MOVIE.AFS table takes the
+`iVar11 >= DAT_003910b4 << 9` fall-through.
+
+Fix (`src/runtime/tol_overrides.cpp`, `dvciCompletionFix`, unconditional): wrap
+`0x196460`; if the active load's request-table `handle[8]` (entry count) is nonzero
+and `DAT_003910a4` (progress) has reached it, perform the `FUN_001963a8` cleanup
+(`DAT_003910a8=0`, `DAT_003910ac=-1`, `DAT_003910a4=0`, `DAT_003910b4=0`) and set
+`v0=3`. Verified with `[dvci-done]`:
+
+```text
+[dvci-done] idx=0 count=430  progress=430
+[dvci-done] idx=1 count=790  progress=790
+[dvci-done] idx=2 count=7931 progress=7931
+[dvci-done] idx=3 count=1831 progress=1831
+[dvci-done] idx=4 count=5501 progress=5501
+[dvci-done] idx=5 count=22   progress=22
+```
+
+The extent-table loop now exits. Remaining: the screen still shows `NOW LOADING`
+because after the tables the **scene** stream stops requesting reads
+(`[adxf-time] reads=70` while `steps` keeps climbing). That is the next blocker,
+separate from the DVCI table completion.
+
+### Session 73 - scene stream stop traced to MOVIE.AFS / IPU stub
+
+Traced the post-DVCI stream stop with `TOL_TRACE_DVCI` (`[adxf] step-in/out`
+dump of stream `0x39EE48`):
+
+```text
+[adxf] step #34 done ... 46=1 49=1 dev=003A75F8 devState=1
+[adxf] step-in  state=1 | 45=0 46=0 47=0 48=0 49=0 ... dev=00000000 devState=0
+```
+
+After step #34 the device closes (`dev=0`), `stream[0x46]`/`[0x49]` go to 0, and
+the stream stays `state=1` with `45=0` (no client read request). `FUN_0019F298`
+only calls the read (`FUN_001a9448`) when `stream[0x45] == 1`, so the step is a
+no-op from then on. `FUN_001AB4F8` only issues `FUN_001029A8` in state 1, and its
+state machine is no longer being driven.
+
+The stream's volume (`totalSectors=323233`, ~662 MB) matches **MOVIE.AFS**, and the
+runtime's IPU is a **stub** (`ps2xRuntime/src/lib/Kernel/Stubs/IPU.cpp`): `sceIpuInit`
+pokes `IPU_CTRL`/`IPU_CMD`/FIFO and `sceIpuRestartDMA`/`sceIpuStopDMA`/`sceIpuSync`
+just return 0. There is no MPEG decode. So the movie/logo player consumes ~386 KB
+(`stream[+0x14]=0x5E75F`), waits for the decoder, and never requests the next
+block. This matches the user's "before the logos ... the screen render is missing":
+the logos are MOVIE.AFS movies, and the IPU never produces frames.
+
+Next step is the IPU/MPEG path (real decode or a controlled skip/blank-frame path),
+not the DVCI or DVCI/ADXF plumbing.
+
+### Session 74 - correction: IPU is not touched; scene load is the ADXF/MBS path
+
+Ran with `TOL_TRACE_IPU` (new, logs IPU/VIF/GIF MMIO in `ps2_memory.cpp`). In 15 s
+the log contains **no** accesses to `0x10002000`/`0x10002010`/`0x10007010`; only
+VIF1/GIF (`0x10003000`, `0x10003C00`, `0x10005000`). So the IPU stub is **not** the
+current blocker and the planned blank-frame IPU would not help.
+
+What actually happens after the extent tables (`TOL_TRACE_FILEIO`):
+
+- The 70 `gameFileRead` calls are the AFS extent reads (sid `0x80000595`, client
+  `0x3863D0`, HLE `gameFileRead` in `tol_overrides.cpp`); the last is
+  `sector 0x700000 (file slot 6 +0)`.
+- Then `ioman` sequentially opens/reads the six scene-layout files:
+  `\MBS\SYS_REG.MBS` (1720), `MAP.MBS` (3160), `SND.MBS` (31724), `FIELD.MBS`
+  (7324), `BATTLE.MBS` (22004), `MOVIE.MBS` (88). All succeed.
+- After `MOVIE.MBS` the file I/O stops. The next guest activity is the sound init
+  (`0x231e00`/`0x231e80`) and the ADXF stream (`0x39EE48`) stays `state=1`,
+  `stream[0x45]=0`.
+
+So the remaining stall is the ADXF consumer: `FUN_0019F710` (ADXF_Read, sets
+`stream[0x45]=1`) is only called from `FUN_00197550`, which is driven by the game
+loaders (`FUN_00206140`, `FUN_00230AD0`, `FUN_001f8530`). The read completion the
+state machine (`FUN_001AB4F8`) waits on is the file-data RPC end function
+`0x1016d0` (registered in the table), which clears `DAT_00385234`. Next: check
+whether that end function is actually invoked for the client `0x3863D0`, or
+whether the game simply stops issuing `ADXF_Read` after `MOVIE.MBS`.
+
+### Session 75 - SIF end function was never invoked (fixed)
+
+Root cause of the read-completion stall: the runtime **replaces** the guest
+`sceSifCallRpc` (`0x118628`) with the HLE `tolSifCallRpc` (`tol_overrides.cpp`).
+The HLE answers the RPC inline (GameFileRead, loadfile, IxAudio, ...), but it read
+only `a0/a1/a3/t0/t1/t2` — not the **8th argument (end function) in `$t3`** or the
+**end parameter in the first stack word**. So the guest's `0x1016D0` end function
+(libsif packet copy + completion, which clears `DAT_00385234`) was **never called**.
+Probing confirmed `0x1016D0` = 0 calls, while the CRI state machine `0x1AB4F8` ran
+40× waiting on `FUN_00101f70(1)`.
+
+Fix: `tolSifCallRpc` now wraps `tolSifCallRpcBody`, reads `endFunction =
+GPR_U32(ctx,11)` and `endParameter = Load32(sp)`, and after the body queues a
+`GuestInvocation` (`RpcCallback`) to run `endFunction` with `a0 = endParameter`
+(same deferral as `RPC.cpp`'s reply callback). Verified: `0x1016D0` now runs **40×**.
+
+Remaining: the **ADXF/scene stream** (`0x39EE48`) is a different client. It still
+shows `state=1`, `stream[0x45]=0`, `dev=0`, `stream[+0x14]=0x5E75F`, and
+`gGameFileReadCount` stays 69. Its read path is `FUN_00197550` -> `FUN_0019F710`
+(ADXF_Read) -> `FUN_0019F298` (step) -> `FUN_001ad850`/`FUN_001aaf80` (CRI device
+DMA via `FUN_001b6f68`/`FUN_001b6fe0`), not the libcdvd `FUN_001029A8` path. The
+client (`FUN_00230AD0`/`FUN_00206140`) only re-reads when `FUN_00197668()==3`, so
+the CRI device DMA completion is the next layer to fix.
+
+### Session 76 - ADXF/CRI device: end-function fix landed, device handle is 0
+
+`tolSifCallRpc` now also clears `DAT_00385234` for the libcdvd end function
+`0x1016D0`, and `0x1016D0` runs 40x. That did **not** move the ADXF stream:
+it still shows `state=1`, `45=0`, `46=0`, `48=0`, `49=0`, `dev=0`, `+14=0x5E75F`,
+and `gGameFileReadCount` stays ~60-69.
+
+So the ADXF stall is not the libcdvd pending flag. The read driver is
+`FUN_0019EF58`: it looks at `stream[+0x14]` (remaining), `stream[+0x44]/[0x48]`
+(cancel), then calls the file object's vtable (`fobj[0] + 0x18`) and
+`FUN_001a98e0` / `FUN_001a9878` (vtable +0x20/+0x18). `dev=0` means the CRI device
+handle (`*(*(stream+8)+4)`) is zero — the device is not open, so the read cannot
+start and the stream never reaches state 3. `FUN_001aae58` returns
+`&DAT_003a55d0` only when `DAT_003a55d0 == 0`; if the CRI device was closed or
+never opened, it returns 0.
+
+Next: the CRI device open/close (`FUN_001aae58`, `DAT_003a55d0`), the file object
+at `stream+8`, and the vtable read methods, not the libcdvd SIF path.
+
+### Session 77 - ADXF file object is 0 (never opened)
+
+Dumped the ADXF stream fields: `stream+4 = 0x003B1998` (the driver object) but
+`stream+8 = 0` (the file object), `stream+0xC = 0`, `stream+0x3C = 0`. The stream is
+`state=1`, `45=0`, `46=0`, `49=0`, and step-in == step-out (no change).
+
+So the stream is in its "reading" state with **no file object**. The step
+`FUN_0019F298` only opens the file (`FUN_001a9448(stream[0x50], stream[0x54], 0)`)
+when `stream[0x45] == 1`, and `FUN_0019F710` (ADXF_Read) is the only setter of
+`0x45`; it is reached from `FUN_00197550` only when the caller's remaining
+(`handle[0xC]`) is > 0xFFFFE and the stream is at state 3. The game loader
+`FUN_00230AD0` only re-reads when `FUN_00197668()==3`. That leaves the stream
+pinned at state 1 with no file object: the open path
+`FUN_001a9448(stream[0x50]=0x1FFFEC0, stream[0x54]=0, 0)` is the next thing to
+verify (it is what would set `stream+8` and let the state reach 3).
+
+Forcing `DAT_00385234 = 0` did not change this, confirming the libcdvd path is no
+longer the limiter here.
+
+The stream's path is valid: `stream[0x50] = 0x01FFFEC0` contains
+`CDV:\AFS\MAP.AFS`. So the ADXF stream is the MAP.AFS, and the open is not failing
+on a bad name. It is simply never reached because `stream[0x45]` never becomes 1:
+the only setter is `FUN_0019F710`, reached only from `FUN_00197550` when the
+caller's remaining exceeds 0xFFFFE and the stream is at state 3. The loader
+`FUN_00206140` opens by name, calls `FUN_00197550`, then waits
+`while (FUN_00197668(handle) != 3)`. Need to find the initial state-1 transition
+(who set `stream[+1] = 1` with `stream+8 = 0`) and the `FUN_001970e8` read that
+should drive it to 3.
+
+### Session 78 - ADXF total size is 0 (read computes negative remaining)
+
+The ADXF stream fields are: `+0x0C = 0` (total size) and `+0x14 = 0x5E75F`
+(position). `FUN_00196db0` computes `remaining = *(p+0xC) - *(p+0x14)` = a
+**negative** value, so the read can never become "nothing left / state 3". The
+credit tick `FUN_001972e0` copies stream state/position into the DVCI handle, and
+`FUN_0019eda0` sets state 2 (reading) when `+0x14 != 0`, else 3. So with a zero
+total and a nonzero position the state machine can only sit at 1/2.
+
+The total (`+0xC`) is normally set by the ADXF open (`FUN_001a9448`) together with
+the file object (`+8`). Both are 0, so the open never ran. The open runs in
+`FUN_0019F298` only when `stream[0x45] == 1`, set by `FUN_0019F710`, reached from
+`FUN_00197550` only when the DVCI handle's `+0x0C > 0xFFFFE`. So the next thing to
+verify is the handle `FUN_00206140` opens with `FUN_00196a10` and whether its
+`+0x0C` is the MAP.AFS size or 0.
+
+### Session 79 - corrected: those fields are the ADXF stream, not the DVCI handle
+
+The `+0x0C`/`+0x14` dump is the **ADXF stream** at `0x39EE48`, not the DVCI handle
+(`lVar3`/`0x390738`). `FUN_00196960` (DVCI open) sets the handle: `+0x10 =
+FUN_0019f560(stream)` (total), `+0x0C = FUN_0019f568(stream)` (stream position
+`stream[+0x14]`). So the handle `+0x0C` is a position, not a total.
+
+`FUN_00197550` gate: it calls `FUN_0019f710` (ADXF_Read, the only setter of
+`stream[0x45]`) **only when the handle position `+0x0C > 0xFFFFE`**. At the stall
+the stream position is `0x5E75F` (386 KB < 1 MB), so the ADXF read is never
+requested, `stream[0x45]` stays 0, `stream+8` never opens, and the DVCI handle
+never reaches state 3. `FUN_00206140` then waits
+`while (FUN_00197668(handle) != 3)` forever.
+
+Also confirmed `DAT_00393208` (pump guard) reading 1/5 is **normal** mid-pump, not
+stuck; the guard-reset workaround was reverted.
+
+Next: why the block loader's stream position sits at 0x5E75F and never advances
+past the 1 MB ADXF gate — i.e. who should consume/advance the prefix before
+`FUN_00197550` starts the ADXF read.
+
+### Session 80 - device read "done" mode DAT_003a7782
+
+`FUN_001ad850` stamps `stream[0x44..0x46]` from `DAT_003a7780/81/82` and
+`stream[0x47]`... The ADXF step (`FUN_0019F298`) completes only when the read-done
+marker (`stream[0x46]`) is 1, and `stream[0x46]` comes from `DAT_003a7782`
+(param_3 of `FUN_001aeab0`). The trace shows `sync=0` (`DAT_003a7784`), i.e. async
+mode, and the completion path depends on `DAT_003a7782`.
+
+`FUN_001aeab0(set, mode, done, sync)` is the CRI device-config setter; it is called
+only from the CRI init `FUN_0019f7b0`/`FUN_0019f9a8`, which `FUN_001663a0` drives
+with the `apuStack_20` config (`{&DAT_003c0a28, 0, 0}`). So the done mode is 0 and
+the async read never reports done; the stream stays state 1 and the block loader
+`FUN_00206140` spins `while (FUN_00197668 != 3)`.
+
+Next: `FUN_0019f7b0`'s `FUN_001aeab0` arguments (the done/sync modes) and the async
+device-read completion (`FUN_0019ef58` / `FUN_001ad850` with `DAT_003a7784==0`).
+
+### Session 81 - CORRECTION: the ADXF stream is NOT stuck at state 1; the async read completes
+
+Instrumented `FUN_0019EF58` (the ADXF read/completion step), `FUN_00196DB0` (the per-arm
+dispatch), `FUN_00197940` (the pump), `FUN_0019A080` (the wait) and a full 40-slot stream
+dump. Results:
+
+* The `state = 1` seen by the `FUN_0019F298` step probe was an **arm-boundary snapshot**:
+  `FUN_00196DB0` deliberately resets the stream to state 1 (`FUN_0019EEC8` ->
+  `FUN_0019EE60`, which sets `stream[1] = 1` unless a read is in flight) before arming the
+  next arm. It is not a deadlock.
+* The async device read works end to end: `FUN_0019EF58` goes `st=2 busy=0` -> `busy=1` ->
+  `st=3`, `stream[0x34]` reaches `stream[0x5C]`, `stream[0x58]` (blocks done) increments, and
+  the credit tick `FUN_001972E0` then lifts the DVCI handle to `h1=3`.
+* `[io-wait]` shows steady progress: one 2 KB block per wait, ~1.5 waits/s, with the loop
+  walking the six AFS files (`894`, `386911`, `223038`, `17204`, `323233`, ...) and `h14`
+  tracking `s58` exactly.
+* At wait #60 (~40 s) the `while (FUN_00196460(i) != 3) FUN_0019A080();` loop in
+  `FUN_001664D0` **finishes** and `FUN_0019A080` stops being called at all. So the whole
+  extent-table load (`FUN_001663A0` -> `FUN_001664D0`) completes.
+
+The arm size is intentionally 1 block: `FUN_00196058` loads `t0 = 0x00391140` / `t1 = 0x800`
+(a static 2 KB extent table) and `FUN_001961A8` sets `DAT_003910B4 = 0x800 >> 11 = 1`. That is
+fine because these are AFS **extent** entries (a handful per file), not per-sector reads.
+
+Therefore the ADXF/CRI device-read path is healthy and the remaining `NOW LOADING` stall is
+**after** `FUN_001663A0` returns into `FUN_00165C90` (the startup/logo routine), not in the
+stream state machine. Next: trace what `FUN_00165C90` does after `FUN_001663A0` and why the
+main loop never reaches the scene load `FUN_002073A0`/`FUN_00206140` (still 0 calls).
+
+### Session 82 - place after the extent load: FUN_00166120 -> script engine
+
+Startup order at `0x165AE0` (inside `FUN_00165AF0`):
+
+```
+FUN_00165C90  startup: CRI init + AFS extent load + logos
+FUN_00165E70  frame update
+FUN_00166010  GS/VIF1 wait (now exits)
+FUN_00166120  script/event dispatcher
+FUN_001667E0 / FUN_00166870
+0x139D50 ...  render setup
+```
+
+`FUN_00166120` is `uVar1 = thunk_FUN_001f88c0(); while (thunk_FUN_001f88f0(uVar1) == 0) { op =
+thunk_FUN_001f8920(uVar1); arg = thunk_FUN_001f8960(uVar1); dispatch(op, arg); uVar1 =
+thunk_FUN_001f89a0(uVar1); }` followed by `FUN_0027AD50(); FUN_00279C00(); FUN_0027A140();
+FUN_002EB320(); FUN_001f7290(1);`.
+
+Control now parks in `FUN_0027AD50` (entered once from `0x166240`) and resumes at `0x28B0C8`.
+That address is **not a function**: it is `caseD_0_0x28b0c8.cpp`, i.e. `switch` case 0 of
+`FUN_0028B010` (cases at `0x28B0C8/0x28B0DC/0x28B0F0`). The `[pc] exit <fn> pc=<other>` lines in
+`TOL_TRACE_PC` are **checkpoint bails**, not returns - do not read them as `$ra` corruption.
+
+Tried a sentinel-`$ra` rework of the `0x1F8150` GS worker override on the theory that the
+`pc=0x1F8168 ra=0x151F88` bail meant `$ra` corruption. It regressed: worker steps went 2 -> 1
+and `DAT_00407740`'s flag stayed 0 instead of reaching 1. Reverted and re-verified (2 steps,
+flag 0 -> 1). The current `0x1F8150` override is correct as written.
+
+Next: `FUN_0027AD50` / the `FUN_0028B010` switch-case resume, and why the dispatcher never
+advances past the first script command.
+
+### Session 83 - FIXED: jump dispatch fell through, restarting switch case 0
+
+`FUN_0028B010` ends in a jump-table switch:
+
+```
+0x28b0a0  sltiu at, s0, 9
+0x28b0a4  beqz  at, 0x28b17c          ; default
+0x28b0ac  v0 = table[s0]              ; table at 0x3CA9F0
+0x28b0c0  jr    v0
+```
+
+Each case is emitted as its own function (`caseD_0_0x28b0c8.cpp` … `ps2_default_0x28b17c.cpp`)
+and they share the parent's epilogue: `caseD_0` computes `v0 = clamp(9999, a0)`, then
+`b 0x28B180` and returns with `ctx->pc = 0x28B180`.
+
+The parent's `jr v0` was emitted as:
+
+```cpp
+if (!runtime->dispatchGuestBranch(..., GuestBranchKind::IndirectJump, "JR")) {
+    return;
+}
+label_fallthrough_0x28b0c0:
+ctx->pc = 0x28B0C8u;      // <-- clobbers the case's 0x28B180 continuation
+```
+
+A jump never falls through, but codegen did, so every `jr v0` ran `caseD_0` and then reset
+`ctx->pc` back to `0x28B0C8` - an endless case-0 loop. That is why `FUN_0027AD50` and
+`FUN_00166120` never returned and the startup stopped right there.
+
+Fix (two parts, both applied):
+
+1. **Emitter** - `thirdparty/PS2Recomp/ps2xRecomp/src/lib/control_flow_emitter.cpp`:
+   `emitExternalJumpDispatch` (non-call branch) and `emitExternalRegisterJumpDispatch` now emit a
+   `return;` after the dispatch, so `ctx->pc` as left by the target body is honoured. Calls
+   (`JAL`/`JALR`) still fall through.
+2. **Existing corpus** - the same transformation applied mechanically to `data/output_fixed/`:
+   **302 files, 1324 jump-dispatch sites** (pattern: `dispatchGuestBranch` + `GuestBranchKind::
+   IndirectJump|DirectJump`, followed by `return;` then `}`).
+
+Verified result: `FUN_00166120` now completes, the startup proceeds to `FUN_001667E0` and
+`FUN_00166870` (both previously unreachable), and the case-0 spin is gone.
+
+Next blocker: after `FUN_00166870`, control returns to `0x151F88`; the GS worker runs
+(`FUN_001F8000` x2, `FUN_0015231C` x4) and then execution parks, so the next call in the startup
+sequence, `FUN_00139D50` at `0x165B54`, is still never reached.
+
+### Session 84 - the park is the guest coroutine scheduler (FUN_0015231C)
+
+`0x151F88` is inside `FUN_00151E90`, the DMA packet-list walker, and is exactly the instruction
+after a `jal FUN_0015231C`. `FUN_0015231C` is **not** a flush - it is the guest's thread
+yield/context switch:
+
+```
+iVar2    = iRam003db1a0 * iRam003db1b0;
+puVar1   = *(u32 **)(iVar2 + 0x48F590 + iRam003db1c0);   // per-context save slot
+puVar1[0x6b] = 1;
+puVar1[0..] = v0, v1, a0..a3, s0..s8, sp, ra, f0..f31;    // full register spill
+... then jumps to 0x151F88 instead of `jr $ra`
+```
+
+`FUN_001F84B0` calls it with `$ra = 0x1F8528` (the instruction after `jal FUN_0015231c`) and
+expects to be resumed there. The port has no coroutine scheduler, so that continuation is
+discarded and the startup parks inside `FUN_00151E90` with `pc == ra == 0x151F88`. Every one of
+the ~30 callers of `0x15231C` has the same problem.
+
+Three approaches were tried and **all reverted** (baseline re-verified: worker steps 2,
+`DAT_00407740` flag 0 -> 1, `FUN_00166120`/`FUN_001667E0`/`FUN_00166870` all reached):
+
+| experiment | result |
+|---|---|
+| worker inner calls use `$ra = savedRa` instead of `0x1F8160`/`0x1F8168` | worker steps 2 -> 1, flag stuck 0 |
+| skip the `FUN_0015231C` call in the worker override entirely | worker steps 2 -> 1, flag stuck 0 |
+| override `0x15231C` as a no-op "return to $ra" | worse - `FUN_00166120` never reached |
+
+Conclusion: this is not a `$ra` bug to patch locally. Making progress needs a real cooperative
+thread model for the guest - save/restore the per-context block at `0x48F590` (index from
+`DAT_003db1a0 * DAT_003db1b0 + DAT_003db1c0`, state word `ctx[0x6b]`) and round-robin between
+contexts, with `FUN_0015231C` as the yield point. That models what the hardware thread does and
+is what `FUN_00166010`'s flag wait and the GS worker were designed around.
+
+### Session 85 - CORRECTION: no host scheduler needed; the second GS worker was the loop
+
+Scoped the "scheduler" properly and the premise in Session 84 was wrong:
+
+* `FUN_001F8180` creates **two** guest threads through `FUN_00151CD0(entry, arg, prio, name)`:
+  `0x1F8150` (worker 1, already overridden) and **`0x1F84B0`** (worker 2).
+* `FUN_00151CD0` -> `FUN_00151C80` scans the guest's own **64-entry thread table at `0x407160`**
+  (stride `0x210`; state `+0x1F0`, id `+0x1F1`, callback `+0x1B0`, callback arg `+0x1C0`,
+  `+0x1AC`, `+0x200`) and fills the first free slot via `FUN_001518C0`. Thread lifecycle is
+  entirely guest-owned - there is nothing for a host scheduler to own.
+* `FUN_0015231C` is **save-only**: it spills the register file into `ctx = table[A*B+C]` at
+  `0x48F590` (`A`=`0x3DB1A0`, `B`=`0x3DB1B0`, `C`=`0x3DB1C0`), sets `ctx[0x1AC] = 1`, stores `$ra`
+  at `ctx[0x1B4]`, and `jr ra`. No switch, no restore, no scheduler counterpart.
+* `FUN_001F84B0` is the actual loop:
+  `do { while (queue == 0) FUN_0015231c(); lock; dispatch(queue); unlock; } while (true);`
+  i.e. a second infinite worker, same shape as `0x1F8150`.
+
+**Fix applied:** `0x1F84B0` is now overridden to process one work item per dispatch and return to
+`$ra` (mirrors `0x1F8150`; logs `[gs] worker2 step #N queue=...` under `TOL_TRACE_GS`).
+
+Also established that the `0x1F8150` override's interior `$ra` values (`0x1F8160` / `0x1F8168`)
+are **load-bearing**: they make the guest run its real loop body, and that pass is what raises the
+completion flag. Tried three replacements - `$ra = savedRa`, two host-driven iterations, and
+skipping the save call - and all left `DAT_00407740` at 0. Original kept.
+
+Verified baseline after the change: worker 1 = 2 steps, worker 2 = 1 step, flag 0 -> 1,
+`FUN_00166120` / `FUN_001667E0` / `FUN_00166870` all reached.
+
+Still open: `FUN_00166870` hands off at `0x1F8168` and `FUN_00139D50` at `0x165B54` is never
+reached, so the remaining question is the worker-1 re-entry contract (why the guest loops back
+into `0x1F8150` instead of returning through `$ra`), not a missing scheduler.
+
+### Session 86 - worker 1 does NOT re-enter; the real spin is the script engine at 0x1ECC40
+
+Instrumented the `0x1F8150` override (entry / guard / after-step / after-save counters, gated by
+`TOL_TRACE_GS`). Result over a full run:
+
+```
+[gs] worker entry #1 savedRa=0x00151F88 afterStep=0x001F8160 afterSave=0x00151F88
+                   exit=0x00151F88 guardHits=0
+```
+
+* Exactly **one** entry, **zero** guard hits. Worker 1 never re-enters `0x1F8150`.
+* `afterStep = 0x1F8160` and `afterSave = 0x151F88`: the step returns into the loop's
+  `jal FUN_0015231c`, and the save returns straight to the callback's caller.
+* `0x1F8150`'s body is `addiu sp,-0x10 / sd ra,0(sp) / jal 0x1F8000 / jal 0x1F5231C / b 0x1F8158`,
+  so `0x1F8160` and `0x1F8168` are the correct continuations, and `0x1F8168` is also one of the
+  slots the override replaced - which is why a checkpoint bail there *looked* like a re-entry.
+
+**Conclusion: the re-entry contract is already correct; nothing to fix there.** The earlier
+`pc=0x1F8168` in the `TOL_TRACE_PC` exit line is a checkpoint bail, not a jump.
+
+Also: `eeCheckpointDue()` is time-based, so single-run A/B counts (e.g. `FUN_001667E0` 0 vs 1) are
+not reliable evidence on their own - use `TOL_TRACE_SPIN` and longer windows.
+
+**Real remaining blocker, found with `TOL_TRACE_SPIN=1`:** after ~7.8M branches the guest pins at
+
+```
+[spin] pc=0x1ECC40 ra=0x1ECD04   (identical for 3,000,000+ branches / ~30 s)
+```
+
+`0x1ECC40` is `jal 0x1F7350` inside `FUN_001ECBE0`, the script/event engine's per-object update.
+Its loop is
+
+```
+0x1ECC38  bne  v0, zero, 0x1ECDA0    ; exit when the script reports finished
+0x1ECC40  jal  0x1F7350              ; peek next opcode
+0x1ECC4C  bne  v0, 0x1b, 0x1ECCF0    ; only opcode 0x1b is handled here
+```
+
+with the "finished" predicate `FUN_001f88f0(handle) = *(u32*)handle <= handle >> 32`, i.e.
+`index < count` on a fat pointer (low word = command table base, high word = current index; the
+opcode peek is `base + 0x10 + index*0x10`). The script context for `s1` never reaches
+`index >= count`, so the dispatcher drains forever and `NOW LOADING` never advances.
+
+Next: why that script context's `count`/`index` never converge - instrument `FUN_001f89a0`
+(advance) and `FUN_001f8920` (peek) for the `FUN_001ECBE0` handle, and identify the opcode the
+script is parked on.
+
+### Session 87 - FIXED: script dispatcher spun on a NULL command block
+
+Instrumented the script-context thunks (`TOL_TRACE_SCRIPT=1`):
+
+```
+[script] status  #1 handle=0000000001523010 base=0x01523010 index=0 count=0          <- empty, finishes
+[script] status  #2 handle=0000000000000000 base=0x00000000 index=0 count=1065353216
+[script] status  #3 handle=0000000100000000 base=0x00000000 index=1 count=1065353216
+...
+[script] status  #6200000 handle=005E9ABE00000000 base=0x00000000 index=6199998 count=1065353216
+[script] peek    #6200000 -> opcode=0x00000000
+```
+
+So the index **was** advancing correctly all along (`advance` produced index+1 every time). The
+problem is the **base is 0**: the packed handle is `(index << 32) | 0`, so
+`FUN_001f88f0` loads `count` from guest address 0, which holds `0x3F800000` (the float 1.0f) =
+**1,065,353,216**. The dispatcher therefore has to walk a billion indices before it can report
+"finished" - the permanent `pc=0x1ECC40` spin.
+
+Handle layout (confirmed from MIPS): low 32 = command block pointer, high 32 = command index;
+`count = *(u32*)base`; advance = index+1; `status = !(index < count)`.
+
+Also found: the thunk at `0x1F7340` does **not** go through the function table - its generated
+body calls `FUN_001f88f0_0x1f88f0(rdram, ctx, runtime)` directly. So overriding `0x1F88F0` never
+fires on the dispatcher path; the guard has to be installed on the **thunk `0x1F7340`**, which the
+dispatchers do reach via `dispatchGuestBranch`.
+
+**Fix:** `scriptStatusProbe` (installed unconditionally on `0x1F7340`) now treats a null command
+block as empty and returns "finished" (v0 = 1) without touching guest state, delegating to the
+real predicate for every non-null handle. A null script has no commands, so this is correct
+semantics, not a workaround for the dispatcher.
+
+Verified with `TOL_TRACE_SPIN=1` over 60 s: `pc=0x1ECC40` no longer appears at all, and the
+sampler keeps moving through real work (`0x27B6E0`, `0x334294`, `0x3436B8`, `0x19BCC8`,
+`0x19F4A0`, `0x1AC518` - the ADXF/CRI path) with no sticky PC.
+
+Still open: `FUN_002073A0`/`FUN_00206140` (scene load) not reached yet; the guest is now running
+I/O code instead of spinning.
+
+### Session 88 - scene load blocked: resource table (gp-0x7534) never initialised
+
+With the script spin gone, the startup reaches `FUN_00166870` -> `FUN_00164EA0` -> **`FUN_001EC670`**,
+which runs five sequential asset-load stages:
+
+```
+job = FUN_001EC9A0(stage, resourceId, 1);
+while (FUN_0027BFF0(job) == 0) { FUN_00151FF0(0); FUN_0019A080(); FUN_001EE060(); FUN_001392D0(); }
+```
+
+`FUN_0027BFF0` is just `*job == 2`. Instrumented with `TOL_TRACE_LOAD=1` (probes on `0x1EC9F0`,
+`0x27BFF0`, `0x3710C0`):
+
+```
+[load] resource id=1 gp=0x003E2BF0 slot=0x003DB6BC table=0x00000000 -> 0x00000000
+[load] resource id=2 ... table=0x00000000 -> 0x00000000
+[load] resource id=3 ... table=0x00000000 -> 0x00000000
+[load] resource id=4 ... table=0x00000000 entry=0x3F800000 -> 0x0FE00000
+[load] start res=3 resource=0x0FE00000 flag=1 -> job=0x004E8A90 state=1
+[load] status #2.. job=0x004E8A90 state=0      (never reaches 2)
+```
+
+The chain:
+
+1. `FUN_003710C0(id) = *(u32*)(table + 0x10 + id*4) >> 2`, where
+   `table = *(gp - 0x7534)`. Note the decompiler's constant is `4294937292` (= -0x7534); the
+   similar-looking `4294939820` used by `FUN_002EB320` is a different offset (-0x6B54) and is a
+   red herring.
+2. That pointer lives at `0x003DB6BC`, which the ELF ships in the **zero-filled tail** of the
+   single PT_LOAD (`vaddr=0x00100000 filesz=0x2DAF80 memsz=0x3E9B80`), i.e. `.bss` - so it starts
+   as 0 and must be set at runtime.
+3. It is written **only** by `FUN_003710A0`, whose only caller is `FUN_0027A990`, which is only
+   called as **script opcode 0** from `FUN_00166120`.
+4. `FUN_00166120` runs with `a0 = 0x01523010`, and that script block's first word is 0, so
+   `FUN_001f88f0` reports "finished" immediately: the boot script has **no commands** and no
+   opcode 0 ever executes.
+
+Net effect: stages 0-2 resolve to 0 (skipped), stage 3 gets garbage `0x0FE00000` from address
+`0x20`, creates a job that immediately drops to state 0, and the startup blocks forever in
+`FUN_001EC670`. `NOW LOADING` stays up.
+
+Next: find why the boot script context at `0x01523010` is empty - where its command block is
+supposed to be loaded/populated, and whether `FUN_0027A990` should also run from an earlier
+(non-script) init path. Probes for this are already in place: `TOL_TRACE_LOAD=1`.
+
+### Session 89 - boot script is a 1.2 MB transfer that never lands
+
+Traced the empty boot script to its origin. `FUN_00166010` does:
+
+```
+size  = FUN_001f72d0(0);            // resource 0 size + 0x10
+buf   = FUN_001013e0(0, size);      // the script block at 0x01523010
+thr   = FUN_00151cd0(0x1660a0, 0, 1, 0);
+FUN_00152030(thr, &flag, buf, 0, 0);
+while (flag == 0) { FUN_00151ff0(0); FUN_00151ff0(1); FUN_001392d0(); }
+return buf;                          // -> becomes FUN_00166120's a0
+```
+
+`FUN_001660A0` (the thread entry) starts the load and waits:
+
+```
+uVar2 = FUN_001f72f0(0, buf, 0);            // -> FUN_001f82f0 -> FUN_001f8be0 (queue) -> FUN_001f8ac0
+lVar3 = FUN_001f8480(uVar2);
+while (lVar3 != 0) { FUN_0015231C(); lVar3 = FUN_001f8480(uVar2); }
+*flag = 1;
+```
+
+`TOL_TRACE_LOAD` shows the real request:
+
+```
+[load] submit #1 type=2 id=0 size=1252176 dest=0x01523010 -> handle=0x00000080
+```
+
+So the boot script is a **1,252,176-byte transfer into 0x01523010**. `FUN_001f8be0` only *queues* a
+0x2C descriptor at `0x4A72C0 + slot*0x2C` (status byte +2 starts at 2; handle at +8). The queue head
+is `*(gp-0x7860)` = `0x003DB390`, and the drainer is **worker 2 (0x1F84B0)**, which dispatches
+`0x1F8530` / `0x1F87C0` per descriptor (`0x1F8530` opens the file with the descriptor id via
+`FUN_00196b88` and reads it).
+
+Fix applied: this port enters guest thread entries only once, so nothing ever drained that queue.
+`ioPumpProbe` (installed on `FUN_0019A080`, which every load wait loop calls each iteration) now
+invokes worker 2 whenever the queue head is non-null. Verified:
+
+```
+[load] pumping transfer queue head=0x004A72C0 (pump 1)
+[load] pumping transfer queue head=0x004A72EC (pump 2)
+```
+
+Remaining gap: the handler issues an **asynchronous** DVCI read and relies on the status byte being
+cleared by completion, but `FUN_001660A0`'s wait is `while (FUN_001f8480(h) != 0) { FUN_0015231C(); }`
+- it only yields, it never pumps I/O. Forcing "done" (the current default) lets the waiter proceed
+before the data lands, so the buffer is still zero and `count = 0`. Reporting the real status instead
+deadlocks: submit #1 happens and then no pumps and no script context (verified with
+`TOL_VIF_STATUS_REAL=1`, which restores hardware behaviour).
+
+So the stub stays default. To actually land the data, the transfer has to be driven to completion
+*inside* that yield-only wait - i.e. make `FUN_001f8480` perform/pump the pending transfer
+synchronously before reporting, rather than just yielding.
+
+### Session 90 - yield now pumps the DVCI engine; transfer handler hits a stale spinlock
+
+Two more fixes landed, both verified, but the boot script still does not land.
+
+1. **Yield pump.** `FUN_001f8530` waits `while (desc[2] != 3) { ... FUN_0015231C(); }` and
+   `FUN_001660A0` waits `while (FUN_001f8480(h) != 0) FUN_0015231C();` - both only yield, so in this
+   scheduler-less port the DVCI read could never retire. `yieldPump` (installed on `0x15231C`) now
+   runs the original context save and then pumps `FUN_00197940` (the DVCI/ADXF engine), guarded
+   against re-entry. Verified: `[load] yield-pump #1..#6`.
+
+2. **Stale transfer spinlock.** `FUN_001f7390` opens the handler with
+   `while (iGpffff8780 != 0) FUN_0015231C(); iGpffff8780 = 1;` (lock at `gp-0x7880` =
+   `0x003DB370`). A cooperative checkpoint inside the handler leaves it held by the same logical
+   thread, so every later acquire spins forever - which is why `0x1F8530` was entered 22x without
+   ever reaching `FUN_00196b88`/`FUN_001970e8`. `transferLockProbe` clears a stale lock before
+   acquiring (single guest thread, so it can only ever be stale). Verified:
+   `[load] clearing stale transfer lock (was 1, clear #1)`.
+
+Remaining blocker: the handler now gets past the lock but is **restarted** rather than resumed.
+`0x1F8530` bails at a cooperative checkpoint (`pc=0x001AD2D8`, later `pc=0x0010EE5C`), the bail
+unwinds back into the queue pump, and `ioPumpProbe` re-dispatches the handler **from its entry** on
+the next iteration - so it redoes the lock/reset and bails again, never progressing to the DVCI
+open/read. Still unlanded: `submit #1 id=0 size=1252176 dest=0x01523010`, so
+`*(0x01523010) == 0` and the script context stays empty (`count = 0`), the resource table
+(`gp-0x7534`) stays null, and `FUN_001EC670` stage 3 keeps failing.
+
+Next: make the queue pump **resume** the in-flight handler instead of re-entering it - i.e. keep
+the handler's `ctx->pc` across pumps (only dispatch `0x1F8530` when the descriptor status is still
+2/queued, and let the runtime continue an in-progress one), which is the same class of problem as
+the earlier checkpoint-resume work.
+
+### Session 91 - transfer handler coroutine: resume captured, but re-entry does not take
+
+Implemented the resume discipline. Worker 2 (`0x1F84B0`) is now a coroutine driver:
+
+* only *starts* a descriptor whose status byte (`slot+2`) is still `2` (queued);
+* on a preempted handler it records `gXferResumePc = ctx->pc` plus `gXferSlot`, then returns
+  normally to the caller (the handler's guest stack frames stay intact);
+* on the next pump, if `gXferSlot` still matches the queue head, it re-enters at
+  `gXferResumePc` with `$ra = 0xFFFFFFF0` (kXferSentinel) so a completed handler still returns
+  into the override and can run `FUN_001f8da0` (reap) + `FUN_00153190` (unlock).
+
+Verified the capture works:
+
+```
+[load] pumping transfer queue head=0x004A72C0 (pump 1..8)
+[load] transfer handler preempted, resume at 0x001AD2D8 (slot=0x004A72C0, #1)
+```
+
+But it still does not progress: there is exactly **one** preemption and no subsequent
+re-entry - `0x1F8530` is entered once, `0x1F96B88` / `0x1F970E8` / `0x1F8DA0` are all **0**, and
+`*(0x01523010)` stays 0. So pumps 2..8 run the worker but fall through the resume path (no second
+"preempted" log and no reap), which means the `gXferResumePc != 0 && gXferSlot == queue` branch is
+not being taken, or `lookupFunction(gXferResumePc)` returns null and the branch silently falls
+through to "completed". That is the next thing to instrument (log inside the resume branch itself,
+before and after `lookupFunction`).
+
+Boot script still unlanded: `submit #1 id=0 size=1252176 dest=0x01523010`, `count = 0`,
+resource table `gp-0x7534` still null, `FUN_001EC670` stage 3 still failing.

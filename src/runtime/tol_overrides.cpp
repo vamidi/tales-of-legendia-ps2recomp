@@ -3,13 +3,34 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "ps2_syscalls.h"
+#include "runtime/ee_scheduler.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+
+// Host-level scheduler counters, defined in EeScheduler.cpp at global scope. Reading them from a probe
+// distinguishes "the guest thread is still being entered" from "the executor loop stopped turning".
+extern std::atomic<uint64_t> g_eeRunLoopIterations;
+extern std::atomic<uint64_t> g_eeProcessPendingEventsCount;
+extern std::atomic<uint64_t> g_eeEnterGuestCount;
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace
 {
+    // Shared timeline counters. Every probe stamps these, so submits, polls and frames sit on one axis.
+    uint32_t gFrameTicks = 0u;
+
     // ---------------------------------------------------------------------------------------------------------
     // NATIVE SIF RPC (the game's own libsif is statically linked, so its API entry points are guest code)
     //
@@ -173,11 +194,29 @@ namespace
         SET_GPR_U32(ctx, 2, savedV0);
     }
 
+    // FUN_00118828 (the guest's libsif "is this client busy?" check) reads client[0] as a header pointer and
+    // tests header[0x10] bit 0. The native overrides below replace the guest's sceSifCallRpc, so nothing
+    // clears that bit after a completed read; the CRI completion poll then sleeps DelayThread(4000) forever.
+    // Clear it on the same path that already completes the request.
+    void clearGuestRpcBusy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t client)
+    {
+        if (client < 0x00100000u || client >= 0x02000000u)
+            return;
+        const uint32_t header = runtime->Load32(rdram, ctx, client);
+        if (header < 0x00100000u || header >= 0x02000000u)
+            return;
+        const uint32_t flags = runtime->Load32(rdram, ctx, header + 0x10u);
+        runtime->Store32(rdram, ctx, header + 0x10u, flags & ~1u);
+    }
+
+    uint32_t gGameFileReadCount = 0u;
+
     // fn 1: {handle, blocks, buffer, info[0], info[1], info[2], desc, countOut}
     bool gameFileRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t request)
-    {
-        if (request == 0u)
+    {        if (request == 0u)
             return false;
+        const bool timing = std::getenv("TOL_TRACE_FILEIO_TIME") != nullptr;
+        const auto entryTime = std::chrono::steady_clock::now();
         const uint32_t sector = runtime->Load32(rdram, ctx, request + 0x00u);
         const uint32_t blocks = runtime->Load32(rdram, ctx, request + 0x04u);
         const uint32_t buffer = runtime->Load32(rdram, ctx, request + 0x08u);
@@ -223,20 +262,50 @@ namespace
         if (size > remaining)
             size = remaining;
 
-        std::vector<uint8_t> data(size);
+        // Reuse one buffer: this is called per sector during streaming, and a fresh vector per 2 KiB block is
+        // pure allocator churn.
+        static thread_local std::vector<uint8_t> data;
+        data.resize(size);
         size_t read = 0u;
+        const auto beforeRead = std::chrono::steady_clock::now();
         if (size != 0u)
         {
             if (std::fseek(gGameFileStream[slot], static_cast<long>(offset), SEEK_SET) != 0)
                 return false;
             read = std::fread(data.data(), 1, size, gGameFileStream[slot]);
         }
-        for (size_t i = 0; i < read; ++i)
+        const auto afterRead = std::chrono::steady_clock::now();
+        // The streaming buffer is ordinary EE RAM; copy it in one shot instead of 2048 Store8 calls.
+        const uint32_t physical = buffer & 0x1FFFFFFFu;
+        const bool bulkCopy = read != 0u && physical < 0x02000000u && read <= 0x02000000u - physical;
+        if (bulkCopy)
         {
-            runtime->Store8(rdram, ctx, buffer + static_cast<uint32_t>(i), data[i]);
+            std::memcpy(rdram + physical, data.data(), read);
         }
+        else
+        {
+            for (size_t i = 0; i < read; ++i)
+            {
+                runtime->Store8(rdram, ctx, buffer + static_cast<uint32_t>(i), data[i]);
+            }
+        }
+        const auto afterCopy = std::chrono::steady_clock::now();
         completeGameIo(runtime, rdram, ctx, countOut, static_cast<uint32_t>(read));
         releaseGameIoLock(rdram, ctx, runtime);
+        ++gGameFileReadCount;
+        if (timing)
+        {
+            static uint32_t sTimingLogs = 0u;
+            if (sTimingLogs < 64u)
+            {
+                ++sTimingLogs;
+                auto us = [](auto from, auto to)
+                { return std::chrono::duration<double, std::micro>(to - from).count(); };
+                std::fprintf(stderr,
+                             "[fileio-time] sector=0x%X bytes=%zu read=%.1fus copy=%.1fus total=%.1fus\n", sector,
+                             read, us(beforeRead, afterRead), us(afterRead, afterCopy), us(entryTime, afterCopy));
+            }
+        }
         if (std::getenv("TOL_TRACE_FILEIO") != nullptr)
         {
             std::fprintf(stderr, "[fileio] gamefile read sector 0x%X (file slot %d +%u) %zu/%u bytes at 0x%08X\n",
@@ -245,23 +314,16 @@ namespace
         return true;
     }
 
-    // IxAudio's server, sid 0x90000200: the module carries a complete server record for it (link vaddr
-    // 0xD180 in IXAUDIO.IRX) but never calls sceSifRegisterRpc, and no other module does either, so the
-    // game's SJX_Init fails and the boot stalls on its loading screen.
-    //
-    // The functions the game drives are thin wrappers that use the reply as an object handle:
-    //   fn 0x002  DTX create      (FUN_001acac8 stores the non-zero reply as the DTX handle)
-    //   fn 0x422  SJUNI remote    (FUN_001b6400 -> ps2rna_init_psj loops forever on a zero reply)
-    // Both are answered with a fresh handle; the rest reply 0. Audio is not produced - the module that would
-    // stream it never registers - but the game's initialisation no longer dead-ends.
+    // IxAudio's server, sid 0x90000200. IXAUDIO.IRX registers it, but its DTX create (fn 0x002) and PS2RNA
+    // create (fn 0x408) return 0 unless the module's full state machine has been driven, and the game uses
+    // those replies as object handles. Supply the handles the game's SJX/CRI layers need; the rest reply 0.
+    // Audio is not produced, but the loading sequence no longer dead-ends on a zero handle.
     constexpr uint32_t kIxAudioSid = 0x90000200u;
-    constexpr uint32_t kIxAudioHandleFunctions[] = {0x002u, 0x400u, 0x422u};
+    constexpr uint32_t kIxAudioHandleFunctions[] = {0x002u, 0x400u, 0x408u, 0x422u};
     uint32_t gIxAudioNextHandle = 1u;
 
-    // The pad/memory-card service the init step polls. Its reply word is the step's state: 0, -1 and 0x20 all
-    // mean "still pending", so the answer must be something else for the step to move on.
-    constexpr uint32_t kPadServiceSid = 0x80000593u;
-    constexpr uint32_t kPadServiceReply = 1u;
+    // The pad/memory-card service the init step polls used to be answered natively (sid 0x80000593). It is
+    // the game's cdvd/pad service and is now served by cdvdfsv on the IOP; see tolSifCallRpc.
 
     // ioman (sid 0x80000001): the game's sceSifInitIoman (FUN_00119568) binds it and sends fn 0xFF with an
     // 8-byte request of two pointers, expecting an 8-byte reply. The IOPRP image's IOMAN module does not
@@ -599,7 +661,7 @@ namespace
         ps2_syscalls::SifBindRpc(rdram, ctx, runtime);
     }
 
-    void tolSifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void tolSifCallRpcBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t client = GPR_U32(ctx, 4);
         const uint32_t function = GPR_U32(ctx, 5);
@@ -744,11 +806,13 @@ namespace
                 {
                     runtime->Store32(rdram, ctx, receiveBuffer, 0u);
                 }
+                clearGuestRpcBusy(rdram, ctx, runtime, client);
                 SET_GPR_S32(ctx, 2, 0);
                 return;
             }
             if (function == kGameDataReadFunction && gameFileRead(rdram, ctx, runtime, sendBuffer))
             {
+                clearGuestRpcBusy(rdram, ctx, runtime, client);
                 SET_GPR_S32(ctx, 2, 0);
                 return;
             }
@@ -758,8 +822,7 @@ namespace
             return;
         }
 
-        // IxAudio: answer the DTX lifecycle so the game's SJX_Init completes. Audio itself is not produced -
-        // the module that would stream it never registers - but the boot no longer stops on the failure.
+        // IxAudio: answer the DTX/PS2RNA lifecycle so the game's SJX_Init and CRI PS2RNA creation complete.
         if (sid == kIxAudioSid)
         {
             uint32_t reply = 0u;
@@ -783,9 +846,6 @@ namespace
                     std::fprintf(stderr, "[rpc] ixaudio fn=0x%X -> reply=0x%08X\n", function, reply);
                 }
             }
-            // The 0x400/0x422 pair is re-issued every few seconds. Dump what the game actually sends (it is
-            // the only description of the request we have) together with the reply and the guest return path,
-            // so the pair can be matched against the SJX remote semantics instead of guessed at.
             if (std::getenv("TOL_TRACE_IXAUDIO") != nullptr)
             {
                 static uint32_t sDetail = 0u;
@@ -809,6 +869,7 @@ namespace
             SET_GPR_S32(ctx, 2, 0);
             return;
         }
+
 
         // ioman: answer the init so sceSifInitIoman succeeds. Other ioman functions (open/read/...) report
         // "unsupported" rather than pretending, because the game's own file server (sid 0x80000597) is what
@@ -864,22 +925,55 @@ namespace
             return;
         }
 
-        // Pad / memory-card service (sid 0x80000593). The game's init step (the function at 0x001AB490) calls
-        // this with fn 4, takes the call's return as its state, and retries while that value is 0, -1 or 0x20.
-        // Nothing in the IOP image registers a server for the sid, so the unhandled reply of 0 left the step
-        // permanently "pending" and the EE span on it ~220 times a second. Answering with a value outside that
-        // set lets the step advance.
-        if (sid == kPadServiceSid)
-        {
-            if (receiveBuffer != 0u && receiveSize >= 4u)
-            {
-                runtime->Store32(rdram, ctx, receiveBuffer, kPadServiceReply);
-            }
-            SET_GPR_S32(ctx, 2, 0);
-            return;
-        }
+        // Pad / memory-card service (sid 0x80000593). This used to be answered natively because the IOPRP
+        // modules were not relocation-loaded and cdvdfsv never registered a server. With the IOPRP slice now
+        // carrying the relocation tables, cdvdfsv serves the sid itself (it is the game's cdvd/pad service),
+        // and the cdvdman imports behind it are the LLE kernel's image-backed handlers. Do not intercept it:
+        // a native reply here bypasses the real read path.
 
         ps2_syscalls::SifCallRpc(rdram, ctx, runtime);
+    }
+
+    // The PS2 ABI passes the eighth argument of sceSifCallRpc — the SIF RPC end
+    // function — in $t3, with the end parameter as the first stack word. This
+    // replacement answers the RPC inline (gameFileRead, loadfile, IxAudio, ...),
+    // so the normal libsif reply path never runs and that end function would be
+    // dropped. Completion-driven callers depend on it: libcdvd's async read
+    // (FUN_001029A8 passes 0x1016D0) clears DAT_00385234 from its end function,
+    // and without it the CRI read state machine waits forever, freezing the
+    // scene/ADXF stream. Run the end function after the body on the scheduler,
+    // exactly like the runtime's own SifCallRpc does for the reply callback.
+    void tolSifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t endFunction = GPR_U32(ctx, 11);
+        const uint32_t sp = GPR_U32(ctx, 29);
+        uint32_t endParameter = 0u;
+        if (sp + 4u <= PS2_RAM_SIZE)
+            endParameter = runtime->Load32(rdram, ctx, sp);
+
+        tolSifCallRpcBody(rdram, ctx, runtime);
+
+        if (endFunction == 0u || !runtime->hasFunction(endFunction))
+            return;
+
+        GuestInvocation callback{};
+        callback.kind = GuestInvocationKind::RpcCallback;
+        callback.context = *ctx;
+        callback.context.pc = endFunction;
+        SET_GPR_U32(&callback.context, 4, endParameter);
+        SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
+        SET_GPR_U32(&callback.context, 31, 0u);
+        runtime->eeScheduler().queueInvocation(std::move(callback));
+
+        // The libcdvd async read (client 0x3863D0) keeps DAT_00385234 ("read
+        // pending") set until its completion runs. FUN_001014C0 only clears it
+        // when the reply status is 0xB or the libsif mode flags allow it; the
+        // HLE path bypasses the guest SIF reply handler that normally writes
+        // those, so the flag can stay set and FUN_00101F70(1) keeps reporting
+        // busy, freezing the CRI/ADXF read. This end function is the libcdvd
+        // read completion, so the read is done: clear the flag here.
+        if (endFunction == 0x001016D0u)
+            runtime->Store32(rdram, ctx, 0x00385234u, 0u);
     }
 
     void installSifRpcOverrides(PS2Runtime &runtime)
@@ -952,8 +1046,8 @@ namespace
         gPcProbeOriginal[idx](rdram, ctx, runtime);
         if (log)
         {
-            std::fprintf(stderr, "[pc] exit  0x%08X #%u pc=0x%08X v0=0x%08X\n", gPcProbeAddr[idx], call, ctx->pc,
-                         GPR_U32(ctx, 2));
+            std::fprintf(stderr, "[pc] exit  0x%08X #%u pc=0x%08X ra=0x%08X v0=0x%08X\n", gPcProbeAddr[idx], call,
+                         ctx->pc, GPR_U32(ctx, 31), GPR_U32(ctx, 2));
         }
     }
 
@@ -1028,6 +1122,7 @@ namespace
     constexpr uint32_t kTickOffCurrent = 0x1Cu;
 
     PS2Runtime::RecompiledFunction gTickOriginal = nullptr;
+    uint32_t gTickEntries = 0u;
 
     bool tickTraceEnabled()
     {
@@ -1081,8 +1176,7 @@ namespace
 
     void tickProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        static uint32_t sEntries = 0;
-        const uint32_t entry = ++sEntries;
+        const uint32_t entry = ++gTickEntries;
         // The loop runs ~16x/s; log the first few passes and then a heartbeat, so a 15 s run stays readable.
         if (entry <= 6u || (entry % 64u) == 0u)
             dumpTickQueue(rdram, ctx, runtime, entry);
@@ -1403,6 +1497,9 @@ namespace
     // Shared counter: the poll freeze is really the question "is anyone still pumping the ADXF streams?", so
     // the poll line reports how many times the stream step has run so far.
     uint32_t gAdxfStepCalls = 0u;
+    uint64_t gAdxfStepWallNs = 0u;
+    uint64_t gAdxfStepCpuNs = 0u;
+    uint64_t threadCpuTimeNs();
 
     void dumpStream(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t stream, const char *when)
     {
@@ -1441,6 +1538,27 @@ namespace
                          ? runtime->Load8(rdram, ctx, devHandle + 2u)
                          : 0u,
                      runtime->Load32(rdram, ctx, 0x003A7784u));
+        std::fprintf(stderr,
+                     "[adxf]   +04=%08X +08=%08X +0C=%08X +3C=%08X +60=%08X devActive=%u pumpGuard=%u\n",
+                     runtime->Load32(rdram, ctx, stream + 4u),
+                     runtime->Load32(rdram, ctx, stream + 8u),
+                     runtime->Load32(rdram, ctx, stream + 0xCu),
+                     runtime->Load32(rdram, ctx, stream + 0x3Cu),
+                     runtime->Load32(rdram, ctx, stream + 0x60u),
+                     static_cast<unsigned>(runtime->Load8(rdram, ctx, 0x003A55D0u)),
+                     static_cast<unsigned>(runtime->Load32(rdram, ctx, 0x00393208u)));
+        const uint32_t pathPtr = runtime->Load32(rdram, ctx, stream + 0x50u);
+        if (pathPtr >= 0x00100000u && pathPtr < 0x02000000u)
+        {
+            char path[64] = {};
+            for (int i = 0; i < 63; ++i)
+            {
+                path[i] = static_cast<char>(runtime->Load8(rdram, ctx, pathPtr + static_cast<uint32_t>(i)));
+                if (path[i] == '\0')
+                    break;
+            }
+            std::fprintf(stderr, "[adxf]   path=0x%08X '%s'\n", pathPtr, path);
+        }
     }
 
     void adxfStepProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1457,7 +1575,31 @@ namespace
             dumpStream(rdram, ctx, runtime, stream, "step-in ");
 
         if (gAdxfStepOriginal != nullptr)
+        {
+            const auto wall0 = std::chrono::steady_clock::now();
+            const uint64_t cpu0 = threadCpuTimeNs();
             gAdxfStepOriginal(rdram, ctx, runtime);
+            const uint64_t cpu1 = threadCpuTimeNs();
+            const auto wall1 = std::chrono::steady_clock::now();
+            gAdxfStepWallNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(wall1 - wall0).count());
+            gAdxfStepCpuNs += cpu1 - cpu0;
+            if ((gAdxfStepCalls % 100u) == 0u)
+            {
+                const double wallMs = static_cast<double>(gAdxfStepWallNs) / 1.0e6;
+                const double cpuMs = static_cast<double>(gAdxfStepCpuNs) / 1.0e6;
+                const double ratio = gAdxfStepWallNs != 0u
+                                         ? static_cast<double>(gAdxfStepCpuNs) / static_cast<double>(gAdxfStepWallNs)
+                                         : 0.0;
+                const double stepsPerRead =
+                    gGameFileReadCount != 0u
+                        ? static_cast<double>(gAdxfStepCalls) / static_cast<double>(gGameFileReadCount)
+                        : 0.0;
+                std::fprintf(stderr,
+                             "[adxf-time] steps=%u wall=%.1fms cpu=%.1fms cpu/wall=%.3f reads=%u steps/read=%.2f\n",
+                             gAdxfStepCalls, wallMs, cpuMs, ratio, gGameFileReadCount, stepsPerRead);
+            }
+        }
 
         // Stall detector: the stream step FUN_0019F298 is a no-op unless it decides to call the read/completion
         // state machine FUN_0019EF58, and the whole DVCI load waits on that. When it stops changing anything the
@@ -1516,6 +1658,65 @@ namespace
         {
             dumpStream(rdram, ctx, runtime, stream, "step-out");
             std::fprintf(stderr, "[adxf] step #%u done pc=0x%08X\n", call, ctx->pc);
+        }
+    }
+
+    // TOL_TRACE_CRI_TIME=1: CPU vs wall time for the CRI state machine FUN_001AB4F8, plus ADXF steps per
+    // completed 2 KiB read. Thread CPU time comes from GetThreadTimes (the guest runs on the dispatcher
+    // thread and its fibers), so preemption shows up as wall >> cpu.
+#if defined(_WIN32)
+    uint64_t threadCpuTimeNs()
+    {
+        FILETIME creation, exit, kernel, user;
+        if (GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user))
+        {
+            ULARGE_INTEGER kernelTime, userTime;
+            kernelTime.LowPart = kernel.dwLowDateTime;
+            kernelTime.HighPart = kernel.dwHighDateTime;
+            userTime.LowPart = user.dwLowDateTime;
+            userTime.HighPart = user.dwHighDateTime;
+            return (kernelTime.QuadPart + userTime.QuadPart) * 100ull;
+        }
+        return 0ull;
+    }
+#else
+    uint64_t threadCpuTimeNs() { return 0ull; }
+#endif
+
+    constexpr uint32_t kCriStateMachinePc = 0x001AB5C8u;
+    PS2Runtime::RecompiledFunction gCriStateOriginal = nullptr;
+    uint64_t gCriStateCalls = 0u;
+    uint64_t gCriStateWallNs = 0u;
+    uint64_t gCriStateCpuNs = 0u;
+
+    void criStateTimeProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const auto wall0 = std::chrono::steady_clock::now();
+        const uint64_t cpu0 = threadCpuTimeNs();
+        if (gCriStateOriginal != nullptr)
+            gCriStateOriginal(rdram, ctx, runtime);
+        const uint64_t cpu1 = threadCpuTimeNs();
+        const auto wall1 = std::chrono::steady_clock::now();
+        gCriStateWallNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(wall1 - wall0).count());
+        gCriStateCpuNs += cpu1 - cpu0;
+        ++gCriStateCalls;
+        if ((gCriStateCalls % 100u) == 0u)
+        {
+            const double wallMs = static_cast<double>(gCriStateWallNs) / 1.0e6;
+            const double cpuMs = static_cast<double>(gCriStateCpuNs) / 1.0e6;
+            const double ratio =
+                gCriStateWallNs != 0u ? static_cast<double>(gCriStateCpuNs) / static_cast<double>(gCriStateWallNs)
+                                      : 0.0;
+            const double stepsPerRead = gGameFileReadCount != 0u
+                                            ? static_cast<double>(gAdxfStepCalls) /
+                                                  static_cast<double>(gGameFileReadCount)
+                                            : 0.0;
+            std::fprintf(stderr,
+                         "[cri-time] calls=%llu wall=%.1fms cpu=%.1fms cpu/wall=%.3f | steps=%u reads=%u "
+                         "steps/read=%.2f\n",
+                         static_cast<unsigned long long>(gCriStateCalls), wallMs, cpuMs, ratio, gAdxfStepCalls,
+                         gGameFileReadCount, stepsPerRead);
         }
     }
 
@@ -1669,6 +1870,687 @@ namespace
                          valid ? runtime->Load32(rdram, ctx, handle + 0x20u) : 0u,
                          valid ? runtime->Load32(rdram, ctx, handle + 0x24u) : 0u);
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // ADXF READ STEP PROBE (TOL_TRACE_DVCI=1) - diagnostic.
+    //
+    // The field layout has two structs that share offsets, which made this look contradictory for a long time:
+    //   * the DVCI *handle* (lVar3) uses +0x0C = total blocks, +0x14 = consumed blocks, +0x1C = this arm's blocks,
+    //     +1 = handle state (2 armed / 3 done), +8 = transfer buffer;
+    //   * the ADXF *stream* (handle+4) uses +0x14 = total blocks, +0x58 = blocks done, +0x34 = bytes done in this
+    //     arm, +0x5C = arm blocks, +8 = open file object, +1 = stream state, +0x45 open req, +0x46 close req,
+    //     +0x48 abort req, +0x49 file open.
+    // FUN_0019EF58 only raises stream[+1] = 3 once (+0x34 >> 11) >= +0x5C, and it needs stream+8 (the open file
+    // object) to actually transfer. Logging entry/exit for the MAP.AFS stream shows which branch returns early.
+    constexpr uint32_t kAdxfReadStepPc = 0x0019EF58u;
+    constexpr uint32_t kMapAfsStream = 0x0039EE48u;
+    PS2Runtime::RecompiledFunction gAdxfReadStepOriginal = nullptr;
+
+    void adxfReadStepProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t stream = GPR_U32(ctx, 4);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        const bool want = (stream == kMapAfsStream) && (sCalls <= 6u || (sCalls % 200u) == 0u);
+
+        auto snap = [&](const char *phase) {
+            if (!want)
+                return;
+            std::fprintf(stderr,
+                         "[adxf-read] #%u %s | st=%u busy=%u 45=%u 46=%u 47=%u 48=%u 49=%u"
+                         " | 08=%08X 14=%u 1C=%u 20=%u 30=%u 34=%u 40=%u 58=%u 5C=%u\n",
+                         sCalls, phase, runtime->Load8(rdram, ctx, stream + 1u),
+                         runtime->Load8(rdram, ctx, stream + 2u), runtime->Load8(rdram, ctx, stream + 0x45u),
+                         runtime->Load8(rdram, ctx, stream + 0x46u), runtime->Load8(rdram, ctx, stream + 0x47u),
+                         runtime->Load8(rdram, ctx, stream + 0x48u), runtime->Load8(rdram, ctx, stream + 0x49u),
+                         runtime->Load32(rdram, ctx, stream + 8u), runtime->Load32(rdram, ctx, stream + 0x14u),
+                         runtime->Load32(rdram, ctx, stream + 0x1Cu), runtime->Load32(rdram, ctx, stream + 0x20u),
+                         runtime->Load32(rdram, ctx, stream + 0x30u), runtime->Load32(rdram, ctx, stream + 0x34u),
+                         runtime->Load32(rdram, ctx, stream + 0x40u), runtime->Load32(rdram, ctx, stream + 0x58u),
+                         runtime->Load32(rdram, ctx, stream + 0x5Cu));
+        };
+
+        snap("in ");
+        if (gAdxfReadStepOriginal != nullptr)
+            gAdxfReadStepOriginal(rdram, ctx, runtime);
+        snap("out");
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // ADXF ARM DISPATCH PROBE (TOL_TRACE_DVCI=1) - diagnostic.
+    //
+    // FUN_00196DB0 arms one read arm on the DVCI handle: it resets the stream to state 1 (FUN_0019EEC8 ->
+    // FUN_0019EE60), computes handle[0x1C] = handle[0xC] - handle[0x14], and arms the stream with
+    // handle[0x1C] blocks (FUN_0019EE18 -> FUN_0019EDA0 sets stream state 2 and stream[0x5C] = arm blocks).
+    // If handle[0xC] <= handle[0x14] the arm is empty and the handle jumps straight to state 3 without ever
+    // arming the stream, which is exactly the "handle done, stream still state 1" combination we saw.
+    constexpr uint32_t kAdxfArmPc = 0x00196DB0u;
+    PS2Runtime::RecompiledFunction gAdxfArmOriginal = nullptr;
+
+    void adxfArmProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t handle = GPR_U32(ctx, 4);
+        const uint32_t blocks = GPR_U32(ctx, 5);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if ((sCalls <= 5u || (sCalls % 50u) == 0u) && handle >= 0x00100000u && handle < 0x02000000u)
+        {
+            const uint32_t stream = runtime->Load32(rdram, ctx, handle + 4u);
+            std::fprintf(stderr,
+                         "[adxf-arm] #%u handle=0x%08X blocks=%u buf=0x%08X stream=0x%08X"
+                         " | h1=%u hC=%u h14=%u h1C=%u h2C=%u | s1=%u s08=%08X s14=%u s5C=%u s49=%u\n",
+                         sCalls, handle, blocks, GPR_U32(ctx, 6), stream,
+                         runtime->Load8(rdram, ctx, handle + 1u), runtime->Load32(rdram, ctx, handle + 0xCu),
+                         runtime->Load32(rdram, ctx, handle + 0x14u), runtime->Load32(rdram, ctx, handle + 0x1Cu),
+                         runtime->Load32(rdram, ctx, handle + 0x2Cu), runtime->Load8(rdram, ctx, stream + 1u),
+                         runtime->Load32(rdram, ctx, stream + 8u), runtime->Load32(rdram, ctx, stream + 0x14u),
+                         runtime->Load32(rdram, ctx, stream + 0x5Cu), runtime->Load8(rdram, ctx, stream + 0x49u));
+        }
+        if (gAdxfArmOriginal != nullptr)
+            gAdxfArmOriginal(rdram, ctx, runtime);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // ASYNC LOAD JOB PROBE (TOL_TRACE_LOAD=1) - diagnostic.
+    //
+    // FUN_001EC670 runs five sequential load stages:
+    //     job = FUN_001EC9A0(stage, resourceId, 1);
+    //     while (FUN_0027BFF0(job) == 0) { FUN_00151FF0(0); FUN_0019A080(); FUN_001EE060(); FUN_001392D0(); }
+    // FUN_001EC9F0 creates the job and starts it with FUN_001F72F0; FUN_0027BFF0 is just `*job == 2`.
+    // If a stage never reaches state 2 the startup blocks inside FUN_001EC670 (reached from FUN_00164EA0
+    // via FUN_00166870) and the frame loop never advances. These probes show which stage hangs and the
+    // job's live state word.
+    constexpr uint32_t kLoadStartPc = 0x001EC9F0u;
+    constexpr uint32_t kLoadStatusPc = 0x0027BFF0u;
+    constexpr uint32_t kResourceLookupPc = 0x003710C0u;
+    constexpr uint32_t kTransferSubmitPc = 0x001F8BE0u;
+    PS2Runtime::RecompiledFunction gLoadStartPrev = nullptr;
+    PS2Runtime::RecompiledFunction gLoadStatusPrev = nullptr;
+    PS2Runtime::RecompiledFunction gResourceLookupPrev = nullptr;
+    PS2Runtime::RecompiledFunction gTransferSubmitPrev = nullptr;
+
+    bool loadTraceEnabled()
+    {
+        static const bool enabled = std::getenv("TOL_TRACE_LOAD") != nullptr;
+        return enabled;
+    }
+
+    void loadStartProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t resId = GPR_U32(ctx, 4);
+        const uint32_t resource = GPR_U32(ctx, 5);
+        const uint32_t flag = GPR_U32(ctx, 6);
+        if (gLoadStartPrev != nullptr)
+            gLoadStartPrev(rdram, ctx, runtime);
+        if (loadTraceEnabled())
+        {
+            const uint32_t job = GPR_U32(ctx, 2);
+            const uint32_t state = (job >= 0x00100000u && job < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, job)
+                                                                             : 0xFFFFFFFFu;
+            std::fprintf(stderr, "[load] start res=%u resource=0x%08X flag=%u -> job=0x%08X state=%u\n", resId,
+                         resource, flag, job, state);
+        }
+    }
+
+    void loadStatusProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t job = GPR_U32(ctx, 4);
+        static uint32_t sCalls = 0u;
+        static uint32_t sLastJob = 0u;
+        static uint32_t sLastState = 0xFFFFFFFFu;
+        ++sCalls;
+        const uint32_t state = (job >= 0x00100000u && job < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, job)
+                                                                         : 0xFFFFFFFFu;
+        if (loadTraceEnabled() && (sCalls <= 10u || job != sLastJob || state != sLastState ||
+                                   (sCalls % 200000u) == 0u))
+        {
+            std::fprintf(stderr, "[load] status #%u job=0x%08X state=%u\n", sCalls, job, state);
+            sLastJob = job;
+            sLastState = state;
+        }
+        if (gLoadStatusPrev != nullptr)
+            gLoadStatusPrev(rdram, ctx, runtime);
+    }
+
+    // FUN_003710C0(id) = *(u32*)(table + 0x10 + id*4) >> 2, where table = *(gp - 0x7534). Printing the table
+    // pointer and the raw entry tells a missing resource table (null pointer -> reads address 0x20) apart from a
+    // genuine asset id.
+    void resourceLookupProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t id = GPR_U32(ctx, 4);
+        const uint32_t gp = GPR_U32(ctx, 28);
+        const uint32_t slot = ADD32(gp, 4294937292u); // gp - 0x7534
+        const uint32_t table = runtime->Load32(rdram, ctx, slot);
+        if (gResourceLookupPrev != nullptr)
+            gResourceLookupPrev(rdram, ctx, runtime);
+        if (loadTraceEnabled())
+        {
+            const uint32_t result = GPR_U32(ctx, 2);
+            uint32_t entry = 0xFFFFFFFFu;
+            if (table >= 0x00100000u && table < PS2_RAM_SIZE)
+                entry = runtime->Load32(rdram, ctx, table + 0x10u + id * 4u);
+            std::fprintf(stderr,
+                         "[load] resource id=%u gp=0x%08X slot=0x%08X table=0x%08X entry=0x%08X -> 0x%08X\n", id,
+                         gp, slot, table, entry, result);
+        }
+    }
+
+    // FUN_001F8BE0 queues one 0x2C-byte transfer descriptor at 0x4A72C0 + slot*0x2C. The descriptor built by
+    // FUN_001f82f0 carries id at +4, byte size at +0x10 and the destination guest pointer at +0x1C. The
+    // transfer itself is a VIF1 DMA unpack; the status byte (+2) starts at 2 and is only cleared by the DMA
+    // completion ISR, which this port never runs - hence the forced "done". Logging the descriptor shows
+    // whether real data was expected (nonzero size) while the destination stays untouched.
+    void transferSubmitProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t desc = GPR_U32(ctx, 4);
+        const bool valid = desc >= 0x00100000u && desc < PS2_RAM_SIZE && (desc & 3u) == 0u;
+        const uint32_t id = valid ? runtime->Load32(rdram, ctx, desc + 4u) : 0u;
+        const uint32_t size = valid ? runtime->Load32(rdram, ctx, desc + 0x10u) : 0u;
+        const uint32_t dest = valid ? runtime->Load32(rdram, ctx, desc + 0x1Cu) : 0u;
+        const uint32_t type = valid ? runtime->Load8(rdram, ctx, desc + 2u) : 0u;
+        if (gTransferSubmitPrev != nullptr)
+            gTransferSubmitPrev(rdram, ctx, runtime);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (loadTraceEnabled() && sCalls <= 12u)
+        {
+            const uint32_t handle = GPR_U32(ctx, 2);
+            std::fprintf(stderr,
+                         "[load] submit #%u type=%u id=%u size=%u dest=0x%08X -> handle=0x%08X\n", sCalls, type,
+                         id, size, dest, handle);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // TRANSFER DESCRIPTOR TRACKER (TOL_TRACE_LOAD=1) - diagnostic.
+    //
+    // Descriptors live at 0x4A72C0 + slot*0x2C: +1 kind, +2 status (2 queued / 1 busy / 0 done), +4 id,
+    // +8 handle, +0x10 size, +0x1C dest, +0x20 mode. FUN_001f8DA0 is the reap: it is called with the
+    // descriptor pointer right after the handler returns, and pops it from the queue. Logging the descriptor
+    // on reap - plus a snapshot of every live slot at each handler entry - shows which request actually
+    // completes and where the other one is stuck.
+    constexpr uint32_t kReapPc = 0x001F8DA0u;
+    constexpr uint32_t kDescBase = 0x004A72C0u;
+    constexpr uint32_t kDescStride = 0x2Cu;
+    constexpr uint32_t kDescSlots = 16u;
+    PS2Runtime::RecompiledFunction gReapPrev = nullptr;
+    PS2Runtime::RecompiledFunction gTransferHandlerPrev = nullptr;
+
+    void dumpDescriptor(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, const char *tag, uint32_t desc)
+    {
+        const bool valid = desc >= 0x00100000u && desc < PS2_RAM_SIZE && (desc & 3u) == 0u;
+        if (!valid)
+        {
+            std::fprintf(stderr, "[xfer] %s desc=0x%08X (invalid)\n", tag, desc);
+            return;
+        }
+        std::fprintf(stderr,
+                     "[xfer] %s desc=0x%08X kind=%u status=%u id=%u handle=0x%08X size=%u dest=0x%08X\n", tag,
+                     desc, runtime->Load8(rdram, ctx, desc + 1u), runtime->Load8(rdram, ctx, desc + 2u),
+                     runtime->Load32(rdram, ctx, desc + 4u), runtime->Load32(rdram, ctx, desc + 8u),
+                     runtime->Load32(rdram, ctx, desc + 0x10u), runtime->Load32(rdram, ctx, desc + 0x1Cu));
+    }
+
+    void dumpLiveDescriptors(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, const char *tag)
+    {
+        for (uint32_t slot = 0; slot < kDescSlots; ++slot)
+        {
+            const uint32_t desc = kDescBase + slot * kDescStride;
+            const uint32_t status = runtime->Load8(rdram, ctx, desc + 2u);
+            const uint32_t queued = runtime->Load8(rdram, ctx, desc);
+            if (status == 0u && queued == 0u)
+                continue;
+            char label[32];
+            std::snprintf(label, sizeof(label), "%s[%u]", tag, slot);
+            dumpDescriptor(rdram, ctx, runtime, label, desc);
+        }
+    }
+
+    void reapProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t desc = GPR_U32(ctx, 4);
+        if (loadTraceEnabled())
+        {
+            dumpDescriptor(rdram, ctx, runtime, "reap-in ", desc);
+            dumpLiveDescriptors(rdram, ctx, runtime, "before");
+        }
+        if (gReapPrev != nullptr)
+            gReapPrev(rdram, ctx, runtime);
+        if (loadTraceEnabled())
+            dumpDescriptor(rdram, ctx, runtime, "reap-out", desc);
+    }
+
+    void transferHandlerEntryProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (loadTraceEnabled())
+            dumpLiveDescriptors(rdram, ctx, runtime, "handler-entry");
+        if (gTransferHandlerPrev != nullptr)
+            gTransferHandlerPrev(rdram, ctx, runtime);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // TRANSFER STATUS WAIT (always installed) - fix.
+    //
+    // FUN_001660A0 loads the boot script like this:
+    //     v = FUN_001f72f0(0, buf, 0);              // queue the transfer
+    //     while (FUN_001f8480(v) != 0) FUN_0015231C();
+    //     *flag = 1;
+    // FUN_001f8480 returns the descriptor status byte (+2): 2 queued, 1 busy, 0 done. It used to be stubbed
+    // to always report done, which set the flag before the 1,252,176-byte transfer into 0x01523010 had landed,
+    // so FUN_00166120 read an empty script (count = 0). Reporting the real status alone deadlocked, because
+    // the wait only yields and nothing pumped the transfer.
+    //
+    // This wrapper reports the REAL status and, while the descriptor is still pending, runs the guest
+    // scheduler (FUN_00151FF0) so worker 2 and the transfer handler make progress. Guest code stays in charge;
+    // if the scheduler is preempted we keep its resume PC and return without fabricating a status.
+    constexpr uint32_t kStatusThunkPc = 0x001F7310u; // thunk_FUN_001f8480 — what FUN_001660A0 calls
+    constexpr uint32_t kStatusRealPc = 0x001F8480u;  // the status function itself
+    constexpr uint32_t kSchedEntryPc = 0x00151FF0u;  // guest scheduler entry
+    PS2Runtime::RecompiledFunction gStatusThunkPrev = nullptr;
+    PS2Runtime::RecompiledFunction gStatusRealPrev = nullptr;
+    PS2Runtime::RecompiledFunction gSchedEntryFn = nullptr;
+    bool gInStatusWait = false;
+    uint32_t gStatusWaits = 0u;
+
+    void drivePendingTransfer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                              PS2Runtime::RecompiledFunction prev, uint32_t entryPc)
+    {
+        const uint32_t savedRa = GPR_U32(ctx, 31);
+        const uint32_t handle = GPR_U32(ctx, 4);
+
+        if (handle != 0u && !gInStatusWait && gSchedEntryFn != nullptr)
+        {
+            const uint32_t slot = handle & 0x3Fu;
+            const uint32_t desc = 0x004A72C0u + slot * 0x2Cu;
+            if (runtime->Load32(rdram, ctx, desc + 8u) == handle)
+            {
+                const uint32_t status = runtime->Load8(rdram, ctx, desc + 2u);
+                if (status != 0u)
+                {
+                    gInStatusWait = true;
+                    ++gStatusWaits;
+                    if (std::getenv("TOL_TRACE_LOAD") != nullptr && gStatusWaits <= 8u)
+                    {
+                        std::fprintf(stderr,
+                                     "[xfer] status-wait #%u slot=%u status=%u -> pumping guest scheduler\n",
+                                     gStatusWaits, slot, status);
+                    }
+                    SET_GPR_U32(ctx, 31, savedRa);
+                    SET_GPR_U32(ctx, 4, 0u);
+                    ctx->pc = kSchedEntryPc;
+                    gSchedEntryFn(rdram, ctx, runtime);
+                    gInStatusWait = false;
+                    if (ctx->pc != savedRa)
+                    {
+                        // Preempted inside the scheduler: keep its resume point.
+                        SET_GPR_U32(ctx, 31, savedRa);
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (prev != nullptr)
+        {
+            SET_GPR_U32(ctx, 31, savedRa);
+            ctx->pc = entryPc;
+            prev(rdram, ctx, runtime);
+            if (ctx->pc != savedRa)
+            {
+                SET_GPR_U32(ctx, 31, savedRa);
+                return;
+            }
+        }
+        SET_GPR_U32(ctx, 31, savedRa);
+        ctx->pc = savedRa;
+    }
+
+    void statusThunkWait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        drivePendingTransfer(rdram, ctx, runtime, gStatusThunkPrev, kStatusThunkPc);
+    }
+
+    void statusRealWait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        drivePendingTransfer(rdram, ctx, runtime, gStatusRealPrev, kStatusRealPc);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // TRANSFER LOCK (always installed) - fix.
+    //
+    // FUN_001f7390 opens the transfer handler with a yield-spinlock:
+    //     while (iGpffff8780 != 0) FUN_0015231C();
+    //     iGpffff8780 = 1;  ... reset decoder state ...
+    // The handler is long-running and can be preempted at a cooperative checkpoint while holding it; the port
+    // then re-enters the handler, sees the lock still set and spins forever (observed: 0x1F8530 entered 22x,
+    // never reaching FUN_00196b88/FUN_001970e8). Everything here runs on one guest thread, so the lock can
+    // only ever be stale, never genuinely contended - clear it before acquiring.
+    constexpr uint32_t kTransferLockPc = 0x001F7390u;
+    constexpr uint32_t kTransferLockAddr = 0x003DB370u; // gp - 0x7880 (iGpffff8780)
+    PS2Runtime::RecompiledFunction gTransferLockPrev = nullptr;
+    uint32_t gStaleLocksCleared = 0u;
+
+    void transferLockProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t held = runtime->Load32(rdram, ctx, kTransferLockAddr);
+        if (held != 0u)
+        {
+            ++gStaleLocksCleared;
+            if (std::getenv("TOL_TRACE_LOAD") != nullptr && gStaleLocksCleared <= 8u)
+            {
+                std::fprintf(stderr, "[load] clearing stale transfer lock (was %u, clear #%u)\n", held,
+                             gStaleLocksCleared);
+            }
+            runtime->Store32(rdram, ctx, kTransferLockAddr, 0u);
+        }
+        if (gTransferLockPrev != nullptr)
+            gTransferLockPrev(rdram, ctx, runtime);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // YIELD PUMP (always installed) - fix.
+    //
+    // The whole asset path waits by yielding: FUN_001f8530 (transfer handler) loops
+    //     while (desc[2] != 3) { ...; if (FUN_00197668(dvci) == 3 && ...) goto done; FUN_0015231C(); }
+    // and FUN_001660A0 waits `while (FUN_001f8480(h) != 0) FUN_0015231C();`. On hardware FUN_0015231C is the
+    // thread yield, so the CRI/DVCI pump runs on another context and the read retires. This port has no
+    // scheduler, so yielding did nothing and the reads never completed - which is why the boot script transfer
+    // (id 0, 1,252,176 bytes into 0x01523010) never landed and FUN_001f8480 had to be force-completed.
+    //
+    // Make the yield do what the scheduler would: run the DVCI/ADXF pump (FUN_00197940) before returning.
+    // Guarded against re-entry, since the pump itself can reach the yield again.
+    constexpr uint32_t kYieldPc = 0x0015231Cu;
+    constexpr uint32_t kDvciPumpPc = 0x00197940u;
+    PS2Runtime::RecompiledFunction gYieldPrev = nullptr;
+    PS2Runtime::RecompiledFunction gDvciPumpFn = nullptr;
+    uint32_t gYieldPumpCount = 0u;
+
+    void yieldPump(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static bool sInYieldPump = false;
+        const uint32_t savedRa = GPR_U32(ctx, 31);
+
+        // Original context save (harmless bookkeeping: spills registers into the per-thread slot).
+        if (gYieldPrev != nullptr)
+        {
+            SET_GPR_U32(ctx, 31, savedRa);
+            ctx->pc = kYieldPc;
+            gYieldPrev(rdram, ctx, runtime);
+            if (ctx->pc != savedRa)
+            {
+                // Preempted inside the save: keep its resume point.
+                SET_GPR_U32(ctx, 31, savedRa);
+                return;
+            }
+        }
+
+        if (!sInYieldPump && gDvciPumpFn != nullptr)
+        {
+            sInYieldPump = true;
+            ++gYieldPumpCount;
+            SET_GPR_U32(ctx, 31, savedRa);
+            ctx->pc = kDvciPumpPc;
+            gDvciPumpFn(rdram, ctx, runtime);
+            sInYieldPump = false;
+            // A cooperative checkpoint inside the pump (observed: FUN_001AD220, the DVCI completion poll)
+            // bails out with ctx->pc at the resume point. Overwriting it here is what kept restarting the
+            // transfer handler from scratch - it re-took its spinlock and bailed again, never reaching
+            // FUN_00196b88. Preserve the resume point instead.
+            if (ctx->pc != savedRa)
+            {
+                SET_GPR_U32(ctx, 31, savedRa);
+                return;
+            }
+            if (std::getenv("TOL_TRACE_LOAD") != nullptr)
+            {
+                static uint32_t sLogged = 0u;
+                ++sLogged;
+                if (sLogged <= 8u || (sLogged % 200000u) == 0u)
+                {
+                    std::fprintf(stderr, "[load] yield-pump #%u (total %u) ra=0x%08X\n", sLogged,
+                                 gYieldPumpCount, savedRa);
+                }
+            }
+        }
+
+        SET_GPR_U32(ctx, 31, savedRa);
+        ctx->pc = savedRa;
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // TRANSFER QUEUE PUMP (always installed) - fix.
+    //
+    // FUN_001f8be0 queues asset transfers at 0x4A72C0 and links them through the head at gp-0x7860
+    // (0x003DB390). Worker 2 (0x1F84B0) is what drains that queue: its loop loads the head and dispatches
+    // 0x1F8530 / 0x1F87C0 per descriptor. This port enters guest thread entries only once, so nothing ever
+    // drains the queue: the boot script transfer (id 0, 1,252,176 bytes into 0x01523010) is queued but never
+    // performed, leaving the script buffer zeroed and the startup blocked in FUN_001EC670. Pump worker 2 from
+    // the I/O wait function, which every load wait loop calls on each iteration.
+    constexpr uint32_t kIoPumpPc = 0x0019A080u;
+    constexpr uint32_t kTransferQueueHead = 0x003DB390u;
+    PS2Runtime::RecompiledFunction gIoPumpPrev = nullptr;
+    uint32_t gTransferPumps = 0u;
+
+    void ioPumpProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static bool sBusy = false;
+        if (!sBusy)
+        {
+            const uint32_t head = runtime->Load32(rdram, ctx, kTransferQueueHead);
+            if (head >= 0x00100000u && head < PS2_RAM_SIZE)
+            {
+                PS2Runtime::RecompiledFunction worker = runtime->lookupFunction(0x001F84B0u);
+                if (worker != nullptr)
+                {
+                    sBusy = true;
+                    const uint32_t savedRa = GPR_U32(ctx, 31);
+                    ++gTransferPumps;
+                    if (std::getenv("TOL_TRACE_LOAD") != nullptr && gTransferPumps <= 8u)
+                    {
+                        std::fprintf(stderr, "[load] pumping transfer queue head=0x%08X (pump %u)\n", head,
+                                     gTransferPumps);
+                    }
+                    ctx->pc = 0x001F84B0u;
+                    worker(rdram, ctx, runtime);
+                    const bool bailed = (ctx->pc != savedRa);
+                    SET_GPR_U32(ctx, 31, savedRa);
+                    sBusy = false;
+                    if (bailed)
+                    {
+                        // The transfer handler was preempted: the worker returned without running its
+                        // epilogue and left ctx->pc at the resume point (guest frame intact). Hand control
+                        // back to the runtime there instead of running the I/O pump over it.
+                        return;
+                    }
+                }
+            }
+        }
+        if (gIoPumpPrev != nullptr)
+            gIoPumpPrev(rdram, ctx, runtime);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // SCRIPT CONTEXT PROBE (TOL_TRACE_SCRIPT=1) - diagnostic.
+    //
+    // A script handle is a packed 64-bit value: low 32 bits = pointer to the command block, high 32 bits = the
+    // current command index. `count` is the block's first word. The API is
+    //   thunk 0x1F7340 -> FUN_001f88f0(handle) = !(index < count)      ("finished")
+    //   thunk 0x1F7350 -> FUN_001f8920(handle) = *(u32*)(base+0x10+index*0x10)  ("peek next opcode")
+    //   thunk 0x1F7370 -> FUN_001f89a0(handle) = (index + 1) packed     ("advance")
+    // The dispatcher FUN_001ECBE0 spins when `status` never becomes non-zero, so print the live base/index/count
+    // and the peeked opcode: a frozen index and a bogus count look completely different here.
+    constexpr uint32_t kScriptStatusPc = 0x001F7340u;   // thunk_FUN_001f88f0
+    constexpr uint32_t kScriptPeekPc = 0x001F7350u;     // thunk_FUN_001f8920
+    constexpr uint32_t kScriptAdvancePc = 0x001F7370u;  // thunk_FUN_001f89a0
+    PS2Runtime::RecompiledFunction gScriptStatusPrev = nullptr;
+    PS2Runtime::RecompiledFunction gScriptPeekPrev = nullptr;
+    PS2Runtime::RecompiledFunction gScriptAdvancePrev = nullptr;
+
+    bool scriptTraceEnabled()
+    {
+        static const bool enabled = std::getenv("TOL_TRACE_SCRIPT") != nullptr;
+        return enabled;
+    }
+
+    // FUN_001f88f0 is the script "finished?" predicate: it loads `count` from the command block and returns
+    // !(index < count). A dispatcher can be handed a **null** command block (object field +0x10 == 0), in which
+    // case the packed handle is (index << 32) | 0 and `count` is read from guest address 0, which holds
+    // 0x3F800000 (1065353216). The dispatcher then has to walk a billion command indices before it reports
+    // "finished" - observed as a permanent spin at 0x1ECC40 in FUN_001ECBE0 with base=0x00000000 and
+    // count=0x3F800000. A null block has no commands, so report finished immediately. The guard is applied in
+    // scriptStatusProbe, which is installed on the 0x1F7340 thunk that the dispatchers actually call.
+
+    void scriptDump(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, const char *tag, uint32_t seq,
+                    uint64_t handle, uint32_t extra)
+    {
+        const uint32_t base = static_cast<uint32_t>(handle);
+        const uint32_t index = static_cast<uint32_t>(handle >> 32);
+        uint32_t count = 0u;
+        // Guest RAM starts at 0, so a null base is a *valid* read - it just reads whatever sits at address 0.
+        // Reporting it as unreadable previously hid the fact that the stalled dispatcher is running on a null
+        // handle.
+        const bool readable = (base & 3u) == 0u && base < PS2_RAM_SIZE;
+        if (readable)
+            count = runtime->Load32(rdram, ctx, base);
+        std::fprintf(stderr,
+                     "[script] %s #%u handle=%016llX base=0x%08X index=%u count=%u readable=%u extra=0x%08X\n",
+                     tag, seq, static_cast<unsigned long long>(handle), base, index, count,
+                     readable ? 1u : 0u, extra);
+    }
+
+    void scriptStatusProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint64_t handle = GPR_U64(ctx, 4);
+        static uint32_t sCalls = 0u;
+        static uint32_t sNullBlocks = 0u;
+        ++sCalls;
+
+        // Null command block: (index << 32) | 0. Reporting "finished" here is what stops the dispatcher's
+        // billion-iteration walk; see scriptStatusGuard for the full explanation.
+        if (GPR_U32(ctx, 4) == 0u)
+        {
+            ++sNullBlocks;
+            if (scriptTraceEnabled() && (sCalls <= 16u || sNullBlocks <= 5u))
+            {
+                std::fprintf(stderr,
+                             "[script] status #%u null command block -> finished (ra=0x%08X, null-hits=%u)\n",
+                             sCalls, GPR_U32(ctx, 31), sNullBlocks);
+            }
+            SET_GPR_S32(ctx, 2, 1);
+            ctx->pc = GPR_U32(ctx, 31);
+            return;
+        }
+
+        if (scriptTraceEnabled() && (sCalls <= 16u || (sCalls % 200000u) == 0u))
+            scriptDump(rdram, ctx, runtime, "status ", sCalls, handle, 0u);
+        if (gScriptStatusPrev != nullptr)
+            gScriptStatusPrev(rdram, ctx, runtime);
+    }
+
+    void scriptPeekProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint64_t handle = GPR_U64(ctx, 4);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        const bool log = scriptTraceEnabled() && (sCalls <= 16u || (sCalls % 200000u) == 0u);
+        if (log)
+            scriptDump(rdram, ctx, runtime, "peek   ", sCalls, handle, 0u);
+        if (gScriptPeekPrev != nullptr)
+            gScriptPeekPrev(rdram, ctx, runtime);
+        if (log)
+            std::fprintf(stderr, "[script] peek   #%u -> opcode=0x%08X\n", sCalls, GPR_U32(ctx, 2));
+    }
+
+    void scriptAdvanceProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint64_t handle = GPR_U64(ctx, 4);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        const bool log = scriptTraceEnabled() && (sCalls <= 16u || (sCalls % 200000u) == 0u);
+        if (log)
+            scriptDump(rdram, ctx, runtime, "advance", sCalls, handle, 0u);
+        if (gScriptAdvancePrev != nullptr)
+            gScriptAdvancePrev(rdram, ctx, runtime);
+        if (log)
+        {
+            const uint64_t after = GPR_U64(ctx, 2);
+            std::fprintf(stderr, "[script] advance #%u -> handle=%016llX (index %u -> %u)\n", sCalls,
+                         static_cast<unsigned long long>(after), static_cast<uint32_t>(handle >> 32),
+                         static_cast<uint32_t>(after >> 32));
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // PUMP HEALTH PROBE (TOL_TRACE_DVCI=1) - diagnostic.
+    //
+    // The extent-table loop is `while (FUN_00196460(i) != 3) FUN_0019A080();`. FUN_0019A080 -> FUN_001B7688(5)
+    // dispatches slot 5; FUN_00198280 (inside the full pump FUN_00198230) calls FUN_00197940, the DVCI/ADXF pump,
+    // which ends with the credit tick FUN_001973A8 (the only thing that can raise the handle to state 3).
+    // FUN_00197940 early-returns while DAT_00393208 != 0, so sampling that guard *outside* the pump tells us
+    // whether the pump is actually running or wedged.
+    constexpr uint32_t kAdxfPumpPc = 0x00197940u;
+    constexpr uint32_t kIoWaitPc = 0x0019A080u;
+    constexpr uint32_t kDvciHandle = 0x00390738u;
+    constexpr uint32_t kSlot5Table = 0x0049C790u;
+    PS2Runtime::RecompiledFunction gAdxfPumpOriginal = nullptr;
+    PS2Runtime::RecompiledFunction gIoWaitOriginal = nullptr;
+    uint32_t gPumpCalls = 0u;
+    uint32_t gPumpBlocked = 0u;
+
+    void adxfPumpProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t guard = runtime->Load32(rdram, ctx, 0x00393208u);
+        ++gPumpCalls;
+        if (guard != 0u)
+            ++gPumpBlocked;
+        if (gPumpCalls <= 10u || (gPumpCalls % 500u) == 0u)
+        {
+            std::fprintf(stderr, "[adxf-pump] #%u guard=%u blocked=%u\n", gPumpCalls, guard, gPumpBlocked);
+        }
+        if (gAdxfPumpOriginal != nullptr)
+            gAdxfPumpOriginal(rdram, ctx, runtime);
+    }
+
+    void ioWaitProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 10u || (sCalls % 10u) == 0u)
+        {
+            std::fprintf(stderr, "[io-wait] #%u guard=%u gate=%08X slot5:", sCalls,
+                         runtime->Load32(rdram, ctx, 0x00393208u), runtime->Load32(rdram, ctx, 0x0039E838u));
+            for (int i = 0; i < 6; ++i)
+                std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, kSlot5Table + static_cast<uint32_t>(i) * 8u));
+            std::fprintf(stderr, " | h1=%u hC=%u h14=%u | s1=%u s58=%u\n",
+                         runtime->Load8(rdram, ctx, kDvciHandle + 1u),
+                         runtime->Load32(rdram, ctx, kDvciHandle + 0xCu),
+                         runtime->Load32(rdram, ctx, kDvciHandle + 0x14u),
+                         runtime->Load8(rdram, ctx, kMapAfsStream + 1u),
+                         runtime->Load32(rdram, ctx, kMapAfsStream + 0x58u));
+        }
+        if (sCalls == 60u)
+        {
+            std::fprintf(stderr, "[adxf-slots] all streams at wait #%u:\n", sCalls);
+            for (int i = 0; i < 40; ++i)
+            {
+                const uint32_t s = 0x0039E848u + static_cast<uint32_t>(i) * 0x60u;
+                const uint32_t active = runtime->Load8(rdram, ctx, s);
+                if (active == 0u)
+                    continue;
+                std::fprintf(stderr,
+                             "[adxf-slots]  [%2d] 0x%08X act=%u st=%u busy=%u 45=%u 46=%u 47=%u 48=%u 49=%u"
+                             " 08=%08X 14=%u 58=%u 5C=%u path=0x%08X\n",
+                             i, s, active, runtime->Load8(rdram, ctx, s + 1u), runtime->Load8(rdram, ctx, s + 2u),
+                             runtime->Load8(rdram, ctx, s + 0x45u), runtime->Load8(rdram, ctx, s + 0x46u),
+                             runtime->Load8(rdram, ctx, s + 0x47u), runtime->Load8(rdram, ctx, s + 0x48u),
+                             runtime->Load8(rdram, ctx, s + 0x49u), runtime->Load32(rdram, ctx, s + 8u),
+                             runtime->Load32(rdram, ctx, s + 0x14u), runtime->Load32(rdram, ctx, s + 0x58u),
+                             runtime->Load32(rdram, ctx, s + 0x5Cu), runtime->Load32(rdram, ctx, s + 0x50u));
+            }
+        }
+        if (gIoWaitOriginal != nullptr)
+            gIoWaitOriginal(rdram, ctx, runtime);
     }
 
     // ---------------------------------------------------------------------------------------------------------
@@ -1829,13 +2711,14 @@ namespace
         if (countAtEntry != 0u)
             ++sSawCount;
 
-        if (call <= 6u || (stateAtEntry == 3u && sSawThree <= 20u) || (indexAtEntry == 5u && sLoadFive++ < 10u))
+        if (call <= 6u || (stateAtEntry == 3u && sSawThree <= 20u) || (indexAtEntry == 5u && sLoadFive++ < 10u) ||
+            (call % 32u) == 0u)
         {
             std::fprintf(stderr,
-                         "[poll-in] #%u i=%u ptid=%d state=%u count=%u progress=%u total=%u consumed=%u transfer=%u"
+                         "[poll-in] #%u frame=%u i=%u ptid=%d state=%u count=%u progress=%u total=%u consumed=%u transfer=%u"
                          " | sState=%u sStream=0x%08X sTotal=%u sDone=%u sBlocks=%u sWin=%u sDevBase=0x%X sDev=%u"
                          " | saw3=%u sawCount=%u\n",
-                         call, indexAtEntry, static_cast<int32_t>(ptidAtEntry), stateAtEntry, countAtEntry,
+                         call, gFrameTicks, indexAtEntry, static_cast<int32_t>(ptidAtEntry), stateAtEntry, countAtEntry,
                          progressAtEntry, totalAtEntry, consumedAtEntry, transferAtEntry, streamState, streamPtr,
                          streamTotal, streamDoneBytes, streamBlocks, streamWindow, streamDeviceBase,
                          streamDeviceState, sSawThree, sSawCount);
@@ -1868,7 +2751,7 @@ namespace
                          streamActive, gAdxfStepCalls, abxrGate, slot5Pump, slot4Pump);
         }
 
-        const bool log = call <= 16u || (call % 512u) == 0u;
+        const bool log = call <= 16u || (call % 512u) == 0u || indexAtEntry == 5u;
         if (gDvciPollOriginal != nullptr)
             gDvciPollOriginal(rdram, ctx, runtime);
 
@@ -1877,10 +2760,852 @@ namespace
             dumpDvci(rdram, ctx, runtime, call, static_cast<int32_t>(GPR_U32(ctx, 2)));
         }
     }
+
+    // DVCI completion fix. FUN_00196460 (the poll) parses the AFS extent table and is
+    // supposed to return 3 when handle[8] <= progress. For the small MOVIE.AFS table
+    // (22 entries, blocks=1) the recompiled flow falls through to the next-read path
+    // and returns the idle stream state (0) without calling FUN_001963a8, so the
+    // loading loop in FUN_001664D0 (`while (FUN_00196460(i) != 3)`) never advances
+    // past i=5. Once the table has been parsed (progress >= the request's entry
+    // count), finish the load the way FUN_001963a8 does and report done.
+    PS2Runtime::RecompiledFunction gDvciCompletionPrev = nullptr;
+
+    void dvciCompletionFix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t index = GPR_U32(ctx, 4);
+        if (gDvciCompletionPrev != nullptr)
+            gDvciCompletionPrev(rdram, ctx, runtime);
+
+        const int32_t result = static_cast<int32_t>(GPR_U32(ctx, 2));
+        const uint32_t active = runtime->Load32(rdram, ctx, kDvciLoadIndex);
+        const uint32_t handle =
+            (index < 16u) ? runtime->Load32(rdram, ctx, kDvciRequestTable + index * 4u) : 0u;
+        uint32_t count = 0u;
+        if (handle >= 0x00100000u && handle < 0x02000000u)
+            count = runtime->Load32(rdram, ctx, handle + 8u);
+        const uint32_t progress = runtime->Load32(rdram, ctx, kDvciProgress);
+        if (std::getenv("TOL_TRACE_DVCI") != nullptr)
+        {
+            static uint32_t sFixLogs = 0u;
+            ++sFixLogs;
+            const bool willComplete =
+                (result != 3 && active == index && handle >= 0x00100000u && handle < 0x02000000u &&
+                 count != 0u && progress >= count);
+            if (willComplete || index == 5u || sFixLogs <= 20u || (sFixLogs % 500u) == 0u)
+            {
+                std::fprintf(stderr,
+                             "[dvci-fix] #%u idx=%u active=%u result=%d count=%u progress=%u done=%d\n",
+                             sFixLogs, index, active, result, count, progress, willComplete ? 1 : 0);
+            }
+        }
+
+        if (result == 3 || index >= 16u)
+            return;
+        if (active != index)
+            return;
+        if (handle < 0x00100000u || handle >= 0x02000000u)
+            return;
+        if (count == 0u || progress < count)
+            return;
+
+        if (std::getenv("TOL_TRACE_DVCI") != nullptr)
+            std::fprintf(stderr, "[dvci-done] idx=%u count=%u progress=%u\n", index, count, progress);
+
+        runtime->Store32(rdram, ctx, kDvciHandlePtr, 0u);
+        runtime->Store32(rdram, ctx, kDvciLoadIndex, 0xFFFFFFFFu);
+        runtime->Store32(rdram, ctx, kDvciProgress, 0u);
+        runtime->Store32(rdram, ctx, kDvciBlocks, 0u);
+        SET_GPR_S32(ctx, 2, 3);
+    }
 }
 
 namespace tol
 {
+    // ---------------------------------------------------------------------------------------------------------
+    // WORKER 2 BACK-EDGE (fix).
+    //
+    // 0x1F84B0 is the transfer-queue worker created as a guest thread:
+    //     while (queue == 0) yield;
+    //     lock; dispatch(queue); reap; unlock;        (loop forever)
+    // Its prologue is `addiu sp,sp,-0x20 / sd ra,0x10(sp) / sq s0,0(sp)`. This port enters guest thread
+    // entries only once, so the infinite loop used to be bounded by overriding the *entry* - which made
+    // every call inside the loop a host call, and a cooperative bail inside the long transfer handler
+    // (0x1F8530) unwound past frames host code could not resume (that is why the coroutine experiment in
+    // session 91 stalled).
+    //
+    // Bound it at the two back edges instead:
+    //     0x1F8518  b 0x1F84C0   (work done)
+    //     0x1F8528  b 0x1F84BC   (idle iteration)
+    // Running the real epilogue there returns to the caller after exactly one iteration, while the loop
+    // body itself executes as ordinary guest code - lock/handler/reap/unlock are real `jal`s, so
+    // dispatchGuestBranch owns the bail and resume bookkeeping and 0x1F8530 resumes at its preemption
+    // point instead of restarting.
+    void worker2BackEdge(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29);
+        // Restore the saved frame: $s0 at sp+0x00, $ra at sp+0x10, frame size 0x20.
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        const uint32_t ra = READ32(sp + 0x10u);
+        SET_GPR_U32(ctx, 29, sp + 0x20u);
+        SET_GPR_U32(ctx, 31, ra);
+        ctx->pc = ra;
+    }
+
+    void installWorker2BackEdge(PS2Runtime &runtime)
+    {
+        runtime.replaceFunction(0x001F8518u, &worker2BackEdge);
+        runtime.replaceFunction(0x001F8528u, &worker2BackEdge);
+    }
+
+    // The GS/transfer workers (0x1F8150, 0x1F84B0) are **green threads of the game's own microkernel**
+    // (0x1517E0/0x1518C0/0x151CD0, TCBs at 0x407160, contexts at 0x48F590). That microkernel is alive in this
+    // port: 0x152200 restores a thread's sp/registers and jumps to its saved pc, 0x15231C saves the current
+    // thread and jumps back into the run loop at 0x151F88. The three host-side pumps below were written before
+    // that was known and they *mask* it:
+    //   * the 0x1F8150 entry override returns to $ra, but a microkernel-dispatched thread has no meaningful $ra
+    //     (it is entered by 0x152200, not by a jal), so the thread dies at pc 0;
+    //   * worker2BackEdge forces the same early return at 0x1F8518/0x1F8528;
+    //   * ioPumpProbe re-enters 0x1F84B0 from the main stack instead of letting the microkernel dispatch it;
+    //   * yieldPump runs the save and then discards the yield by restoring $ra.
+    // Verified with TOL_TRACE_EE_THREADS=1: thread 1 (main) went Dormant with pc=0 inside the worker-2 loop while
+    // the ADX thread spun at 0x198C88. Let the guest body and the microkernel drive them by default;
+    // TOL_LEGACY_WORKER_PUMPS=1 restores the old host pumps for A/B.
+    bool legacyWorkerPumpsEnabled()
+    {
+        static const bool enabled = std::getenv("TOL_LEGACY_WORKER_PUMPS") != nullptr;
+        return enabled;
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // GREEN-THREAD (game microkernel) STATE DUMP - diagnostic, TOL_TRACE_GTHREADS=1.
+    //
+    // The game's own microkernel owns the GS/transfer workers: TCBs at 0x407160 stride 0x210 (state +0x1F0,
+    // priority +0x1F1, entry +0x1B0, arg/self +0x1C0, started +0x1F3), a run-queue linked list through
+    // +0x1F8/+0x1FC, and per-priority ready counters at 0x48F570. FUN_00151E90 walks that list; a thread that
+    // yields (FUN_0015231C) returns to the run loop at 0x151F88, and the run loop then *deletes* the thread
+    // unless TCB+0x1AC is non-zero. Print the table so a disappearing thread is visible instead of inferred.
+    constexpr uint32_t kGreenTcbBase = 0x00407160u;
+    constexpr uint32_t kGreenTcbStride = 0x210u;
+    constexpr uint32_t kGreenTcbCount = 64u;
+    constexpr uint32_t kGreenReadyCounts = 0x0048F570u;
+
+    void dumpGreenThreads(uint8_t *rdram, PS2Runtime *runtime, R5900Context *ctx, const char *tag)
+    {
+        std::fprintf(stderr, "[gthreads] %s ready0=%u ready1=%u\n", tag,
+                     runtime->Load16(rdram, ctx, kGreenReadyCounts),
+                     runtime->Load16(rdram, ctx, kGreenReadyCounts + 2u));
+        for (uint32_t i = 0; i < kGreenTcbCount; ++i)
+        {
+            const uint32_t tcb = kGreenTcbBase + i * kGreenTcbStride;
+            const uint32_t entry = runtime->Load32(rdram, ctx, tcb + 0x1B0u);
+            const uint32_t state = runtime->Load8(rdram, ctx, tcb + 0x1F0u);
+            const uint32_t prio = runtime->Load8(rdram, ctx, tcb + 0x1F1u);
+            const uint32_t started = runtime->Load8(rdram, ctx, tcb + 0x1F3u);
+            const uint32_t yieldFlag = runtime->Load32(rdram, ctx, tcb + 0x1ACu);
+            const uint32_t resumePc = runtime->Load32(rdram, ctx, tcb + 0x1B4u);
+            if (entry == 0u && state == 0u)
+                continue;
+            std::fprintf(stderr,
+                         "[gthreads]   slot=%2u tcb=0x%08X state=%u prio=%u started=%u yield=%u entry=0x%08X "
+                         "resume=0x%08X\n",
+                         i, tcb, state, prio, started, yieldFlag, entry, resumePc);
+        }
+    }
+
+    // Wraps FUN_0015231C (the yield) so the dump is taken exactly at the point where the run loop decides whether
+    // to delete the thread, and prints the context pointer the save actually wrote through.
+    constexpr uint32_t kGreenYieldPc = 0x0015231Cu;
+    constexpr uint32_t kGreenEnterPc = 0x00152200u;
+    constexpr uint32_t kGreenIndexA = 0x003DB1A0u;
+    constexpr uint32_t kGreenIndexB = 0x003DB1B0u;
+    constexpr uint32_t kGreenIndexC = 0x003DB1C0u;
+    constexpr uint32_t kGreenContextArray = 0x0048F590u;
+    constexpr uint32_t kGreenTransferHead = 0x003DB390u;
+    PS2Runtime::RecompiledFunction gGreenYieldPrev = nullptr;
+    PS2Runtime::RecompiledFunction gGreenEnterPrev = nullptr;
+    // Set by the transfer waiter (first tell poll) so the dispatch probe logs every turn during the wait,
+    // and the TCB table is dumped at the boundaries rather than only at the first twelve yields.
+    bool gTransferWaitActive = false;
+    uint32_t gWaitTurnLogs = 0u;
+
+    // FUN_00152200 is the "enter thread" half of the microkernel switch: FUN_00151E90 stores the chosen TCB at
+    // scheduler-context+0x1C0 (0x48F920) and calls this, which zeroes TCB+0x1AC, restores the thread's registers
+    // and jumps to TCB+0x1B4. Logging it names the dispatch order and the resume pc of every turn.
+    void greenEnterProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sTurns = 0u;
+        ++sTurns;
+        if (sTurns <= 40u || (sTurns % 200u) == 0u)
+        {
+            const uint32_t a = runtime->Load32(rdram, ctx, kGreenIndexA);
+            const uint32_t b = runtime->Load32(rdram, ctx, kGreenIndexB);
+            const uint32_t c = runtime->Load32(rdram, ctx, kGreenIndexC);
+            const uint32_t tcb = runtime->Load32(rdram, ctx, kGreenContextArray + a * b + c);
+            const bool readable = tcb >= 0x00100000u && tcb < PS2_RAM_SIZE;
+            const uint32_t resume = readable ? runtime->Load32(rdram, ctx, tcb + 0x1B4u) : 0u;
+            const uint32_t state = readable ? runtime->Load8(rdram, ctx, tcb + 0x1F0u) : 0u;
+            const uint32_t queue = runtime->Load32(rdram, ctx, kGreenTransferHead);
+            std::fprintf(stderr,
+                         "[gthreads] turn #%u tcb=0x%08X state=%u resume=0x%08X xferQueue=0x%08X ready0=%u ra=0x%08X\n",
+                         sTurns, tcb, state, resume, queue,
+                         runtime->Load16(rdram, ctx, kGreenReadyCounts), GPR_U32(ctx, 31));
+        }
+        // While the transfer waiter is parked, every dispatch matters: this is the window in which a pump
+        // thread would have to be scheduled.
+        if (gTransferWaitActive && gWaitTurnLogs < 120u)
+        {
+            const uint32_t a = runtime->Load32(rdram, ctx, kGreenIndexA);
+            const uint32_t b = runtime->Load32(rdram, ctx, kGreenIndexB);
+            const uint32_t c = runtime->Load32(rdram, ctx, kGreenIndexC);
+            const uint32_t tcb = runtime->Load32(rdram, ctx, kGreenContextArray + a * b + c);
+            const bool readable = tcb >= 0x00100000u && tcb < PS2_RAM_SIZE;
+            ++gWaitTurnLogs;
+            std::fprintf(stderr,
+                         "[wait-turn] #%u tcb=0x%08X entry=0x%08X state=%u prio=%u resume=0x%08X ready1=%u\n",
+                         sTurns, tcb, readable ? runtime->Load32(rdram, ctx, tcb + 0x1B0u) : 0u,
+                         readable ? runtime->Load8(rdram, ctx, tcb + 0x1F0u) : 0u,
+                         readable ? runtime->Load8(rdram, ctx, tcb + 0x1F1u) : 0u,
+                         readable ? runtime->Load32(rdram, ctx, tcb + 0x1B4u) : 0u,
+                         runtime->Load16(rdram, ctx, kGreenReadyCounts + 2u));
+        }
+        if (gGreenEnterPrev != nullptr)
+            gGreenEnterPrev(rdram, ctx, runtime);
+    }
+
+    void greenYieldProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a = runtime->Load32(rdram, ctx, kGreenIndexA);
+        const uint32_t b = runtime->Load32(rdram, ctx, kGreenIndexB);
+        const uint32_t c = runtime->Load32(rdram, ctx, kGreenIndexC);
+        const uint32_t offset = a * b + c;
+        const uint32_t block = runtime->Load32(rdram, ctx, kGreenContextArray + offset);
+        const bool readable = block >= 0x00100000u && block < PS2_RAM_SIZE;
+        static uint32_t sYields = 0u;
+        ++sYields;
+        if (sYields <= 12u || (sYields % 200u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[gthreads] yield #%u A=0x%08X B=0x%08X C=0x%08X offset=0x%X block=0x%08X ra=0x%08X "
+                         "sp=0x%08X schedPc=%s0x%08X resumePc=%s0x%08X\n",
+                         sYields, a, b, c, offset, block, GPR_U32(ctx, 31), GPR_U32(ctx, 29),
+                         readable ? "" : "(?)", readable ? runtime->Load32(rdram, ctx, block + 0x1A8u) : 0u,
+                         readable ? "" : "(?)", readable ? runtime->Load32(rdram, ctx, block + 0x1B4u) : 0u);
+        }
+        if (gGreenYieldPrev != nullptr)
+            gGreenYieldPrev(rdram, ctx, runtime);
+        if (sYields <= 12u || (sYields % 200u) == 0u)
+        {
+            std::fprintf(stderr, "[gthreads] yield #%u -> pc=0x%08X ra=0x%08X sp=0x%08X\n", sYields, ctx->pc,
+                         GPR_U32(ctx, 31), GPR_U32(ctx, 29));
+        }
+        if (sYields <= 12u && std::getenv("TOL_TRACE_GTHREADS") != nullptr)
+            dumpGreenThreads(rdram, runtime, ctx, "after-yield");
+    }
+
+    void installGreenThreadProbe(PS2Runtime &runtime)
+    {
+        if (std::getenv("TOL_TRACE_GTHREADS") == nullptr)
+            return;
+        PS2Runtime::RecompiledFunction yieldFn = runtime.lookupFunction(kGreenYieldPc);
+        if (yieldFn == nullptr)
+            return;
+        gGreenYieldPrev = yieldFn;
+        runtime.replaceFunction(kGreenYieldPc, &greenYieldProbe);
+
+        PS2Runtime::RecompiledFunction switchFn = runtime.lookupFunction(kGreenEnterPc);
+        if (switchFn != nullptr)
+        {
+            gGreenEnterPrev = switchFn;
+            runtime.replaceFunction(kGreenEnterPc, &greenEnterProbe);
+        }
+    }
+
+    // ---- Boot-transfer read path (TOL_TRACE_XFER=1) ------------------------------------------------
+    // FUN_001f8530 is a guest async file-read state machine, not a device:
+    //     open 0x196B88 -> size 0x197550 -> read 0x1970E8 -> tell 0x197638
+    //     while (status != 3) { ... }
+    // These probes only observe. Each one runs the real recompiled body and then reports the arguments
+    // and the result, so "did the read move any bytes?" is answered by measurement instead of by another
+    // host-side pump. Nothing here changes guest behaviour.
+    PS2Runtime::RecompiledFunction gXferOpenPrev = nullptr;
+    PS2Runtime::RecompiledFunction gXferSizePrev = nullptr;
+    PS2Runtime::RecompiledFunction gXferReadPrev = nullptr;
+    PS2Runtime::RecompiledFunction gXferTellPrev = nullptr;
+    PS2Runtime::RecompiledFunction gXferCompletePrev = nullptr;
+    PS2Runtime::RecompiledFunction gXferStatePrev = nullptr;
+    PS2Runtime::RecompiledFunction gXferDevPosPrev = nullptr;
+    PS2Runtime::RecompiledFunction gXferReapPrev = nullptr;
+    PS2Runtime::RecompiledFunction gXferSeekPrev = nullptr;
+    PS2Runtime::RecompiledFunction gXferPumpPrev = nullptr;
+    PS2Runtime::RecompiledFunction gXferSubmitPrev = nullptr;
+    PS2Runtime::RecompiledFunction gDvciPumpDriverPrev = nullptr;
+    PS2Runtime::RecompiledFunction gDvciCbPrev = nullptr;
+    uint32_t gDvciPumpCalls = 0u;
+    uint32_t gDvciCbCalls = 0u;
+    int gDvciPumpDepth = 0;
+    PS2Runtime::RecompiledFunction gFrameTickPrev = nullptr;
+    
+    PS2Runtime::RecompiledFunction gIoPump2Prev = nullptr;
+    uint32_t gIoPump2Calls = 0u;
+
+    bool xferTraceEnabled()
+    {
+        static const bool enabled = std::getenv("TOL_TRACE_XFER") != nullptr;
+        return enabled;
+    }
+
+    void xferLog(const char *what, uint32_t call, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                 int32_t result, uint32_t pc)
+    {
+        std::fprintf(stderr,
+                     "[xfer] %s #%u a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X -> %d (0x%08X) pc=0x%08X\n",
+                     what, call, a0, a1, a2, a3, result, static_cast<uint32_t>(result), pc);
+    }
+
+    // The CRI file handle is the structure the read path mutates. In FUN_00196f58 the fields that matter are
+    //   +0x01 state (2 == hard EOF, every read returns 0), +0x04 device, +0x08 pending request,
+    //   +0x0C cached size, +0x20 position (what FUN_00197638 "tell" returns),
+    //   +0x24 dest, +0x28 last request size.
+    void xferDumpHandle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t handle, const char *tag,
+                        uint32_t call)
+    {
+        if (handle < 0x00100000u || handle >= 0x02000000u)
+        {
+            std::fprintf(stderr, "[xfer] %s #%u handle=0x%08X (not a RAM pointer)\n", tag, call, handle);
+            return;
+        }
+        std::fprintf(stderr,
+                     "[xfer] %s #%u handle=0x%08X state=%u dev=0x%08X req=0x%08X size=%d pos=%u dest=0x%08X "
+                     "len=%u\n",
+                     tag, call, handle, static_cast<unsigned>(runtime->Load8(rdram, ctx, handle + 0x01u)),
+                     runtime->Load32(rdram, ctx, handle + 0x04u), runtime->Load32(rdram, ctx, handle + 0x08u),
+                     static_cast<int32_t>(runtime->Load32(rdram, ctx, handle + 0x0Cu)),
+                     runtime->Load32(rdram, ctx, handle + 0x20u), runtime->Load32(rdram, ctx, handle + 0x24u),
+                     runtime->Load32(rdram, ctx, handle + 0x28u));
+    }
+
+    void xferOpenProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t a0 = GPR_U32(ctx, 4), a1 = GPR_U32(ctx, 5);
+        const uint32_t a2 = GPR_U32(ctx, 6), a3 = GPR_U32(ctx, 7);
+        if (gXferOpenPrev != nullptr)
+            gXferOpenPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 8u)
+        {
+            xferLog("open", sCalls, a0, a1, a2, a3, static_cast<int32_t>(GPR_U32(ctx, 2)), ctx->pc);
+            xferDumpHandle(rdram, ctx, runtime, GPR_U32(ctx, 2), "open", sCalls);
+        }
+    }
+
+    void xferSizeProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t a0 = GPR_U32(ctx, 4), a1 = GPR_U32(ctx, 5);
+        const uint32_t a2 = GPR_U32(ctx, 6), a3 = GPR_U32(ctx, 7);
+        if (gXferSizePrev != nullptr)
+            gXferSizePrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 8u)
+        {
+            xferLog("size", sCalls, a0, a1, a2, a3, static_cast<int32_t>(GPR_U32(ctx, 2)), ctx->pc);
+            xferDumpHandle(rdram, ctx, runtime, a0, "size", sCalls);
+        }
+    }
+
+    void xferReadProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        static int64_t sBytes = 0;
+        const uint32_t a0 = GPR_U32(ctx, 4), a1 = GPR_U32(ctx, 5);
+        const uint32_t a2 = GPR_U32(ctx, 6), a3 = GPR_U32(ctx, 7);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        // The transfer handler's two call sites (FUN_001f8530): 0x1F85A4 -> ra 0x1F85AC,
+        // and 0x1F8718 -> ra 0x1F8720. These are logged unconditionally, because the ordinary
+        // counter cap is exactly what hid the handler's read last time.
+        const bool fromHandler = (ra == 0x001F85ACu || ra == 0x001F8720u);
+        if (fromHandler)
+            std::fprintf(stderr,
+                         "[xfer] HANDLER-READ enter ra=0x%08X handle=0x%08X blocks=%u dest=0x%08X sp=0x%08X "
+                         "pumpDepth=%d frames=%u pumps=%u\n",
+                         ra, a0, a1, a2, GPR_U32(ctx, 29), gDvciPumpDepth, gFrameTicks, gDvciPumpCalls);
+        if (gXferReadPrev != nullptr)
+            gXferReadPrev(rdram, ctx, runtime);
+        ++sCalls;
+        const int32_t result = static_cast<int32_t>(GPR_U32(ctx, 2));
+        if (result > 0)
+            sBytes += result;
+        if (fromHandler)
+            std::fprintf(stderr,
+                         "[xfer] HANDLER-READ exit ra=0x%08X pc=0x%08X %s result=%d\n", ra, ctx->pc,
+                         ctx->pc == ra ? "RETURNED-OK" : "BAILED", result);
+        if (sCalls <= 12u || (sCalls % 64u) == 0u)
+        {
+            xferLog("read", sCalls, a0, a1, a2, a3, result, ctx->pc);
+            std::fprintf(stderr, "[xfer]      caller ra=0x%08X\n", ra);
+            std::fprintf(stderr, "[xfer]      total=%lld bytes over %u reads\n",
+                         static_cast<long long>(sBytes), sCalls);
+            if (sCalls <= 6u)
+                xferDumpHandle(rdram, ctx, runtime, a0, "read", sCalls);
+        }
+    }
+
+    void xferTellProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t a0 = GPR_U32(ctx, 4), a1 = GPR_U32(ctx, 5);
+        const uint32_t a2 = GPR_U32(ctx, 6), a3 = GPR_U32(ctx, 7);
+        if (gXferTellPrev != nullptr)
+            gXferTellPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls == 1u)
+        {
+            gTransferWaitActive = true;
+            dumpGreenThreads(rdram, runtime, ctx, "wait-begin");
+        }
+        else if (sCalls == 128u || sCalls == 256u)
+        {
+            dumpGreenThreads(rdram, runtime, ctx, "wait-later");
+        }
+        if (sCalls <= 12u || (sCalls % 64u) == 0u)
+            std::fprintf(stderr, "[xfer]      tell-count#%u pumps=%u cb4=%u ticks=%u frames=%u iopump=%u lock=0x%08X status=0x%08X\n", sCalls,
+                         gDvciPumpCalls, gDvciCbCalls, gTickEntries, gFrameTicks, gIoPump2Calls, runtime->Load32(rdram, ctx, GPR_U32(ctx, 28) - 0x7880u), ctx->cop0_status);
+        if (sCalls <= 12u || (sCalls % 64u) == 0u)
+            std::fprintf(stderr, "[xfer]      host loops=%llu evts=%llu enterGuest=%llu\n",
+                         static_cast<unsigned long long>(g_eeRunLoopIterations.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(
+                             g_eeProcessPendingEventsCount.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(g_eeEnterGuestCount.load(std::memory_order_relaxed)));
+        if (sCalls <= 12u || (sCalls % 64u) == 0u)
+            std::fprintf(stderr, "[xfer]      timers t0=%u/%u/%u t1=%u/%u/%u t2=%u/%u/%u\n",
+                         runtime->Load32(rdram, ctx, 0x10000000u), runtime->Load32(rdram, ctx, 0x10000010u),
+                         runtime->Load32(rdram, ctx, 0x10000020u), runtime->Load32(rdram, ctx, 0x10000800u),
+                         runtime->Load32(rdram, ctx, 0x10000810u), runtime->Load32(rdram, ctx, 0x10000820u),
+                         runtime->Load32(rdram, ctx, 0x10001000u), runtime->Load32(rdram, ctx, 0x10001010u),
+                         runtime->Load32(rdram, ctx, 0x10001020u));
+        if (sCalls <= 3u || (sCalls % 512u) == 0u)
+            xferDumpHandle(rdram, ctx, runtime, a0, "tell", sCalls);
+    }
+
+    // FUN_00197128 is the only writer of handle[0x20] (what "tell" returns): it reaps a finished read and
+    // sets pos = device_position - consumed. Counting it answers "does anything complete the request".
+    void xferCompleteProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t handle = GPR_U32(ctx, 4);
+        const bool ram = handle >= 0x00100000u && handle < 0x02000000u;
+        const uint32_t stateIn = ram ? runtime->Load8(rdram, ctx, handle + 1u) : 0u;
+        if (gXferCompletePrev != nullptr)
+            gXferCompletePrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 16u || (sCalls % 256u) == 0u)
+            std::fprintf(stderr, "[xfer] complete #%u handle=0x%08X state_in=%u -> %d pos=%u\n", sCalls, handle,
+                         stateIn, static_cast<int32_t>(GPR_U32(ctx, 2)),
+                         ram ? runtime->Load32(rdram, ctx, handle + 0x20u) : 0u);
+    }
+
+    // FUN_00197668 returns handle[1]; the transfer loop spins until it reads 3 (done). Report transitions
+    // together with the handle and its device, so "stuck at 2" is distinguishable from "never polled".
+    void xferStateProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        static uint32_t sLastHandle = 0u;
+        static uint32_t sLastState = 0xFFFFFFFFu;
+        const uint32_t handle = GPR_U32(ctx, 4);
+        if (gXferStatePrev != nullptr)
+            gXferStatePrev(rdram, ctx, runtime);
+        ++sCalls;
+        const uint32_t state = GPR_U32(ctx, 2) & 0xFFu;
+        const bool ram = handle >= 0x00100000u && handle < 0x02000000u;
+        if (handle != sLastHandle || state != sLastState)
+        {
+            sLastHandle = handle;
+            sLastState = state;
+            std::fprintf(stderr, "[xfer] state #%u handle=0x%08X -> %u\n", sCalls, handle, state);
+            if (ram)
+            {
+                const uint32_t dev = runtime->Load32(rdram, ctx, handle + 4u);
+                std::fprintf(stderr,
+                             "[xfer]   pos=%u consumed=%u size=%d dest=0x%08X len=%u dev=0x%08X\n",
+                             runtime->Load32(rdram, ctx, handle + 0x20u),
+                             runtime->Load32(rdram, ctx, handle + 0x14u),
+                             static_cast<int32_t>(runtime->Load32(rdram, ctx, handle + 0x0Cu)),
+                             runtime->Load32(rdram, ctx, handle + 0x24u),
+                             runtime->Load32(rdram, ctx, handle + 0x28u), dev);
+                if (dev >= 0x00100000u && dev < 0x02000000u)
+                    std::fprintf(stderr, "[xfer]   dev +08=0x%08X +58=0x%08X (position)\n",
+                                 runtime->Load32(rdram, ctx, dev + 8u),
+                                 runtime->Load32(rdram, ctx, dev + 0x58u));
+            }
+        }
+    }
+
+    // FUN_0019ed88 is the device byte position that FUN_00197128 subtracts the consumed count from.
+    void xferDevPosProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t dev = GPR_U32(ctx, 4);
+        if (gXferDevPosPrev != nullptr)
+            gXferDevPosPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 16u || (sCalls % 256u) == 0u)
+            std::fprintf(stderr, "[xfer] devpos #%u dev=0x%08X -> %d\n", sCalls, dev,
+                         static_cast<int32_t>(GPR_U32(ctx, 2)));
+    }
+
+    // The two helpers that are allowed to reap a pending read (and therefore to run FUN_00197128).
+    void xferReapProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t handle = GPR_U32(ctx, 4);
+        if (gXferReapPrev != nullptr)
+            gXferReapPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 12u || (sCalls % 128u) == 0u)
+            std::fprintf(stderr, "[xfer] reap 0x196C98 #%u handle=0x%08X -> %d\n", sCalls, handle,
+                         static_cast<int32_t>(GPR_U32(ctx, 2)));
+    }
+
+    void xferSeekProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t handle = GPR_U32(ctx, 4);
+        if (gXferSeekPrev != nullptr)
+            gXferSeekPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 12u || (sCalls % 128u) == 0u)
+            std::fprintf(stderr, "[xfer] seek 0x197408 #%u handle=0x%08X off=%d whence=%u -> %d\n", sCalls, handle,
+                         static_cast<int32_t>(GPR_U32(ctx, 5)), GPR_U32(ctx, 6),
+                         static_cast<int32_t>(GPR_U32(ctx, 2)));
+    }
+
+    // The chaining decision in FUN_0019ef58. After each chunk:
+    //     dev[0x58] += dev[0x20]                    blocks done
+    //     dev[0x34] += dev[0x20] << 11              bytes done
+    //     if (blocksDone < remaining) {
+    //         if ((bytesDone >> 11) < dev[0x5C]) continue;   // window not reached
+    //         if (0xFFFFE < dev[0x5C]) continue;
+    //     }
+    //     dev[1] = 3;                                DONE
+    // so a small dev[0x5C] ends the transfer after one chunk. This prints the fields around every call.
+    void xferPumpProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t dev = GPR_U32(ctx, 4);
+        const bool ram = dev >= 0x00100000u && dev < 0x02000000u;
+        uint32_t before[6] = {};
+        const uint32_t offsets[6] = {0x14u, 0x20u, 0x30u, 0x34u, 0x58u, 0x5Cu};
+        if (ram)
+            for (int i = 0; i < 6; ++i)
+                before[i] = runtime->Load32(rdram, ctx, dev + offsets[i]);
+        if (gXferPumpPrev != nullptr)
+            gXferPumpPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (!ram || sCalls > 400u)
+            return;
+        const uint32_t win = runtime->Load32(rdram, ctx, dev + 0x5Cu);
+        // The handler's request uses a 266-block window; the DVCI background path uses 1. Keep the
+        // multi-block windows and the first 40 calls, so the handler's chain is visible.
+        if (win <= 1u && sCalls > 40u)
+            return;
+        const uint32_t state = runtime->Load8(rdram, ctx, dev + 1u);
+        std::fprintf(stderr,
+                     "[xfer] pump #%u dev=0x%08X state=%u | remain=%u chunk=%u total=%u bytes=%u done=%u win=%u "
+                     "(was remain=%u chunk=%u bytes=%u done=%u)\n",
+                     sCalls, dev, state, runtime->Load32(rdram, ctx, dev + 0x14u),
+                     runtime->Load32(rdram, ctx, dev + 0x20u), runtime->Load32(rdram, ctx, dev + 0x30u),
+                     runtime->Load32(rdram, ctx, dev + 0x34u), runtime->Load32(rdram, ctx, dev + 0x58u),
+                     runtime->Load32(rdram, ctx, dev + 0x5Cu), before[0], before[1], before[3], before[4]);
+    }
+
+    // FUN_00196db0 is the submit: it re-arms the device (FUN_0019ee18 -> FUN_0019eda0 zeroes dev[0x34]),
+    // then  handle[0x1C] = min(blocks, handle[0xC] - handle[0x14])  and  dev[0x5C] = handle[0x1C].
+    // So the window is the request's own block count; this shows which operand is 1.
+    void xferSubmitProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t handle = GPR_U32(ctx, 4);
+        const uint32_t blocks = GPR_U32(ctx, 5);
+        const uint32_t request = GPR_U32(ctx, 6);
+        const bool ram = handle >= 0x00100000u && handle < 0x02000000u;
+        if (gXferSubmitPrev != nullptr)
+            gXferSubmitPrev(rdram, ctx, runtime);
+        ++sCalls;
+        const uint32_t sizeAfter = ram ? runtime->Load32(rdram, ctx, handle + 0x0Cu) : 0u;
+        const uint32_t consumedAfter = ram ? runtime->Load32(rdram, ctx, handle + 0x14u) : 0u;
+        const uint32_t windowAfter = ram ? runtime->Load32(rdram, ctx, handle + 0x1Cu) : 0u;
+        const uint32_t dev = ram ? runtime->Load32(rdram, ctx, handle + 0x04u) : 0u;
+        // Always report a multi-block request: the handler asks for 266 and must not be filtered out by
+        // the counter cap again.
+        if (!ram || (blocks <= 1u && sCalls > 40u))
+            return;
+        const uint32_t dev0 = (dev >= 0x00100000u && dev < 0x02000000u) ? runtime->Load32(rdram, ctx, dev) : 0u;
+        const uint32_t dev1 = (dev >= 0x00100000u && dev < 0x02000000u) ? runtime->Load8(rdram, ctx, dev + 1u) : 0u;
+        const uint32_t dev24 = (dev >= 0x00100000u && dev < 0x02000000u) ? runtime->Load32(rdram, ctx, dev + 0x24u) : 0u;
+        std::fprintf(stderr,
+                     "[xfer] submit #%u handle=0x%08X blocks=%u request=0x%08X | size=%u consumed=%u "
+                     "size-cons=%d -> window=%u dev=0x%08X devWin=%u dev0=0x%08X dev1=%u dev24=0x%08X "
+                     "| frames=%u iopump=%u pumps=%u cb4=%u\n",
+                     sCalls, handle, blocks, request, sizeAfter, consumedAfter,
+                     static_cast<int32_t>(sizeAfter - consumedAfter), windowAfter, dev,
+                     (dev >= 0x00100000u && dev < 0x02000000u) ? runtime->Load32(rdram, ctx, dev + 0x5Cu) : 0u,
+                     dev0, dev1, dev24, gFrameTicks, gIoPump2Calls, gDvciPumpCalls, gDvciCbCalls);
+    }
+
+    // FUN_00197940 is the DVCI pump (kDvciPumpPc); FUN_00198280 is the callback registered into slot 4
+    // by FUN_001982a0 (FUN_001b7378(4, 0x198280, 0)). Logging the caller's $ra says which driver runs it,
+    // and the timestamps against the handler's submit say when it stops.
+    void dvciPumpDriverProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t ra = GPR_U32(ctx, 31);
+        ++gDvciPumpDepth;
+        if (gDvciPumpDriverPrev != nullptr)
+            gDvciPumpDriverPrev(rdram, ctx, runtime);
+        --gDvciPumpDepth;
+        ++sCalls;
+        ++gDvciPumpCalls;
+        if (sCalls <= 60u || (sCalls % 64u) == 0u)
+            std::fprintf(stderr, "[xfer] dvci-pump #%u ra=0x%08X\n", sCalls, ra);
+    }
+
+    void dvciCbProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (gDvciCbPrev != nullptr)
+            gDvciCbPrev(rdram, ctx, runtime);
+        ++sCalls;
+        ++gDvciCbCalls;
+        if (sCalls <= 40u || (sCalls % 64u) == 0u)
+            std::fprintf(stderr, "[xfer] dvci-cb4 #%u ra=0x%08X\n", sCalls, ra);
+    }
+
+    void ioPump2Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (gIoPump2Prev != nullptr)
+            gIoPump2Prev(rdram, ctx, runtime);
+        ++sCalls;
+        ++gIoPump2Calls;
+        if (sCalls <= 24u || (sCalls % 64u) == 0u)
+            std::fprintf(stderr, "[xfer] iopump #%u ra=0x%08X\n", sCalls, ra);
+    }
+
+    void frameTickProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gFrameTickPrev != nullptr)
+            gFrameTickPrev(rdram, ctx, runtime);
+        ++gFrameTicks;
+    }
+
+
+
+
+
+
+
+
+    // ---- drain probe (TOL_TRACE_DRAIN=1): pure observation of FUN_0019EEC8 ------------------------
+    // FUN_0019EEC8 is the device drain:
+    //     FUN_0019ee60(dev);  do { do { pump } while (dev[1] != 1); } while (dev[0x24] != 0);
+    // It is the natural place to fix "armed but never started", because its whole job is to drive the
+    // device to idle. This wrapper only observes first: it records the entry/exit state so the real
+    // transitions are known before any behaviour is added.
+    PS2Runtime::RecompiledFunction gDrainPrev = nullptr;
+    uint32_t gDrainCalls = 0u;
+
+    struct DrainFields
+    {
+        uint32_t dev0;
+        uint8_t state;
+        uint8_t busy;
+        uint8_t flag3;
+        uint32_t remaining;
+        uint32_t chunk;
+        uint32_t req;
+        uint32_t done;
+        uint32_t window;
+    };
+
+    DrainFields drainRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t dev)
+    {
+        DrainFields f{};
+        if (dev < 0x00100000u || dev >= 0x02000000u)
+            return f;
+        f.dev0 = runtime->Load32(rdram, ctx, dev);
+        f.state = runtime->Load8(rdram, ctx, dev + 1u);
+        f.busy = runtime->Load8(rdram, ctx, dev + 2u);
+        f.flag3 = runtime->Load8(rdram, ctx, dev + 3u);
+        f.remaining = runtime->Load32(rdram, ctx, dev + 0x14u);
+        f.chunk = runtime->Load32(rdram, ctx, dev + 0x20u);
+        f.req = runtime->Load32(rdram, ctx, dev + 0x24u);
+        f.done = runtime->Load32(rdram, ctx, dev + 0x58u);
+        f.window = runtime->Load32(rdram, ctx, dev + 0x5Cu);
+        return f;
+    }
+
+    void drainProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t dev = GPR_U32(ctx, 4);
+        const uint32_t returnPc = GPR_U32(ctx, 31);
+        const DrainFields in = drainRead(rdram, ctx, runtime, dev);
+        if (gDrainPrev != nullptr)
+            gDrainPrev(rdram, ctx, runtime);
+        ++gDrainCalls;
+        const bool bailed = ctx->pc != returnPc;
+        const DrainFields out = drainRead(rdram, ctx, runtime, dev);
+        // Log the interesting cases in full: first calls, any entry while armed, and any exit transition.
+        const bool interesting = gDrainCalls <= 20u || in.state == 2u || in.state != out.state;
+        if (interesting && gDrainCalls <= 400u)
+            std::fprintf(stderr,
+                         "[drain] #%u dev=0x%08X in{dev0=0x%08X st=%u busy=%u f3=%u rem=%u chunk=%u req=0x%08X "
+                         "done=%u win=%u} out{st=%u busy=%u rem=%u chunk=%u req=0x%08X done=%u}%s\n",
+                         gDrainCalls, dev, in.dev0, in.state, in.busy, in.flag3, in.remaining, in.chunk, in.req,
+                         in.done, in.window, out.state, out.busy, out.remaining, out.chunk, out.req, out.done,
+                         bailed ? " BAILED" : "");
+    }
+
+    void installDrainProbe(PS2Runtime &runtime)
+    {
+        if (std::getenv("TOL_TRACE_DRAIN") == nullptr)
+            return;
+        PS2Runtime::RecompiledFunction drain = runtime.lookupFunction(0x0019EEC8u);
+        if (drain == nullptr)
+        {
+            std::fprintf(stderr, "[drain] 0x0019EEC8 is not in the function table\n");
+            return;
+        }
+        gDrainPrev = drain;
+        runtime.replaceFunction(0x0019EEC8u, &drainProbe);
+        std::fprintf(stderr, "[drain] probe installed on 0x0019EEC8\n");
+    }
+
+    // ---- frame-tick start (TOL_XFER_START=1) ------------------------------------------------------
+    // The drain cannot fix this: FUN_0019ee60 sees dev[1]==2, dev[2]==0, writes dev[1]=1 and the loop
+    // exits, discarding the armed read. The transfer must be *started* (FUN_0019ef58 sets dev[2]=1) before
+    // any drain. The load stage runs FUN_001392D0 (frame tick) every iteration, so tick there.
+    PS2Runtime::RecompiledFunction gFrameStartPrev = nullptr;
+    uint32_t gFrameStarts = 0u;
+
+    bool frameStartEnabled()
+    {
+        // Default ON: this is the fix that unblocks the boot script load. It gives the load stage
+        // (FUN_00166010) the same per-frame FUN_0019a080 pump the frame loop already does, which is what
+        // drains the armed CRI read. Measured effect: the boot script lands (script count 5/48 readable),
+        // the resource table at 0x003DB6BC populates (ids 1,2,3...), and the script engine starts walking
+        // commands. Reproducible. Disable with TOL_XFER_NO_TICK=1 to reproduce the old stall.
+        static const bool enabled = std::getenv("TOL_XFER_NO_TICK") == nullptr;
+        return enabled;
+    }
+
+    void frameStartFix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t returnPc = GPR_U32(ctx, 31);
+        if (gFrameStartPrev != nullptr)
+            gFrameStartPrev(rdram, ctx, runtime);
+        if (ctx->pc != returnPc)
+            return; // the frame tick bailed; propagate like generated code
+
+        // Gate: the device exists and the pump is not inside itself. Deliberately NOT keyed on the
+        // handle/device state: those flip 2 -> 0 -> 3 between ticks (measured), so any state test makes
+        // the hook fire once. The frame loop pumps unconditionally every frame; this mirrors that.
+        constexpr uint32_t kHandle = 0x00390738u;
+        const uint32_t dev = runtime->Load32(rdram, ctx, kHandle + 0x04u);
+        if (dev < 0x00100000u || dev >= 0x02000000u)
+            return;
+        if (runtime->Load8(rdram, ctx, dev + 2u) != 0u) // 1 = the pump is inside itself right now
+            return;
+
+        // The frame loop does  ... FUN_00151ff0(0/1/4); ... FUN_0019a080(); ...  once per frame.
+        // The load stage (FUN_00166010) runs FUN_001392d0 every iteration but never the IO pump, so an
+        // armed read is never drained while a load is in progress.
+        //
+        // Queued invocation, NOT an inline call: the pump chain (FUN_0019a080 -> FUN_001b7870 ->
+        // FUN_001b7688) is emitted as direct C++ tail-calls, which never touch the guest $ra register.
+        // An inline call therefore has no legitimate return address and the innermost handler's
+        // `jr $ra` lands on whatever was in $ra (measured: source=0xdeadbeef). sp=0 / ra=0 is the
+        // contract dispatchIrq uses: the scheduler hands out an invocation stack and treats the
+        // function's return as completion.
+        constexpr uint32_t kPumpEntry = 0x0019A080u;
+        if (runtime->lookupFunction(kPumpEntry) == nullptr)
+            return;
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::Interrupt;
+        invocation.context = *ctx;
+        invocation.context.pc = kPumpEntry;
+        SET_GPR_U32(&invocation.context, 29, 0u);
+        SET_GPR_U32(&invocation.context, 31, 0u);
+        runtime->eeScheduler().queueInvocation(std::move(invocation));
+        ++gFrameStarts;
+        if (gFrameStarts <= 8u || (gFrameStarts % 64u) == 0u)
+        {
+            const bool devOk = dev >= 0x00100000u && dev < 0x02000000u;
+            std::fprintf(stderr,
+                         "[xfer] tick-pump #%u queued dev=0x%08X st=%u busy=%u done=%u chunk=%u win=%u\n",
+                         gFrameStarts, dev, devOk ? runtime->Load8(rdram, ctx, dev + 1u) : 0u,
+                         devOk ? runtime->Load8(rdram, ctx, dev + 2u) : 0u,
+                         devOk ? runtime->Load32(rdram, ctx, dev + 0x58u) : 0u,
+                         devOk ? runtime->Load32(rdram, ctx, dev + 0x20u) : 0u,
+                         devOk ? runtime->Load32(rdram, ctx, dev + 0x5Cu) : 0u);
+        }
+    }
+
+    void installFrameStartFix(PS2Runtime &runtime)
+    {
+        if (!frameStartEnabled())
+            return;
+        PS2Runtime::RecompiledFunction tick = runtime.lookupFunction(0x001392D0u);
+        if (tick == nullptr)
+            return;
+        gFrameStartPrev = tick;
+        runtime.replaceFunction(0x001392D0u, &frameStartFix);
+        std::fprintf(stderr, "[xfer] frame-start installed on 0x001392D0\n");
+    }
+
+    void installXferProbes(PS2Runtime &runtime)
+    {
+        if (!xferTraceEnabled())
+            return;
+        const struct
+        {
+            uint32_t pc;
+            PS2Runtime::RecompiledFunction probe;
+            PS2Runtime::RecompiledFunction *prev;
+            const char *name;
+        } table[] = {
+            {0x00196B88u, &xferOpenProbe, &gXferOpenPrev, "open"},
+            {0x00197550u, &xferSizeProbe, &gXferSizePrev, "size"},
+            {0x001970E8u, &xferReadProbe, &gXferReadPrev, "read"},
+            {0x00197638u, &xferTellProbe, &gXferTellPrev, "tell"},
+            {0x00197128u, &xferCompleteProbe, &gXferCompletePrev, "complete"},
+            {0x00197668u, &xferStateProbe, &gXferStatePrev, "state"},
+            {0x0019ED88u, &xferDevPosProbe, &gXferDevPosPrev, "devpos"},
+            {0x00196C98u, &xferReapProbe, &gXferReapPrev, "reap"},
+            {0x00197408u, &xferSeekProbe, &gXferSeekPrev, "seek"},
+            {0x0019EF58u, &xferPumpProbe, &gXferPumpPrev, "pump"},
+            {0x00196DB0u, &xferSubmitProbe, &gXferSubmitPrev, "submit"},
+            {0x00197940u, &dvciPumpDriverProbe, &gDvciPumpDriverPrev, "dvci-pump"},
+            {0x00198280u, &dvciCbProbe, &gDvciCbPrev, "dvci-cb4"},
+            {0x001392D0u, &frameTickProbe, &gFrameTickPrev, "frame-tick"},
+            {0x0019A080u, &ioPump2Probe, &gIoPump2Prev, "iopump"},
+        };
+        for (const auto &entry : table)
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(entry.pc);
+            if (fn == nullptr)
+            {
+                std::fprintf(stderr, "[xfer] 0x%08X (%s) is not in the function table\n", entry.pc, entry.name);
+                continue;
+            }
+            *entry.prev = fn;
+            runtime.replaceFunction(entry.pc, entry.probe);
+            std::fprintf(stderr, "[xfer] probe installed on 0x%08X (%s)\n", entry.pc, entry.name);
+        }
+    }
+
     void installOverrides(PS2Runtime &runtime)
     {
         // 0x0011F400 was overridden here as a "SIF command issuer". That reading was wrong: the registers it
@@ -1895,6 +3620,291 @@ namespace tol
         // recompiled body, so nothing about guest behaviour changes while the queue is being observed.
         installPcProbes(runtime);
         installSifRpcOverrides(runtime);
+        installXferProbes(runtime);
+        // installXferStartFix is deliberately NOT called: wrapping 0x00196DB0 perturbs the submit path
+        // (41 submits -> 2) even when the wrapper only observes. See HANDOFF §0o.
+        installDrainProbe(runtime);
+        installFrameStartFix(runtime);
+
+        // Function-table gap: 0x139690 is a shared clamp-setter epilogue
+        // (`jr ra; sw a0, -0x7b44(gp)`) reached by a `j 0x139690` tail jump from
+        // FUN_00139ca0. Ghidra folded it into its callers, so the dense table has
+        // a null slot here (indices 0x139684..0x13969c are all gaps). The sound
+        // init's clamp helper tail-jumps here, the jump target is reported missing,
+        // and the runtime then spins on the missing-PC stub forever, which is why
+        // the first frame never finishes and the screen stays on NOW LOADING.
+        // Re-express the two instructions natively rather than regenerating the
+        // whole corpus for one 8-byte setter.
+        runtime.replaceFunction(0x00139690u,
+                                [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                    const uint32_t gp = GPR_U32(ctx, 28);
+                                    WRITE32(gp - 0x7b44u, GPR_U32(ctx, 4));
+                                    ctx->pc = GPR_U32(ctx, 31);
+                                });
+
+        // 0x1F8150 is the GS/VU1 worker loop:
+        //     do { FUN_001f8000(); FUN_0015231c(); } while (true);
+        // On hardware it runs as its own guest thread and the loop yields each iteration, so the game's own
+        // microkernel owns it. Legacy host pump only (see legacyWorkerPumpsEnabled).
+        if (legacyWorkerPumpsEnabled())
+            runtime.replaceFunction(0x001F8150u,
+                                [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                    // Guard against the flush path re-entering the worker
+                                    // (FUN_0015231c -> FUN_00151ff0 -> FUN_00151e90 -> handler).
+                                    static bool sInWorkerStep = false;
+                                    static uint32_t sGuardHits = 0u;
+                                    static uint32_t sEntries = 0u;
+                                    if (sInWorkerStep)
+                                    {
+                                        ++sGuardHits;
+                                        if (std::getenv("TOL_TRACE_GS") != nullptr && sGuardHits <= 20u)
+                                        {
+                                            std::fprintf(stderr,
+                                                         "[gs] worker GUARD hit #%u ra=0x%08X entries=%u\n",
+                                                         sGuardHits, GPR_U32(ctx, 31), sEntries);
+                                        }
+                                        ctx->pc = GPR_U32(ctx, 31);
+                                        return;
+                                    }
+                                    sInWorkerStep = true;
+                                    ++sEntries;
+                                    const uint32_t savedRa = GPR_U32(ctx, 31);
+                                    if (std::getenv("TOL_TRACE_GS") != nullptr)
+                                    {
+                                        static uint32_t sWorkerSteps = 0;
+                                        ++sWorkerSteps;
+                                        if (sWorkerSteps <= 8u || (sWorkerSteps % 5000u) == 0u)
+                                        {
+                                            std::fprintf(stderr, "[gs] worker step #%u ra=0x%08X\n",
+                                                         sWorkerSteps, savedRa);
+                                        }
+                                    }
+
+                                    PS2Runtime::RecompiledFunction step = runtime->lookupFunction(0x001F8000u);
+                                    SET_GPR_U32(ctx, 31, 0x001F8160u);
+                                    ctx->pc = 0x001F8000u;
+                                    step(rdram, ctx, runtime);
+                                    const uint32_t pcAfterStep = ctx->pc;
+
+                                    PS2Runtime::RecompiledFunction flush = runtime->lookupFunction(0x0015231Cu);
+                                    SET_GPR_U32(ctx, 31, 0x001F8168u);
+                                    ctx->pc = 0x0015231Cu;
+                                    flush(rdram, ctx, runtime);
+                                    const uint32_t pcAfterSave = ctx->pc;
+
+                                    sInWorkerStep = false;
+                                    SET_GPR_U32(ctx, 31, savedRa);
+                                    ctx->pc = savedRa;
+                                    if (std::getenv("TOL_TRACE_GS") != nullptr && sEntries <= 20u)
+                                    {
+                                        std::fprintf(stderr,
+                                                     "[gs] worker entry #%u savedRa=0x%08X afterStep=0x%08X "
+                                                     "afterSave=0x%08X exit=0x%08X guardHits=%u\n",
+                                                     sEntries, savedRa, pcAfterStep, pcAfterSave, savedRa,
+                                                     sGuardHits);
+                                    }
+                                    if (std::getenv("TOL_TRACE_GS") != nullptr)
+                                    {
+                                        static uint32_t sFlagLogs = 0;
+                                        if (sFlagLogs < 6u && rdram != nullptr)
+                                        {
+                                            uint32_t flagPtr = 0;
+                                            std::memcpy(&flagPtr, rdram + 0x00407740u, sizeof(flagPtr));
+                                            uint32_t flagVal = 0;
+                                            if (flagPtr + sizeof(flagPtr) <= PS2_RAM_SIZE)
+                                            {
+                                                std::memcpy(&flagVal, rdram + flagPtr, sizeof(flagVal));
+                                            }
+                                            ++sFlagLogs;
+                                            std::fprintf(stderr,
+                                                         "[gs] flag ctx=0x00407740 ptr=0x%08X val=0x%08X sp=0x%08X\n",
+                                                         flagPtr, flagVal, GPR_U32(ctx, 29));
+                                        }
+                                    }
+                                });
+        // The generated function resumes at interior labels (the loop back-edge
+        // lands on 0x1F8168), and lookupFunction goes through the dense table
+        // slot for that exact address, so replace every slot in the body too.
+        if (legacyWorkerPumpsEnabled())
+        {
+            const PS2Runtime::RecompiledFunction workerStep = runtime.lookupFunction(0x001F8150u);
+            for (uint32_t pc = 0x001F8154u; pc < 0x001F8170u; pc += 4u)
+            {
+                runtime.replaceFunction(pc, workerStep);
+            }
+        }
+
+        if (legacyWorkerPumpsEnabled())
+            installWorker2BackEdge(runtime);
+
+        // Green-thread microkernel dump (TOL_TRACE_GTHREADS=1, see dumpGreenThreads).
+        installGreenThreadProbe(runtime);
+
+
+        // Script "finished?" entry point: this is the address the dispatchers actually call (the thunk at
+        // 0x1F7340 jumps to FUN_001f88f0 by direct C++ call, so overriding 0x1F88F0 in the table would never
+        // fire). Installed unconditionally because it carries the null-command-block fix.
+        {
+            PS2Runtime::RecompiledFunction scriptStatus = runtime.lookupFunction(kScriptStatusPc);
+            if (scriptStatus != nullptr)
+            {
+                gScriptStatusPrev = scriptStatus;
+                runtime.replaceFunction(kScriptStatusPc, &scriptStatusProbe);
+            }
+        }
+
+        // Clear a stale transfer lock before the handler acquires it (see transferLockProbe).
+        {
+            PS2Runtime::RecompiledFunction lockFn = runtime.lookupFunction(kTransferLockPc);
+            if (lockFn != nullptr)
+            {
+                gTransferLockPrev = lockFn;
+                runtime.replaceFunction(kTransferLockPc, &transferLockProbe);
+            }
+        }
+
+        // Pump the DVCI/ADXF engine whenever the guest yields (see yieldPump). Legacy host pump only: with the
+        // guest microkernel running, 0x15231C's real save+yield must reach the run loop at 0x151F88.
+        if (legacyWorkerPumpsEnabled())
+        {
+            PS2Runtime::RecompiledFunction yieldFn = runtime.lookupFunction(kYieldPc);
+            PS2Runtime::RecompiledFunction dvciPump = runtime.lookupFunction(kDvciPumpPc);
+            if (yieldFn != nullptr && dvciPump != nullptr)
+            {
+                gYieldPrev = yieldFn;
+                gDvciPumpFn = dvciPump;
+                runtime.replaceFunction(kYieldPc, &yieldPump);
+            }
+        }
+
+        // Pump queued asset transfers from the I/O wait (see ioPumpProbe). Legacy host pump only: the microkernel
+        // dispatches worker 2 itself, and re-entering it from the main stack kills thread 1.
+        if (legacyWorkerPumpsEnabled())
+        {
+            PS2Runtime::RecompiledFunction ioPump = runtime.lookupFunction(kIoPumpPc);
+            if (ioPump != nullptr)
+            {
+                gIoPumpPrev = ioPump;
+                runtime.replaceFunction(kIoPumpPc, &ioPumpProbe);
+            }
+        }
+
+        // Async load job probes (see loadStartProbe/loadStatusProbe).
+        if (loadTraceEnabled())
+        {
+            PS2Runtime::RecompiledFunction loadStart = runtime.lookupFunction(kLoadStartPc);
+            if (loadStart != nullptr)
+            {
+                gLoadStartPrev = loadStart;
+                runtime.replaceFunction(kLoadStartPc, &loadStartProbe);
+            }
+            PS2Runtime::RecompiledFunction loadStatus = runtime.lookupFunction(kLoadStatusPc);
+            if (loadStatus != nullptr)
+            {
+                gLoadStatusPrev = loadStatus;
+                runtime.replaceFunction(kLoadStatusPc, &loadStatusProbe);
+            }
+            PS2Runtime::RecompiledFunction resourceLookup = runtime.lookupFunction(kResourceLookupPc);
+            if (resourceLookup != nullptr)
+            {
+                gResourceLookupPrev = resourceLookup;
+                runtime.replaceFunction(kResourceLookupPc, &resourceLookupProbe);
+            }
+            PS2Runtime::RecompiledFunction transferSubmit = runtime.lookupFunction(kTransferSubmitPc);
+            if (transferSubmit != nullptr)
+            {
+                gTransferSubmitPrev = transferSubmit;
+                runtime.replaceFunction(kTransferSubmitPc, &transferSubmitProbe);
+            }
+            PS2Runtime::RecompiledFunction reapFn = runtime.lookupFunction(kReapPc);
+            if (reapFn != nullptr)
+            {
+                gReapPrev = reapFn;
+                runtime.replaceFunction(kReapPc, &reapProbe);
+            }
+            PS2Runtime::RecompiledFunction handlerFn = runtime.lookupFunction(0x001F8530u);
+            if (handlerFn != nullptr)
+            {
+                gTransferHandlerPrev = handlerFn;
+                runtime.replaceFunction(0x001F8530u, &transferHandlerEntryProbe);
+            }
+            std::fprintf(stderr, "[load] probes installed on 0x%08X/0x%08X/0x%08X\n", kLoadStartPc, kLoadStatusPc,
+                         kResourceLookupPc);
+        }
+
+        // Wait for pending transfers while driving the guest scheduler (see drivePendingTransfer).
+        // EXPERIMENTAL / OFF BY DEFAULT: see the note at the status-stub block above.
+        if (std::getenv("TOL_VIF_STATUS_WAIT") != nullptr && std::getenv("TOL_VIF_STATUS_REAL") != nullptr)
+        {
+            PS2Runtime::RecompiledFunction schedEntry = runtime.lookupFunction(kSchedEntryPc);
+            PS2Runtime::RecompiledFunction statusThunk = runtime.lookupFunction(kStatusThunkPc);
+            PS2Runtime::RecompiledFunction statusReal = runtime.lookupFunction(kStatusRealPc);
+            if (schedEntry != nullptr && statusThunk != nullptr)
+            {
+                gSchedEntryFn = schedEntry;
+                gStatusThunkPrev = statusThunk;
+                runtime.replaceFunction(kStatusThunkPc, &statusThunkWait);
+                if (statusReal != nullptr)
+                {
+                    gStatusRealPrev = statusReal;
+                    runtime.replaceFunction(kStatusRealPc, &statusRealWait);
+                }
+                std::fprintf(stderr, "[load] transfer status wait installed (pumps guest scheduler)\n");
+            }
+        }
+
+        // Script-context probes (see scriptPeekProbe/scriptAdvanceProbe).
+        if (scriptTraceEnabled())
+        {
+            PS2Runtime::RecompiledFunction scriptPeek = runtime.lookupFunction(kScriptPeekPc);
+            if (scriptPeek != nullptr)
+            {
+                gScriptPeekPrev = scriptPeek;
+                runtime.replaceFunction(kScriptPeekPc, &scriptPeekProbe);
+            }
+            PS2Runtime::RecompiledFunction scriptAdvance = runtime.lookupFunction(kScriptAdvancePc);
+            if (scriptAdvance != nullptr)
+            {
+                gScriptAdvancePrev = scriptAdvance;
+                runtime.replaceFunction(kScriptAdvancePc, &scriptAdvanceProbe);
+            }
+            std::fprintf(stderr, "[script] probes installed on 0x%08X/0x%08X/0x%08X\n", kScriptStatusPc,
+                         kScriptPeekPc, kScriptAdvancePc);
+        }
+        // 0x1F8480 is the VIF1 transfer status read used by the loading
+        // callback 0x1660A0: it returns record[2] from the guest transfer table
+        // at 0x4A72C0, which the runtime never retires (the VIF1 DMA packet is
+        // not executed to completion), so it stays 2 (busy) forever and
+        // FUN_00166010 never leaves its wait loop. The host GS backend already
+        // consumes submitted packets synchronously, so report the transfer as
+        // complete. The callback dispatches to thunk 0x1F7310, whose generated
+        // body calls FUN_001f8480_0x1f8480 directly (bypassing the table), so
+        // both slots are replaced.
+        {
+            // Forced "transfer complete" (opt-in, TOL_VIF_STATUS_STUB=1).
+            //
+            // FUN_001660A0 waits as  while (FUN_001f8480(handle) != 0) { FUN_0015231C(); }
+            // and the yield really does return to the guest run loop (FUN_00151E90 at 0x151F88), so the
+            // microkernel keeps running other threads while this one waits - verified on hardware
+            // 2026-11-06. The earlier claim that "the wait only yields and nothing pumps I/O" was wrong.
+            // Leaving the stub off is the truthful configuration; the deadlock it used to hide is the
+            // thing to diagnose (see TOL_TRACE_XFER).
+            // DEFAULT OFF as of the 2026-11-06 reassessment: 0x1F8480 reads desc[2] from the *guest's own*
+            // transfer table (0x4A72C0 + (handle & 0x3F) * 0x2C, validated against desc[0x8]) - it is not a
+            // hardware register, so answering it with a constant fabricates guest state and makes the waiter
+            // proceed before the data lands. Opt in with TOL_VIF_STATUS_STUB=1 to reproduce the old race.
+            if (std::getenv("TOL_VIF_STATUS_STUB") != nullptr)
+            {
+                PS2Runtime::RecompiledFunction statusDone =
+                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *) {
+                        (void)rdram;
+                        SET_GPR_S32(ctx, 2, 0);
+                        ctx->pc = GPR_U32(ctx, 31);
+                    };
+                runtime.replaceFunction(0x001F7310u, statusDone);
+                runtime.replaceFunction(0x001F8480u, statusDone);
+            }
+        }
         if (tickTraceEnabled())
         {
             PS2Runtime::RecompiledFunction original = runtime.lookupFunction(kTickLoopPc);
@@ -1964,7 +3974,40 @@ namespace tol
                 runtime.replaceFunction(kGameReadPc, &gameReadProbe);
                 std::fprintf(stderr, "[dvci] game read probe installed on 0x%08X\n", kGameReadPc);
             }
+            PS2Runtime::RecompiledFunction adxfRead = runtime.lookupFunction(kAdxfReadStepPc);
+            if (adxfRead != nullptr)
+            {
+                gAdxfReadStepOriginal = adxfRead;
+                runtime.replaceFunction(kAdxfReadStepPc, &adxfReadStepProbe);
+                std::fprintf(stderr, "[adxf] read step probe installed on 0x%08X\n", kAdxfReadStepPc);
+            }
+            PS2Runtime::RecompiledFunction adxfArm = runtime.lookupFunction(kAdxfArmPc);
+            if (adxfArm != nullptr)
+            {
+                gAdxfArmOriginal = adxfArm;
+                runtime.replaceFunction(kAdxfArmPc, &adxfArmProbe);
+                std::fprintf(stderr, "[adxf] arm probe installed on 0x%08X\n", kAdxfArmPc);
+            }
+            PS2Runtime::RecompiledFunction adxfPump = runtime.lookupFunction(kAdxfPumpPc);
+            if (adxfPump != nullptr)
+            {
+                gAdxfPumpOriginal = adxfPump;
+                runtime.replaceFunction(kAdxfPumpPc, &adxfPumpProbe);
+                std::fprintf(stderr, "[adxf] pump probe installed on 0x%08X\n", kAdxfPumpPc);
+            }
+            PS2Runtime::RecompiledFunction ioWait = runtime.lookupFunction(kIoWaitPc);
+            if (ioWait != nullptr)
+            {
+                gIoWaitOriginal = ioWait;
+                runtime.replaceFunction(kIoWaitPc, &ioWaitProbe);
+                std::fprintf(stderr, "[adxf] io-wait probe installed on 0x%08X\n", kIoWaitPc);
+            }
         }
+
+        // Unconditional DVCI completion fix (see dvciCompletionFix). Installed after the trace probe, so it wraps
+        // the probe when TOL_TRACE_DVCI is on and the plain poll otherwise.
+        gDvciCompletionPrev = runtime.lookupFunction(kDvciPollPc);
+        runtime.replaceFunction(kDvciPollPc, &dvciCompletionFix);
 
         // Behaviour-changing replacements live OUTSIDE the TOL_TRACE_DVCI gate; each is enabled by its own variable.
         // Gating them behind the trace made the window fix look timing-dependent - it was simply never installed
@@ -1993,6 +4036,21 @@ namespace tol
             {
                 std::fprintf(stderr, "[cri] 0x%08X (pump registrar) is not in the function table\n",
                              kPumpRegisterPc);
+            }
+        }
+        if (std::getenv("TOL_TRACE_CRI_TIME") != nullptr)
+        {
+            PS2Runtime::RecompiledFunction original = runtime.lookupFunction(kCriStateMachinePc);
+            if (original != nullptr)
+            {
+                gCriStateOriginal = original;
+                runtime.replaceFunction(kCriStateMachinePc, &criStateTimeProbe);
+                std::fprintf(stderr, "[cri] time probe installed on 0x%08X\n", kCriStateMachinePc);
+            }
+            else
+            {
+                std::fprintf(stderr, "[cri] 0x%08X (state machine) is not in the function table\n",
+                             kCriStateMachinePc);
             }
         }
         std::fprintf(stderr, "[tol] no native overrides installed (the Timer-2 override was withdrawn)\n");
