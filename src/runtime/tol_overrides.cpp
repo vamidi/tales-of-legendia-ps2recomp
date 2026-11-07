@@ -2757,6 +2757,16 @@ namespace
             gEnginePrev(rdram, ctx, runtime);
         static uint32_t sCalls = 0u;
         ++sCalls;
+        if (std::getenv("TOL_DUMP_LOADER") != nullptr && sCalls >= 2u && sCalls <= 4u)
+        {
+            std::fprintf(stderr, "[loader] #%u globals 0x3DB000:", sCalls);
+            for (uint32_t w = 0u; w < 16u; ++w)
+                std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x003DB000u + w * 4u));
+            std::fprintf(stderr, "\n[loader] #%u table 0x497010:", sCalls);
+            for (uint32_t w = 0u; w < 16u; ++w)
+                std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x00497010u + w * 4u));
+            std::fprintf(stderr, "\n");
+        }
         if (const char *dumpPath = std::getenv("TOL_DUMP_ENGINE"))
         {
             static bool sDumped = false;
@@ -2833,6 +2843,16 @@ namespace
                         }
                         std::fprintf(stderr, "[engine] #%u substep%u obj=0x%08X vt=0x%08X step1C=0x%08X\n",
                                      sCalls, k, obj, vt, step);
+                    }
+                    if (std::getenv("TOL_DUMP_LOADER") != nullptr && sCalls >= 2u && sCalls <= 4u)
+                    {
+                        std::fprintf(stderr, "[loader] globals 0x3DB000:");
+                        for (uint32_t w = 0u; w < 16u; ++w)
+                            std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x003DB000u + w * 4u));
+                        std::fprintf(stderr, "\n[loader] table 0x497010:");
+                        for (uint32_t w = 0u; w < 16u; ++w)
+                            std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x00497010u + w * 4u));
+                        std::fprintf(stderr, "\n");
                     }
                 }
             }

@@ -2669,3 +2669,31 @@ Each of those pump loops is where the 16 slot cycles come from, and the load pro
 Next cheap step: after `FUN_001EC670` returns, the loader (`FUN_00164F80`) pops the next task from
 `0x497010` / `puRam003db1f8`. Dumping that list at the stall shows whether the next task is queued at all
 - i.e. whether the boot script is supposed to queue it and does not.
+
+## Session 106 - the loader's task queue is empty at the stall
+
+Dumping the loader state at engine calls 2-4 (`TOL_DUMP_LOADER`):
+
+```
+[loader] #2 globals 0x3DB000: 00000001 00000001 00000000 00000000 00000001 00000001 00000000 ...
+[loader] #2 table   0x497010: 00000000 00000000 00000000 ... (all zero)
+[loader] #3 ... identical
+[loader] #4 ... identical
+```
+
+`FUN_00164F80` pops the next task from the table at `0x497010` (count at the gp-relative `0x3DB014`,
+current-task pointer at `0x3DB018`). **The table is entirely zero and the globals never change**, so the
+loader is running its fallback task (`LAB_0016C700`) - there is no queued work.
+
+That lines up with everything else measured:
+
+- the six loads of `FUN_001EC670` completed (each `FUN_0027bff0` returned 2),
+- the script/data bank is complete in memory (48/48 chunks, session 103),
+- the engine's sub-objects are zeroed after the first call, so the 16-slot loop has nothing to consume,
+- audio and the IOP are healthy (session 102).
+
+So the stall is now pinned to one question: **which guest path is supposed to enqueue the next loader
+task, and why does it not run?** Nothing downstream refuses work; nobody asks.
+
+Also fixed a self-inflicted problem: a careless replace had copied the loader dump into ten probes; it is
+back to exactly one, in the engine probe, outside the renderer check.
