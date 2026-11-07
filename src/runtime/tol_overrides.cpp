@@ -3893,6 +3893,48 @@ namespace tol
             gBootStagePrev(rdram, ctx, runtime);
     }
 
+    // One outer iteration, end to end: load stage -> asset pipeline -> its body -> frame loop.
+    PS2Runtime::RecompiledFunction gLoadStagePrev = nullptr;
+    PS2Runtime::RecompiledFunction gPipePrev = nullptr;
+    PS2Runtime::RecompiledFunction gPipeBodyPrev = nullptr;
+    PS2Runtime::RecompiledFunction gFramePrev = nullptr;
+    uint32_t gBootSeq = 0u;
+
+    void bootEntryExit(const char *name, PS2Runtime::RecompiledFunction &prev, uint8_t *rdram, R5900Context *ctx,
+                       PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const bool logging = gBootSeq < 120u;
+        if (logging)
+            std::fprintf(stderr, "[boot] %3u %s enter ra=0x%08X\n", ++gBootSeq, name, ra);
+        else
+            ++gBootSeq;
+        if (prev != nullptr)
+            prev(rdram, ctx, runtime);
+        if (logging)
+            std::fprintf(stderr, "[boot] %3u %s exit  pc=0x%08X %s\n", ++gBootSeq, name, ctx->pc,
+                         ctx->pc == ra ? "(normal)" : "(bailed)");
+        else
+            ++gBootSeq;
+    }
+
+    void loadStageProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        bootEntryExit("load-stage", gLoadStagePrev, rdram, ctx, runtime);
+    }
+    void pipelineProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        bootEntryExit("pipeline", gPipePrev, rdram, ctx, runtime);
+    }
+    void pipelineBodyProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        bootEntryExit("pipe-body", gPipeBodyPrev, rdram, ctx, runtime);
+    }
+    void frameLoopProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        bootEntryExit("frame", gFramePrev, rdram, ctx, runtime);
+    }
+
     void installBootTrace(PS2Runtime &runtime)
     {
         if (std::getenv("TOL_TRACE_BOOT") == nullptr)
@@ -3905,7 +3947,11 @@ namespace tol
             const char *name;
         } table[] = {
             {0x00165AD0u, &bootLoopProbe, &gBootLoopPrev, "outer-loop"},
+            {0x00166010u, &loadStageProbe, &gLoadStagePrev, "load-stage"},
+            {0x00166870u, &pipelineProbe, &gPipePrev, "pipeline"},
+            {0x00164EA0u, &pipelineBodyProbe, &gPipeBodyPrev, "pipe-body"},
             {0x00139D50u, &bootStageProbe, &gBootStagePrev, "stage"},
+            {0x00152B70u, &frameLoopProbe, &gFramePrev, "frame"},
         };
         for (const auto &entry : table)
         {
