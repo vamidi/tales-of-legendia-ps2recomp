@@ -2481,3 +2481,26 @@ So the bug is inside what that renderer step walks, not in the guard and not in 
 Next: compare the list/state the renderer step traverses at the first step (the port deletes the engine
 there; PCSX2 does not), i.e. the pointers inside `0x4E9DB0` and whatever `FUN_00230ad0`/`FUN_00230d90`
 walk.
+
+## Session 100 - the third sub-object researched
+
+The engine's third sub-object is `*(engine+0x18) = 0x5AA170` (allocated by `FUN_001edc20` as a
+`0x3F8` block through `FUN_0032f3a0`).
+
+- Static constructor `FUN_0032f3a0` sets `*obj = 0x3D9168`, then calls `FUN_0032f440`.
+- **At runtime the object's vtable is `0x3D50D0`** (read from PCSX2 at `0x5AA170`), not `0x3D9168` -
+  the follow-up initialiser replaces it.
+- Vtable `0x3D50D0` slot `0x1C` = **`0x002853d0`**, the third step.
+- `FUN_002853d0` = `FUN_00285410()` + `FUN_002855e0(p)` + `FUN_002854a0(p)` + `FUN_002857c0(p)`.
+- `FUN_002855e0` is a media/stream update: it gates on `FUN_00197668()` (stream state), checks the
+  fourcc `0x53504C54` and copies frames through `FUN_00108f50` / `FUN_001a0470`.
+- `FUN_002857c0` walks `p+0x08` buffers calling `FUN_00292800` / `FUN_00292810`.
+
+So the engine's three sub-objects are a renderer (`0x4E9DB0`), an unnamed object (`0x5AA140`) and a
+media/stream player (`0x5AA170`). Nothing in the third step obviously deletes the engine, and the call
+ring still records no third call - the `free` is logged between the second (a `jr $ra` stub) and the
+third.
+
+Open: how `FUN_00231E20` is entered at all. Neither `dispatchGuestBranch` (ring/dtorcall) nor the
+scheduler dispatch (dtorentry) records a transfer to `0x231E20`, yet its body runs
+(`free` at `ra=0x231E6C`).
