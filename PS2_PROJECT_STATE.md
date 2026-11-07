@@ -2307,3 +2307,68 @@ not a game-side release. It is deterministic and unaffected by `TOL_NO_EE_CKPT`.
 Next: dump the heap (e.g. `0x4E9000..0x4EA800`) at the moment before and after `FUN_001664d0` runs and
 compare it against PCSX2 at the same guest moment (`abdiff.py mem`); a single wrong opcode in the
 allocator would corrupt the free list exactly this way.
+
+## Session 96 (2026-11-07) - the engine block is freed from inside its own step
+
+### PCSX2 reference: blocked
+
+PCSX2 was running (`C:\PCSX2-MCP-v1.0.0\pcsx2-qt.exe`, game loaded) and I saved your state to slot 0
+before touching it. The first `read_memory` of `0x0015230A0` timed out, then the tool layer hung again
+on `evaluate gp`. I stopped there rather than risk the session. **Slot 0 holds your pre-comparison
+state.**
+
+Useful data captured before it hung: at `0x0015230A0` PCSX2 had `70 9d 4e 00 f0 14 62 00 d0 9c 4e 00 ...`
+and at `0x003DB320` it read `30 00 00 00 ... 00 05 08 00 ... 40 03 00 00 40 08 00 00`, i.e. the same
+`0x30 / 0x00080500 / 0x340 / 0x840` shape our port has in the script handle struct. So PCSX2 at that
+moment was in a *different* phase than our stall (its `0x3DB320` is not a heap pointer), which is why a
+like-for-like heap diff needs a synchronised guest moment, not just the same address.
+
+### In-port heap forensics (this is the useful result)
+
+The game's allocator is `FUN_00100700` (allocate), `FUN_001008d0` (free), with 0x20-byte headers and
+ASCII magics: `0x4D514553` "SEQM" fresh, `0x4D444E52` "RNDM" reused, `0x45455246` "FREE" free.
+Header: `+0x00` magic, `+0x04` prev physical, `+0x08` next physical, `+0x10` size, `+0x14/+0x18`
+free-list links.
+
+Watching the engine block's header (`0x4E9D50`) at *every* inter-function call gives the exact
+ordering:
+
+```
+[magicwatch] 0x00000000 -> 0x45455246 at source=0x0010082C target=0x00100B20   (allocator internals)
+[magicwatch] 0x45455246 -> 0x4D444E52 at source=0x0010082C target=0x00100B20
+[objwatch]   0x00000000 -> 0x003D4B20 at source=0x001EDCF0 target=0x00231F30   (engine ctor)
+[magicwatch] 0x4D444E52 -> 0x45455246 at source=0x001EE0AC target=0x001F0320   <- freed
+[magicwatch] 0x45455246 -> 0x4D444E52 at source=0x001007A8 target=0x00100B70   <- reallocated
+[objwatch]   0x003D4B20 -> 0x003D26D8 at source=0x00171088 target=0x00101420   (new class)
+```
+
+`source=0x001EE0AC` is the call inside `FUN_001EE060` that follows the engine's virtual step at
+`0x001EE0A4`. Because `dispatchGuestBranch` samples *before* it invokes the target, the free happened
+**inside the step** (`FUN_00232110`, vtable slot 0x1C), not in the submit call after it:
+
+```c
+void FUN_00232110(int p) {
+    (**(code **)(**(int **)(p + 0x0c) + 0x1c))();   // sub-object steps
+    (**(code **)(**(int **)(p + 0x10) + 0x1c))();
+    (**(code **)(**(int **)(p + 0x18) + 0x1c))();
+}
+```
+
+The engine object's `+0xC` is `0x4E9DB0` and `+0x10` is `0x5AA140`; one of those sub-steps frees the
+engine block. Meanwhile the global `0x3DB320` is set once (0 -> 0x4E9D70) and **never changes again**
+for the whole run, so from that point the loader steps a freed, re-used block.
+
+Confirmed independent of the scheduler: identical with `TOL_NO_EE_CKPT=1` (checkpoints off).
+
+### Honest state
+
+Script index 16 of 48, loading screen up, engine step NULL, engine global dangling. The remaining work
+is to identify which sub-object step frees the parent and whether the parent pointer should be cleared
+there - that is a focused question, but I could not finish it in this session.
+
+### Probes added
+
+`[magicwatch]` (block magic at every call boundary) joins `[objwatch]`, `[heapalloc]`, `[heapfree]`,
+`[heapfree2]`, `[taskfind]`, `[engineobj]`, `[enginestep]`; `TOL_WATCH_TASK` drives the watches.
+Note the free does **not** go through `0x001013c0`/`0x001008d0` as a table call, which is why hooking
+those showed nothing - the sampling watch was the way to catch it.

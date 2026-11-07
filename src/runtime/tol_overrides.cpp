@@ -2722,7 +2722,7 @@ namespace
             {0x001ED0C0u, &scriptEngineObjProbe, &gEngineObjPrev, "engineobj"},
             {0x001013C0u, &heapFreeProbe, &gFreePrev, "heapfree"},
             {0x00101420u, &heapAllocProbe, &gAllocPrev, "heapalloc"},
-            {0x001004E0u, &heapFree2Probe, &gFree2Prev, "heapfree2"},
+            {0x001013A0u, &heapFree2Probe, &gFree2Prev, "heapfree2"},
             {0x001ECBE0u, &scriptDispatchProbe, &gDispatchPrev, "dispatch"},
             {0x001EDF80u, &scriptSlotLoopProbe, &gSlotLoopPrev, "slot-loop"},
             {0x00164F80u, &scriptLoaderEntryProbe, &gLoaderEntryPrev, "loader-entry"},
