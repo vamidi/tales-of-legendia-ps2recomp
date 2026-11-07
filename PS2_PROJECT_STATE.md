@@ -2166,3 +2166,36 @@ every 500 calls).
    `thevent` (2), `thbase` (2), `intrman` (2), `sifman` (1).
 3. Treat the 1.5 fps guest speed as a first-class defect: even with a working load path, a
    frame-paced boot at that rate takes tens of minutes.
+
+### Addendum: where the 1.5 fps goes
+
+`TOL_TRACE_EE_DISPATCH=1` (the scheduler's own profiling) over 25 s:
+
+```
+[eedispatch] 891/s mean=1.107 ms max=17.525 ms (tid=1) over 901 turns
+[turnbucket] pc=0x0027B67C 42 turns   718.6 ms ( 71% of the second)
+[turnbucket] pc=0x00349D68 126 turns  157.2 ms ( 16% of the second)
+[turnbucket] pc=0x0027B45C 42 turns    40.7 ms (  4%)
+[eeturn] tid=1 16.73 ms cycles=76128 start=0x0027B67C end=0x003499A8 ra=0x00349868
+```
+
+- `FUN_0027b5a0` (entry `0x27B67C` in the sample) runs 42x/s at ~16.7 ms a pass and alone accounts
+  for 71% of the host CPU. It loops `0x180 * 2` slots: `FUN_0027b290(i, ch)` probes a slot and, when
+  empty, `FUN_0027b390(i, ch, 1)` programs it through `FUN_00349c00(0x10/0x11/0x12, ...)` and
+  `FUN_00349770(0x13, ...)`.
+- 16.7 ms for ~768 slot probes means roughly 20 us per probe, far more than the guest code itself;
+  each probe is a chain of `dispatchGuestBranch` calls, so inter-function dispatch overhead (table
+  lookup + checkpoint accounting) dominates the pass.
+- 76128 EE cycles are accounted for a turn that takes 16.7 ms of host time, i.e. the host runs ~64x
+  slower than EE cycle time on this path.
+
+Consequence: the loader's `while (task busy) { render; engine; }` loop only gets ~1.5 iterations per
+second of guest time, so everything the boot waits on crawls.
+
+### Where to attack next, in order
+
+1. The `AppCell daemon` task (slot 3, `0x407790`): find what clears its `+0x1F0` byte. That is the
+   direct blocker for script entry 17.
+2. Inter-function dispatch cost: it is the 71% item. A faster `lookupFunction`/`checkpointDue` path
+   (inline table index, cheaper cycle accounting) would multiply the whole boot.
+3. The missing IOP services (ioman 25, loadcore 23, ...) if the daemon turns out to wait on one.
