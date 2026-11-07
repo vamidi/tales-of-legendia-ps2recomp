@@ -1478,3 +1478,57 @@ resources = 4, submits = 6
 
 Nothing runnable remains, so the boot does not continue into the frame loop. That - why the ELF entry
 returns instead of running `FUN_00165ad0`'s outer loop - is the next blocker, not audio.
+
+---
+
+## 0w. Rendering: frames are produced, the picture is black
+
+Started on the GS side with the console-graphics skill, whose method is "measure what the game sends
+before touching the renderer".
+
+### Frames are being presented
+
+`TOL_GFX_SCREENSHOT_DIR=<dir> TOL_GFX_SCREENSHOT_EVERY=20` (`gs_frontend.cpp:614`) writes the latched
+host presentation frame as PPM. Over 90 s it wrote ~150 files at 512x448, so the presenter is running and
+the frame loop from §0v is real.
+
+### The picture is black
+
+P6 header parsed, pixels scanned (every 3rd byte sampled, then a full non-black pass):
+
+```
+frame_000012.ppm  min=0 max=230 mean=0.7  nonBlack=0.66%   <- something visible (NOW LOADING)
+frame_001012.ppm  min=0 max=0   mean=0    nonBlack=0%      <- fully black
+frame_002012.ppm  min=0 max=0   mean=0    nonBlack=0%      <- fully black
+frame_002772.ppm  min=0 max=0   mean=0    nonBlack=0%      <- fully black
+```
+
+So rendering works for the first frames and then everything is black afterwards. That matches the stale
+README line about geometry submitted but degenerate at the GIF level, except the boot now reaches the
+frame loop, which that note predates. This is a rendering defect, not a boot defect.
+
+### Incident: a broken analysis command, not a broken port
+
+One measurement command flooded the log with ~724k `Cannot index into a null array` lines and hit the
+120 s timeout. Cause was the PowerShell helper, not the emulator: four paths were passed to a
+one-parameter function (so `ReadAllBytes` received an object[] and returned null) and the PPM header
+scan used an unbounded `while` that spun on the null array. Re-run per-file with a bounded header parse
+produced the numbers above. No game state was touched.
+
+### Next, per the skill
+
+1. Read what the guest actually submits. The frontend already keeps `GSDebugHistory` entries
+   (`gs_frontend.cpp:240/313`, `GS::getDebugHistory()`), including `entry.prim` - dumping that per frame
+   answers "no primitives" versus "degenerate primitives" in one step.
+2. If primitives are present but wrong, use `gspacket.py dma <ram.bin> --tag <VIF1_TADR>` on a RAM dump
+   (`runtime.memory().getRDRAM()` written from an override) to read the chains, VIF codes, GIF tags and
+   the `TEX0`/`FRAME` fields, and check the issues list at the bottom.
+3. Compare the same moment in PCSX2 (`abdiff.py mem`): same packets with a wrong picture means the
+   runtime draws them wrong (`gs_frontend.cpp`, `gs_cpu_backend.cpp`, `ps2_vif1_interpreter.cpp`);
+   different packets means something upstream fed the game bad data.
+
+### State of the tree
+
+Committed and green: boot-script load fix (load-stage IO pump), ADX lifecycle workaround, `sysclib #19`,
+`dmacman` bindings, KORG short-circuit, plus the tracing behind them
+(`TOL_TRACE_BOOT/_XFER/_DVCI/_ADX/_INTR/_CREATE`). Uncommitted: nothing.
