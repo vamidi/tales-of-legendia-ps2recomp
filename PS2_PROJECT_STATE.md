@@ -2697,3 +2697,36 @@ task, and why does it not run?** Nothing downstream refuses work; nobody asks.
 
 Also fixed a self-inflicted problem: a careless replace had copied the loader dump into ten probes; it is
 back to exactly one, in the engine probe, outside the renderer check.
+
+## Session 107 - there is no enqueue to trace; the real scheduler is the 64-task table
+
+Watching the loader's queue count (`0x3DB1F4`) showed exactly **one** transition:
+
+```
+[queuewatch] count 4294967295 -> 0 turn start=0x00100008   (initial)
+```
+
+It is **0 from reset and never changes**. `0x497010` (the function queue `FUN_00164F80` pops from) is
+never written - the loader always takes the empty-queue path and runs `&LAB_0016C700`, which is a
+trampoline `j 0x00204900` -> `FUN_00204900` -> `FUN_002045f0`: allocate a 0x18 object, set vtable
+`0x3D4770`, then `FUN_00151db0(6)`.
+
+So my session-106 wording ("nothing is queued") was a misread: there is no enqueue path in use at all.
+The real scheduler is `FUN_00151db0(prio)` / `FUN_00151ff0(prio)`, which walk **64 task blocks at
+`0x407160`, stride `0x210`**:
+
+- `+0x1F0` byte: active
+- `+0x1F1` byte: priority
+- `+0x1D0`: name (inline ASCII)
+- `+0x200`: task id
+
+Live at the stall (engine calls 2-4, identical):
+
+```
+[tasks] [0]=CCDVD_MCD_MANAGER::Deam(p0) [1]=CCDVD_MCD_MANAGER::Deam(p0) [3]=AppCell deamon(p4)
+```
+
+Only three tasks exist, and the loader loop runs `FUN_00151ff0(7)`, `(9)`, `(8)` - **priorities with no
+registered tasks** - which is why the engine has nothing to do.
+
+Next cheap question: which tasks should occupy priorities 7/8/9, and did they exist earlier and exit?

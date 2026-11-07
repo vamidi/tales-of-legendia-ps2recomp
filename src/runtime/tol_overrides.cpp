@@ -2759,12 +2759,25 @@ namespace
         ++sCalls;
         if (std::getenv("TOL_DUMP_LOADER") != nullptr && sCalls >= 2u && sCalls <= 4u)
         {
-            std::fprintf(stderr, "[loader] #%u globals 0x3DB000:", sCalls);
-            for (uint32_t w = 0u; w < 16u; ++w)
-                std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x003DB000u + w * 4u));
-            std::fprintf(stderr, "\n[loader] #%u table 0x497010:", sCalls);
-            for (uint32_t w = 0u; w < 16u; ++w)
-                std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x00497010u + w * 4u));
+            std::fprintf(stderr, "[tasks] #%u active tasks at 0x407160:", sCalls);
+            for (uint32_t i = 0u; i < 64u; ++i)
+            {
+                const uint32_t b = 0x00407160u + i * 0x210u;
+                const uint8_t busy = static_cast<uint8_t>(runtime->Load8(rdram, ctx, b + 0x1F0u));
+                if (busy == 0u)
+                    continue;
+                const uint32_t prio = runtime->Load8(rdram, ctx, b + 0x1F1u);
+                const uint32_t namePtr = b + 0x1D0u;
+                char name[24] = {};
+                for (uint32_t c = 0u; c < sizeof(name) - 1u; ++c)
+                {
+                    const uint8_t ch = runtime->Load8(rdram, ctx, namePtr + c);
+                    if (ch == 0u)
+                        break;
+                    name[c] = static_cast<char>(ch);
+                }
+                std::fprintf(stderr, " [%u]=%s(p%u)", i, name, prio);
+            }
             std::fprintf(stderr, "\n");
         }
         if (const char *dumpPath = std::getenv("TOL_DUMP_ENGINE"))
@@ -2846,9 +2859,9 @@ namespace
                     }
                     if (std::getenv("TOL_DUMP_LOADER") != nullptr && sCalls >= 2u && sCalls <= 4u)
                     {
-                        std::fprintf(stderr, "[loader] globals 0x3DB000:");
+                        std::fprintf(stderr, "[loader] globals 0x3DB1E0:");
                         for (uint32_t w = 0u; w < 16u; ++w)
-                            std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x003DB000u + w * 4u));
+                            std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x003DB1E0u + w * 4u));
                         std::fprintf(stderr, "\n[loader] table 0x497010:");
                         for (uint32_t w = 0u; w < 16u; ++w)
                             std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x00497010u + w * 4u));
