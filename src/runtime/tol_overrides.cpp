@@ -2575,8 +2575,26 @@ namespace
     }
 
     PS2Runtime::RecompiledFunction gTaskFindPrev = nullptr;
+    PS2Runtime::RecompiledFunction gLoaderPollPrev = nullptr;
     PS2Runtime::RecompiledFunction gReaderAvailPrev = nullptr;
     PS2Runtime::RecompiledFunction gReaderCmdPrev = nullptr;
+    void loaderPollProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t job = GPR_U32(ctx, 4);
+        if (gLoaderPollPrev != nullptr)
+            gLoaderPollPrev(rdram, ctx, runtime);
+        const uint32_t ret = GPR_U32(ctx, 2);
+        static uint32_t sCalls = 0u;
+        static uint32_t sLastJob = 0xFFFFFFFFu, sLastRet = 0xFFFFFFFFu;
+        ++sCalls;
+        if (job != sLastJob || ret != sLastRet || (sCalls % 500u) == 0u)
+        {
+            sLastJob = job;
+            sLastRet = ret;
+            std::fprintf(stderr, "[poll] #%u job=0x%08X busy=%u\n", sCalls, job, ret);
+        }
+    }
+
     void scriptReaderAvailProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t h = GPR_U32(ctx, 4);
@@ -2969,6 +2987,7 @@ namespace
             const char *name;
         } table[] = {
             {0x00152160u, &scriptTaskFindProbe, &gTaskFindPrev, "taskfind"},
+            {0x00165420u, &loaderPollProbe, &gLoaderPollPrev, "poll"},
             {0x001F88F0u, &scriptReaderAvailProbe, &gReaderAvailPrev, "reader-avail"},
             {0x001F8920u, &scriptReaderCmdProbe, &gReaderCmdPrev, "reader-cmd"},
             {0x001EE060u, &scriptEngineProbe, &gEnginePrev, "engine"},

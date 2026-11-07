@@ -2755,3 +2755,29 @@ Distinct tasks seen: `CCDVD_MCD_MANAGER::Deam` (slots 0 and 1), `#UNKNOWN` (slot
 loader's own job being reprioritised as it is dispatched.
 
 So the task landscape is stable and sane; the stall is not a missing task registration.
+
+## Session 109 - slot 2 does NOT keep the loader busy
+
+Hooked the loader's poll (`FUN_00165420` -> `FUN_001521c0` -> `FUN_00152160`) and logged every change of its
+(job, result) plus the task lookups:
+
+```
+[poll] #1 job=0x005C6490 busy=0          <- the only poll of the whole 25 s run
+[poll] (no further lines: job/result never change, %500 never reached)
+```
+
+So `FUN_00165420` is called **once**, the job is `0x005C6490`, and it reports **not busy (0)**. The loader's
+inner `while (poll != 0) { render; engine; }` therefore exits immediately - **slot 2 is not holding the
+loader**.
+
+The `[taskfind]` traffic (43 hits) comes from other callers, named by `ra`:
+
+- `ra=0x15205C` - inside `FUN_00152030` (bind params to a task block)
+- `ra=0x151D00` - inside `FUN_00151cf0` (the per-task runner)
+- `ra=0x1521D0` - inside `FUN_001521c0` itself (the poll wrapper), one hit with `ret=0` (block not found)
+
+and those lookups do see slot 2 (`0x407580`) and slot 3 (`0x407790`) with `busy=1` - but they are
+parameter/runner traffic, not the loader's wait.
+
+Conclusion: the loader is not spinning on slot 2 or on the daemon block. Its single job completed, and the
+loader loop is not what is blocking the boot.
