@@ -2005,7 +2005,7 @@ namespace
         const uint32_t state = (job >= 0x00100000u && job < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, job)
                                                                          : 0xFFFFFFFFu;
         if (loadTraceEnabled() && (sCalls <= 10u || job != sLastJob || state != sLastState ||
-                                   (sCalls % 200000u) == 0u))
+                                   (sCalls % 500u) == 0u))
         {
             std::fprintf(stderr, "[load] status #%u job=0x%08X state=%u\n", sCalls, job, state);
             sLastJob = job;
@@ -2466,7 +2466,7 @@ namespace
             return;
         }
 
-        if (scriptTraceEnabled() && (sCalls <= 16u || (sCalls % 200000u) == 0u))
+        if (scriptTraceEnabled() && (sCalls <= 16u || (sCalls % 500u) == 0u))
             scriptDump(rdram, ctx, runtime, "status ", sCalls, handle, 0u);
         if (gScriptStatusPrev != nullptr)
             gScriptStatusPrev(rdram, ctx, runtime);
@@ -2477,7 +2477,7 @@ namespace
         const uint64_t handle = GPR_U64(ctx, 4);
         static uint32_t sCalls = 0u;
         ++sCalls;
-        const bool log = scriptTraceEnabled() && (sCalls <= 16u || (sCalls % 200000u) == 0u);
+        const bool log = scriptTraceEnabled() && (sCalls <= 16u || (sCalls % 500u) == 0u);
         if (log)
             scriptDump(rdram, ctx, runtime, "peek   ", sCalls, handle, 0u);
         if (gScriptPeekPrev != nullptr)
@@ -2491,7 +2491,7 @@ namespace
         const uint64_t handle = GPR_U64(ctx, 4);
         static uint32_t sCalls = 0u;
         ++sCalls;
-        const bool log = scriptTraceEnabled() && (sCalls <= 16u || (sCalls % 200000u) == 0u);
+        const bool log = scriptTraceEnabled() && (sCalls <= 16u || (sCalls % 500u) == 0u);
         if (log)
             scriptDump(rdram, ctx, runtime, "advance", sCalls, handle, 0u);
         if (gScriptAdvancePrev != nullptr)
@@ -2538,8 +2538,59 @@ namespace
             std::fprintf(stderr, "[script] slot-loop #%u tid=%d ra=0x%08X\n", sCalls, tid, ra);
     }
 
-    void scriptLoaderEntryProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2Runtime::RecompiledFunction gTaskFindPrev = nullptr;
+
+    // FUN_00152160 scans the 64 objects at 0x407160 (stride 0x210) for one whose byte +0x1F0 is set and
+    // whose +0x200 equals its argument; FUN_001521c0 turns that into "the load task is still busy", which
+    // is the condition FUN_00164F80's loader loop spins on. Naming the object says which subsystem the
+    // boot is waiting for.
+    void scriptTaskFindProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        const uint32_t arg = GPR_U32(ctx, 4);
+        if (gTaskFindPrev != nullptr)
+            gTaskFindPrev(rdram, ctx, runtime);
+        const uint32_t ret = GPR_U32(ctx, 2);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 20u || (sCalls % 2000u) == 0u)
+        {
+            std::fprintf(stderr, "[taskfind] #%u arg=0x%08X ret=0x%08X", sCalls, arg, ret);
+            if (ret >= 0x00407000u && ret < 0x00410000u)
+                std::fprintf(stderr, " slot=%u busy=%u id=0x%08X", (ret - 0x00407160u) / 0x210u,
+                             runtime->Load8(rdram, ctx, ret + 0x1F0u), runtime->Load32(rdram, ctx, ret + 0x200u));
+            std::fprintf(stderr, "\n");
+        }
+        if (sCalls == 12u)
+        {
+            std::fprintf(stderr, "[taskfind] script handle 0x015230A0:");
+            for (uint32_t off = 0u; off < 0x20u; off += 4u)
+                std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x015230A0u + off));
+            std::fprintf(stderr, "\n");
+            for (uint32_t slot = 2u; slot <= 3u; ++slot)
+            {
+                const uint32_t base = 0x00407160u + slot * 0x210u;
+                std::fprintf(stderr, "[taskfind] --- slot %u @0x%08X ---\n", slot, base);
+                for (uint32_t off = 0u; off < 0x40u; off += 16u)
+                {
+                    uint32_t w0 = runtime->Load32(rdram, ctx, base + off);
+                    uint32_t w1 = runtime->Load32(rdram, ctx, base + off + 4u);
+                    uint32_t w2 = runtime->Load32(rdram, ctx, base + off + 8u);
+                    uint32_t w3 = runtime->Load32(rdram, ctx, base + off + 12u);
+                    std::fprintf(stderr, "[taskfind]   +0x%02X: %08X %08X %08X %08X\n", off, w0, w1, w2, w3);
+                }
+                for (uint32_t off = 0x1B0u; off < 0x210u; off += 16u)
+                {
+                    uint32_t w0 = runtime->Load32(rdram, ctx, base + off);
+                    uint32_t w1 = runtime->Load32(rdram, ctx, base + off + 4u);
+                    uint32_t w2 = runtime->Load32(rdram, ctx, base + off + 8u);
+                    uint32_t w3 = runtime->Load32(rdram, ctx, base + off + 12u);
+                    std::fprintf(stderr, "[taskfind]   +0x%02X: %08X %08X %08X %08X\n", off, w0, w1, w2, w3);
+                }
+            }
+        }
+    }
+
+    void scriptLoaderEntryProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)    {
         static uint32_t sCalls = 0u;
         const int tid = runtime->eeScheduler().currentThreadId();
         if (gLoaderEntryPrev != nullptr)
@@ -2571,6 +2622,7 @@ namespace
             PS2Runtime::RecompiledFunction *prev;
             const char *name;
         } table[] = {
+            {0x00152160u, &scriptTaskFindProbe, &gTaskFindPrev, "taskfind"},
             {0x001ECBE0u, &scriptDispatchProbe, &gDispatchPrev, "dispatch"},
             {0x001EDF80u, &scriptSlotLoopProbe, &gSlotLoopPrev, "slot-loop"},
             {0x00164F80u, &scriptLoaderEntryProbe, &gLoaderEntryPrev, "loader-entry"},
@@ -2625,6 +2677,36 @@ namespace
         // scheduler resumes at ctx->pc later) or a dropped invocation - and every later call then
         // early-returns at `if (DAT_00393208 != 0)`. Log the transitions, not every call.
         const uint32_t after = runtime->Load32(rdram, ctx, 0x00393208u);
+        if (gPumpCalls == 60u || gPumpCalls == 2000u)
+        {
+            if (const char *dumpPath = std::getenv("TOL_DUMP_VRAM"))
+            {
+                char scriptPath[512];
+                std::snprintf(scriptPath, sizeof(scriptPath), "%s_script.bin", dumpPath);
+                if (std::FILE *sf = std::fopen(scriptPath, "wb"))
+                {
+                    for (uint32_t i = 0u; i < 0x8000u; ++i)
+                    {
+                        const uint8_t byte = runtime->Load8(rdram, ctx, 0x01520000u + i);
+                        std::fwrite(&byte, 1u, 1u, sf);
+                    }
+                    std::fclose(sf);
+                    std::fprintf(stderr, "[adxf] script window dumped -> %s\n", scriptPath);
+                }
+                char destPath[512];
+                std::snprintf(destPath, sizeof(destPath), "%s_dest.bin", dumpPath);
+                if (std::FILE *df = std::fopen(destPath, "wb"))
+                {
+                    for (uint32_t i = 0u; i < 0x1000u; ++i)
+                    {
+                        const uint8_t byte = runtime->Load8(rdram, ctx, 0x005C64C0u + i);
+                        std::fwrite(&byte, 1u, 1u, df);
+                    }
+                    std::fclose(df);
+                    std::fprintf(stderr, "[adxf] load dest dumped -> %s\n", destPath);
+                }
+            }
+        }
         static uint32_t sLastAfter = 0u;
         static uint32_t sLeaks = 0u;
         if (after != sLastAfter)
@@ -4025,6 +4107,14 @@ namespace tol
                         std::fwrite(runtime->memory().getGSVRAM(), 1u, 4u * 1024u * 1024u, fp);
                         std::fclose(fp);
                         std::fprintf(stderr, "[gs] vram dumped at frame %u -> %s\n", gGsHistFrames, finalPath);
+                    }
+                    char scriptPath[512];
+                    std::snprintf(scriptPath, sizeof(scriptPath), "%s_script_%u.bin", dumpPath, gGsHistFrames);
+                    if (std::FILE *sf = std::fopen(scriptPath, "wb"))
+                    {
+                        std::fwrite(runtime->memory().getRDRAM() + 0x01520000u, 1u, 0x10000u, sf);
+                        std::fclose(sf);
+                        std::fprintf(stderr, "[gs] script window dumped -> %s\n", scriptPath);
                     }
                 }
             }

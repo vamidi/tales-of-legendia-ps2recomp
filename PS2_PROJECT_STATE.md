@@ -2076,3 +2076,93 @@ TOL_TRACE_DVCI=1 TOL_TRACE_SCRIPT=1 build\tol2\src\runtime\tol.exe .\data\CD\SLU
 
 and watch for `[adxf-guard] ... after=5`; the first one is the failure. Then confirm the thread's saved
 pc for the next dispatch is `0x00198AB0` (or later) and not the renderer loop.
+
+## Session 94 (2026-11-07) - the checkpoint unwarp loses guest state; the loader waits on two daemons
+
+### What the pump stall actually is
+
+The ADXF pump (`FUN_00197940`) is a guest state machine over `DAT_00393208` (1,2,3,4,5,6,0) and
+`FUN_00198ab0` writes through `$s0`, which it loads as `0x393208`. Instrumenting every call shows the
+register is correct at every call:
+
+```
+[pumpcall] target=0x0019F468 guard=1 sp=... s0=0x00393208 ra=0x0019798C
+[pumpcall] target=0x0019F468 guard=5 sp=... s0=0x00393208 ra=0x001979BC
+```
+
+The fatal event is a **checkpoint bail** inside the chain, and the resumed chain reaches the pump's
+continuation `0x1979BC` with `$s0` no longer `0x393208` (measured 1), so the `sw` that would set the
+guard to 6/0 writes to the wrong address and the state machine is pinned forever.
+
+The mechanism: a checkpoint preemption at an inter-function `dispatchGuestBranch` leaves the thread
+parked at the callee entry with the host call chain unwound; resuming re-enters the callee and walks
+back up through every caller's return label. Callee-saved registers survive that walk only while every
+frame's saved copy is intact, and in deep chains they are not.
+
+Isolation: `TOL_NO_EE_CKPT=1` makes `EeScheduler::checkpointDue` always false (syscall preemption still
+suspends the fiber). With it the pump never leaks again - `[adxf-pump] #2000 guard=0 blocked=9`
+against `blocked=2749` before. `TOL_NO_CALL_CKPT=1` restores the old `dispatchGuestBranch` behaviour
+(default now defers a call-boundary checkpoint to the callee's own backward edge).
+
+So the pump guard is a **symptom**, and the boot stall at script entry 16 has a second cause.
+
+### The real stall: two loader tasks never finish
+
+`FUN_00164F80` is the loader thread:
+
+```c
+lVar2 = (*task)();
+FUN_00152030(FUN_001520c0(), lVar2, 0,0,0);
+while (FUN_00165420(lVar2) != 0) {   // FUN_00165420 -> FUN_001521c0 -> FUN_00152160
+    render(); FUN_001ee060();        // loading screen + script engine
+    ...
+}
+```
+
+`FUN_00152160` scans 64 objects at `0x407160` (stride `0x210`) for one whose `+0x1F0` byte is set and
+whose `+0x200` equals the task pointer; `FUN_001521c0` reports "busy" while `+0x1F0 == 1`.
+
+Traced with `[taskfind]`, the loader polls exactly two of them, and both stay busy for the whole run:
+
+```
+[taskfind] #1  arg=0x00407580 ret=0x00407580 slot=2 busy=1 id=0x00407580
+[taskfind] #3  arg=0x00407790 ret=0x00407790 slot=3 busy=1 id=0x00407790
+```
+
+Their names are in the object (`+0x1D0`):
+
+- slot 2 `0x407580`: `#UNKNOWN`
+- slot 3 `0x407790`: **`AppCell daemon`**
+
+So the boot is waiting for the game's own "AppCell daemon" (and an unnamed task) to finish. The script
+index is genuinely stuck at 16 of 48 (verified past the probes' 16-line logging cap by raising it to
+every 500 calls).
+
+### Also measured
+
+- Script handle struct at `0x015230A0` is live: `count=0x30` (48) plus size/pointer fields. Careful:
+  the *data* buffer is not valid before the script lands, so dumps taken early read as zeros.
+- The load staging buffer `0x005C64C0` is all zero at ~20 s, and the last resource submitted is #6
+  (`id=0x4012E`, 260368 bytes, job state 2). No 7th submit happens.
+- Guest speed is ~1.5 frames/s (VBlank tick 61 after 40 s), so the loading screen advances ~1.5x/s.
+
+### Probes added this session
+
+| probe | location | what it shows |
+|---|---|---|
+| `TOL_TRACE_EE_IRQ` | `EeScheduler.cpp` | interrupt counts by cause (ruled out an IRQ storm) |
+| `TOL_TRACE_EE_PC` | `EeScheduler.cpp` | dispatch-entry pc sampling (main thread is awake and looping) |
+| `TOL_TRACE_PUMPPC` | `EeScheduler.cpp`, `ps2_runtime.cpp` | pump-chain dispatch entries, resumed `$s0`/`$s1`/`$sp`, stack frames, and every call into `FUN_0019F468`/`FUN_00197940` with the guard |
+| `TOL_NO_EE_CKPT` | `EeScheduler.cpp` | disables checkpoint bails (diagnostic A/B) |
+| `TOL_NO_CALL_CKPT` | `ps2_runtime.cpp` | restores call-boundary checkpoint declines |
+| `[taskfind]` | `tol_overrides.cpp` | names the loader's pending tasks and their busy state |
+
+### Next
+
+1. Find what clears `+0x1F0` on the `AppCell daemon` object (0x407790). Its slot holds three function
+   pointers at `+0x1B0` (`0x164F40`, `0x164FCC`, `0x165110`); the completion path is what never runs.
+2. In parallel, check whether the daemon waits on an IOP service: the run still reports
+   `no kernel service for ioman` (25), `loadcore` (23), `sysmem` (6), `sifcmd` (3), `sysclib` (3),
+   `thevent` (2), `thbase` (2), `intrman` (2), `sifman` (1).
+3. Treat the 1.5 fps guest speed as a first-class defect: even with a working load path, a
+   frame-paced boot at that rate takes tens of minutes.
