@@ -2847,3 +2847,8 @@ polled.**
 
 Session 108's trace of the same block shows slot 2 does become active (`active` flips, priority 4 <-> 10,
 ~618 changes in 25 s) - but the loader only polls once, so it never observes that activity.
+
+Refinement (measured, not inferred): the poll probe now also emits a `repeat` line every 200 calls. None appeared, and
+the only state line is `#1`, so `FUN_00165420` is called **exactly once** in 25 s - the loader never reaches the poll
+a second time, even though `FUN_00151ff0(4)` (the AppCell daemon step, `FUN_00164f80` itself) fires 94 times. So the
+loader re-enters its body and returns before the poll on almost every entry; the single poll it does make reports idle.

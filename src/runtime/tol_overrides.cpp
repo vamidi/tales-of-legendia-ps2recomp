@@ -2629,7 +2629,7 @@ namespace
         static uint32_t sCalls = 0u;
         static uint32_t sLastJob = 0xFFFFFFFFu, sLastRet = 0xFFFFFFFFu;
         ++sCalls;
-        if (job != sLastJob || ret != sLastRet || (sCalls % 500u) == 0u)
+        if (job != sLastJob || ret != sLastRet)
         {
             sLastJob = job;
             sLastRet = ret;
@@ -2662,6 +2662,12 @@ namespace
                     std::fprintf(stderr, " (none)");
                 std::fprintf(stderr, "  ret=0x%08X\n", ret);
             }
+        }
+        else if ((sCalls % 200u) == 0u)
+        {
+            const uint32_t slot2 = 0x00407160u + 2u * 0x210u;
+            std::fprintf(stderr, "[poll] #%u repeat job=0x%08X busy=%u slot2active=%u\n", sCalls, job, ret,
+                         static_cast<unsigned>(runtime->Load8(rdram, ctx, slot2 + 0x1F0u)));
         }
     }
 
