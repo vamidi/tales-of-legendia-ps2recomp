@@ -2476,6 +2476,8 @@ namespace
             scriptDump(rdram, ctx, runtime, "status ", sCalls, handle, 0u);
         if (gScriptStatusPrev != nullptr)
             gScriptStatusPrev(rdram, ctx, runtime);
+        if (scriptTraceEnabled() && (sCalls <= 24u || (sCalls % 500u) == 0u))
+            std::fprintf(stderr, "[script] status-ret #%u -> 0x%08X\n", sCalls, GPR_U32(ctx, 2));
     }
 
     void scriptPeekProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2545,6 +2547,31 @@ namespace
     }
 
     PS2Runtime::RecompiledFunction gTaskFindPrev = nullptr;
+    PS2Runtime::RecompiledFunction gReaderAvailPrev = nullptr;
+    PS2Runtime::RecompiledFunction gReaderCmdPrev = nullptr;
+    void scriptReaderAvailProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t h = GPR_U32(ctx, 4);
+        if (gReaderAvailPrev != nullptr)
+            gReaderAvailPrev(rdram, ctx, runtime);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        const uint32_t ret = GPR_U32(ctx, 2);
+        if (ret != 0u || sCalls <= 20u || (sCalls % 500u) == 0u)
+            std::fprintf(stderr, "[reader-avail] #%u h=0x%08X ret=0x%08X\n", sCalls, h, ret);
+    }
+
+    void scriptReaderCmdProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t h = GPR_U32(ctx, 4);
+        if (gReaderCmdPrev != nullptr)
+            gReaderCmdPrev(rdram, ctx, runtime);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        const uint32_t ret = GPR_U32(ctx, 2);
+        if (sCalls <= 40u || (sCalls % 500u) == 0u)
+            std::fprintf(stderr, "[reader-cmd] #%u h=0x%08X id=0x%X\n", sCalls, h, ret);
+    }
     PS2Runtime::RecompiledFunction gEnginePrev = nullptr;
     PS2Runtime::RecompiledFunction gFreePrev = nullptr;
     PS2Runtime::RecompiledFunction gAllocPrev = nullptr;
@@ -2572,6 +2599,19 @@ namespace
         if ((arg >= 0x004E9000u && arg <= 0x004EA800u) || (arg2 >= 0x004E9000u && arg2 <= 0x004EA800u))
         {
             std::fprintf(stderr, "[heapfree2] tid=%d a0=0x%08X a1=0x%08X ra=0x%08X\n", runtime->eeScheduler().currentThreadId(), arg, arg2, GPR_U32(ctx, 31));
+            // Diagnostic: PCSX2 never frees this block. Refusing the free shows whether the delete is
+            // the gate that stops the boot.
+            if (std::getenv("TOL_REFUSE_ENGINE_FREE") != nullptr && arg == 0x004E9D70u)
+            {
+                static uint32_t sBlocked = 0u;
+                if (sBlocked < 8u)
+                {
+                    ++sBlocked;
+                    std::fprintf(stderr, "[refuse-free] blocked free(0x4E9D70) #%u ra=0x%08X\n", sBlocked,
+                                 GPR_U32(ctx, 31));
+                }
+                return;
+            }
             // Guest stack scan: $ra is unreliable (two table entries cover the same instructions), so
             // look for values on the stack that are real dispatch targets - those are return addresses.
             const uint32_t sp = GPR_U32(ctx, 29);
@@ -2704,6 +2744,24 @@ namespace
                     }
                     std::fclose(fp);
                     std::fprintf(stderr, "[engine] dumped 0x4E9D40..0x4EA140 -> %s\n", dumpPath);
+                }
+            }
+        }
+        if (const char *scriptPath = std::getenv("TOL_DUMP_SCRIPT"))
+        {
+            static bool sScriptDumped = false;
+            if (!sScriptDumped)
+            {
+                sScriptDumped = true;
+                if (std::FILE *sf = std::fopen(scriptPath, "wb"))
+                {
+                    for (uint32_t i = 0u; i < 0x800u; ++i)
+                    {
+                        const uint8_t byte = runtime->Load8(rdram, ctx, 0x015230A0u + i);
+                        std::fwrite(&byte, 1u, 1u, sf);
+                    }
+                    std::fclose(sf);
+                    std::fprintf(stderr, "[engine] dumped script 0x15230A0..0x15238A0 -> %s\n", scriptPath);
                 }
             }
         }
@@ -2850,6 +2908,8 @@ namespace
             const char *name;
         } table[] = {
             {0x00152160u, &scriptTaskFindProbe, &gTaskFindPrev, "taskfind"},
+            {0x001F88F0u, &scriptReaderAvailProbe, &gReaderAvailPrev, "reader-avail"},
+            {0x001F8920u, &scriptReaderCmdProbe, &gReaderCmdPrev, "reader-cmd"},
             {0x001EE060u, &scriptEngineProbe, &gEnginePrev, "engine"},
             {0x001ED0C0u, &scriptEngineObjProbe, &gEngineObjPrev, "engineobj"},
             {0x001013C0u, &heapFreeProbe, &gFreePrev, "heapfree"},
