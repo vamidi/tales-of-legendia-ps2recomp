@@ -2734,6 +2734,20 @@ namespace
                                  "[engine] #%u script h18=0x%08X h1C=0x%08X reader=0x%08X pending=%u cnt34=%u "
                                  "mode=%u st160=%u\n",
                                  sCalls, h18, h1c, h24, pend, cnt34, mode, st160);
+                    for (uint32_t k = 0u; k < 3u; ++k)
+                    {
+                        const uint32_t off = (k == 2u) ? 0x18u : (0x0Cu + k * 4u);
+                        const uint32_t obj = runtime->Load32(rdram, ctx, sub + off);
+                        uint32_t vt = 0u, step = 0u;
+                        if (obj >= 0x00100000u && obj < 0x02000000u)
+                        {
+                            vt = runtime->Load32(rdram, ctx, obj);
+                            if (vt >= 0x00100000u && vt < 0x02000000u)
+                                step = runtime->Load32(rdram, ctx, vt + 0x1Cu);
+                        }
+                        std::fprintf(stderr, "[engine] #%u substep%u obj=0x%08X vt=0x%08X step1C=0x%08X\n",
+                                     sCalls, k, obj, vt, step);
+                    }
                 }
             }
             std::fprintf(stderr, "[engine] #%u g334=0x%08X g328=0x%08X renderer +8=%08X +C=%08X +10=%08X +14=%u\n",
