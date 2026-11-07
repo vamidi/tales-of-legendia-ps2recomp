@@ -1410,3 +1410,71 @@ script lines 81, resources 1-3 loaded.
 
 **Next:** the second transfer (530512 bytes) and the stages beyond it. The load is no longer stuck on the
 boot script.
+
+---
+
+## 0v. Audio path: what is real now, what still isn't, and the workaround
+
+### Implemented and verified
+
+- `dmacman` bound in the LLE (4 reset, 5/6 env, 8/9 CHCR/MADR readback, 14 `sceDmaSend`,
+  15 `sceDmaSendN`), routed through the existing `Iop::dmaTransfer`. `no kernel service for dmacman`
+  goes 7 -> 0 and a real transfer runs (`[dma] start ch=4 addr=0x17BC0 bcr=0x19438`, ~151 KiB).
+- `sysclib #19` (sprintf) bound; the audio modules' import resolves (1 -> 0 log lines).
+- With the bindings in place SPU2 is genuinely programmed by the modules: 185 register writes in 60 s,
+  including TSA (`0x1A8/0x1AA`) and one ADMAS write (`val=0`, so manual transfers, not AutoDMA).
+
+### The completion IRQ is NOT dropped (hypothesis refuted)
+
+```
+[intr] register line=36 handler=0x49CE8   (INUM_DMA_4, SPU0)
+[intr] register line=40 handler=0x49CE8   (INUM_DMA_7, SPU1)
+[intr] register line=9  handler=0x4B410   (SPU2)
+[intr] raise line=36 deliverable=1 registered=1 enabled=1 handler=0x49CE8   (x11+)
+LINE DISABLED after handler: 0
+```
+
+`serviceInterrupts` finds the line registered, enabled and handled every time; the handler never
+returns 0, so the line is never disabled. No fix was applied because none was needed.
+
+### What the EE is actually doing: starvation, not waiting
+
+With the provoked detach disabled (`TOL_NO_STREAM_RELEASE=1`):
+
+```
+tid=2 Running  pc=0x198C88  prio 8/119    ADX shutdown waiter (busy-wait, no yield)
+tid=3 Ready    pc=0x198E14  prio 16/119   ADX worker  - never scheduled
+tid=4 Ready    pc=0x198EF8  prio 18/119   ADX worker  - never scheduled
+tid=5 WaitSusp wait=sleep   prio 25/119
+tid=6 Ready    pc=0x218908  prio 99/99
+```
+
+So the audio workers are READY and simply outranked. `DAT_00394378` (the flag the waiter spins on) is
+written only by `FUN_00199938`, reached only from the two release paths when `DAT_003942c4` hits 0 -
+i.e. ADX shutdown. The game does not close ADX during boot (8 audio objects created, none closed;
+`attach` measured 0 -> 1, `detach` never), so the flag stays 0 and the prio-8 waiter keeps the CPU from
+the prio-16/18 workers that would make audio progress. That is circular by the game's own design and
+the port reproduces it faithfully - the priorities are the game's, set at ADX init
+(`0x199314` creates the waiter at 119, `0x19935C` raises it to 8).
+
+### Workaround (kept, default on)
+
+`installSpinRelease`: after ~4096 spins, run the guest's own detach (`FUN_00199988`), which takes
+`DAT_003942c4` 1 -> 0, executes the release branch and sets the stream flags. Verified:
+`[adx] detach refcount 1 -> 0, stream flag 0x394378 = 1`; the waiter exits and the starved threads run.
+This is a workaround, not the natural path: the game never asks for the close, so the lifecycle is
+provoked rather than observed. `TOL_NO_STREAM_RELEASE=1` disables it for A/B.
+
+### Next boot stop after the workaround
+
+The pipeline finishes and the bootstrap thread exits:
+
+```
+tid=1 Dormant  pc=0x00000041  entry=0x00100008     <- ELF entry returned
+tid=6 Waiting  wait=sleep      prio 99/99
+[script] advance #16 -> index 15 -> 16 of 48       (last script activity)
+resources = 4, submits = 6
+```
+
+Nothing runnable remains, so the boot does not continue into the frame loop. That - why the ELF entry
+returns instead of running `FUN_00165ad0`'s outer loop - is the next blocker, not audio.
