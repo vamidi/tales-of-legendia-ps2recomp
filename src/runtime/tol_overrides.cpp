@@ -2576,6 +2576,15 @@ namespace
         if (gAllocPrev != nullptr)
             gAllocPrev(rdram, ctx, runtime);
         const uint32_t ret = GPR_U32(ctx, 2);
+        if (std::getenv("TOL_TRACE_ALLOC") != nullptr)
+        {
+            static uint32_t sLogged = 0u;
+            if (sLogged < 400u)
+            {
+                ++sLogged;
+                std::fprintf(stderr, "[alloc] #%u size=0x%X ret=0x%08X ra=0x%08X\n", sLogged, size, ret, ra);
+            }
+        }
         if (ret >= 0x004E9D00u && ret <= 0x004EA400u)
             std::fprintf(stderr, "[heapalloc] size=0x%X ret=0x%08X ra=0x%08X\n", size, ret, ra);
     }
@@ -2639,13 +2648,13 @@ namespace
                 sDumped = true;
                 if (std::FILE *fp = std::fopen(dumpPath, "wb"))
                 {
-                    for (uint32_t i = 0u; i < 0x300u; ++i)
+                    for (uint32_t i = 0u; i < 0x400u; ++i)
                     {
                         const uint8_t byte = runtime->Load8(rdram, ctx, 0x004E9D40u + i);
                         std::fwrite(&byte, 1u, 1u, fp);
                     }
                     std::fclose(fp);
-                    std::fprintf(stderr, "[engine] dumped 0x4E9D40..0x4EA040 -> %s\n", dumpPath);
+                    std::fprintf(stderr, "[engine] dumped 0x4E9D40..0x4EA140 -> %s\n", dumpPath);
                 }
             }
         }
