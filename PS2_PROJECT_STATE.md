@@ -2888,3 +2888,37 @@ earlier 25 s runs ended before the loader reached that phase (16 script advances
 Next: compare this byte in PCSX2 at the loader poll. State 1 there means our runtime completes the job
 synchronously where hardware keeps it queued; state 0 means the behaviour is correct and the stall is
 elsewhere.
+
+## Session 113 - direct PCSX2 comparison: the job thread is alive there, finished here
+
+Read PCSX2's memory directly (paused, no state disturbed; Pine is down so no savestate was possible):
+
+```
+0x3DB1F4 (job queue count) = 0          -> PCSX2 uses the same fallback job
+0x497050 (job record)      = 0x0016C700 -> LAB_0016C700, the fallback entry
+0x407770 (slot 2 state)    = 01 04 00 01 -> state 1, priority 4, +1F3 = 1
+0x407740 (slot 2 +0x1C0)   = 0x0063D850 -> job object pointer
+0x407750 (slot 2 +0x1D0)   = "#UNKNOWN"
+0x407730 (slot 2 +0x1B0)   = 0x00165210, 0x002047D0, 0x00165250
+```
+
+So in PCSX2 slot 2 is the **same thread** (entry `0x165210`, priority 4) and it is **alive in state 1**, with
+its resume PC parked at `0x002047D0` - inside `FUN_00204690`, the job's step method (vtable+0x0C), which is
+the real game job (`FUN_00204690` loops: `while (poll(child)) yield();`).
+
+In the port:
+
+- `[create] entry=0x00165210 prio=4 -> block=0x00407580` - the same thread is created.
+- `[jobcfg]` (`FUN_00204630`, vtable+0x08) runs 20x - the trivial entry body.
+- `[jobstep]` (`FUN_00204690`, vtable+0x0C) **never runs**.
+- `[thunk]` (`FUN_00165400`, the vtable+0x0C dispatcher reached from the step wrapper `0x165220`) **never runs**.
+- Slot 2's state cycles `0->1->3->0` 486 times in 60 s and the loader poll returns 0 on every one of 400+
+  iterations, so its frame loop never executes.
+
+The vtable is correct at the moment the step would be dispatched (`vt=0x003D4770, m8=0x00204630,
+mC=0x00204690`, verified by probe), and the resume proxy `FUN_00152200` does run - but `0x165400`
+(which would `jr` to `mC`) is never reached, so the step is never entered.
+
+Next probe: read the *resumed block's* `+0x1B4` inside `FUN_00152200` (its block pointer is `$t0` at
+`0x152310`, so a mid-function probe there, not a function-entry probe) to see which address the resume
+actually jumps to for the job block.

@@ -2583,12 +2583,13 @@ namespace
     void loopRunProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t prio = GPR_U32(ctx, 4);
+        const uint32_t ra = GPR_U32(ctx, 31);
         if (gLoopRunPrev != nullptr)
             gLoopRunPrev(rdram, ctx, runtime);
         static uint32_t sCalls = 0u;
         ++sCalls;
         if (sCalls <= 300u)
-            std::fprintf(stderr, "[loop] ff0(%u)\n", prio);
+            std::fprintf(stderr, "[loop] ff0(%u) ra=0x%08X\n", prio, ra);
     }
 
     void loopE3b0Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2610,6 +2611,163 @@ namespace
         if (sCalls <= 120u)
             std::fprintf(stderr, "[loop] d230\n");
     }
+    PS2Runtime::RecompiledFunction gTaskRunPrev = nullptr;
+    void taskRunProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t id = GPR_U32(ctx, 4);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        static uint32_t sCalls = 0u;
+        if (id == 0x00407580u && sCalls < 120u)
+        {
+            ++sCalls;
+            std::fprintf(stderr, "[run] enter slot2 id=0x%08X ra=0x%08X\n", id, ra);
+        }
+        if (gTaskRunPrev != nullptr)
+            gTaskRunPrev(rdram, ctx, runtime);
+        if (id == 0x00407580u && sCalls < 120u)
+            std::fprintf(stderr, "[run] leave slot2\n");
+    }
+
+    PS2Runtime::RecompiledFunction gThreadCreatePrev = nullptr;
+    void threadCreateProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t entry = GPR_U32(ctx, 4);
+        const uint32_t prio = GPR_U32(ctx, 7);
+        const uint32_t namePtr = GPR_U32(ctx, 10);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (gThreadCreatePrev != nullptr)
+            gThreadCreatePrev(rdram, ctx, runtime);
+        const uint32_t block = GPR_U32(ctx, 2);
+        static uint32_t sCalls = 0u;
+        if (sCalls < 60u)
+        {
+            ++sCalls;
+            std::fprintf(stderr, "[create] entry=0x%08X prio=%u name=0x%08X ra=0x%08X -> block=0x%08X\n",
+                         entry, prio, namePtr, ra, block);
+        }
+    }
+
+    PS2Runtime::RecompiledFunction gJobPostPrev = nullptr;
+    void jobPostProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t fn = GPR_U32(ctx, 4);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        static uint32_t sCalls = 0u;
+        if (sCalls < 40u)
+        {
+            ++sCalls;
+            std::fprintf(stderr, "[post] enter fn=0x%08X ra=0x%08X\n", fn, ra);
+        }
+        if (gJobPostPrev != nullptr)
+            gJobPostPrev(rdram, ctx, runtime);
+        if (sCalls <= 40u && sCalls > 0u)
+            std::fprintf(stderr, "[post] leave ret=%u count=%u\n",
+                         static_cast<unsigned>(GPR_U32(ctx, 2)),
+                         static_cast<unsigned>(runtime->Load32(rdram, ctx, 0x003DB1F4u)));
+    }
+
+    PS2Runtime::RecompiledFunction gAppStartPrev = nullptr;
+    void appStartProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        static uint32_t sCalls = 0u;
+        if (sCalls < 10u)
+        {
+            ++sCalls;
+            std::fprintf(stderr, "[appstart] enter ra=0x%08X\n", ra);
+        }
+        if (gAppStartPrev != nullptr)
+            gAppStartPrev(rdram, ctx, runtime);
+    }
+
+    PS2Runtime::RecompiledFunction gJobStepPrev = nullptr;
+    void jobStepProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 20u)
+            std::fprintf(stderr, "[jobstep] enter #%u pc=0x%08X ra=0x%08X a0=0x%08X\n", sCalls,
+                         static_cast<unsigned>(ctx->pc), GPR_U32(ctx, 31), GPR_U32(ctx, 4));
+        if (gJobStepPrev != nullptr)
+            gJobStepPrev(rdram, ctx, runtime);
+    }
+
+    PS2Runtime::RecompiledFunction gJobCfgPrev = nullptr;
+    void jobCfgProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 20u)
+            std::fprintf(stderr, "[jobcfg] enter #%u ra=0x%08X a0=0x%08X\n", sCalls, GPR_U32(ctx, 31), GPR_U32(ctx, 4));
+        if (gJobCfgPrev != nullptr)
+            gJobCfgPrev(rdram, ctx, runtime);
+    }
+
+    PS2Runtime::RecompiledFunction gStepWrapPrev = nullptr;
+    void stepWrapProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 12u)
+        {
+            const uint32_t param = GPR_U32(ctx, 4);
+            uint32_t obj = 0u, vt = 0u, m8 = 0u, mC = 0u;
+            if (param >= 0x00100000u && param < 0x02000000u)
+                obj = runtime->Load32(rdram, ctx, param);
+            if (obj >= 0x00100000u && obj < 0x02000000u)
+            {
+                vt = runtime->Load32(rdram, ctx, obj + 0x10u);
+                if (vt >= 0x00100000u && vt < 0x02000000u)
+                {
+                    m8 = runtime->Load32(rdram, ctx, vt + 0x08u);
+                    mC = runtime->Load32(rdram, ctx, vt + 0x0Cu);
+                }
+            }
+            std::fprintf(stderr, "[stepwrap] #%u param=0x%08X obj=0x%08X vt=0x%08X m8=0x%08X mC=0x%08X ra=0x%08X\n",
+                         sCalls, param, obj, vt, m8, mC, GPR_U32(ctx, 31));
+        }
+        if (gStepWrapPrev != nullptr)
+            gStepWrapPrev(rdram, ctx, runtime);
+    }
+
+    PS2Runtime::RecompiledFunction gResumePrev = nullptr;
+    void resumeProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 12u)
+        {
+            // FUN_00152200 reads the current block from its per-priority table; the block base for slot 2 is
+            // 0x407580, so sample the trio directly.
+            const uint32_t b0 = runtime->Load32(rdram, ctx, 0x00407730u);
+            const uint32_t b4 = runtime->Load32(rdram, ctx, 0x00407734u);
+            const uint32_t b8 = runtime->Load32(rdram, ctx, 0x00407738u);
+            const uint32_t f3 = runtime->Load8(rdram, ctx, 0x00407773u);
+            std::fprintf(stderr, "[resume] #%u ra=0x%08X slot2 +1B0=0x%08X +1B4=0x%08X +1B8=0x%08X +1F3=%u\n",
+                         sCalls, GPR_U32(ctx, 31), b0, b4, b8, static_cast<unsigned>(f3));
+        }
+        if (gResumePrev != nullptr)
+            gResumePrev(rdram, ctx, runtime);
+    }
+
+    PS2Runtime::RecompiledFunction gThunkPrev = nullptr;
+    void thunkProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 12u)
+        {
+            const uint32_t a0 = GPR_U32(ctx, 4);
+            const uint32_t obj = (a0 >= 0x00100000u && a0 < 0x02000000u) ? runtime->Load32(rdram, ctx, a0) : 0u;
+            const uint32_t vt = (obj >= 0x00100000u && obj < 0x02000000u) ? runtime->Load32(rdram, ctx, obj + 0x10u) : 0u;
+            const uint32_t mC = (vt >= 0x00100000u && vt < 0x02000000u) ? runtime->Load32(rdram, ctx, vt + 0x0Cu) : 0u;
+            std::fprintf(stderr, "[thunk] #%u a0=0x%08X obj=0x%08X vt=0x%08X target=0x%08X ra=0x%08X\n",
+                         sCalls, a0, obj, vt, mC, GPR_U32(ctx, 31));
+        }
+        if (gThunkPrev != nullptr)
+            gThunkPrev(rdram, ctx, runtime);
+    }
+
     PS2Runtime::RecompiledFunction gReaderAvailPrev = nullptr;
     PS2Runtime::RecompiledFunction gReaderCmdPrev = nullptr;
     void loaderPollProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -3065,7 +3223,15 @@ namespace
             {0x00152160u, &scriptTaskFindProbe, &gTaskFindPrev, "taskfind"},
             {0x00165420u, &loaderPollProbe, &gLoaderPollPrev, "poll"},
             {0x00151FF0u, &loopRunProbe, &gLoopRunPrev, "loop-ff0"},
-            {0x0016E3B0u, &loopE3b0Probe, &gLoopE3b0Prev, "loop-e3b0"},
+            {0x00151CF0u, &taskRunProbe, &gTaskRunPrev, "task-run"},
+            {0x001518C0u, &threadCreateProbe, &gThreadCreatePrev, "thread-create"},
+            {0x00165150u, &jobPostProbe, &gJobPostPrev, "job-post"},
+            {0x002055B0u, &appStartProbe, &gAppStartPrev, "app-start"},
+            {0x00204690u, &jobStepProbe, &gJobStepPrev, "job-step"},
+            {0x00204630u, &jobCfgProbe, &gJobCfgPrev, "job-cfg"},
+            // {0x00165220u, &stepWrapProbe, &gStepWrapPrev, "step-wrap"},  // disabled: probe would occupy the 0x165220 slot
+            {0x00152200u, &resumeProbe, &gResumePrev, "resume"},
+            {0x00165400u, &thunkProbe, &gThunkPrev, "thunk"},            {0x0016E3B0u, &loopE3b0Probe, &gLoopE3b0Prev, "loop-e3b0"},
             {0x0016D230u, &loopD230Probe, &gLoopD230Prev, "loop-d230"},
             {0x001F88F0u, &scriptReaderAvailProbe, &gReaderAvailPrev, "reader-avail"},
             {0x001F8920u, &scriptReaderCmdProbe, &gReaderCmdPrev, "reader-cmd"},
