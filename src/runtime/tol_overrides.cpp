@@ -2417,6 +2417,28 @@ namespace
                      "[script] %s #%u handle=%016llX base=0x%08X index=%u count=%u readable=%u extra=0x%08X\n",
                      tag, seq, static_cast<unsigned long long>(handle), base, index, count,
                      readable ? 1u : 0u, extra);
+
+        // Command records: 16 bytes each at base + 0x10 + index*0x10 (layout pinned in session 86; the
+        // opcode peek is that address). Print the neighbourhood of the current index once per index so the
+        // command the dispatcher is parked on is visible.
+        if (readable && scriptTraceEnabled())
+        {
+            static uint32_t sLastDumpedIndex = 0xFFFFFFFFu;
+            if (index != sLastDumpedIndex && index >= 12u && index <= 24u)
+            {
+                sLastDumpedIndex = index;
+                for (int32_t d = -1; d <= 2; ++d)
+                {
+                    const int32_t i = static_cast<int32_t>(index) + d;
+                    if (i < 0)
+                        continue;
+                    const uint32_t rec = base + 0x10u + static_cast<uint32_t>(i) * 0x10u;
+                    std::fprintf(stderr, "[script]    rec[%d] @0x%08X: %08X %08X %08X %08X\n", i, rec,
+                                 runtime->Load32(rdram, ctx, rec), runtime->Load32(rdram, ctx, rec + 4u),
+                                 runtime->Load32(rdram, ctx, rec + 8u), runtime->Load32(rdram, ctx, rec + 12u));
+                }
+            }
+        }
     }
 
     void scriptStatusProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2479,6 +2501,91 @@ namespace
                          static_cast<unsigned long long>(after), static_cast<uint32_t>(handle >> 32),
                          static_cast<uint32_t>(after >> 32));
         }
+    }
+
+    // Which host thread drives the script dispatcher? FUN_001ECBE0 is called from FUN_001edf80 (the
+    // 16-slot object loop), reached from FUN_001ee060, which the loader (FUN_00164f80) calls - and
+    // FUN_00164ea0 creates that thread with entry 0x164f80 at priority 0. These probes name the tid.
+    PS2Runtime::RecompiledFunction gDispatchPrev = nullptr;
+    PS2Runtime::RecompiledFunction gSlotLoopPrev = nullptr;
+    PS2Runtime::RecompiledFunction gLoaderEntryPrev = nullptr;
+    PS2Runtime::RecompiledFunction gLoaderStartPrev = nullptr;
+    uint32_t gDispatchCalls = 0u;
+
+    void scriptDispatchProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const int tid = runtime->eeScheduler().currentThreadId();
+        if (gDispatchPrev != nullptr)
+            gDispatchPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 12u || (sCalls % 256u) == 0u)
+            std::fprintf(stderr, "[script] dispatch #%u tid=%d ra=0x%08X\n", sCalls, tid, ra);
+    }
+
+    void scriptSlotLoopProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const int tid = runtime->eeScheduler().currentThreadId();
+        if (gSlotLoopPrev != nullptr)
+            gSlotLoopPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 8u || (sCalls % 256u) == 0u)
+            std::fprintf(stderr, "[script] slot-loop #%u tid=%d ra=0x%08X\n", sCalls, tid, ra);
+    }
+
+    void scriptLoaderEntryProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const int tid = runtime->eeScheduler().currentThreadId();
+        if (gLoaderEntryPrev != nullptr)
+            gLoaderEntryPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 8u || (sCalls % 256u) == 0u)
+            std::fprintf(stderr, "[script] loader-entry #%u tid=%d\n", sCalls, tid);
+    }
+
+    void scriptLoaderStartProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const int tid = runtime->eeScheduler().currentThreadId();
+        if (gLoaderStartPrev != nullptr)
+            gLoaderStartPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 8u || (sCalls % 256u) == 0u)
+            std::fprintf(stderr, "[script] loader-start #%u tid=%d\n", sCalls, tid);
+    }
+
+    void installScriptThreadProbes(PS2Runtime &runtime)
+    {
+        if (!scriptTraceEnabled())
+            return;
+        const struct
+        {
+            uint32_t pc;
+            PS2Runtime::RecompiledFunction probe;
+            PS2Runtime::RecompiledFunction *prev;
+            const char *name;
+        } table[] = {
+            {0x001ECBE0u, &scriptDispatchProbe, &gDispatchPrev, "dispatch"},
+            {0x001EDF80u, &scriptSlotLoopProbe, &gSlotLoopPrev, "slot-loop"},
+            {0x00164F80u, &scriptLoaderEntryProbe, &gLoaderEntryPrev, "loader-entry"},
+            {0x00164EA0u, &scriptLoaderStartProbe, &gLoaderStartPrev, "loader-start"},
+        };
+        for (const auto &entry : table)
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(entry.pc);
+            if (fn == nullptr)
+            {
+                std::fprintf(stderr, "[script] 0x%08X (%s) not in function table\n", entry.pc, entry.name);
+                continue;
+            }
+            *entry.prev = fn;
+            runtime.replaceFunction(entry.pc, entry.probe);
+        }
+        std::fprintf(stderr, "[script] thread probes installed (dispatch/slot-loop/loader)\n");
     }
 
     // ---------------------------------------------------------------------------------------------------------
@@ -3565,6 +3672,134 @@ namespace tol
         std::fprintf(stderr, "[xfer] frame-start installed on 0x001392D0\n");
     }
 
+    // ---- stream-release unblock (TOL_STREAM_RELEASE=1) --------------------------------------------
+    // FUN_00198C60 is a waiter thread:
+    //     while (DAT_00394378 == 0) FUN_00198C48();   // FUN_00198C48: DAT_00394320 += 1; return
+    //     DAT_00394380 = 1; ExitDeleteThread();
+    // FUN_00198C48 does not yield, and per the EE kernel model (09-ps2tek "Thread Scheduler":
+    // cooperative, absolute priority, syscall-only) a priority-8 spin starves the priority 16/18/99
+    // threads - measured: tid 3/4/6 Ready forever.
+    // DAT_00394378 is set only by FUN_00199938, which runs from the audio layer's release path when the
+    // refcount DAT_003942c4 reaches 0. The IxAudio/KORG RPCs are short-circuited (they hang), so that
+    // open->close cycle never completes. Invoke the guest's own release routine after the spin has
+    // clearly made no progress, so the waiter can exit and the starved threads run.
+    PS2Runtime::RecompiledFunction gSpinReleasePrev = nullptr;
+    uint32_t gSpinReleaseCalls = 0u;
+
+    void spinReleaseProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gSpinReleasePrev != nullptr)
+            gSpinReleasePrev(rdram, ctx, runtime);
+        if (++gSpinReleaseCalls != 4096u)
+            return;
+        // Complete the ADX lifecycle through the guest's own detach: refcount 1 -> 0, which makes
+        // FUN_00199988 run its release branch (FUN_00199938 sets the stream flags). Calling
+        // FUN_00199938 directly would set the flags but leave the refcount at 1, which is not the
+        // lifecycle the game closes and reopens with.
+        PS2Runtime::RecompiledFunction detach = runtime->lookupFunction(0x00199988u);
+        if (detach == nullptr)
+            return;
+        const int32_t before = static_cast<int32_t>(runtime->Load32(rdram, ctx, 0x003942C4u));
+        SET_GPR_U32(ctx, 31, 0xDEADBEF0u);
+        detach(rdram, ctx, runtime);
+        SET_GPR_U32(ctx, 31, 0x198C90u);
+        const int32_t after = static_cast<int32_t>(runtime->Load32(rdram, ctx, 0x003942C4u));
+        std::fprintf(stderr,
+                     "[xfer] adx-detach after %u spins: refcount %d -> %d, stream flag 0x394378 = %u\n",
+                     gSpinReleaseCalls, before, after, runtime->Load32(rdram, ctx, 0x00394378u));
+    }
+
+    void installSpinRelease(PS2Runtime &runtime)
+    {
+        // Default ON: this completes the ADX lifecycle (refcount 1 -> 0 via the guest's own detach), which
+        // is what makes FUN_00199938 set the stream flags. Without it the priority-8 waiter at 0x198C60
+        // spins forever and starves the priority 16/18/99 threads, because the EE kernel schedules by
+        // absolute priority (09-ps2tek "Thread Scheduler"). TOL_NO_STREAM_RELEASE=1 disables it.
+        if (std::getenv("TOL_NO_STREAM_RELEASE") != nullptr)
+            return;
+        PS2Runtime::RecompiledFunction spin = runtime.lookupFunction(0x00198C48u);
+        if (spin == nullptr)
+            return;
+        gSpinReleasePrev = spin;
+        runtime.replaceFunction(0x00198C48u, &spinReleaseProbe);
+        std::fprintf(stderr, "[xfer] stream-release hook installed on 0x00198C48\n");
+    }
+
+    // ---- ADX attach/detach lifecycle (TOL_TRACE_ADX=1) ---------------------------------------------
+    // FUN_001997a8 = attach: at refcount 0 it initialises ADXPS2 and registers callback slot 6
+    // (0x198bf8), then DAT_003942c4++. FUN_00199988 / FUN_0019a550 = detach: DAT_003942c4-- and, at
+    // exactly 0, run FUN_00199938 which sets the stream flags (0x394378..) the waiter 0x198C60 spins on.
+    // If attach never runs, a detach takes the count to -1 and the release branch can never fire.
+    PS2Runtime::RecompiledFunction gAdxAttachPrev = nullptr;
+    PS2Runtime::RecompiledFunction gAdxDetach1Prev = nullptr;
+    PS2Runtime::RecompiledFunction gAdxDetach2Prev = nullptr;
+    uint32_t gAdxAttachCalls = 0u;
+    uint32_t gAdxDetachCalls = 0u;
+
+    void adxAttachProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const int32_t before = static_cast<int32_t>(runtime->Load32(rdram, ctx, 0x003942C4u));
+        if (gAdxAttachPrev != nullptr)
+            gAdxAttachPrev(rdram, ctx, runtime);
+        ++gAdxAttachCalls;
+        if (gAdxAttachCalls <= 8u)
+            std::fprintf(stderr, "[adx] attach #%u refcount %d -> %d\n", gAdxAttachCalls, before,
+                         static_cast<int32_t>(runtime->Load32(rdram, ctx, 0x003942C4u)));
+    }
+
+    void adxDetachProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const int32_t before = static_cast<int32_t>(runtime->Load32(rdram, ctx, 0x003942C4u));
+        if (gAdxDetach1Prev != nullptr)
+            gAdxDetach1Prev(rdram, ctx, runtime);
+        ++gAdxDetachCalls;
+        if (gAdxDetachCalls <= 8u)
+            std::fprintf(stderr, "[adx] detach #%u (0x00199988) refcount %d -> %d ra=0x%08X\n", gAdxDetachCalls,
+                         before, static_cast<int32_t>(runtime->Load32(rdram, ctx, 0x003942C4u)), ra);
+    }
+
+    void adxDetach2Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const int32_t before = static_cast<int32_t>(runtime->Load32(rdram, ctx, 0x003942C4u));
+        if (gAdxDetach2Prev != nullptr)
+            gAdxDetach2Prev(rdram, ctx, runtime);
+        ++gAdxDetachCalls;
+        if (gAdxDetachCalls <= 8u)
+            std::fprintf(stderr, "[adx] detach #%u (0x0019a550) refcount %d -> %d ra=0x%08X\n", gAdxDetachCalls,
+                         before, static_cast<int32_t>(runtime->Load32(rdram, ctx, 0x003942C4u)), ra);
+    }
+
+    void installAdxLifecycleProbe(PS2Runtime &runtime)
+    {
+        if (std::getenv("TOL_TRACE_ADX") == nullptr)
+            return;
+        const struct
+        {
+            uint32_t pc;
+            PS2Runtime::RecompiledFunction probe;
+            PS2Runtime::RecompiledFunction *prev;
+            const char *name;
+        } table[] = {
+            {0x001997A8u, &adxAttachProbe, &gAdxAttachPrev, "attach"},
+            {0x00199988u, &adxDetachProbe, &gAdxDetach1Prev, "detach1"},
+            {0x0019A550u, &adxDetach2Probe, &gAdxDetach2Prev, "detach2"},
+        };
+        for (const auto &entry : table)
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(entry.pc);
+            if (fn == nullptr)
+            {
+                std::fprintf(stderr, "[adx] 0x%08X (%s) not in function table\n", entry.pc, entry.name);
+                continue;
+            }
+            *entry.prev = fn;
+            runtime.replaceFunction(entry.pc, entry.probe);
+        }
+        std::fprintf(stderr, "[adx] lifecycle probes installed\n");
+    }
+
     void installXferProbes(PS2Runtime &runtime)
     {
         if (!xferTraceEnabled())
@@ -3625,6 +3860,9 @@ namespace tol
         // (41 submits -> 2) even when the wrapper only observes. See HANDOFF §0o.
         installDrainProbe(runtime);
         installFrameStartFix(runtime);
+        installSpinRelease(runtime);
+        installScriptThreadProbes(runtime);
+        installAdxLifecycleProbe(runtime);
 
         // Function-table gap: 0x139690 is a shared clamp-setter epilogue
         // (`jr ra; sw a0, -0x7b44(gp)`) reached by a `j 0x139690` tail jump from
