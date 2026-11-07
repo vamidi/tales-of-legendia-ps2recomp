@@ -2542,6 +2542,16 @@ namespace
     PS2Runtime::RecompiledFunction gEnginePrev = nullptr;
     PS2Runtime::RecompiledFunction gFreePrev = nullptr;
     PS2Runtime::RecompiledFunction gAllocPrev = nullptr;
+    PS2Runtime::RecompiledFunction gFree2Prev = nullptr;
+    void heapFree2Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t arg = GPR_U32(ctx, 4);
+        const uint32_t arg2 = GPR_U32(ctx, 5);
+        if ((arg >= 0x004E9000u && arg <= 0x004EA800u) || (arg2 >= 0x004E9000u && arg2 <= 0x004EA800u))
+            std::fprintf(stderr, "[heapfree2] a0=0x%08X a1=0x%08X ra=0x%08X\n", arg, arg2, GPR_U32(ctx, 31));
+        if (gFree2Prev != nullptr)
+            gFree2Prev(rdram, ctx, runtime);
+    }
 
     void heapAllocProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -2712,6 +2722,7 @@ namespace
             {0x001ED0C0u, &scriptEngineObjProbe, &gEngineObjPrev, "engineobj"},
             {0x001013C0u, &heapFreeProbe, &gFreePrev, "heapfree"},
             {0x00101420u, &heapAllocProbe, &gAllocPrev, "heapalloc"},
+            {0x001004E0u, &heapFree2Probe, &gFree2Prev, "heapfree2"},
             {0x001ECBE0u, &scriptDispatchProbe, &gDispatchPrev, "dispatch"},
             {0x001EDF80u, &scriptSlotLoopProbe, &gSlotLoopPrev, "slot-loop"},
             {0x00164F80u, &scriptLoaderEntryProbe, &gLoaderEntryPrev, "loader-entry"},
