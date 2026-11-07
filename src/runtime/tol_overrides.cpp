@@ -3800,6 +3800,127 @@ namespace tol
         std::fprintf(stderr, "[adx] lifecycle probes installed\n");
     }
 
+    // ---- thread creation audit (TOL_TRACE_CREATE=1) ------------------------------------------------
+    // CreateThread(ThreadParam*): +0 status, +4 func, +8 stack, +0xC stack_size, +0x10 gp,
+    // +0x14 initial_priority, +0x18 current_priority, +0x1C attr, +0x20 option.
+    // Logging every creation names the origin of the priority-8 waiter at 0x198C60 and the priority
+    // each other thread is created with, which decides whether the starvation is the port's or the game's.
+    PS2Runtime::RecompiledFunction gCreateThreadPrev = nullptr;
+    uint32_t gCreateThreadCalls = 0u;
+
+    void createThreadProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t param = GPR_U32(ctx, 4);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (param >= 0x00100000u && param < 0x02000000u)
+        {
+            const uint32_t func = runtime->Load32(rdram, ctx, param + 4u);
+            const uint32_t stack = runtime->Load32(rdram, ctx, param + 8u);
+            const uint32_t prio = runtime->Load32(rdram, ctx, param + 0x14u);
+            ++gCreateThreadCalls;
+            if (gCreateThreadCalls <= 40u)
+                std::fprintf(stderr, "[create] #%u func=0x%08X prio=%u stack=0x%08X ra=0x%08X%s\n",
+                             gCreateThreadCalls, func, prio, stack, ra, func == 0x00198C60u ? "  <-- WAITER" : "");
+        }
+        if (gCreateThreadPrev != nullptr)
+            gCreateThreadPrev(rdram, ctx, runtime);
+    }
+
+    PS2Runtime::RecompiledFunction gChangePrioPrev = nullptr;
+
+    void changePriorityProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        const uint32_t tid = GPR_U32(ctx, 4);
+        const uint32_t prio = GPR_U32(ctx, 5);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (gChangePrioPrev != nullptr)
+            gChangePrioPrev(rdram, ctx, runtime);
+        ++sCalls;
+        if (sCalls <= 40u)
+            std::fprintf(stderr, "[create] setprio tid=%u -> %u ra=0x%08X%s\n", tid, prio, ra,
+                         prio == 8u ? "  <-- TO 8" : "");
+    }
+
+    void installCreateThreadProbe(PS2Runtime &runtime)
+    {
+        if (std::getenv("TOL_TRACE_CREATE") == nullptr)
+            return;
+        PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x001144E0u);
+        if (fn == nullptr)
+        {
+            std::fprintf(stderr, "[create] 0x001144E0 not in function table\n");
+            return;
+        }
+        gCreateThreadPrev = fn;
+        runtime.replaceFunction(0x001144E0u, &createThreadProbe);
+        PS2Runtime::RecompiledFunction prio = runtime.lookupFunction(0x00114570u);
+        if (prio != nullptr)
+        {
+            gChangePrioPrev = prio;
+            runtime.replaceFunction(0x00114570u, &changePriorityProbe);
+        }
+        std::fprintf(stderr, "[create] probe installed on 0x001144E0 (+0x00114570)\n");
+    }
+
+    // ---- boot loop trace (TOL_TRACE_BOOT=1) ------------------------------------------------------
+    // FUN_00165ad0 is the game's outer loop:
+    //   do { ...load stage...; FUN_00166870(); FUN_00139d50(); ...; do { frame } while (FUN_00153180()==0); } while(true);
+    // The thread table ends with tid 1 Dormant at pc=0x41, i.e. the ELF entry returned instead of staying
+    // in this loop. These probes show whether the loop and FUN_00139d50 are entered, and how often.
+    PS2Runtime::RecompiledFunction gBootLoopPrev = nullptr;
+    PS2Runtime::RecompiledFunction gBootStagePrev = nullptr;
+    uint32_t gBootLoopEntries = 0u;
+    uint32_t gBootStageEntries = 0u;
+
+    void bootLoopProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gBootLoopEntries;
+        if (gBootLoopEntries <= 8u)
+            std::fprintf(stderr, "[boot] FUN_00165AD0 (outer loop) entry #%u tid=%d\n", gBootLoopEntries,
+                         runtime->eeScheduler().currentThreadId());
+        if (gBootLoopPrev != nullptr)
+            gBootLoopPrev(rdram, ctx, runtime);
+    }
+
+    void bootStageProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gBootStageEntries;
+        if (gBootStageEntries <= 8u)
+            std::fprintf(stderr, "[boot] FUN_00139D50 (post-pipeline) entry #%u tid=%d\n", gBootStageEntries,
+                         runtime->eeScheduler().currentThreadId());
+        if (gBootStagePrev != nullptr)
+            gBootStagePrev(rdram, ctx, runtime);
+    }
+
+    void installBootTrace(PS2Runtime &runtime)
+    {
+        if (std::getenv("TOL_TRACE_BOOT") == nullptr)
+            return;
+        const struct
+        {
+            uint32_t pc;
+            PS2Runtime::RecompiledFunction probe;
+            PS2Runtime::RecompiledFunction *prev;
+            const char *name;
+        } table[] = {
+            {0x00165AD0u, &bootLoopProbe, &gBootLoopPrev, "outer-loop"},
+            {0x00139D50u, &bootStageProbe, &gBootStagePrev, "stage"},
+        };
+        for (const auto &entry : table)
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(entry.pc);
+            if (fn == nullptr)
+            {
+                std::fprintf(stderr, "[boot] 0x%08X (%s) not in function table\n", entry.pc, entry.name);
+                continue;
+            }
+            *entry.prev = fn;
+            runtime.replaceFunction(entry.pc, entry.probe);
+        }
+        std::fprintf(stderr, "[boot] probes installed\n");
+    }
+
     void installXferProbes(PS2Runtime &runtime)
     {
         if (!xferTraceEnabled())
@@ -3863,6 +3984,8 @@ namespace tol
         installSpinRelease(runtime);
         installScriptThreadProbes(runtime);
         installAdxLifecycleProbe(runtime);
+        installCreateThreadProbe(runtime);
+        installBootTrace(runtime);
 
         // Function-table gap: 0x139690 is a shared clamp-setter epilogue
         // (`jr ra; sw a0, -0x7b44(gp)`) reached by a `j 0x139690` tail jump from
