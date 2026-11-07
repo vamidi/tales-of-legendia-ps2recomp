@@ -17,6 +17,11 @@
 extern std::atomic<uint64_t> g_eeRunLoopIterations;
 extern std::atomic<uint64_t> g_eeProcessPendingEventsCount;
 extern std::atomic<uint64_t> g_eeEnterGuestCount;
+extern uint32_t g_lastDispatchPcs[16];
+extern uint32_t g_lastDispatchCount;
+extern uint32_t g_callRingSrc[16];
+extern uint32_t g_callRingTgt[16];
+extern uint32_t g_callRingCount;
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -2564,7 +2569,24 @@ namespace
         const uint32_t arg = GPR_U32(ctx, 4);
         const uint32_t arg2 = GPR_U32(ctx, 5);
         if ((arg >= 0x004E9000u && arg <= 0x004EA800u) || (arg2 >= 0x004E9000u && arg2 <= 0x004EA800u))
-            std::fprintf(stderr, "[heapfree2] a0=0x%08X a1=0x%08X ra=0x%08X\n", arg, arg2, GPR_U32(ctx, 31));
+        {
+            std::fprintf(stderr, "[heapfree2] a0=0x%08X a1=0x%08X ra=0x%08X chain:", arg, arg2, GPR_U32(ctx, 31));
+            const uint32_t shown = std::min<uint32_t>(g_lastDispatchCount, 16u);
+            for (uint32_t i = 0u; i < shown; ++i)
+            {
+                const uint32_t index = (g_lastDispatchCount - 1u - i) & 15u;
+                std::fprintf(stderr, " 0x%08X", g_lastDispatchPcs[index]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fprintf(stderr, "[heapfree2] calls:");
+            const uint32_t calls = std::min<uint32_t>(g_callRingCount, 16u);
+            for (uint32_t i = 0u; i < calls; ++i)
+            {
+                const uint32_t index = (g_callRingCount - 1u - i) & 15u;
+                std::fprintf(stderr, " 0x%08X->0x%08X", g_callRingSrc[index], g_callRingTgt[index]);
+            }
+            std::fprintf(stderr, "\n");
+        }
         if (gFree2Prev != nullptr)
             gFree2Prev(rdram, ctx, runtime);
     }
@@ -2701,6 +2723,17 @@ namespace
                     sub0c = runtime->Load32(rdram, ctx, renderer + 0x0Cu);
                     sub10 = runtime->Load32(rdram, ctx, renderer + 0x10u);
                     sub14 = runtime->Load8(rdram, ctx, renderer + 0x14u);
+                    const uint32_t h18 = runtime->Load32(rdram, ctx, renderer + 0x18u);
+                    const uint32_t h1c = runtime->Load32(rdram, ctx, renderer + 0x1Cu);
+                    const uint32_t h24 = runtime->Load32(rdram, ctx, renderer + 0x24u);
+                    const uint32_t pend = runtime->Load32(rdram, ctx, renderer + 0x28u);
+                    const uint32_t cnt34 = runtime->Load32(rdram, ctx, renderer + 0x34u);
+                    const uint32_t mode = runtime->Load32(rdram, ctx, renderer + 0x158u);
+                    const uint32_t st160 = runtime->Load32(rdram, ctx, renderer + 0x160u);
+                    std::fprintf(stderr,
+                                 "[engine] #%u script h18=0x%08X h1C=0x%08X reader=0x%08X pending=%u cnt34=%u "
+                                 "mode=%u st160=%u\n",
+                                 sCalls, h18, h1c, h24, pend, cnt34, mode, st160);
                 }
             }
             std::fprintf(stderr, "[engine] #%u g334=0x%08X g328=0x%08X renderer +8=%08X +C=%08X +10=%08X +14=%u\n",
