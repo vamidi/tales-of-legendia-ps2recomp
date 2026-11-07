@@ -2041,8 +2041,11 @@ if (DAT_00394300 == 0) {
 }
 ```
 
-So the pump was abandoned after a `ChangeThreadPriority` transfer and the guest never resumed at
-`0x00198AB0`. From that point the guard is pinned at 5 and the pump is dead.
+So the pump was abandoned at that transfer. What is measured is that the guard stays at 5 forever after
+it: no later pump call ever clears it, and the sample stream never shows the thread re-entered at
+`0x00198AB0` (bails that do resume appear as dispatch entries - `0x001F8168` is sampled 97 times that
+way - while `0x00198AB0` is sampled zero times). Whether the thread is parked mid-call or the resume
+point was lost is the open question the fix has to answer.
 
 Consequences, all measured:
 
