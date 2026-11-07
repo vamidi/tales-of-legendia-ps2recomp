@@ -2730,3 +2730,28 @@ Only three tasks exist, and the loader loop runs `FUN_00151ff0(7)`, `(9)`, `(8)`
 registered tasks** - which is why the engine has nothing to do.
 
 Next cheap question: which tasks should occupy priorities 7/8/9, and did they exist earlier and exit?
+
+## Session 108 - full 64-task trace from boot: priorities 7/8/9 never exist
+
+`TOL_TRACE_TASKS=1` logs the active task set at `0x407160` whenever it changes (index, inline name,
+priority). 618 changes in 25 s. Timeline:
+
+```
+[tasks] turn=0x00100008 active=0:
+[tasks] turn=0x00165B14 active=2: [0]CCDVD_MCD_MANAGER::Deam(p0) [1]CCDVD_MCD_MANAGER::Deam(p0)
+[tasks] turn=0x001F8150 active=3: ... [2]#UNKNOWN(p0)
+[tasks] turn=0x0015201C active=3: ... [2]#UNKNOWN(p10)
+[tasks] turn=0x001F8168 active=4: ... [2]#UNKNOWN(p10) [3]AppCell deamon(p4)
+   ... then a steady cycle of [2]#UNKNOWN appearing as p4 and p10 ...
+[tasks] last: active=3: [0]CCDVD(p0) [1]CCDVD(p0) [3]AppCell(p4)
+```
+
+**Priorities observed across the whole run: p0 (1235), p4 (818), p10 (206). Priorities 7, 8 and 9 never
+appear at all.** So the loader's `FUN_00151ff0(7)`, `(9)`, `(8)` calls are generic scheduler pumps that
+are vacuous in this game - they are not evidence of a missing task. That hypothesis is dead.
+
+Distinct tasks seen: `CCDVD_MCD_MANAGER::Deam` (slots 0 and 1), `#UNKNOWN` (slot 2), `AppCell deamon`
+(slot 3). The only activity at the stall is slot 2 flipping between priority 4 and 10, which is the
+loader's own job being reprioritised as it is dispatched.
+
+So the task landscape is stable and sane; the stall is not a missing task registration.
