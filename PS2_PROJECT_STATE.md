@@ -2638,3 +2638,34 @@ the reader reports ready, audio is healthy (session 102).
 
 Next cheap step: watch `0x4A5840` (slot[0]) and log the guest pc that writes `1` - that names the
 producer and shows why it stops after 16.
+
+## Session 105 - the boot loader chain identified (FUN_001EC670)
+
+Watching `slot[0]` at `0x4A5840` names the producer: every `0 -> 1` transition comes from a turn starting
+in `FUN_001EC670` (`0x1EC6DC`, `0x1EC6E4`, `0x1EC74C`, ...), with `ra=0x151F88` (it is pumped by
+`FUN_00151ff0(0)`), then `1 -> 2` dispatches it and `2 -> 0` clears it. Exactly **16** such cycles.
+
+`FUN_001EC670(param)` is the boot loader's sequential chain:
+
+```c
+FUN_0027bf20(0); FUN_0027c2e0();
+lVar2 = FUN_001ec9a0(0, 1, 1);
+if (param_1 && lVar2) while (FUN_0027bff0(lVar2) == 0) { FUN_00151ff0(0); FUN_0019a080(); FUN_001ee060(); FUN_001392d0(); }
+... (1,2,1) (2,3,1) (3,4,1) ...
+FUN_0027bf20(1);
+lVar2 = FUN_001ec9f0(8, 0x4012e, 1);
+if (param_1 && lVar2) { while (FUN_0027bff0(lVar2) == 0) { ...pump... } thunk_FUN_0027c360(lVar2); }
+FUN_0027bf20(0);
+return;
+```
+
+So the six `[load] submit` entries seen in the logs are exactly this chain (0->1, 1->2, 2->3, 3->4, then
+resource 8 = `0x4012E`), each pumped by `FUN_00151ff0(0)` + `FUN_0019a080` (IO) + `FUN_001ee060`
+(engine) + `FUN_001392d0` (load tick).
+
+Each of those pump loops is where the 16 slot cycles come from, and the load probe showed every job's
+`FUN_0027bff0` returning 2 (done), so the loader chain itself completes.
+
+Next cheap step: after `FUN_001EC670` returns, the loader (`FUN_00164F80`) pops the next task from
+`0x497010` / `puRam003db1f8`. Dumping that list at the stall shows whether the next task is queued at all
+- i.e. whether the boot script is supposed to queue it and does not.
