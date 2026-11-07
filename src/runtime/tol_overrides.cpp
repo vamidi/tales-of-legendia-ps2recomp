@@ -2571,21 +2571,20 @@ namespace
         const uint32_t arg2 = GPR_U32(ctx, 5);
         if ((arg >= 0x004E9000u && arg <= 0x004EA800u) || (arg2 >= 0x004E9000u && arg2 <= 0x004EA800u))
         {
-            std::fprintf(stderr, "[heapfree2] a0=0x%08X a1=0x%08X ra=0x%08X ring:", arg, arg2, GPR_U32(ctx, 31));
-            const uint32_t shown = std::min<uint32_t>(g_lastDispatchCount, 24u);
-            for (uint32_t i = 0u; i < shown; ++i)
+            std::fprintf(stderr, "[heapfree2] a0=0x%08X a1=0x%08X ra=0x%08X\n", arg, arg2, GPR_U32(ctx, 31));
+            // Guest stack scan: $ra is unreliable (two table entries cover the same instructions), so
+            // look for values on the stack that are real dispatch targets - those are return addresses.
+            const uint32_t sp = GPR_U32(ctx, 29);
+            std::fprintf(stderr, "[stackscan] sp=0x%08X\n", sp);
+            for (int32_t off = -0x600; off < 0x140; off += 4)
             {
-                const uint32_t index = (g_lastDispatchCount - 1u - i) & 31u;
-                std::fprintf(stderr, " %d:0x%08X", g_lastDispatchTids[index], g_lastDispatchPcs[index]);
+                const uint32_t v = runtime->Load32(rdram, ctx, sp + static_cast<uint32_t>(off));
+                if (v >= 0x00100000u && v < 0x003D1CBCu && runtime->hasFunction(v))
+                    std::fprintf(stderr, "[stackscan] sp%+d = 0x%08X\n", off, v);
             }
-            std::fprintf(stderr, "\n");
-            std::fprintf(stderr, "[heapfree2] calls:");
-            const uint32_t calls = std::min<uint32_t>(g_callRingCount, 16u);
-            for (uint32_t i = 0u; i < calls; ++i)
-            {
-                const uint32_t index = (g_callRingCount - 1u - i) & 15u;
-                std::fprintf(stderr, " 0x%08X->0x%08X", g_callRingSrc[index], g_callRingTgt[index]);
-            }
+            std::fprintf(stderr, "[stackscan] raw sp-0x60..sp+0x30:");
+            for (int32_t off = -0x60; off < 0x30; off += 4)
+                std::fprintf(stderr, " %+d:%08X", off, runtime->Load32(rdram, ctx, sp + static_cast<uint32_t>(off)));
             std::fprintf(stderr, "\n");
         }
         if (gFree2Prev != nullptr)
