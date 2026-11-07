@@ -2573,6 +2573,33 @@ namespace
     {
         const uint32_t size = GPR_U32(ctx, 4);
         const uint32_t ra = GPR_U32(ctx, 31);
+        // Walk the allocator's free list just before the renderer's first 0x154 buffer request.
+        if (size == 0x154u && std::getenv("TOL_DUMP_FREELIST") != nullptr)
+        {
+            static bool sDumped = false;
+            if (!sDumped)
+            {
+                sDumped = true;
+                const uint32_t root = runtime->Load32(rdram, ctx, 0x003DAF84u);
+                const uint32_t head = runtime->Load32(rdram, ctx, root + 8u);
+                std::fprintf(stderr, "[freelist] root=0x%08X head=0x%08X\n", root, head);
+                uint32_t node = head;
+                uint32_t guard = 0u;
+                for (uint32_t n = 0u; n < 64u && node >= 0x00100000u && node < 0x02000000u; ++n)
+                {
+                    const uint32_t magic = runtime->Load32(rdram, ctx, node);
+                    const uint32_t nodeSize = runtime->Load32(rdram, ctx, node + 0x10u);
+                    const uint32_t prev = runtime->Load32(rdram, ctx, node + 0x14u);
+                    const uint32_t next = runtime->Load32(rdram, ctx, node + 0x18u);
+                    std::fprintf(stderr, "[freelist] node=0x%08X magic=0x%08X size=0x%X prev=0x%08X next=0x%08X\n",
+                                 node, magic, nodeSize, prev, next);
+                    if (next == guard || next == node)
+                        break;
+                    guard = node;
+                    node = next;
+                }
+            }
+        }
         if (gAllocPrev != nullptr)
             gAllocPrev(rdram, ctx, runtime);
         const uint32_t ret = GPR_U32(ctx, 2);
