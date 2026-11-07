@@ -2573,3 +2573,36 @@ Narrowing done this session:
 | VU1 interpretation is the hot path | no (`m_vu1.execute` never called in this phase) |
 | SPU2 STATX bit 7 spins | no (IOP-side normal AutoDMA polling) |
 | Grandia as an audio reference | not useful for STATX (its runtime is HLE-level, no core regs) |
+
+## Session 103 - MIX buffer checked: complete, not truncated
+
+Dumped 528 KB (`0x1523010..0x15A4010`) during the read burst (peek #8) with `TOL_DUMP_MIX`.
+
+The container header at `0x15230A0`:
+
+```
++0x00 count = 48
++0x08 0x00080500   +0x14 0x340   +0x18 0x840
++0x20 48 entries of 16 bytes { id, offset, size, pad }
+```
+
+Entries: ids `1,2,3,4,5,...,0x30,0x31,0x32` (last slot empty), e.g.
+
+```
+id=0x01 off=0x0B80 size=0x10     id=0x05 off=0x0FC0 size=0x12D60
+id=0x31 off=0x7F800 size=0xC68   id=0x32 off=0x80480 size=0x6C
+```
+
+Validation:
+
+- **max end offset = 0x804EC**, and the loaded file is 0x131B50 (1,252,176 bytes) - every chunk lies
+  inside the buffer, **no entry is truncated**.
+- Data verified present at the far end: the window at 0x15A3410..0x15A3810 is 453/1024 non-zero, and
+  the last chunk at 0x15A3490 reads `48 FF 02 D8 1D 20 23 FF ...`.
+- `0x80500` in the header matches the table's max end (the bank's total size).
+
+So the 16-of-48 stop is **not** missing data. The reader simply stops asking.
+
+Note: a full scan of the 528 KB that covers every chunk finds **zero "MIX" fourccs**, so the
+MIXq/MIXe/MIXc/MIXr dispatch in FUN_001ECBE0 belongs to a different object (the slot dispatcher), not to
+this bank. The bank is the boot-script/data container, and it is complete in memory.

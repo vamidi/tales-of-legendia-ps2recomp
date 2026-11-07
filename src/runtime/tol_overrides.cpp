@@ -2485,6 +2485,24 @@ namespace
         const uint64_t handle = GPR_U64(ctx, 4);
         static uint32_t sCalls = 0u;
         ++sCalls;
+        if (const char *mixPath = std::getenv("TOL_DUMP_MIX"))
+        {
+            static bool sMixDumped = false;
+            if (!sMixDumped && sCalls == 8u)
+            {
+                sMixDumped = true;
+                if (std::FILE *mf = std::fopen(mixPath, "wb"))
+                {
+                    for (uint32_t i = 0u; i < 0x81000u; ++i)
+                    {
+                        const uint8_t byte = runtime->Load8(rdram, ctx, 0x01523010u + i);
+                        std::fwrite(&byte, 1u, 1u, mf);
+                    }
+                    std::fclose(mf);
+                    std::fprintf(stderr, "[script] dumped MIX window 0x1523010..0x15A4010 -> %s\n", mixPath);
+                }
+            }
+        }
         const bool log = scriptTraceEnabled() && (sCalls <= 16u || (sCalls % 500u) == 0u);
         if (log)
             scriptDump(rdram, ctx, runtime, "peek   ", sCalls, handle, 0u);
@@ -2755,17 +2773,17 @@ namespace
                 sScriptDumped = true;
                 if (std::FILE *sf = std::fopen(scriptPath, "wb"))
                 {
-                    for (uint32_t i = 0u; i < 0x800u; ++i)
+                    for (uint32_t i = 0u; i < 0x20000u; ++i)
                     {
-                        const uint8_t byte = runtime->Load8(rdram, ctx, 0x015230A0u + i);
+                        const uint8_t byte = runtime->Load8(rdram, ctx, 0x01523010u + i);
                         std::fwrite(&byte, 1u, 1u, sf);
                     }
                     std::fclose(sf);
-                    std::fprintf(stderr, "[engine] dumped script 0x15230A0..0x15238A0 -> %s\n", scriptPath);
+                    std::fprintf(stderr, "[engine] dumped script 0x1523010..0x1543010 -> %s\n", scriptPath);
                 }
             }
         }
-        if (sCalls <= 6u || (sCalls % 200u) == 0u)
+        if (sCalls <= 40u || (sCalls % 200u) == 0u)
         {
             const uint32_t g334 = runtime->Load32(rdram, ctx, 0x003DB334u);
             const uint32_t g328 = runtime->Load32(rdram, ctx, 0x003DB328u);
@@ -2979,7 +2997,7 @@ namespace
                 std::snprintf(scriptPath, sizeof(scriptPath), "%s_script.bin", dumpPath);
                 if (std::FILE *sf = std::fopen(scriptPath, "wb"))
                 {
-                    for (uint32_t i = 0u; i < 0x8000u; ++i)
+                    for (uint32_t i = 0u; i < 0x81000u; ++i)
                     {
                         const uint8_t byte = runtime->Load8(rdram, ctx, 0x01520000u + i);
                         std::fwrite(&byte, 1u, 1u, sf);
