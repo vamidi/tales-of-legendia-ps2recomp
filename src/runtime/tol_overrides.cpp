@@ -2539,6 +2539,52 @@ namespace
     }
 
     PS2Runtime::RecompiledFunction gTaskFindPrev = nullptr;
+    PS2Runtime::RecompiledFunction gEnginePrev = nullptr;
+    PS2Runtime::RecompiledFunction gEngineObjPrev = nullptr;
+
+    // FUN_001ED0C0 returns the engine object; FUN_001EE060 calls vtable slot 0x1C on it to step the
+    // script. Naming the object and its step entry says whether the engine is being advanced at all.
+    void scriptEngineObjProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gEngineObjPrev != nullptr)
+            gEngineObjPrev(rdram, ctx, runtime);
+        const uint32_t obj = GPR_U32(ctx, 2);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 8u || (sCalls % 500u) == 0u)
+        {
+            uint32_t vtable = 0u, step = 0u, f0 = 0u, f1 = 0u, f2 = 0u, f3 = 0u;
+            if (obj >= 0x00100000u && obj < 0x02000000u)
+            {
+                vtable = runtime->Load32(rdram, ctx, obj);
+                f0 = runtime->Load32(rdram, ctx, obj + 4u);
+                f1 = runtime->Load32(rdram, ctx, obj + 8u);
+                f2 = runtime->Load32(rdram, ctx, obj + 12u);
+                f3 = runtime->Load32(rdram, ctx, obj + 16u);
+                if (vtable >= 0x00100000u && vtable < 0x02000000u)
+                    step = runtime->Load32(rdram, ctx, vtable + 0x1Cu);
+            }
+            std::fprintf(stderr, "[engineobj] #%u obj=0x%08X vt=0x%08X step=0x%08X fields=%08X %08X %08X %08X\n",
+                         sCalls, obj, vtable, step, f0, f1, f2, f3);
+        }
+    }
+
+    // FUN_001EE060 is the script engine's per-iteration entry. Its two globals gate the engine, and
+    // FUN_001ED0C0 returns the object whose vtable slot 0x1C is called to step it, so logging them says
+    // whether the engine is advancing or parked.
+    void scriptEngineProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gEnginePrev != nullptr)
+            gEnginePrev(rdram, ctx, runtime);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 6u || (sCalls % 200u) == 0u)
+        {
+            const uint32_t g334 = runtime->Load32(rdram, ctx, 0x003DB334u);
+            const uint32_t g328 = runtime->Load32(rdram, ctx, 0x003DB328u);
+            std::fprintf(stderr, "[engine] #%u g334=0x%08X g328=0x%08X\n", sCalls, g334, g328);
+        }
+    }
 
     // FUN_00152160 scans the 64 objects at 0x407160 (stride 0x210) for one whose byte +0x1F0 is set and
     // whose +0x200 equals its argument; FUN_001521c0 turns that into "the load task is still busy", which
@@ -2547,14 +2593,26 @@ namespace
     void scriptTaskFindProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t arg = GPR_U32(ctx, 4);
+        const uint32_t callerRa = GPR_U32(ctx, 31);
         if (gTaskFindPrev != nullptr)
             gTaskFindPrev(rdram, ctx, runtime);
         const uint32_t ret = GPR_U32(ctx, 2);
         static uint32_t sCalls = 0u;
         ++sCalls;
+        if (std::getenv("TOL_FORCE_TASK_IDLE") != nullptr && arg == 0x00407790u)
+        {
+            static uint32_t sForced = 0u;
+            if (sForced < 3u)
+            {
+                ++sForced;
+                std::fprintf(stderr, "[taskfind] forcing daemon block idle (call #%u)\n", sCalls);
+            }
+            SET_GPR_U32(ctx, 2, 0u);
+            return;
+        }
         if (sCalls <= 20u || (sCalls % 2000u) == 0u)
         {
-            std::fprintf(stderr, "[taskfind] #%u arg=0x%08X ret=0x%08X", sCalls, arg, ret);
+            std::fprintf(stderr, "[taskfind] #%u arg=0x%08X ret=0x%08X ra=0x%08X", sCalls, arg, ret, callerRa);
             if (ret >= 0x00407000u && ret < 0x00410000u)
                 std::fprintf(stderr, " slot=%u busy=%u id=0x%08X", (ret - 0x00407160u) / 0x210u,
                              runtime->Load8(rdram, ctx, ret + 0x1F0u), runtime->Load32(rdram, ctx, ret + 0x200u));
@@ -2623,6 +2681,8 @@ namespace
             const char *name;
         } table[] = {
             {0x00152160u, &scriptTaskFindProbe, &gTaskFindPrev, "taskfind"},
+            {0x001EE060u, &scriptEngineProbe, &gEnginePrev, "engine"},
+            {0x001ED0C0u, &scriptEngineObjProbe, &gEngineObjPrev, "engineobj"},
             {0x001ECBE0u, &scriptDispatchProbe, &gDispatchPrev, "dispatch"},
             {0x001EDF80u, &scriptSlotLoopProbe, &gSlotLoopPrev, "slot-loop"},
             {0x00164F80u, &scriptLoaderEntryProbe, &gLoaderEntryPrev, "loader-entry"},

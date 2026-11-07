@@ -2199,3 +2199,85 @@ second of guest time, so everything the boot waits on crawls.
 2. Inter-function dispatch cost: it is the 71% item. A faster `lookupFunction`/`checkpointDue` path
    (inline table index, cheaper cycle accounting) would multiply the whole boot.
 3. The missing IOP services (ioman 25, loadcore 23, ...) if the daemon turns out to wait on one.
+
+## Session 95 (2026-11-07) - the AppCell daemon traced to a dangling script-engine object
+
+### What the daemon is
+
+`FUN_00164ea0` creates it:
+
+```c
+FUN_00151c80(0x164f40, 0x164f80, 0x165110, 4, 0, 0x3c08a0);   // entry, step, term, prio 4, name
+```
+
+The name at `0x3c08a0` is **"AppCell deamon"** (the game's spelling). Its step is `FUN_00164f80`, the
+loader loop itself, so it is a permanent daemon: `+0x1F0 == 1` is *expected* for it and is not what the
+boot waits on. `FUN_00152160(param)` scans the 64 blocks at `0x407160` (stride `0x210`) matching
+`+0x200 == param`; slot 2 (`0x407580`) is a real job and cycles `0/1/3/0` normally, slot 3
+(`0x407790`) is the daemon and goes to 1 once and stays.
+
+Forcing the daemon's poll to report idle (`TOL_FORCE_TASK_IDLE=1`) changes nothing, which rules the
+daemon out as the gate.
+
+### The actual gate: the script engine's object is released and reused
+
+`FUN_001ee060` is the engine's per-iteration entry:
+
+```c
+FUN_001edf80();  FUN_001ed2e0();
+uVar1 = FUN_001ed0c0();                       // returns the global at 0x3DB320
+(**(code **)(*(int *)uVar1 + 0x1c))(uVar1);   // vtable slot 0x1C = "step"
+```
+
+Instrumenting the object gives:
+
+```
+[engineobj] #1 obj=0x004E9D70 vt=0x003D4B20 step=0x00232110
+[engineobj] #2 obj=0x004E9D70 vt=0x003D26D8 step=0x00000000   <- step is NULL from here on
+[enginestep] #1 target=0x00232110
+[enginestep] #2.. #N target=0x00000000
+```
+
+A second virtual call is also seen jumping to `0x3F800000` (float 1.0) - i.e. non-pointer values are
+being read out of a pointer table.
+
+The switch is caught at a call boundary:
+
+```
+[objwatch] 0x00000000 -> 0x003D4B20 at source=0x001EDCF0 target=0x00231F30   (engine ctor)
+[objwatch] 0x003D4B20 -> 0x003D26D8 at source=0x00171088 target=0x00101420   (after this point)
+```
+
+`0x3D26D8 == 0x3D26C0 + 0x18`, and `0x3D26C0` is the vtable of the class built by `FUN_00171020`
+(`*puVar3 = &DAT_003d26c0`). The heap around the object shows the game's own debug tags:
+
+```
+before: 004E9D68: FFFFFFFF 00000000 003D4B20 00000000
+        004E9D88: ...                               45455246 ("FREE")
+after:  004E9D70: 003D26D8 00000000
+        004E9D78: 00020000 00010001 005AA140
+        004E9D88: ...                               4D444E52 ("RNDM")
+```
+
+So the block the global `0x3DB320` still points at has been released and reused, and the engine then
+calls vtable slot 0x1C of whatever now lives there. That is why the script stops advancing at entry 16
+of 48 and why the loader keeps rendering the loading screen: every `FUN_001ee060` call is a no-op.
+
+It is not a checkpoint-bail artefact: with `TOL_NO_EE_CKPT=1` the same switch happens at the same
+place, and the script still stops at 16.
+
+### Probes added
+
+| probe | location | what it shows |
+|---|---|---|
+| `TOL_WATCH_TASK` | `EeScheduler.cpp` | task-block `+0x1F0` transitions per guest turn, and every change of the engine object's word 0 |
+| `[taskfind]` extras | `tol_overrides.cpp` | caller `$ra` of each task lookup, plus `TOL_FORCE_TASK_IDLE` to report the daemon block idle |
+| `[engine]` / `[engineobj]` / `[enginestep]` | `tol_overrides.cpp`, `ps2_runtime.cpp` | engine globals, object vtable and step slot, and the actual target of the `jalr` at `0x1EE0A4` |
+| `[objwatch]` | `ps2_runtime.cpp` | the engine object word and its neighbourhood at the call boundary that changed it |
+
+### Where this leaves the boot
+
+Script index 16 of 48, loading screen up, ~1.5 guest fps, and the script engine stepping into a NULL
+pointer every iteration. Next: find who releases the block at `0x4E9D70` while `0x3DB320` still points
+at it (the game's heap tags "FREE"/"RNDM" are at payload `+0x18`), and whether the release is the game's
+own teardown or a consequence of a guest-state difference upstream.
