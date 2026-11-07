@@ -2372,3 +2372,51 @@ there - that is a focused question, but I could not finish it in this session.
 `[heapfree2]`, `[taskfind]`, `[engineobj]`, `[enginestep]`; `TOL_WATCH_TASK` drives the watches.
 Note the free does **not** go through `0x001013c0`/`0x001008d0` as a table call, which is why hooking
 those showed nothing - the sampling watch was the way to catch it.
+
+### Session 97 - the engine object is deleted by its own destructor during the first sub-step
+
+Wrapping the call site in `PS2Runtime::dispatchGuestBranch` (magic read before and after the callee)
+attributes the heap change to an exact call:
+
+```
+[callwatch] src=0x00231E64 target=0x00101440 kind=1 ... magic 0x4D444E52 -> 0x45455246
+[callwatch] src=0x00232140 target=0x00231EA0 kind=3 ...
+[callwatch] src=0x001EE0A4 target=0x00232110 kind=3 ...
+[heapfree2] a0=0x004E9D70 a1=0x00591FA0 ra=0x00231E6C
+```
+
+- `0x00101440` is `thunk_FUN_001008d0` - the allocator's free entry (`FUN_001008d0`).
+- `ra=0x00231E6C` is the return address of the `jal 0x00101440` inside the destructor at `0x231E20`:
+
+```
+0x231E20  addiu sp,sp,-0x20
+0x231E2C  move  s0,a0
+0x231E30  beq   s0,zero, 0x231E6C
+0x231E38  v0 = 0x3D4B00 ; 0x231E44 sw v0,0(s0)     ; vtable = base
+0x231E48  v0 = 0x3D4AE0 ; 0x231E50 sw v0,0(s0)     ; vtable = base-base
+0x231E54  v0 = (int16)a1 ; 0x231E5C blez v0, 0x231E6C
+0x231E64  jal   0x00101440                          ; free(this)
+0x231E68  move  a0,s0
+```
+
+So `FUN_00231E20(obj, deleting)` is the object's destructor: it walks the vtable to the base class and,
+when `deleting > 0`, frees the block. It is reached only through a vtable slot (its only xref is the
+DATA word at `0x3D4B08`, i.e. the destructor slot of the base vtable at `0x3D4B00`), which is why
+hooking its entry with `replaceFunction` fires nothing - the call resumes at a label inside it.
+
+Ordering puts the delete **inside the first sub-step** of `FUN_00232110`:
+
+```c
+0x232120  a0 = [s0 + 0x0c];  jalr [*a0 + 0x1c]     // sub-object 0x4E9DB0  <- delete happens here
+0x232134  a0 = [s0 + 0x10];  jalr [*a0 + 0x1c]     // sub-object 0x5AA140 (this step is a bare jr ra)
+0x232148  a0 = [s0 + 0x18];  jalr [*a0 + 0x1c]
+```
+
+`[callwatch] src=0x00232140 target=0x00231EA0` is the second (no-op) step, so the free logged just
+before it belongs to the first sub-step's subtree.
+
+Consequence, unchanged from Session 96: the global `0x3DB320` still points at the freed block, and the
+next iteration steps vtable slot 0x1C of whatever now occupies `0x4E9D70` (NULL).
+
+Next question is now narrow and concrete: what does the first sub-object (`0x4E9DB0`, stored at
+engine+0x0C) do that destroys its owner, and is the engine supposed to be on that object's list at all.
