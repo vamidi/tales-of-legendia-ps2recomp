@@ -2556,12 +2556,22 @@ namespace
     {
         static uint32_t sCalls = 0u;
         const uint32_t ra = GPR_U32(ctx, 31);
+        const uint32_t arg = GPR_U32(ctx, 4);
         const int tid = runtime->eeScheduler().currentThreadId();
         if (gSlotLoopPrev != nullptr)
             gSlotLoopPrev(rdram, ctx, runtime);
         ++sCalls;
-        if (sCalls <= 8u || (sCalls % 256u) == 0u)
-            std::fprintf(stderr, "[script] slot-loop #%u tid=%d ra=0x%08X\n", sCalls, tid, ra);
+        if (sCalls <= 12u || (sCalls % 256u) == 0u)
+        {
+            std::fprintf(stderr, "[script] slot-loop #%u tid=%d ra=0x%08X a0=0x%08X slots:", sCalls, tid, ra, arg);
+            for (uint32_t s = 0u; s < 4u; ++s)
+            {
+                std::fprintf(stderr, " [%u]", s);
+                for (uint32_t f = 0u; f < 5u; ++f)
+                    std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x004A5840u + s * 0x24u + f * 4u));
+            }
+            std::fprintf(stderr, "\n");
+        }
     }
 
     PS2Runtime::RecompiledFunction gTaskFindPrev = nullptr;

@@ -2606,3 +2606,35 @@ So the 16-of-48 stop is **not** missing data. The reader simply stops asking.
 Note: a full scan of the 528 KB that covers every chunk finds **zero "MIX" fourccs**, so the
 MIXq/MIXe/MIXc/MIXr dispatch in FUN_001ECBE0 belongs to a different object (the slot dispatcher), not to
 this bank. The bank is the boot-script/data container, and it is complete in memory.
+
+## Session 104 - the 16-slot loop located; the producer stops refilling it
+
+`FUN_001EDF80` (the "slot loop") iterates **16 slots at `0x4A5840`, stride `0x24`** (9 words), not the
+object I had been reading. Per slot:
+
+```c
+if (slot[0] == 1) {                 // 1 = pending, 2 = dispatched
+    if (ready(slot[1], slot[2])) {
+        slot[0] = 2;
+        FUN_001ecbe0(slot);         // the MIXq/MIXe/MIXc/MIXr dispatcher
+        FUN_001ec5b0(slot);
+    }
+}
+```
+
+Live trace (11 slot-loop calls in 25 s, script still 16):
+
+```
+#1  [0] 00000000 ...                                  (empty)
+#2  [0] 00000001 00000000 00000101 00000000 005C64C0  (pending, cmd 0x101)
+#3  [0] 00000002 ...                                  (dispatched)
+#4  [0] 00000001 ... 00000182 ... 005C64C0            (pending, cmd 0x182)
+#5  [0] 00000002 ...                                  (dispatched)
+```
+
+So only slot 0 is ever used, it cycles `1 -> 2` once per call, and **the producer stops writing
+`slot[0] = 1` after 16 commands**. Nothing downstream refuses them: the bank is complete (session 103),
+the reader reports ready, audio is healthy (session 102).
+
+Next cheap step: watch `0x4A5840` (slot[0]) and log the guest pc that writes `1` - that names the
+producer and shows why it stops after 16.
