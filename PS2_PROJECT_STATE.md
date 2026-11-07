@@ -2504,3 +2504,45 @@ third.
 Open: how `FUN_00231E20` is entered at all. Neither `dispatchGuestBranch` (ring/dtorcall) nor the
 scheduler dispatch (dtorentry) records a transfer to `0x231E20`, yet its body runs
 (`free` at `ra=0x231E6C`).
+
+## Session 101 - cheap steps: a real 2.5x speedup, and the "script" is a MIX container
+
+### Performance fix (committed)
+
+`dispatchGuestBranch` called `std::getenv` **per guest call** (for TOL_TRACE_SCRIPT / TOL_WATCH_TASK /
+TOL_TRACE_PUMPPC - instrumentation I added). Hoisted them to `static const bool`, evaluated once.
+
+Measured with the scheduler's own profiler:
+
+| build | dispatches/s | mean turn |
+|---|---|---|
+| before probes (session 93) | 891 | 1.107 ms |
+| with per-call getenv probes | 480-505 | 1.97-2.06 ms |
+| **after hoisting** | **1535-1569** | **0.62 ms** |
+
+So the probes alone had halved the emulator, and the fix leaves it ~2.5x faster than even the original
+build. VU1 timing probe added too: `m_vu1.execute` is **never called** during the loading phase, so VU1
+interpretation is not the hot path.
+
+### The "script" is a MIX container, not a boot script
+
+`FUN_001EE060` -> `FUN_001EDF80` (16-slot loop) -> `FUN_001ECBE0`, which dispatches on the fourcc at the
+chunk head:
+
+```
+0x7158494d "MIXq"  0x6558494d "MIXe"  0x6358494d "MIXc"  0x7258494d "MIXr"
+```
+
+The handle at `0x15230A0` (count 48) is a MIX command stream, and the 16 advances are 16 MIX chunks
+processed inside the *first* engine call. After that the stream is never read again, and the presented
+frame at 120 s (frame_003612) is pure black (max=0).
+
+Opcode/advance order, all inside engine call #1: indices 0..15 read opcodes
+0,1,2,3,4,5,0x0B,0x0C,0x0D,0x0E,0x0F,0x2A,0x10,0x11,0x12 and advance 16 times; reader status stays 0
+("ready") on every sampled call.
+
+### Still true
+
+- Refusing the engine free does not unblock the boot (delete is a side effect).
+- PCSX2's handle at 0x15230A0 is byte-identical to ours.
+- 120 s run: 16 advances, 15 engine calls, 5 screenshots, last frame black.
