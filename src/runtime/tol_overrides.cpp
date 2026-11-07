@@ -2571,7 +2571,7 @@ namespace
         const uint32_t arg2 = GPR_U32(ctx, 5);
         if ((arg >= 0x004E9000u && arg <= 0x004EA800u) || (arg2 >= 0x004E9000u && arg2 <= 0x004EA800u))
         {
-            std::fprintf(stderr, "[heapfree2] a0=0x%08X a1=0x%08X ra=0x%08X\n", arg, arg2, GPR_U32(ctx, 31));
+            std::fprintf(stderr, "[heapfree2] tid=%d a0=0x%08X a1=0x%08X ra=0x%08X\n", runtime->eeScheduler().currentThreadId(), arg, arg2, GPR_U32(ctx, 31));
             // Guest stack scan: $ra is unreliable (two table entries cover the same instructions), so
             // look for values on the stack that are real dispatch targets - those are return addresses.
             const uint32_t sp = GPR_U32(ctx, 29);
