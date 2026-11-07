@@ -2546,3 +2546,30 @@ Opcode/advance order, all inside engine call #1: indices 0..15 read opcodes
 - Refusing the engine free does not unblock the boot (delete is a side effect).
 - PCSX2's handle at 0x15230A0 is byte-identical to ours.
 - 120 s run: 16 advances, 15 engine calls, 5 screenshots, last frame black.
+
+## Session 102 - audio/MIX traced: the audio side is healthy, the stall is on the EE
+
+30 s boot with `TOL_TRACE_IXAUDIO=1` and `TOL_TRACE_SPU2=1`:
+
+- IxAudio starts (`[iop] started IxAudio at 933632`, `IxAudio Ver 1.0.0.7`).
+- Its RPCs are answered in sequence: fn 0x2, 0x400, 0x403, 0x408, 0x40A, 0x40C, 0x422 with increasing
+  reply ids (0x12, 0x13, 0x14 ...), so the audio RPC channel is alive.
+- SPU2 register writes flow (185 `write` lines) and the module reports its memory layout
+  (`ManagementMemory[S]/[E]`, `EffectWork[C0]/[C1]`).
+- `STATX` (0x344) is read 37+ times, always `0x0080`, from **IOP pc 0x00049084**. That is AutoDMA:
+  `dmaWrite`/`dmaRead` set bit 7 after every block, so the bit is re-set continuously while the driver
+  streams. Clearing it on read changes nothing (tested), and the same value comes back. It is the normal
+  IxAudio polling loop, not a stall.
+
+So: **audio and MIX are not where the boot stops.** The MIX stream at 0x15230A0 really is read 16 times
+and then not again, but the EE loader - not the audio driver - stops asking for more.
+
+Narrowing done this session:
+
+| hypothesis | verdict |
+|---|---|
+| engine object delete blocks the boot | no (refusing the free changes nothing) |
+| per-call `getenv` in dispatchGuestBranch | yes, real - fixed, ~2.5x faster (0.62 ms/turn) |
+| VU1 interpretation is the hot path | no (`m_vu1.execute` never called in this phase) |
+| SPU2 STATX bit 7 spins | no (IOP-side normal AutoDMA polling) |
+| Grandia as an audio reference | not useful for STATX (its runtime is HLE-level, no core regs) |
