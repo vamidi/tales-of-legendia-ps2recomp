@@ -1919,3 +1919,99 @@ If the display selects FBP 0 while everything is drawn to 224, the presenter is 
   disables.
 - KORG RPC functions 0x0/0x11/0x3C are answered with a zero reply in `ps2xIOP` because those handlers
   never complete.
+
+## Session 93 (2026-11-07) - the renderer is alive; the guest is still loading, at ~1.5 fps
+
+Picked up from Session 92's "frames are black". The measurements below separate three things that
+looked like one bug: what the guest submits, what the display selects, and how fast the guest runs.
+
+### 1. The guest submits continuously
+
+`TOL_TRACE_GSHIST=1` unpauses `GSDebugHistory` (it starts paused) and reports at the frame tail
+(`0x00139A20`):
+
+```
+[gs] f=30 tags=42 regs=60 draws=410 verts=1192 transfers=0 presents=0
+     lastPrim=4 y=[2240.0..2272.0] drawFbp=224 range=[0..224] fbp=0<-0 preferred=0
+[gs]    bounds px(x/16) x=[112.0..152.0] y=[114.0..142.0] degenerate=0 prim[0..7]=0/0/0/0/372/0/38/0
+[gs]    fbp0=38 fbp224=372
+```
+
+- 410 Draw entries per 512-entry ring window, 1192 vertices, none degenerate; primitive types 4 (372
+  draws) and 6 (38 draws); all geometry inside a 112..152 x 114..142 pixel box.
+- Draws target **FBP 224** (0x800E0, i.e. 0x70000) mostly and FBP 0 for the rest.
+- `FRAME_1` is rewritten constantly and alternates between FBP 0 and FBP 224: the guest double-buffers.
+
+### 2. The display never leaves FBP 0
+
+`TOL_TRACE_GSPRIV=1` (ps2_memory write64) shows the guest performing **exactly three** privileged
+writes for the whole run:
+
+```
+[gspriv] PMODE   = 0x0000000000000066   -> EN1=0, EN2=1 (display circuit 2)
+[gspriv] DISPFB2 = 0x0000000000001000   -> FBP 0, FBW 8 (512 px), PSM 0 (32-bit)
+[gspriv] DISPLAY2= 0x001BF9FF0203227C   -> DW 2559 / MAGH 4 = 512 wide, DH 447 = 448 high
+```
+
+`TOL_TRACE_GSPRESENT=1` confirms every presentation is 512x448, HostPixels, `displayFbp=0`,
+`sourceFbp=0`. `DISPFB1`/`DISPLAY1` are never written at runtime (init values only: 0x1400 / 640x448),
+and `DISPFB2` is never moved to 224.
+
+So the guest draws into 224 and displays 0. That is either this game's own scheme (224 as a work
+buffer) or the display swap that should follow is not happening - which cannot be decided until the
+guest gets past the loading phase.
+
+### 3. The guest runs at ~1.5 frames per second
+
+- `TOL_VBLANK_PACING_TRACE=1`: only 61 VBlank ticks in 40 s; each VBlank fires 0.5-1.9 s late.
+  When the guest goes idle the same trace shows 60 ticks/s at ~2 ms late, so the pacer itself is fine -
+  the guest is simply holding the EE for ~0.6 s per frame.
+- `TOL_TRACE_GSHIST` shows the sequence number advancing ~12k per 30 outer-loop tail calls (about 400
+  GS events per tail call), so work is being submitted; it is the frame clock that is slow.
+
+### 4. The boot script is advancing
+
+`TOL_TRACE_SCRIPT=1` over 60 s:
+
+```
+[script] status  #2  handle=...015230A0 index=0  count=48
+[script] advance #1 -> index 0 -> 1
+...
+[script] advance #16 -> index 15 -> 16
+```
+
+The resource table handle walks 0 -> 16 of 48 entries. `loader-entry` is `FUN_00164F80`, a thread
+entry that never returns, so a single `loader-entry #1` is expected; the dispatch/slot-loop counters
+inside it are the real progress signal.
+
+### 5. The two raster backends
+
+- `--gs=sdlgpu` (GPU rasteriser): frames are presented continuously, `frame_000012` has content
+  (max=230, 0.66% non-black - the NOW LOADING screen), `frame_001012` and later are fully black.
+- `--gs=sw` (software rasteriser, the default): only two frames are produced in 40 s because it is far
+  slower, and both contain the same 0.66% non-black NOW LOADING image.
+- GS VRAM readback (`TOL_DUMP_VRAM`, 4 MB) is all zero under `sdlgpu`: expected, because that backend
+  rasterises on the host GPU and does not fill GS memory. Not evidence of a rendering failure.
+
+These runs are not a same-guest-moment comparison, so "sw shows content, sdlgpu shows black" is not a
+conclusion yet - only that a picture exists and that the loading screen is static.
+
+### Probes added
+
+| probe | location | what it does |
+|---|---|---|
+| `TOL_TRACE_GSHIST` | `src/runtime/tol_overrides.cpp` | unpauses GS debug history, per-window submission counts, draw bounds/prim histogram, per-frame digests, newest sequence and GS tick |
+| `TOL_DUMP_VRAM` | same | writes the live 4 MB GS VRAM at the 400th frame tail (gated with `TOL_TRACE_GSHIST`) |
+| `TOL_TRACE_GSPRESENT` | `ps2xRuntime/src/lib/gs/gs_frontend.cpp` | logs every 30th presentation: presented/mode, display+source FBP, size, PMODE/SMODE2, DISPFB1/2, DISPLAY1/2, context FBPs |
+| `TOL_TRACE_GSREG` | same | logs FRAME_1/2 and privileged GIF register writes |
+| `TOL_TRACE_GSPRIV` | `ps2xRuntime/src/lib/ps2_memory.cpp` | logs privileged MMIO writes (PMODE, DISPFB1/2, DISPLAY1/2) when the value changes |
+
+### Where the work goes next
+
+1. **Speed first.** The boot is progressing but at ~1.5 guest fps, so every screen test is expensive.
+   Profile one guest frame (EE execution vs GS submit vs raster) before changing anything else; the
+   VBlank pacing trace already proves the pacer is not the bottleneck when the guest idles.
+2. **Re-check the display after the script reaches 48.** If `DISPFB2` moves to FBP 224 then, the port
+   is rendering correctly and the black screen was the loader. If the script finishes and the display
+   is still FBP 0 while draws go to 224, the display-swap path is the defect.
+3. Only then compare the same guest tick against PCSX2 (`abdiff.py mem` / a GS register read).

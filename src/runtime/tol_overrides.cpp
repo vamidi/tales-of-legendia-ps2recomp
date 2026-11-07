@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <map>
+#include <vector>
 
 // Host-level scheduler counters, defined in EeScheduler.cpp at global scope. Reading them from a probe
 // distinguishes "the guest thread is still being entered" from "the executor loop stopped turning".
@@ -3991,7 +3993,25 @@ namespace tol
             std::fprintf(stderr, "[gs] history unpaused\n");
         }
         if ((++gGsHistFrames % 30u) != 0u)
+        {
+            // TOL_DUMP_VRAM=<path>: write the live 4 MB GS VRAM at two frame tails, so the framebuffer
+            // the display reads and the framebuffer the draws target can be compared byte for byte.
+            if (const char *dumpPath = std::getenv("TOL_DUMP_VRAM"))
+            {
+                if (gGsHistFrames == 150u || gGsHistFrames == 400u)
+                {
+                    char finalPath[512];
+                    std::snprintf(finalPath, sizeof(finalPath), "%s_%u.bin", dumpPath, gGsHistFrames);
+                    if (std::FILE *fp = std::fopen(finalPath, "wb"))
+                    {
+                        std::fwrite(runtime->memory().getGSVRAM(), 1u, 4u * 1024u * 1024u, fp);
+                        std::fclose(fp);
+                        std::fprintf(stderr, "[gs] vram dumped at frame %u -> %s\n", gGsHistFrames, finalPath);
+                    }
+                }
+            }
             return;
+        }
 
         const std::vector<GSDebugHistoryEntry> history = runtime->gs().getDebugHistory();
         uint32_t tags = 0u, regs = 0u, draws = 0u, transfers = 0u, presents = 0u;
@@ -4003,6 +4023,12 @@ namespace tol
         uint32_t displayFbp = 0u, sourceFbp = 0u;
         bool sawPresent = false;
         bool usedPreferred = false;
+        // Aggregate the whole window so "the geometry is degenerate" and "the geometry is real but
+        // lands off-screen" can be told apart. Coordinates arrive in GS fixed point (x16).
+        float allXMin = 1e9f, allXMax = -1e9f, allYMin = 1e9f, allYMax = -1e9f;
+        uint32_t degenerate = 0u;
+        uint32_t primHist[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        uint32_t fbpHist[512] = {0u};
         for (const GSDebugHistoryEntry &entry : history)
         {
             if (entry.seq <= gGsHistLastSeq)
@@ -4014,14 +4040,23 @@ namespace tol
             case GSDebugEventKind::Draw:
                 ++draws;
                 verts += entry.vertexCount;
-                lastDrawPrim = static_cast<uint32_t>(entry.prim.type);
+                lastDrawPrim = static_cast<uint32_t>(entry.prim.type) & 7u;
+                ++primHist[lastDrawPrim];
                 yMin = entry.yMin;
                 yMax = entry.yMax;
+                if (entry.xMin < allXMin) allXMin = entry.xMin;
+                if (entry.xMax > allXMax) allXMax = entry.xMax;
+                if (entry.yMin < allYMin) allYMin = entry.yMin;
+                if (entry.yMax > allYMax) allYMax = entry.yMax;
+                if ((entry.xMax - entry.xMin) < 1.0f && (entry.yMax - entry.yMin) < 1.0f)
+                    ++degenerate;
                 lastDrawFbp = entry.frame.fbp;
                 if (entry.frame.fbp < minFbp)
                     minFbp = entry.frame.fbp;
                 if (entry.frame.fbp > maxFbp)
                     maxFbp = entry.frame.fbp;
+                if (entry.frame.fbp < 512u)
+                    ++fbpHist[entry.frame.fbp];
                 break;
             case GSDebugEventKind::Transfer: ++transfers; break;
             case GSDebugEventKind::Present:
@@ -4035,16 +4070,67 @@ namespace tol
         }
         if (!history.empty())
             gGsHistLastSeq = history.back().seq;
+        uint64_t maxSeq = 0u;
+        uint64_t maxVsync = 0u;
+        for (const GSDebugHistoryEntry &entry : history)
+        {
+            if (entry.seq > maxSeq) maxSeq = entry.seq;
+            if (entry.vsyncTick > maxVsync) maxVsync = entry.vsyncTick;
+        }
+        const uint64_t guestTick = runtime->memory().gs().vsyncTick.load(std::memory_order_acquire);
+        std::fprintf(stderr, "[gs]    seqMax=%llu entryTickMax=%llu guestTick=%llu entries=%u\n",
+                     static_cast<unsigned long long>(maxSeq), static_cast<unsigned long long>(maxVsync),
+                     static_cast<unsigned long long>(guestTick), static_cast<unsigned>(history.size()));
         std::fprintf(stderr,
                      "[gs] f=%u tags=%u regs=%u draws=%u verts=%llu transfers=%u presents=%u"
                      " lastPrim=%u y=[%.1f..%.1f] drawFbp=%u range=[%u..%u] fbp=%u<-%u preferred=%d\n",
                      gGsHistFrames, tags, regs, draws, static_cast<unsigned long long>(verts), transfers, presents,
                      lastDrawPrim, yMin, yMax, lastDrawFbp, minFbp == 0xFFFFFFFFu ? 0u : minFbp, maxFbp, displayFbp, sourceFbp, (sawPresent && usedPreferred) ? 1 : 0);
+        std::fprintf(stderr,
+                     "[gs]    bounds x=[%.1f..%.1f] y=[%.1f..%.1f] px(x/16) x=[%.1f..%.1f] y=[%.1f..%.1f]"
+                     " degenerate=%u prim[0..7]=%u/%u/%u/%u/%u/%u/%u/%u\n",
+                     allXMin, allXMax, allYMin, allYMax, allXMin / 16.0f, allXMax / 16.0f, allYMin / 16.0f,
+                     allYMax / 16.0f, degenerate, primHist[0], primHist[1], primHist[2], primHist[3], primHist[4],
+                     primHist[5], primHist[6], primHist[7]);
+        if (minFbp != 0xFFFFFFFFu)
+            std::fprintf(stderr, "[gs]    fbp0=%u fbp224=%u\n", fbpHist[0], fbpHist[224]);
+
+        // Per-frame summary: draws, target framebuffer and vertex volume for the newest frames in the
+        // ring. Double-buffered games alternate FRAME between two FBPs; seeing which FBP the newest
+        // frames draw into, next to the FBP the display registers select, says whether the presented
+        // buffer is a frame the guest never finished or the wrong buffer entirely.
+        struct FrameDigest
+        {
+            uint32_t draws = 0u;
+            uint64_t verts = 0u;
+            uint32_t fbp = 0xFFFFFFFFu;
+            bool mixed = false;
+        };
+        std::map<uint32_t, FrameDigest> digests;
+        for (const GSDebugHistoryEntry &entry : history)
+        {
+            if (entry.kind != GSDebugEventKind::Draw)
+                continue;
+            FrameDigest &digest = digests[entry.frameIndex];
+            ++digest.draws;
+            digest.verts += entry.vertexCount;
+            if (digest.fbp == 0xFFFFFFFFu)
+                digest.fbp = entry.frame.fbp;
+            else if (digest.fbp != entry.frame.fbp)
+                digest.mixed = true;
+        }
+        uint32_t shown = 0u;
+        for (auto it = digests.rbegin(); it != digests.rend() && shown < 6u; ++it, ++shown)
+        {
+            std::fprintf(stderr, "[gs]    frame %u draws=%u verts=%llu fbp=%u%s\n", it->first, it->second.draws,
+                         static_cast<unsigned long long>(it->second.verts), it->second.fbp,
+                         it->second.mixed ? " (mixed)" : "");
+        }
     }
 
     void installGsHistoryProbe(PS2Runtime &runtime)
     {
-        if (std::getenv("TOL_TRACE_GSHIST") == nullptr)
+        if (std::getenv("TOL_TRACE_GSHIST") == nullptr && std::getenv("TOL_DUMP_VRAM") == nullptr)
             return;
         PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00139A20u);
         if (fn == nullptr)
