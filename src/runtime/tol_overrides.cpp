@@ -2619,6 +2619,24 @@ namespace
         }
         if (gAdxfPumpOriginal != nullptr)
             gAdxfPumpOriginal(rdram, ctx, runtime);
+
+        // A completed pump walks the guard 1..6 and clears it. Anything else means the pump left the
+        // state machine mid-sequence - either a checkpoint bail (the recompiled body returns and the
+        // scheduler resumes at ctx->pc later) or a dropped invocation - and every later call then
+        // early-returns at `if (DAT_00393208 != 0)`. Log the transitions, not every call.
+        const uint32_t after = runtime->Load32(rdram, ctx, 0x00393208u);
+        static uint32_t sLastAfter = 0u;
+        static uint32_t sLeaks = 0u;
+        if (after != sLastAfter)
+        {
+            if (sLeaks < 40u)
+            {
+                std::fprintf(stderr, "[adxf-guard] #%u before=%u after=%u pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                             gPumpCalls, guard, after, ctx->pc, GPR_U32(ctx, 31), GPR_U32(ctx, 29));
+                ++sLeaks;
+            }
+            sLastAfter = after;
+        }
     }
 
     void ioWaitProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

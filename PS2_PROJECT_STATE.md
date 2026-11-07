@@ -2015,3 +2015,61 @@ conclusion yet - only that a picture exists and that the loading screen is stati
    is rendering correctly and the black screen was the loader. If the script finishes and the display
    is still FBP 0 while draws go to 224, the display-swap path is the defect.
 3. Only then compare the same guest tick against PCSX2 (`abdiff.py mem` / a GS register read).
+
+### Addendum: the actual blocker is the ADXF pump, not the renderer
+
+Measured after the section above, with `TOL_TRACE_DVCI=1` (the guard probe now logs transitions) and
+`TOL_TRACE_EE_PC=1`:
+
+```
+[adxf-guard] #2    before=0 after=2 pc=0x001AD2D8 ra=0x001AD334   <- ordinary checkpoint bail
+[adxf-guard] #7    before=0 after=0 pc=0x0019ED38 ra=0x0019ED38   <- completed (guard cleared)
+...
+[adxf-guard] #1375 before=0 after=5 pc=0x00198AB0 ra=0x001B6F20   <- dies here, once
+[adxf-pump]  #2500 guard=5 blocked=1125                            <- every later call early-returns
+```
+
+`FUN_00197940` is a state machine: `DAT_00393208` = 1,2,3,4,5,6 then 0, and the first line of the
+function is `if (DAT_00393208 != 0) return;`. At state 5 it calls `FUN_0019f468`, which walks the 40
+ADXF stream slots and services each active one. The bail pc `0x00198AB0` is inside `FUN_00198ab0`:
+
+```c
+DAT_00394300 = DAT_00394300 - 1;
+if (DAT_00394300 == 0) {
+    FUN_00199268(DAT_00394358);
+    ChangeThreadPriority(GetThreadId(), DAT_0039bbf0);   // <- the host call leaves here
+}
+```
+
+So the pump was abandoned after a `ChangeThreadPriority` transfer and the guest never resumed at
+`0x00198AB0`. From that point the guard is pinned at 5 and the pump is dead.
+
+Consequences, all measured:
+
+- the 17th boot-script entry never loads; `[script] advance` stops at index 16 of 48 (stable over
+  minutes, both with and without the ADX spin-release workaround, so it is not that workaround);
+- `[load] submit #6 ... size=260368 dest=0x005C64C0 -> handle=0x00000305` is the last request, and
+  `[adxf-stall] ... state=1 busy=0 done=0 blocks=0 dev=0 devBase=0x0` shows the slot never moves;
+- the main thread then spins at ~1.5 guest fps, which is what made the screen look frozen/black.
+
+Thread sampling (`TOL_TRACE_EE_PC`) confirms the main thread is the one spinning: 7016 of 7052
+dispatches are `tid=1`, and after the stall its samples sit in `0x0015fb60`/`0x0015fcb0` (a
+set/clear-flag pair that republishes handlers) rather than at `0x00198AB0`.
+
+EE interrupt delivery was also counted (`TOL_TRACE_EE_IRQ`) to rule out an interrupt storm: 1800
+IRQs, 1656 of them DMAC cause 1 (VIF1 channel), and no handler is registered for it, so they are
+dropped rather than looping. Not the cause.
+
+### What to fix next
+
+The pump must survive the transfer: when the scheduler takes a thread out of guest code at
+`ChangeThreadPriority` (or at any checkpoint), the guest thread has to resume at the bail pc so the
+state machine finishes. Either the resume context is being overwritten while the pump is parked, or
+the transfer is being treated as completion. Reproduce with:
+
+```
+TOL_TRACE_DVCI=1 TOL_TRACE_SCRIPT=1 build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
+```
+
+and watch for `[adxf-guard] ... after=5`; the first one is the failure. Then confirm the thread's saved
+pc for the next dispatch is `0x00198AB0` (or later) and not the renderer loop.
