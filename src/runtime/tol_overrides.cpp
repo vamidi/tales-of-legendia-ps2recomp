@@ -2654,7 +2654,7 @@ namespace
                             break;
                         name[c] = static_cast<char>(ch);
                     }
-                    std::fprintf(stderr, " [%u]%s active=%u prio=%u", i, name,
+                    std::fprintf(stderr, " [%u]%s state=%u prio=%u", i, name,
                                  static_cast<unsigned>(runtime->Load8(rdram, ctx, b + 0x1F0u)),
                                  static_cast<unsigned>(runtime->Load8(rdram, ctx, b + 0x1F1u)));
                 }

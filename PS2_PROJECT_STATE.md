@@ -2852,3 +2852,39 @@ Refinement (measured, not inferred): the poll probe now also emits a `repeat` li
 the only state line is `#1`, so `FUN_00165420` is called **exactly once** in 25 s - the loader never reaches the poll
 a second time, even though `FUN_00151ff0(4)` (the AppCell daemon step, `FUN_00164f80` itself) fires 94 times. So the
 loader re-enters its body and returns before the poll on almost every entry; the single poll it does make reports idle.
+
+## Session 112 - write-watch on slot 2: the clear is 0x151F18 and it always runs just before the poll
+
+`TOL_WATCH_SLOT2` hooks `ps2TraceGuestWrite` and logs every store touching `0x407770` (slot 2 block
+`0x407580` + `0x1F0`). Only six writers exist, and the byte has a strict lifecycle:
+
+```
+pc=0x00100160 WRITE128 0->0    zero-init
+pc=0x00109154 WRITE128 0->0    zero-init
+pc=0x00151840 WRITE8   0->0    FUN_001517e0, clear (no-op here)
+pc=0x00151AC4 WRITE8   0->1    FUN_001518c0, mark ready (sb $a3 = 1)
+pc=0x00151D24 WRITE8   1->3    FUN_00151cf0, runner takes it
+pc=0x00151F18 WRITE8   3->0    FUN_00151e90, pump clears after the body returns
+```
+
+A 60 s run shows **486 full cycles** (`0->1` x486, `1->3` x486, `3->0` x485) and the poll counter
+passes 400. Every poll is immediately preceded by the clear:
+
+```
+[slot2] pc=0x00151F18 ... old=3 new=0
+[poll] #1 job=0x005C6490 busy=0
+[slot2] pc=0x00151F18 ... old=3 new=0
+[poll] #200 repeat ... slot2active=0
+```
+
+`FUN_00165420` returns 1 only while the byte is exactly 1, and state 1 exists only between `0x151AC4`
+and `0x151D24` - both inside the create/run chain. By the time the loader polls, the job has been
+created, run and cleared within the same call chain, so the poll sees 0 on every one of the 400+
+iterations and the frame loop is skipped every time.
+
+**Correction to sessions 109/111:** the poll is not called once. It is called 400+ times in 60 s; the
+earlier 25 s runs ended before the loader reached that phase (16 script advances, no poll at all).
+
+Next: compare this byte in PCSX2 at the loader poll. State 1 there means our runtime completes the job
+synchronously where hardware keeps it queued; state 0 means the behaviour is correct and the stall is
+elsewhere.
