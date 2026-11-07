@@ -2454,3 +2454,30 @@ So the next target is the earliest allocation-order divergence in boot, not the 
 PCSX2 was paused once and resumed; the user's state is in slot 0. The MCP wedges when two reads are
 issued in parallel - use one read per call from now on. Port unchanged functionally; `TOL_DUMP_ENGINE`
 added for the snapshot.
+
+## Session 99 - PCSX2 reference settled with watchpoints (restart authorised)
+
+PCSX2 was restarted from `data\Tales of Legendia (USA).iso` (its original command line had no arguments).
+A window capture confirmed it boots to the **title screen with the Tales of Legendia logo** within
+seconds, so it is a valid reference.
+
+**Watchpoint on the engine block header `0x4E9D50` (write/break) across a full boot: 0 hits**, and at the
+title screen the magic still reads `RNDM`. PCSX2 allocates the engine block at `0x4E9D70` and **never
+frees it**.
+
+**Guard check:** `0x4E9DC4` reads **1** in PCSX2 at the title. (The earlier reading of 0 was stale - a
+repeat read on the same instance now returns 1.) So the renderer step guard matches the port and is not
+the differentiator either.
+
+### Conclusion
+
+Both emulators have the guard set and both run `FUN_00232110`; only the port deletes the engine, and the
+delete comes from the first sub-step (the renderer object at engine+0x0C = `0x4E9DB0`):
+`FUN_00230a50` -> `FUN_00230ad0` / `FUN_00230c80` / `FUN_00230d90` / `FUN_002314a0` -> ... ->
+deleting destructor `FUN_00231e20(obj, 1)` -> `free(0x4E9D70)` at `ra=0x231E6C`.
+
+So the bug is inside what that renderer step walks, not in the guard and not in the allocator.
+
+Next: compare the list/state the renderer step traverses at the first step (the port deletes the engine
+there; PCSX2 does not), i.e. the pointers inside `0x4E9DB0` and whatever `FUN_00230ad0`/`FUN_00230d90`
+walk.
