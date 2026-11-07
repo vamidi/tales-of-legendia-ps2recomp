@@ -1849,3 +1849,73 @@ before and after `lookupFunction`).
 
 Boot script still unlanded: `submit #1 id=0 size=1252176 dest=0x01523010`, `count = 0`,
 resource table `gp-0x7534` still null, `FUN_001EC670` stage 3 still failing.
+
+## Session 92 (2026-11-07) - boot script lands, audio path bound, and the screen is black
+
+### Committed milestones
+
+| commit | what |
+|---|---|
+| `cec6b04` | boot-script load fixed: the load stage (`FUN_00166010`) now pumps the CRI device per tick via a queued invocation of `FUN_0019A080`. Boot script lands, resource table `0x003DB6BC` populates, script engine walks (count 5/48, index advancing), 6 asset files load |
+| `9a3aa89` | ADX lifecycle completed through the guest's own detach (`FUN_00199988`), refcount 1 -> 0, stream flags set; waiter thread exits and the starved ADX workers run |
+| `45f931c` | `sysclib #19` (sprintf) bound in the LLE IOP kernel |
+| `77bec89` | `dmacman` bound (4 reset, 5/6 env, 8/9 CHCK/MADR, 14 `sceDmaSend`, 15 `sceDmaSendN`) routed through `Iop::dmaTransfer`; `no kernel service for dmacman` 7 -> 0, real DMA and SPU2 register writes now happen |
+| `a42afbe` | SPU DMA completion IRQ traced: lines 36/40 register to `0x49CE8`, delivered, never disabled - the IRQ was not dropped |
+| `94399fd` | outer-loop trace + correction: the main thread never exits; `tid 1 Dormant` is the bootstrap record |
+| `ca550d1` | one outer iteration traced end to end: load stage -> pipeline (both bail on ordinary checkpoint preemption at worker 1's `0x1F8150`/`0x1F8168`) -> frame loop runs normally, repeatedly |
+| `f3f85b9` | GS state recorded (frames presented, picture black) |
+
+### Where it stands
+
+The game boots, loads assets, runs the frame loop - and the picture is black.
+
+```
+frame_000012.ppm  max=230  mean=0.7  nonBlack=0.66%   <- NOW LOADING visible
+frame_001012.ppm  max=0    mean=0    nonBlack=0%      <- black from here on
+```
+
+Screenshots come from `TOL_GFX_SCREENSHOT_DIR` / `TOL_GFX_SCREENSHOT_EVERY` (`gs_frontend.cpp:614`),
+which writes the latched host presentation frame (512x448 PPM).
+
+### GS history measurement (`TOL_TRACE_GSHIST=1`)
+
+`GS` keeps a 512-entry `GSDebugHistoryEntry` ring but starts **paused**; the probe unpauses it at the
+frame tail (`0x00139A20`) and reports what the guest submits:
+
+```
+[gs] f=30 tags=42 regs=60 draws=410 verts=1192 transfers=0 presents=0
+     lastPrim=4 y=[2240.0..2272.0] drawFbp=224 range=[0..224] fbp=0<-0 preferred=0
+```
+
+Reading it:
+
+- **The guest does draw**: 410 Draw entries, 1192 vertices, ~14 draws per frame, continuously. So this
+  is not "nothing is submitted".
+- 42 + 60 + 410 = 512 = ring capacity, so these are the last 512 GS events, not a per-window count.
+- **`presents=0`**: no Present event is ever recorded.
+- Draws target **FBP 224** (0x70000) as well as FBP 0; `y=[2240..2272]` is 12-bit fixed point, i.e.
+  140..142 px, plausible on a 448-line buffer.
+- `transfers=0`: no texture uploads in that window.
+
+So the open question is the one the graphics skill calls "same packets, wrong picture": the guest draws
+into a framebuffer, and what gets presented is black. The presenter builds its request from
+`pmode` / `dispfb1` / `display1` (+ preferred source) in `buildPresentationRequestUnlocked`, so the next
+step is to compare **the FBP the display registers select** against **the FBP the draws target (224)**.
+If the display selects FBP 0 while everything is drawn to 224, the presenter is reading the wrong buffer.
+
+### How to reproduce any of this
+
+- Screenshots: `TOL_GFX_SCREENSHOT_DIR=<dir> TOL_GFX_SCREENSHOT_EVERY=20`.
+- GS submission: `TOL_TRACE_GSHIST=1`.
+- Boot flow: `TOL_TRACE_BOOT=1`.
+- Transfer/CRI: `TOL_TRACE_XFER=1`, `TOL_TRACE_DVCI=1`.
+- Audio lifecycle: `TOL_TRACE_ADX=1`; `TOL_NO_STREAM_RELEASE=1` disables the provoked ADX detach for A/B.
+- IOP interrupts: `TOL_TRACE_INTR=1`.
+
+### Known workarounds still in place
+
+- ADX is detached by the port after ~4096 spins of the shutdown waiter (`installSpinRelease`), because
+  the game never closes the audio session during boot. Documented, default on, `TOL_NO_STREAM_RELEASE=1`
+  disables.
+- KORG RPC functions 0x0/0x11/0x3C are answered with a zero reply in `ps2xIOP` because those handlers
+  never complete.

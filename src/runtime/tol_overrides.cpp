@@ -3967,6 +3967,96 @@ namespace tol
         std::fprintf(stderr, "[boot] probes installed\n");
     }
 
+    // ---- GS history dump (TOL_TRACE_GSHIST=1) ------------------------------------------------------
+    // GS keeps a ring of GSDebugHistoryEntry (512 entries) but starts PAUSED (m_debugHistoryPaused =
+    // true), so nothing is recorded until it is unpaused. This unpauses it at the first frame tail and
+    // reports, every 30 frames, what the guest actually submitted to the GS: how many GIF tags, register
+    // writes, Draw entries, texture transfers and Present events, plus the vertex volume and bounds of
+    // the draws and which framebuffer was presented. That separates "the guest submits nothing" from
+    // "the guest submits degenerate geometry" - the first question the console-graphics method asks.
+    PS2Runtime::RecompiledFunction gGsHistPrev = nullptr;
+    uint64_t gGsHistLastSeq = 0u;
+    uint32_t gGsHistFrames = 0u;
+
+    void gsHistoryProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gGsHistPrev != nullptr)
+            gGsHistPrev(rdram, ctx, runtime);
+        static bool sUnpaused = false;
+        if (!sUnpaused)
+        {
+            runtime->gs().setDebugHistoryPaused(false);
+            runtime->gs().clearDebugHistory();
+            sUnpaused = true;
+            std::fprintf(stderr, "[gs] history unpaused\n");
+        }
+        if ((++gGsHistFrames % 30u) != 0u)
+            return;
+
+        const std::vector<GSDebugHistoryEntry> history = runtime->gs().getDebugHistory();
+        uint32_t tags = 0u, regs = 0u, draws = 0u, transfers = 0u, presents = 0u;
+        uint64_t verts = 0u;
+        uint32_t lastDrawPrim = 0u;
+        float yMin = 0.0f, yMax = 0.0f;
+        uint32_t lastDrawFbp = 0xFFFFFFFFu;
+        uint32_t minFbp = 0xFFFFFFFFu, maxFbp = 0u;
+        uint32_t displayFbp = 0u, sourceFbp = 0u;
+        bool sawPresent = false;
+        bool usedPreferred = false;
+        for (const GSDebugHistoryEntry &entry : history)
+        {
+            if (entry.seq <= gGsHistLastSeq)
+                continue;
+            switch (entry.kind)
+            {
+            case GSDebugEventKind::GifTag: ++tags; break;
+            case GSDebugEventKind::Register: ++regs; break;
+            case GSDebugEventKind::Draw:
+                ++draws;
+                verts += entry.vertexCount;
+                lastDrawPrim = static_cast<uint32_t>(entry.prim.type);
+                yMin = entry.yMin;
+                yMax = entry.yMax;
+                lastDrawFbp = entry.frame.fbp;
+                if (entry.frame.fbp < minFbp)
+                    minFbp = entry.frame.fbp;
+                if (entry.frame.fbp > maxFbp)
+                    maxFbp = entry.frame.fbp;
+                break;
+            case GSDebugEventKind::Transfer: ++transfers; break;
+            case GSDebugEventKind::Present:
+                ++presents;
+                displayFbp = entry.displayFbp;
+                sourceFbp = entry.sourceFbp;
+                usedPreferred = entry.usedPreferred;
+                sawPresent = true;
+                break;
+            }
+        }
+        if (!history.empty())
+            gGsHistLastSeq = history.back().seq;
+        std::fprintf(stderr,
+                     "[gs] f=%u tags=%u regs=%u draws=%u verts=%llu transfers=%u presents=%u"
+                     " lastPrim=%u y=[%.1f..%.1f] drawFbp=%u range=[%u..%u] fbp=%u<-%u preferred=%d\n",
+                     gGsHistFrames, tags, regs, draws, static_cast<unsigned long long>(verts), transfers, presents,
+                     lastDrawPrim, yMin, yMax, lastDrawFbp, minFbp == 0xFFFFFFFFu ? 0u : minFbp, maxFbp, displayFbp, sourceFbp, (sawPresent && usedPreferred) ? 1 : 0);
+    }
+
+    void installGsHistoryProbe(PS2Runtime &runtime)
+    {
+        if (std::getenv("TOL_TRACE_GSHIST") == nullptr)
+            return;
+        PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00139A20u);
+        if (fn == nullptr)
+        {
+            std::fprintf(stderr, "[gs] 0x00139A20 (frame tail) not in function table\n");
+            return;
+        }
+        gGsHistPrev = fn;
+        runtime.replaceFunction(0x00139A20u, &gsHistoryProbe);
+        std::fprintf(stderr, "[gs] history probe installed on 0x00139A20\n");
+    }
+
     void installXferProbes(PS2Runtime &runtime)
     {
         if (!xferTraceEnabled())
@@ -4032,6 +4122,7 @@ namespace tol
         installAdxLifecycleProbe(runtime);
         installCreateThreadProbe(runtime);
         installBootTrace(runtime);
+        installGsHistoryProbe(runtime);
 
         // Function-table gap: 0x139690 is a shared clamp-setter epilogue
         // (`jr ra; sw a0, -0x7b44(gp)`) reached by a `j 0x139690` tail jump from
