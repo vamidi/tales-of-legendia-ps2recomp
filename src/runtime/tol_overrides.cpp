@@ -17,8 +17,9 @@
 extern std::atomic<uint64_t> g_eeRunLoopIterations;
 extern std::atomic<uint64_t> g_eeProcessPendingEventsCount;
 extern std::atomic<uint64_t> g_eeEnterGuestCount;
-extern uint32_t g_lastDispatchPcs[16];
+extern uint32_t g_lastDispatchPcs[32];
 extern uint32_t g_lastDispatchCount;
+extern int32_t g_lastDispatchTids[32];
 extern uint32_t g_callRingSrc[16];
 extern uint32_t g_callRingTgt[16];
 extern uint32_t g_callRingCount;
@@ -2570,12 +2571,12 @@ namespace
         const uint32_t arg2 = GPR_U32(ctx, 5);
         if ((arg >= 0x004E9000u && arg <= 0x004EA800u) || (arg2 >= 0x004E9000u && arg2 <= 0x004EA800u))
         {
-            std::fprintf(stderr, "[heapfree2] a0=0x%08X a1=0x%08X ra=0x%08X chain:", arg, arg2, GPR_U32(ctx, 31));
-            const uint32_t shown = std::min<uint32_t>(g_lastDispatchCount, 16u);
+            std::fprintf(stderr, "[heapfree2] a0=0x%08X a1=0x%08X ra=0x%08X ring:", arg, arg2, GPR_U32(ctx, 31));
+            const uint32_t shown = std::min<uint32_t>(g_lastDispatchCount, 24u);
             for (uint32_t i = 0u; i < shown; ++i)
             {
-                const uint32_t index = (g_lastDispatchCount - 1u - i) & 15u;
-                std::fprintf(stderr, " 0x%08X", g_lastDispatchPcs[index]);
+                const uint32_t index = (g_lastDispatchCount - 1u - i) & 31u;
+                std::fprintf(stderr, " %d:0x%08X", g_lastDispatchTids[index], g_lastDispatchPcs[index]);
             }
             std::fprintf(stderr, "\n");
             std::fprintf(stderr, "[heapfree2] calls:");
