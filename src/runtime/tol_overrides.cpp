@@ -2544,6 +2544,14 @@ namespace
     PS2Runtime::RecompiledFunction gAllocPrev = nullptr;
     PS2Runtime::RecompiledFunction gFree2Prev = nullptr;
     PS2Runtime::RecompiledFunction gDtorPrev = nullptr;
+    PS2Runtime::RecompiledFunction gDtor2Prev = nullptr;
+    void engineDtor2Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::fprintf(stderr, "[enginedtor2] obj=0x%08X flag=0x%08X ra=0x%08X\n", GPR_U32(ctx, 4), GPR_U32(ctx, 5),
+                     GPR_U32(ctx, 31));
+        if (gDtor2Prev != nullptr)
+            gDtor2Prev(rdram, ctx, runtime);
+    }
     void engineDtorProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::fprintf(stderr, "[enginedtor] obj=0x%08X flag=0x%08X ra=0x%08X\n", GPR_U32(ctx, 4), GPR_U32(ctx, 5),
@@ -2732,6 +2740,7 @@ namespace
             {0x00101420u, &heapAllocProbe, &gAllocPrev, "heapalloc"},
             {0x00101440u, &heapFree2Probe, &gFree2Prev, "heapfree2"},
             {0x00231E20u, &engineDtorProbe, &gDtorPrev, "enginedtor"},
+            {0x00231ED0u, &engineDtor2Probe, &gDtor2Prev, "enginedtor2"},
             {0x001ECBE0u, &scriptDispatchProbe, &gDispatchPrev, "dispatch"},
             {0x001EDF80u, &scriptSlotLoopProbe, &gSlotLoopPrev, "slot-loop"},
             {0x00164F80u, &scriptLoaderEntryProbe, &gLoaderEntryPrev, "loader-entry"},
