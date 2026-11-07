@@ -2820,3 +2820,30 @@ the daemon being stepped.
 
 Next: find what sets the state of job `0x5C6490` (the poll `FUN_0027bff0` reads it) and why it is
 already "done" on the first poll.
+
+## Session 111 - the loader's job key is slot 2, and slot 2 is idle at the first poll
+
+Dumping the job object and searching the task table for its key:
+
+```
+[poll] job=0x005C6490 busy=0
+[poll]   job words: 00407580 00000000 00000040 41504144 003D4770 00000003 (key=0x00407580)
+[poll]   blocks with +0x200 == key: [2]#UNKNOWN active=0 prio=10  ret=0x00000000
+```
+
+So:
+
+- The job's first word is **`0x00407580`** = the block address of **slot 2 (`#UNKNOWN`)**.
+- Slot 2 exists and its `+0x200` matches the key exactly.
+- But its `+0x1F0` active byte is **0** at that moment, so `FUN_001521c0` returns 0 and the loader's
+  `while` body (task priority 7/9/8/6 runs, `FUN_0016e3b0`, `FUN_001ee060`, `FUN_0016d230`) is skipped.
+
+The job object itself is a task object: vtable `0x3D4770` (the same one `FUN_002045f0` assigns), field
+`+0x08 = 0x40`, `+0x0C = "DAPA"` fourcc, `+0x14 = 3`.
+
+So the loader's frame loop is gated on slot 2 being active, and at the first poll slot 2 is idle. That is
+the last link: **the game never renders a frame because the task it waits on was already idle when it
+polled.**
+
+Session 108's trace of the same block shows slot 2 does become active (`active` flips, priority 4 <-> 10,
+~618 changes in 25 s) - but the loader only polls once, so it never observes that activity.

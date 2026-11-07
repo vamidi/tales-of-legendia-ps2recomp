@@ -2615,6 +2615,14 @@ namespace
     void loaderPollProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t job = GPR_U32(ctx, 4);
+        uint32_t key = 0u;
+        uint32_t jobWords[6] = {};
+        if (job >= 0x00100000u && job < 0x02000000u)
+        {
+            key = runtime->Load32(rdram, ctx, job);
+            for (uint32_t i = 0u; i < 6u; ++i)
+                jobWords[i] = runtime->Load32(rdram, ctx, job + i * 4u);
+        }
         if (gLoaderPollPrev != nullptr)
             gLoaderPollPrev(rdram, ctx, runtime);
         const uint32_t ret = GPR_U32(ctx, 2);
@@ -2626,6 +2634,34 @@ namespace
             sLastJob = job;
             sLastRet = ret;
             std::fprintf(stderr, "[poll] #%u job=0x%08X busy=%u\n", sCalls, job, ret);
+            if (job >= 0x00100000u && job < 0x02000000u)
+            {
+                std::fprintf(stderr, "[poll]   job words: %08X %08X %08X %08X %08X %08X (key=0x%08X)\n",
+                             jobWords[0], jobWords[1], jobWords[2], jobWords[3], jobWords[4], jobWords[5], key);
+                std::fprintf(stderr, "[poll]   blocks with +0x200 == key:");
+                bool any = false;
+                for (uint32_t i = 0u; i < 64u; ++i)
+                {
+                    const uint32_t b = 0x00407160u + i * 0x210u;
+                    if (runtime->Load32(rdram, ctx, b + 0x200u) != key)
+                        continue;
+                    any = true;
+                    char name[24] = {};
+                    for (uint32_t c = 0u; c < sizeof(name) - 1u; ++c)
+                    {
+                        const uint8_t ch = runtime->Load8(rdram, ctx, b + 0x1D0u + c);
+                        if (ch == 0u)
+                            break;
+                        name[c] = static_cast<char>(ch);
+                    }
+                    std::fprintf(stderr, " [%u]%s active=%u prio=%u", i, name,
+                                 static_cast<unsigned>(runtime->Load8(rdram, ctx, b + 0x1F0u)),
+                                 static_cast<unsigned>(runtime->Load8(rdram, ctx, b + 0x1F1u)));
+                }
+                if (!any)
+                    std::fprintf(stderr, " (none)");
+                std::fprintf(stderr, "  ret=0x%08X\n", ret);
+            }
         }
     }
 
