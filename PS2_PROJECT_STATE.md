@@ -2781,3 +2781,42 @@ parameter/runner traffic, not the loader's wait.
 
 Conclusion: the loader is not spinning on slot 2 or on the daemon block. Its single job completed, and the
 loader loop is not what is blocking the boot.
+
+## Session 110 - the loader's frame loop never runs at all
+
+Hooked every call in the loader's inner loop and logged them in order:
+
+```
+[loop] ff0(0) x108   [loop] ff0(1) x98   [loop] ff0(4) x94
+[loop] e3b0: 0       [loop] d230: 0
+```
+
+- `FUN_00151ff0` is called only with priorities **0, 1 and 4** - never 7, 9 or 8.
+- `FUN_0016e3b0` and `FUN_0016d230` are **never called**.
+
+The loader's loop is:
+
+```c
+lVar4 = FUN_00165420(lVar2);          // poll: returned 0 (session 109)
+while (lVar4 != 0) {
+    FUN_0015231c();  FUN_00151ff0(7); FUN_00151ff0(9); FUN_00151ff0(8);
+    do { FUN_00151ff0(6); } while (...);
+    FUN_0016e3b0();  FUN_001ee060();   FUN_0016d230();
+    lVar4 = FUN_00165420(lVar2);
+}
+```
+
+With the poll returning 0, **the entire body is skipped**. The game never enters its per-frame
+render/engine loop after the asset chain finishes - which is exactly why the presented frames are black
+(session 92/103) and why the engine is only ever called from `FUN_001EC670`'s load pump.
+
+So the stall is upstream of everything we have been chasing: the job handed to the loader (`0x5C6490`)
+reports "not busy" immediately instead of staying busy for the lifetime of the main loop.
+
+Note also the context: the AppCell daemon was created with
+`FUN_00151c80(0x164f40, 0x164f80, 0x165110, prio 4, 0, "AppCell deamon")` - its *step* is
+`FUN_00164f80`, the loader loop itself, and `FUN_00151ff0(4)` is what runs it. The `ff0(4)` traffic is
+the daemon being stepped.
+
+Next: find what sets the state of job `0x5C6490` (the poll `FUN_0027bff0` reads it) and why it is
+already "done" on the first poll.

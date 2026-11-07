@@ -2576,6 +2576,40 @@ namespace
 
     PS2Runtime::RecompiledFunction gTaskFindPrev = nullptr;
     PS2Runtime::RecompiledFunction gLoaderPollPrev = nullptr;
+    PS2Runtime::RecompiledFunction gLoopRunPrev = nullptr;
+    PS2Runtime::RecompiledFunction gLoopE3b0Prev = nullptr;
+    PS2Runtime::RecompiledFunction gLoopD230Prev = nullptr;
+
+    void loopRunProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t prio = GPR_U32(ctx, 4);
+        if (gLoopRunPrev != nullptr)
+            gLoopRunPrev(rdram, ctx, runtime);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 300u)
+            std::fprintf(stderr, "[loop] ff0(%u)\n", prio);
+    }
+
+    void loopE3b0Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gLoopE3b0Prev != nullptr)
+            gLoopE3b0Prev(rdram, ctx, runtime);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 120u)
+            std::fprintf(stderr, "[loop] e3b0\n");
+    }
+
+    void loopD230Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gLoopD230Prev != nullptr)
+            gLoopD230Prev(rdram, ctx, runtime);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 120u)
+            std::fprintf(stderr, "[loop] d230\n");
+    }
     PS2Runtime::RecompiledFunction gReaderAvailPrev = nullptr;
     PS2Runtime::RecompiledFunction gReaderCmdPrev = nullptr;
     void loaderPollProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2988,6 +3022,9 @@ namespace
         } table[] = {
             {0x00152160u, &scriptTaskFindProbe, &gTaskFindPrev, "taskfind"},
             {0x00165420u, &loaderPollProbe, &gLoaderPollPrev, "poll"},
+            {0x00151FF0u, &loopRunProbe, &gLoopRunPrev, "loop-ff0"},
+            {0x0016E3B0u, &loopE3b0Probe, &gLoopE3b0Prev, "loop-e3b0"},
+            {0x0016D230u, &loopD230Probe, &gLoopD230Prev, "loop-d230"},
             {0x001F88F0u, &scriptReaderAvailProbe, &gReaderAvailPrev, "reader-avail"},
             {0x001F8920u, &scriptReaderCmdProbe, &gReaderCmdPrev, "reader-cmd"},
             {0x001EE060u, &scriptEngineProbe, &gEnginePrev, "engine"},
