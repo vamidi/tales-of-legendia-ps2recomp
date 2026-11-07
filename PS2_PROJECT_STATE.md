@@ -2281,3 +2281,29 @@ Script index 16 of 48, loading screen up, ~1.5 guest fps, and the script engine 
 pointer every iteration. Next: find who releases the block at `0x4E9D70` while `0x3DB320` still points
 at it (the game's heap tags "FREE"/"RNDM" are at payload `+0x18`), and whether the release is the game's
 own teardown or a consequence of a guest-state difference upstream.
+
+### Addendum: the block is reused by the game's own allocator
+
+Hooking the allocator (`FUN_00101420` -> `FUN_001013b0` -> `FUN_00100700`) shows the engine block handed
+out a second time:
+
+```
+[heapalloc] size=0x1C  ret=0x004E9D70 ra=0x001EDCD4   <- engine object (FUN_001edc20)
+[heapalloc] size=0x14  ret=0x004E9D70 ra=0x00171070   <- FUN_00171020's sub-object, same block
+```
+
+and hooking the free thunk (`0x001013c0`, which is the table entry - hooking `0x001008d0` catches
+nothing because the thunk jumps to it directly) shows the only frees in that neighbourhood:
+
+```
+[heapfree] ptr=0x004E9BD0 ra=0x001666F8
+[heapfree] ptr=0x004E9C30 ra=0x00166700
+```
+
+So `0x4E9D70` is never freed, yet the allocator re-issues it. That is allocator free-list corruption
+(two frees made from `FUN_001664d0`, a data loader that allocates temp buffers with the same heap),
+not a game-side release. It is deterministic and unaffected by `TOL_NO_EE_CKPT`.
+
+Next: dump the heap (e.g. `0x4E9000..0x4EA800`) at the moment before and after `FUN_001664d0` runs and
+compare it against PCSX2 at the same guest moment (`abdiff.py mem`); a single wrong opcode in the
+allocator would corrupt the free list exactly this way.

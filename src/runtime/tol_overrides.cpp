@@ -2540,6 +2540,33 @@ namespace
 
     PS2Runtime::RecompiledFunction gTaskFindPrev = nullptr;
     PS2Runtime::RecompiledFunction gEnginePrev = nullptr;
+    PS2Runtime::RecompiledFunction gFreePrev = nullptr;
+    PS2Runtime::RecompiledFunction gAllocPrev = nullptr;
+
+    void heapAllocProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t size = GPR_U32(ctx, 4);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (gAllocPrev != nullptr)
+            gAllocPrev(rdram, ctx, runtime);
+        const uint32_t ret = GPR_U32(ctx, 2);
+        if (ret >= 0x004E9D00u && ret <= 0x004EA400u)
+            std::fprintf(stderr, "[heapalloc] size=0x%X ret=0x%08X ra=0x%08X\n", size, ret, ra);
+    }
+
+    // The engine object at 0x4E9D70 is released while the global at 0x3DB320 still points at it.
+    // FUN_001008d0 is the underlying free; logging frees whose argument lands in its neighbourhood
+    // names the caller that releases it.
+    void heapFreeProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t arg = GPR_U32(ctx, 4);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (arg >= 0x004E9000u && arg <= 0x004EA800u)
+            std::fprintf(stderr, "[heapfree] ptr=0x%08X ra=0x%08X caller's ra=0x%08X\n", arg, ra,
+                         runtime->eeScheduler().currentThreadId());
+        if (gFreePrev != nullptr)
+            gFreePrev(rdram, ctx, runtime);
+    }
     PS2Runtime::RecompiledFunction gEngineObjPrev = nullptr;
 
     // FUN_001ED0C0 returns the engine object; FUN_001EE060 calls vtable slot 0x1C on it to step the
@@ -2683,6 +2710,8 @@ namespace
             {0x00152160u, &scriptTaskFindProbe, &gTaskFindPrev, "taskfind"},
             {0x001EE060u, &scriptEngineProbe, &gEnginePrev, "engine"},
             {0x001ED0C0u, &scriptEngineObjProbe, &gEngineObjPrev, "engineobj"},
+            {0x001013C0u, &heapFreeProbe, &gFreePrev, "heapfree"},
+            {0x00101420u, &heapAllocProbe, &gAllocPrev, "heapalloc"},
             {0x001ECBE0u, &scriptDispatchProbe, &gDispatchPrev, "dispatch"},
             {0x001EDF80u, &scriptSlotLoopProbe, &gSlotLoopPrev, "slot-loop"},
             {0x00164F80u, &scriptLoaderEntryProbe, &gLoaderEntryPrev, "loader-entry"},
