@@ -2631,11 +2631,44 @@ namespace
             gEnginePrev(rdram, ctx, runtime);
         static uint32_t sCalls = 0u;
         ++sCalls;
+        if (const char *dumpPath = std::getenv("TOL_DUMP_ENGINE"))
+        {
+            static bool sDumped = false;
+            if (!sDumped && sCalls >= 1u)
+            {
+                sDumped = true;
+                if (std::FILE *fp = std::fopen(dumpPath, "wb"))
+                {
+                    for (uint32_t i = 0u; i < 0x300u; ++i)
+                    {
+                        const uint8_t byte = runtime->Load8(rdram, ctx, 0x004E9D40u + i);
+                        std::fwrite(&byte, 1u, 1u, fp);
+                    }
+                    std::fclose(fp);
+                    std::fprintf(stderr, "[engine] dumped 0x4E9D40..0x4EA040 -> %s\n", dumpPath);
+                }
+            }
+        }
         if (sCalls <= 6u || (sCalls % 200u) == 0u)
         {
             const uint32_t g334 = runtime->Load32(rdram, ctx, 0x003DB334u);
             const uint32_t g328 = runtime->Load32(rdram, ctx, 0x003DB328u);
-            std::fprintf(stderr, "[engine] #%u g334=0x%08X g328=0x%08X\n", sCalls, g334, g328);
+            const uint32_t sub = runtime->Load32(rdram, ctx, 0x003DB320u);
+            uint32_t sub08 = 0u, sub0c = 0u, sub10 = 0u;
+            uint8_t sub14 = 0u;
+            if (sub >= 0x00100000u && sub < 0x02000000u)
+            {
+                const uint32_t renderer = runtime->Load32(rdram, ctx, sub + 0x0Cu);
+                if (renderer >= 0x00100000u && renderer < 0x02000000u)
+                {
+                    sub08 = runtime->Load32(rdram, ctx, renderer + 0x08u);
+                    sub0c = runtime->Load32(rdram, ctx, renderer + 0x0Cu);
+                    sub10 = runtime->Load32(rdram, ctx, renderer + 0x10u);
+                    sub14 = runtime->Load8(rdram, ctx, renderer + 0x14u);
+                }
+            }
+            std::fprintf(stderr, "[engine] #%u g334=0x%08X g328=0x%08X renderer +8=%08X +C=%08X +10=%08X +14=%u\n",
+                         sCalls, g334, g328, sub08, sub0c, sub10, static_cast<unsigned>(sub14));
         }
     }
 

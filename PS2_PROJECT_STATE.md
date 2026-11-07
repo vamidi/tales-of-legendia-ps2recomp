@@ -2420,3 +2420,37 @@ next iteration steps vtable slot 0x1C of whatever now occupies `0x4E9D70` (NULL)
 
 Next question is now narrow and concrete: what does the first sub-object (`0x4E9DB0`, stored at
 engine+0x0C) do that destroys its owner, and is the engine supposed to be on that object's list at all.
+
+## Session 98 - single-snapshot heap diff against PCSX2 (cheap path)
+
+One 768-byte read of PCSX2 at `0x4E9D40` (running, no parallel calls) against the port's dump of the same
+range taken at the first `FUN_001EE060` call (`TOL_DUMP_ENGINE=<path>`).
+
+**Confirmed differences:**
+
+| address | port | PCSX2 | meaning |
+|---|---|---|---|
+| `0x4E9D50` | `46 52 45 45` "FREE" | `52 4E 44 4D` "RNDM" | engine block freed by us, alive there |
+| `0x4E9D64` | `00…`/`70 A5 5A 00` | `FF…`/`FF…` | free-list links written on our side only |
+| `0x4E9DC4` | `01` | `00` | renderer step guard (`FUN_00230a50` gate) |
+| `0x4E9DBC` | `0x4EA090` | `0x53DE20` | renderer buffer[1] pointer |
+| `0x4E9DC0` | `0x53DE20` | `0x4EA070` | renderer buffer[2] pointer - **swapped, and one address differs** |
+| `0x4E9DE8/EC/F1` | `00 00 00` | `80 02 02` | renderer fields past the 4 sub-allocations |
+| `0x4E9EF6…` | `0x447A0000`, `0xBF800000` | `0` | renderer constants only we have |
+| `0x4E9F00…` | `0` | `0x43A50000`, `0x3F23D70A` | renderer constants only PCSX2 has |
+
+**Reading it honestly:** the guard difference alone is not conclusive. PCSX2's renderer object has
+`+0x08 = 2`, both buffer pointers set and the fields past `+0x34` populated, but `+0x14 = 0` - that is
+exactly the state of `FUN_00230810` *part way through its body* (it sets `+0x14 = 1` only after the
+`0x18000` allocation). So PCSX2 was sampled mid-constructor and would very likely set the guard to 1 as
+well. The two buffer pointers being swapped and pointing at different addresses
+(`0x4EA090` vs `0x4EA070`) means the **heap layout already differed before the engine step**, i.e. the
+divergence is upstream of the delete, not in the guard.
+
+So the next target is the earliest allocation-order divergence in boot, not the renderer step.
+
+### State
+
+PCSX2 was paused once and resumed; the user's state is in slot 0. The MCP wedges when two reads are
+issued in parallel - use one read per call from now on. Port unchanged functionally; `TOL_DUMP_ENGINE`
+added for the snapshot.
