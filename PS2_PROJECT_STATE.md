@@ -2922,3 +2922,110 @@ mC=0x00204690`, verified by probe), and the resume proxy `FUN_00152200` does run
 Next probe: read the *resumed block's* `+0x1B4` inside `FUN_00152200` (its block pointer is `$t0` at
 `0x152310`, so a mid-function probe there, not a function-entry probe) to see which address the resume
 actually jumps to for the job block.
+
+## Session 114 - NEW SESSION BASELINE (start here)
+
+**Goal:** get the port past the loading screen to the logos and the title.
+
+**Where it stops today:** the AppCell loader (`FUN_00164f80`) never enters its per-frame loop, because the
+job thread it creates is already finished when the loader polls it. Everything downstream (rendering,
+script, audio) is idle as a consequence, not as a cause.
+
+### The scheduler, as decompiled (this is the model everything below uses)
+
+| address | role |
+|---|---|
+| `FUN_001518c0` | **thread create** - fills a 64-slot block (`0x407160 + i*0x210`), state `+0x1F0` = 1, priority `+0x1F1`, entry `+0x1B0`, step `+0x1B4`, exit `+0x1B8` |
+| `FUN_00151cf0` | **finish** - calls `+0x1B8`, sets state 3, demotes priority to 10 |
+| `FUN_00151e90` | **pump** - runs state-1 tasks of one priority, clears state-3 tasks to 0 at `0x151F18` |
+| `FUN_00152200` | **resume** - restores registers and jumps to `block+0x1B4` (the saved coroutine PC) |
+| `FUN_001517c0` / `FUN_00151780` | block list iteration / tail-append insert |
+| `FUN_001521c0` | `return block && block->state == 1` - the loader poll primitive |
+
+Task triplet for the loader's job: entry `0x165210` -> vtable+8, step `0x165220` -> vtable+0x0C,
+exit `0x165250` -> vtable+0x10/+0x14. Job object vtable `0x3D4770`:
+`+0x08 = FUN_00204630` (trivial config), `+0x0C = FUN_00204690` (**the real game job**, loops
+`while (poll(child)) yield()`), `+0x2C = FUN_002055b0` (app main loop).
+
+### The divergence (verified, not inferred)
+
+PCSX2, read directly while paused (no state disturbed):
+
+```
+0x3DB1F4 queue count = 0          -> fallback job, same as the port
+0x497050 job record  = 0x0016C700 -> LAB_0016C700
+0x407770 slot 2      = 01 04 00 01 -> state 1, priority 4, +0x1F3 = 1
+0x407740 slot 2+0x1C0 = 0x0063D850 -> job object pointer
+0x407730 slot 2+0x1B0 = 0x00165210, 0x002047D0, 0x00165250
+```
+
+So on hardware the job thread is **alive in state 1**, parked at resume PC `0x002047D0` inside
+`FUN_00204690`. That is what makes `FUN_00165420` (poll) return 1 and the loader frame loop run.
+
+In the port: the same thread is created (`[create] entry=0x00165210 prio=4 -> 0x00407580`), its trivial
+entry body runs (`[jobcfg]`), and then it is finished - `[jobstep]` (`FUN_00204690`) and `[thunk]`
+(`FUN_00165400`, the vtable+0x0C dispatcher) **never run at all**. Slot 2 cycles `0->1->3->0` 486 times
+in 60 s; the poll returns 0 on every one of 400+ iterations, so the loader's frame loop is skipped every
+time.
+
+The vtable is correct at the decisive instant (`vt=0x003D4770, m8=0x00204630, mC=0x00204690`) and the
+resume proxy `FUN_00152200` does execute - but `0x165400` is never reached, so the step is never entered.
+
+### Next step (single probe, not yet run)
+
+Read the **resumed block's** `+0x1B4` inside `FUN_00152200`. The block pointer is in `$t0` at
+`0x152310` (`lw $t1, 0x1B4($t0)`), so this must be a **mid-function** probe at `0x152310`, not a
+function-entry probe - entry probes at `FUN_00152200` sample a stale block (slot 2 shows `+0x1B0 = 0`
+while other priorities are being resumed) and give the wrong answer.
+
+That tells us which address the job's resume actually jumps to, and therefore why `0x165400` /
+`FUN_00204690` are never entered.
+
+### Ruled out (do not re-run these)
+
+| hypothesis | measured result |
+|---|---|
+| loader waits on slot 2 / slot 3 | no - single poll returns 0; the busy flags belong to other call paths |
+| priorities 7 / 8 / 9 missing | never exist in this game (only 0, 4, 10) - the `ff0(7/9/8)` calls are vacuous by design |
+| job queue `0x497010` unfilled | correctly empty; PCSX2 uses the same fallback `0x16C700` |
+| engine object delete | not the gate; PCSX2 never frees `0x4E9D50` either |
+| audio / MIX / SPU2 | healthy; the STATX `0x80` polling is IOP AutoDMA |
+| VU1 | never called in this phase |
+| script bank truncation | 48/48 chunks intact |
+| dispatch overhead | fixed - per-call `getenv` hoisted (1535-1569 dispatches/s, 0.62 ms mean) |
+
+### Build / run
+
+```
+cmd /c '"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1 && ninja -C build/tol2 -j 12 tol'
+build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
+```
+
+Note: touching `ps2xRuntime/include/ps2_runtime.h` rebuilds all ~13.5k generated TUs; touching
+`src/runtime/tol_overrides.cpp` rebuilds in seconds.
+
+### Instrumentation already in the tree
+
+`TOL_TRACE_SCRIPT=1` installs the probe table in `installScriptThreadProbes` and enables:
+
+`[tasks]` 64-slot task table on change · `[slot2]` writes to `0x407770` · `[ptr]` writes to `0x407740`
+(job pointer, set `0x152064` / cleared `0x151B78`) · `[poll]` loader poll · `[run]` `FUN_00151cf0` for
+slot 2 · `[create]` `FUN_001518c0` · `[jobcfg]`/`[jobstep]` `0x204630`/`0x204690` · `[thunk]`
+`0x165400` · `[resume]` `FUN_00152200` · `[loop]` `FUN_00151ff0` with caller · `[engine]` `FUN_001ee060`
+· `[script]` reader advances/status.
+
+`TOL_WATCH_SLOT2=1` enables the two write-watches in `ps2TraceGuestWrite`.
+
+`TOL_NO_EE_CKPT=1` disables checkpoint bails (they lose callee-saved registers in deep chains);
+`TOL_REFUSE_ENGINE_FREE=1`, `TOL_NO_STREAM_RELEASE=1` exist but the first is not the gate and the second is
+a documented workaround that is on by default.
+
+### External reference
+
+`vs-sr-dev/ps2-talesoflegendia-doc` documents the **JP build (SLPS_255.33)** and covers disc/volume, AFS +
+CPS containers, the block codec, media budget and `CDVD.000` - **nothing on the runtime scheduler**, so it
+does not shortcut this work. Two facts worth keeping: the ELF has a single flat `PT_LOAD` with **no
+overlay map** ("whatever this game loads at runtime, it does not describe in its ELF"), and `CDVD.000`
+carries Metrowerks-compiled code plus a `TLPKv1+50` tag. Its `tools/prefix_scan.py` is a cross-binary
+routine fingerprint (longest identical byte run at any alignment, with a control) - the right instrument
+for transferring a routine identified in the JP docs into our US ELF, not for debugging behaviour.
