@@ -3685,6 +3685,69 @@ namespace tol
         runtime.replaceFunction(0x001F8528u, &worker2BackEdge);
     }
 
+    // ---- Interior entry points whose emitted row has no switch case ---------------------------------
+    // Ghidra merges small adjacent routines into one map row, but their addresses keep their own table
+    // slots and are reachable (usually through a vtable). The emitted prologue switch only contains the
+    // row's internal branch/call targets, so dispatching at such an interior address falls through to the
+    // default and *restarts the row at its start* - running code that belongs to a different function.
+    //
+    // The row 0x231E54..0x231EB0 is the sharpest example: 0x231E54 is the deleting tail of the 0x231E20
+    // base destructor (`if (deleting) free(this);`), while 0x231E80 / 0x231E90 / 0x231EA0 are three empty
+    // destructors (`jr $ra`) that each have their own vtable slot. Entering one of those restarted the row
+    // at 0x231E54 and freed whatever $s0 happened to hold - which is how the script-engine object at
+    // 0x4E9D70 was freed while the engine global still pointed at it (sessions 95-100). The slot's own
+    // instruction is `jr $ra`, so executing exactly that is the faithful behaviour.
+    void returnToRa(uint8_t * /*rdram*/, R5900Context *ctx, PS2Runtime * /*runtime*/)
+    {
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    // ---- Thread step-entry codegen gap (0x165220) -----------------------------------------------
+    // The game's microkernel dispatches a thread at TCB+0x1B4. For the loader's job thread that pointer is
+    // 0x165220, the `step` fragment of entry_00165210 (row 0x165210..0x165250). The dense function table
+    // maps every 4-byte slot of the row to entry_00165210, but the emitted prologue switch only contains
+    // cases for the row's call continuations (0x165230 / 0x165238). Dispatching at 0x165220 therefore falls
+    // through to the default, which starts the body at 0x165210 - the *entry* tail:
+    //
+    //     0x165210  a0 = *a0 ; j 0x1653F0     -> vtable+0x08  (config)
+    //     0x165220  sp -= 0x10 ; sd ra ; jal 0x165400 (a0 = *a0) -> vtable+0x0C (the real step)
+    //
+    // so the job only ever gets configured, never stepped: [jobcfg] runs, [jobstep]/[thunk] never do, the
+    // loader's poll sees the job idle, and its per-frame loop is skipped (sessions 109-114).
+    //
+    // Re-express the three instructions of the step prologue natively. 0x165400 (the vtable+0x0C thunk) and
+    // the continuation 0x165230 both have table slots and switch cases, so the guest body still runs.
+    void taskStepEntryFix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool trace = std::getenv("TOL_TRACE_TASKSTEP") != nullptr;
+        static uint32_t sCalls = 0u;
+        const uint32_t param = GPR_U32(ctx, 4);
+        const uint32_t obj =
+            (param >= 0x00100000u && param < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, param) : 0u;
+
+        // 0x165220 addiu sp,sp,-0x10 ; 0x165224 sd $ra,0($sp)
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x10u;
+        SET_GPR_U32(ctx, 29, sp);
+        WRITE64(sp, GPR_U64(ctx, 31));
+        // 0x165228 jal 0x165400 with the delay slot's `a0 = *a0` applied first.
+        SET_GPR_U32(ctx, 4, obj);
+        SET_GPR_U32(ctx, 31, 0x00165230u);
+
+        if (trace)
+        {
+            ++sCalls;
+            if (sCalls <= 8u)
+                std::fprintf(stderr, "[taskstep] #%u param=0x%08X obj=0x%08X ra=0x%08X sp=0x%08X\n",
+                             sCalls, param, obj, GPR_U32(ctx, 31), sp);
+        }
+
+        ctx->pc = 0x00165400u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00165400u, 0x00165220u, 0x00165230u,
+                                          PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+        ctx->pc = 0x00165230u;
+    }
+
     // The GS/transfer workers (0x1F8150, 0x1F84B0) are **green threads of the game's own microkernel**
     // (0x1517E0/0x1518C0/0x151CD0, TCBs at 0x407160, contexts at 0x48F590). That microkernel is alive in this
     // port: 0x152200 restores a thread's sp/registers and jumps to its saved pc, 0x15231C saves the current
@@ -4952,6 +5015,20 @@ namespace tol
                                     WRITE32(gp - 0x7b44u, GPR_U32(ctx, 4));
                                     ctx->pc = GPR_U32(ctx, 31);
                                 });
+
+        // Function-table interior gap: 0x165220 is the loader job thread's step entry (TCB+0x1B4). The row
+        // entry_00165210 has a table slot for every 4 bytes but switch cases only for its call continuations,
+        // so dispatching at 0x165220 ran the row's entry tail (vtable+0x08) instead of the step (vtable+0x0C).
+        // See taskStepEntryFix for the full reasoning.
+        if (runtime.lookupFunction(0x00165220u) != nullptr)
+            runtime.replaceFunction(0x00165220u, &taskStepEntryFix);
+
+        // Interior entry points of merged rows that are empty destructors (see returnToRa).
+        for (uint32_t pc : {0x00231E80u, 0x00231E90u, 0x00231EA0u})
+        {
+            if (runtime.lookupFunction(pc) != nullptr)
+                runtime.replaceFunction(pc, &returnToRa);
+        }
 
         // 0x1F8150 is the GS/VU1 worker loop:
         //     do { FUN_001f8000(); FUN_0015231c(); } while (true);

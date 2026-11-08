@@ -3029,3 +3029,100 @@ overlay map** ("whatever this game loads at runtime, it does not describe in its
 carries Metrowerks-compiled code plus a `TLPKv1+50` tag. Its `tools/prefix_scan.py` is a cross-binary
 routine fingerprint (longest identical byte run at any alignment, with a control) - the right instrument
 for transferring a routine identified in the JP docs into our US ELF, not for debugging behaviour.
+
+## Session 115 (2026-11-08/09) - the loader frame loop and the engine object: two codegen gaps fixed
+
+### 1. Loader job never stepped (0x165220)
+
+Session 114's probe question was answered with the existing `TOL_TRACE_GTHREADS` probe: after the job thread is created its
+TCB `+0x1B4` (resume pc) is **0x165220**, and it stays there for the whole run (`turn #33/#40/#600/#2000/...`).
+`0x165220` is the `step` fragment of map row `entry_00165210` (0x165210..0x165250). The function table maps every 4-byte
+slot of that row to `entry_00165210`, but the **emitted prologue switch only has cases for the row's call continuations
+(0x165230 / 0x165238)**. A dispatch at 0x165220 therefore hit `default`, restarted the body at 0x165210 - the row's
+*entry* tail - and called vtable+0x08 (config) instead of vtable+0x0C (step). Measured before the fix:
+`[jobcfg]` ran, `[jobstep]`/`[thunk]` never, `[poll] ... busy=0` forever, so `FUN_00164f80`'s per-frame loop was skipped.
+
+Fix: `taskStepEntryFix` in `src/runtime/tol_overrides.cpp`, installed on slot 0x165220. It re-expresses the three
+prologue instructions natively (`sp -= 0x10; sd ra; a0 = *a0`) and dispatches 0x165400 (vtable+0x0C thunk), then
+continues at 0x165230 (which has a case).
+
+Verified: `[taskstep] #1 param=0x00407740 obj=0x005C6490`, `[thunk] #1`, `[jobstep] enter #1 pc=0x00204690`,
+`[poll] #1 job=... busy=1`. The loader's frame loop now runs (`[loop] ff0(0/1/4)` + `[engine]` repeatedly).
+
+### 2. The engine object was freed by an interior entry point (0x231E80/90/A0)
+
+The Session 95-100 "the engine block at 0x4E9D70 is freed by its own sub-step" mystery is solved. The map row
+`entry_00231e54` (0x231E54..0x231EB0) is a **merge of several tiny routines**:
+
+```
+0x231E54  delete tail of the 0x231E20 base destructor: if (deleting) free($s0)
+0x231E80  jr $ra        <- empty destructor, own vtable slot
+0x231E90  jr $ra        <- empty destructor, own vtable slot
+0x231EA0  jr $ra        <- empty destructor, own vtable slot (obj 0x5AA140)
+0x231EB0  FUN_00231eb0  set vtable 0x3D4B20; return this
+```
+
+The emitted switch only has `case 0x231e6c`; dispatching at 0x231E80/0x231E90/0x231EA0 hit `default` and restarted the
+row at **0x231E54**, i.e. ran the *deleting* tail with whatever `$s0` the caller had - which was the engine object.
+`[dtorrange]` traces before the fix: `target=0x231E80 a0=0x5AA140` then `src=0x231E64 ... a0=0x004E9D70 free`.
+This is why the block's magic went `RNDM -> FREE` while `0x3DB320` still pointed at it, and why a fresh 0x14-byte
+allocation reused it (Session 95-98). PCSX2 never frees it (Session 99 watchpoint) because on hardware those slots
+execute `jr $ra`, not a delete.
+
+Fix: `returnToRa` in `src/runtime/tol_overrides.cpp`, installed on slots 0x231E80 / 0x231E90 / 0x231EA0.
+
+Verified (`TOL_WATCH_TASK=1`): `heapfree2 = 0`, magic stays `4D444E52` (RNDM), engine word stays `003D4B20`, and the
+engine now reports real substeps:
+
+```
+[engine] substep0 obj=0x004E9DB0 vt=0x003D4AC0 step1C=0x00230A50   (renderer)
+[engine] substep1 obj=0x005AA140 vt=0x003D4B00 step1C=0x00231EA0
+[engine] substep2 obj=0x005AA170 vt=0x003D50D0 step1C=0x002853D0   (media/stream)
+[engine] g334=0x004E9C50 renderer +8=00000002 +C=0x004EA090 +10=0x0053DE20 +14=1
+```
+
+That renderer state matches PCSX2's (Session 98): guard 1, both buffer pointers set - it used to be all zero.
+
+### 3. What the guest does now
+
+Past the 16-chunk MIX bank the boot streams real data instead of 2 KB extent reads:
+
+```
+[fileio] gamefile read sector 0x200002 544768 bytes
+[fileio] gamefile read sector 0x40001F 522240 bytes
+[fileio] gamefile read sector 0x40015E 389120 bytes
+[fileio] gamefile read sector 0x604C37 262144 bytes
+```
+
+75 reads over 200 s, frames presented at ~50/s, `[spin]` keeps moving (no sticky pc). The screen is still black after the
+early `NOW LOADING` frame (`frame_000012` nonblack 0.587%, every later frame max=0).
+
+### 4. New blocker
+
+After the last read (`slots 5 +19511`, 256 KB) no further `gamefile read` is issued, while the spin sampler ends in the
+ADXF/CRI path (`0x1A9A28`, `0x1AD320`, `0x1B1910`). Next: the ADXF guard/pump counters for this phase
+(`TOL_TRACE_DVCI`) and whether the loader is waiting on the job chain (`0x5C6490 -> 0x5C64D0 -> 0x63D850 -> 0x63D890 ...`).
+
+### 5. Root cause of both fixes (worth fixing in the recompiler)
+
+Both defects are the same codegen gap: **a map row can be entered at an interior address that has no switch case**, and
+the emitted default restarts the row at its start. `Option A` in `ps2_recompiler.cpp` (register every decoded instruction)
+is supposed to make the switch dense, but this corpus (generated 2026-11-02 18:18) is not dense for these rows
+(`FUN_00204690`: 156 cases over ~13k instructions). The general fix is to regenerate with a recompiler build that really
+emits Option A, which also makes the 0x165220 and 0x231E80/90/A0 overrides unnecessary. Until then the three tiny
+overrides are the faithful per-slot behaviour.
+
+### Probes added
+
+| probe | where | what |
+|---|---|---|
+| `[dtorrange]` / `[dtorrange2]` | `ps2_runtime.cpp` `dispatchGuestBranch` | every transfer in/out of 0x231E00..0x231EC0 (the 2nd is after the callee) |
+| `[dtorrrun]` / `[dtorsched]` | `EeScheduler.cpp` | scheduler-side dispatch into that range (proves the fiber-resume path) |
+| `TOL_TRACE_TASKSTEP` | `tol_overrides.cpp` | logs the 0x165220 step fix |
+
+### Build / run (unchanged)
+
+```
+cmd /c '"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1 && ninja -C build/tol2 -j 12 tol'
+build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
+```
