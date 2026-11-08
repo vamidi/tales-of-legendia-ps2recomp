@@ -3126,3 +3126,24 @@ overrides are the faithful per-slot behaviour.
 cmd /c '"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1 && ninja -C build/tol2 -j 12 tol'
 build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
 ```
+
+### 6. New blocker, measured (session 115 close)
+
+`TOL_TRACE_DVCI=1` for 60 s after the fixes:
+
+```
+[adxf-pump]  #2500 guard=0 blocked=0          <- the guard is NOT wedged (session 93 has not come back)
+[adxf-stall] step #29407 unchanged x28000 | state=1 busy=0 45=0 48=0 49=0 buf=0x0 done=0 blocks=0
+             win=1048575 dev=0 devBase=0x0    <- the ADXF stream is idle: no client read request
+```
+
+So the pump runs freely; the *consumer* has stopped asking (stream[0x45] = 0, the only setter is `FUN_0019F710`
+ADXF_Read). The last data request was `slots 5 +19511`, 262144 bytes into 0x0067D200. `TOL_TRACE_GSHIST` installs and
+unpauses but never reports, because the frame-tail address it samples (`0x00139A20`) is never reached - the guest is
+still inside the loader's per-frame loop (`FUN_00164F80`), not the game's main render loop (`FUN_00165AD0`).
+
+Next probes (not yet run): the job chain at that moment (`[create]`/`[jobstep]`/`[thunk]`/`[poll]` with
+`TOL_TRACE_SCRIPT=1`, raising their print caps), and which job step should call `FUN_00197550`/`FUN_0019F710` next.
+
+Display measurement after all fixes (unchanged): `DISPFB2 = 0x1000` (FBP 0), `ctxFbp=[224,0]`, every presentation is
+512x448 from FBP 0 -> black. The early `NOW LOADING` frame (frame_000012, 0.587% non-black) is the only picture so far.
