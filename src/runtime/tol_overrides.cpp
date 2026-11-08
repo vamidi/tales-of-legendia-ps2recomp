@@ -2584,12 +2584,28 @@ namespace
     {
         const uint32_t prio = GPR_U32(ctx, 4);
         const uint32_t ra = GPR_U32(ctx, 31);
+        if (prio == 4u)
+            std::fprintf(stderr, "[prio4] enter\n");
         if (gLoopRunPrev != nullptr)
             gLoopRunPrev(rdram, ctx, runtime);
         static uint32_t sCalls = 0u;
         ++sCalls;
         if (sCalls <= 300u)
             std::fprintf(stderr, "[loop] ff0(%u) ra=0x%08X\n", prio, ra);
+        if (prio == 4u)
+        {
+            // The AppCell loader daemon is slot 3. If it is ready but never runs, its state/resume pc says why.
+            static uint32_t sPrio4 = 0u;
+            ++sPrio4;
+            const uint32_t tcb = 0x00407790u;
+            std::fprintf(stderr,
+                         "[prio4] #%u slot3 state=%u prio=%u started=%u yield=0x%08X resume=0x%08X entry=0x%08X ra=0x%08X\n",
+                         sPrio4, static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1F0u)),
+                         static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1F1u)),
+                         static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1F3u)),
+                         runtime->Load32(rdram, ctx, tcb + 0x1ACu), runtime->Load32(rdram, ctx, tcb + 0x1B4u),
+                         runtime->Load32(rdram, ctx, tcb + 0x1B0u), ra);
+        }
     }
 
     void loopE3b0Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2784,14 +2800,16 @@ namespace
         if (gLoaderPollPrev != nullptr)
             gLoaderPollPrev(rdram, ctx, runtime);
         const uint32_t ret = GPR_U32(ctx, 2);
+        const uint32_t callerRa = GPR_U32(ctx, 31);
         static uint32_t sCalls = 0u;
-        static uint32_t sLastJob = 0xFFFFFFFFu, sLastRet = 0xFFFFFFFFu;
+        static uint32_t sLastJob = 0xFFFFFFFFu, sLastRet = 0xFFFFFFFFu, sLastRa = 0xFFFFFFFFu;
         ++sCalls;
-        if (job != sLastJob || ret != sLastRet)
+        if (job != sLastJob || ret != sLastRet || callerRa != sLastRa || sCalls <= 50u)
         {
             sLastJob = job;
             sLastRet = ret;
-            std::fprintf(stderr, "[poll] #%u job=0x%08X busy=%u\n", sCalls, job, ret);
+            sLastRa = callerRa;
+            std::fprintf(stderr, "[poll] #%u job=0x%08X busy=%u ra=0x%08X\n", sCalls, job, ret, callerRa);
             if (job >= 0x00100000u && job < 0x02000000u)
             {
                 std::fprintf(stderr, "[poll]   job words: %08X %08X %08X %08X %08X %08X (key=0x%08X)\n",
@@ -2824,8 +2842,8 @@ namespace
         else if ((sCalls % 200u) == 0u)
         {
             const uint32_t slot2 = 0x00407160u + 2u * 0x210u;
-            std::fprintf(stderr, "[poll] #%u repeat job=0x%08X busy=%u slot2active=%u\n", sCalls, job, ret,
-                         static_cast<unsigned>(runtime->Load8(rdram, ctx, slot2 + 0x1F0u)));
+            std::fprintf(stderr, "[poll] #%u repeat job=0x%08X busy=%u ra=0x%08X slot2active=%u\n", sCalls, job, ret,
+                         callerRa, static_cast<unsigned>(runtime->Load8(rdram, ctx, slot2 + 0x1F0u)));
         }
     }
 
@@ -3209,6 +3227,60 @@ namespace
             std::fprintf(stderr, "[script] loader-start #%u tid=%d\n", sCalls, tid);
     }
 
+    // The AppCell loader row entry_00164f8c is dispatched at several interior switch cases when the microkernel
+    // resumes it after a yield. Wrap the four decision points so "where did the daemon resume" is measured
+    // instead of inferred: row start, after the task call, the poll, and the no-task path.
+    struct LoaderSpot
+    {
+        uint32_t pc = 0u;
+        PS2Runtime::RecompiledFunction prev = nullptr;
+        const char *name = "";
+        uint32_t hits = 0u;
+    };
+    LoaderSpot gLoaderSpots[] = {
+        {0x00164F8Cu, nullptr, "row-start"},
+        {0x00164FA4u, nullptr, "after-task"},
+        {0x00164FCCu, nullptr, "poll"},
+        {0x001650A8u, nullptr, "no-task"},
+    };
+
+    void loaderSpotProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        for (auto &spot : gLoaderSpots)
+        {
+            if (spot.pc != ctx->pc)
+                continue;
+            ++spot.hits;
+            if (spot.hits <= 12u || (spot.hits % 500u) == 0u)
+                std::fprintf(stderr, "[loaderspot] %s #%u tid=%d ra=0x%08X v0=0x%08X s0=0x%08X sp=0x%08X\n",
+                             spot.name, spot.hits, runtime->eeScheduler().currentThreadId(), GPR_U32(ctx, 31),
+                             GPR_U32(ctx, 2), GPR_U32(ctx, 16), GPR_U32(ctx, 29));
+            if (spot.prev != nullptr)
+                spot.prev(rdram, ctx, runtime);
+            return;
+        }
+        std::fprintf(stderr, "[loaderspot] unexpected pc=0x%08X\n", ctx->pc);
+    }
+
+    // FUN_0016AD0's per-frame body ends with FUN_001516B0 right after the priority pumps, so its call rate is
+    // the frame-loop rate. One line per 10 calls answers "is it looping slowly or not looping at all".
+    PS2Runtime::RecompiledFunction gFrameBodyPrev = nullptr;
+    void frameBodyProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        static std::chrono::steady_clock::time_point sStart = std::chrono::steady_clock::now();
+        ++sCalls;
+        if ((sCalls % 10u) == 1u)
+        {
+            const double dt =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - sStart).count();
+            std::fprintf(stderr, "[framebody] #%u t=%.1fs rate=%.2f/s ra=0x%08X\n", sCalls, dt,
+                         dt > 0.0 ? static_cast<double>(sCalls) / dt : 0.0, GPR_U32(ctx, 31));
+        }
+        if (gFrameBodyPrev != nullptr)
+            gFrameBodyPrev(rdram, ctx, runtime);
+    }
+
     void installScriptThreadProbes(PS2Runtime &runtime)
     {
         if (!scriptTraceEnabled())
@@ -3259,6 +3331,25 @@ namespace
             runtime.replaceFunction(entry.pc, entry.probe);
         }
         std::fprintf(stderr, "[script] thread probes installed (dispatch/slot-loop/loader)\n");
+
+        for (auto &spot : gLoaderSpots)
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(spot.pc);
+            if (fn == nullptr)
+            {
+                std::fprintf(stderr, "[script] loader spot 0x%08X (%s) not in function table\n", spot.pc, spot.name);
+                continue;
+            }
+            spot.prev = fn;
+            runtime.replaceFunction(spot.pc, &loaderSpotProbe);
+        }
+
+        PS2Runtime::RecompiledFunction frameBodyFn = runtime.lookupFunction(0x001516B0u);
+        if (frameBodyFn != nullptr)
+        {
+            gFrameBodyPrev = frameBodyFn;
+            runtime.replaceFunction(0x001516B0u, &frameBodyProbe);
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------

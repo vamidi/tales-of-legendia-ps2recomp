@@ -3147,3 +3147,89 @@ Next probes (not yet run): the job chain at that moment (`[create]`/`[jobstep]`/
 
 Display measurement after all fixes (unchanged): `DISPFB2 = 0x1000` (FBP 0), `ctxFbp=[224,0]`, every presentation is
 512x448 from FBP 0 -> black. The early `NOW LOADING` frame (frame_000012, 0.587% non-black) is the only picture so far.
+
+## Session 116 (2026-11-09) - frame loop measured; the AppCell daemon is starved and the run loop parks the main thread
+
+### 1. What runs now (measured)
+
+`TOL_TRACE_PC` on the startup chain: the main loop's first iteration completes its whole body -
+
+```
+enter 0x165AD0 (main)          -> 0x165C90 startup
+enter 0x165C90                 -> exits to memset (ordinary checkpoint bail)
+enter 0x165E70 (frame update)  -> 0x19BD20
+enter 0x166010 (GS/VIF wait)   -> 0x1F8150 (worker)
+enter 0x166120 (script)        -> 0x27AA08
+enter 0x1667E0                 -> returns v0=1
+enter 0x166870                 -> 0x1F8168
+enter 0x139D50 (render setup)  x10
+```
+
+and `TOL_TRACE_LOAD` shows the asset chain **completing**: submits #1..#6 (`size=1252176`, 530512, 71760, 90192,
+387344, 260368) all reach job state 2 (`[load] status ... state=2`). So the boot is past the asset chain.
+
+### 2. The AppCell loader daemon only runs once
+
+`[loaderspot]` (new probe on the loader row entry_00164f8c) shows:
+
+```
+[loaderspot] row-start #1 tid=1 ra=0x00151F88 ...     <- entered once
+(poll / after-task / no-task: 0 hits)
+```
+
+and `[prio4]` (new probe on FUN_00151FF0(4)) shows the pump is called **once** with slot 3 ready:
+
+```
+[prio4] enter
+[prio4] #1 slot3 state=1 prio=4 started=1 yield=0 resume=0x00164F80 entry=0x00164F40
+```
+
+The daemon creates the fallback job (`[create] entry=0x00165210 -> block=0x00407580`), binds it (`FUN_00152030`),
+yields at `0x164FC4`, and is never resumed. Reason: the frame loop's three pumps are at `0x165B90/98/A0`
+(prio 0, 1, 4) but the *whole iteration is consumed by the startup asset chain* (`FUN_001EC670`), whose pump loops call
+`ff0(0)`/`ff0(1)` only - measured `[loop] ff0(0) x14, ff0(1) x4, ff0(4) x1` with the `ff0(0/1)` calls coming from
+`0x166070/78` (FUN_00166010) and `0x1EC6D4/73C/7A4/80C/880` (FUN_001EC670), and only **one** call with
+`ra=0x165B98/BA0/BA8` (the main loop).
+
+So the daemon (which owns the loader task queue) is parked for the whole asset phase; the job chain it spawned runs once.
+
+### 3. The job chain and where it stops
+
+```
+[thunk] #1 a0=0x0063D850 -> step 0x00204690  (runs, exits to 0x151F88 = yield)
+[poll]  #1 job=0x0063D890 busy=1 ra=0x002046F0   (parent polls child, child ready)
+[thunk] #2 a0=0x0063D890
+[pc] enter 0x00366090 #1 a0=0x0063D890 ... exit pc=0x001C03DC
+```
+
+The child job's step is **0x00366090** (`FUN_00366090`, 572 B; present in the table), which calls `0x1C03DC` and then
+never returns to the loader. After that the EE is *alive but cycling*: `TOL_TRACE_EE_PC` at the end is dominated by
+`tid=1` in the microkernel run loop (`0x151F88`) and the CRI pump (`0x1A152C/0x1A36A0/0x1AD2C4/0x19ED1C/0x198270`),
+plus `tid=3/tid=4` (CRI workers at `0x198E0C/0x198EF8`). `TOL_TRACE_DVCI` shows the ADXF stream idle
+(`state=1 45=0 dev=0`) with the pump healthy (`guard=0 blocked=0`), and no further `gamefile read`.
+
+`FUN_001516B0` (called right after the prio-4 pump in the main loop, `0x165BB0`) is **never** called
+(new `[framebody]` probe, 0 hits), which says the main thread never gets back out of the pump/run-loop to the rest of
+the frame body.
+
+### 4. Conclusion / next
+
+Two coupled defects remain:
+
+1. **Daemon starvation**: the asset chain pumps only priorities 0/1, so the AppCell loader daemon (prio 4) cannot run
+   while it loads. Either the chain must pump 4 too (it is the loader's own task queue), or the daemon must be pumped
+   from the I/O wait (`FUN_0019A080`) as well.
+2. **Run-loop park**: the daemon's job chain parks the main thread inside the microkernel run loop (`0x151F88`) after
+   `thunk #2`; the child job's step `0x366090` runs (calls `0x1C03DC`) but the loader never resumes at its poll.
+
+Next probes: `TOL_TRACE_PC=0x1C03DC` and the callees under it to see where `FUN_00366090` parks; and whether pumping
+priority 4 from `FUN_0019A080` (guarded) lets the daemon's poll finally run.
+
+### Probes added this session (all `TOL_TRACE_SCRIPT`)
+
+| probe | what |
+|---|---|
+| `[loaderspot]` | loader row entry_00164f8c at row-start / after-task / poll / no-task |
+| `[prio4]` (enter + TCB dump) | every FUN_00151FF0(4) call with slot 3 state/prio/resume/entry |
+| `[framebody]` | FUN_001516B0 call rate (main-loop body completion) |
+| `[poll]` | now prints caller `$ra` and the first 50 calls (the old key suppressed identical results from another caller) |
