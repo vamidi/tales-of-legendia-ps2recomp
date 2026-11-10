@@ -3305,3 +3305,80 @@ AppCell loader, then the fix is to get the guest's own frame loop to its prio-4 
 | `[runq]` / `[runq2]` | `EeScheduler.cpp` + `tol_overrides.cpp` | full TCB table (state/prio/started/yield/resume/entry/links) + `ready[0..7]`, throttled 2 s, at dispatch and at every green-thread enter |
 | `[pumpbody]` | `tol_overrides.cpp` | `FUN_00151E90` entry/return with prio, elapsed us, and the pc it leaves |
 | `[prio4]` extras | `tol_overrides.cpp` | slot-3 links and ready counters on every `FUN_00151FF0(4)` |
+
+## Session 118 (2026-11-10) - the parked main thread: it is Dormant (no wait object), killed by bogus returns from merged rows
+
+### 1. Identification (TOL_TRACE_EE_THREADS / TOL_TRACE_PARK / new [retbad] [badpc])
+
+`TOL_TRACE_EE_THREADS=1` last dump, with no probe poking the guest:
+
+```
+[eethreads] cycle=... running=-1 threads=7 sema=14 evf=0
+  tid=  1 Dormant   wait=-    prio= 24/  0 pc=0x00000000 ra=0x00000000 sp=0x00423530 entry=0x00100008
+  tid=  2 Suspended prio=  8/119 pc=0x00198C60
+  tid=  3 Ready     prio= 16/119 pc=0x00198E14 entry=0x00198D50
+  tid=  4 Ready     prio= 18/119 pc=0x00198EF8 entry=0x00198E58
+  tid=  5 WaitSusp  wait=sleep entry=0x00198F38
+  tid=  6 Waiting   wait=sleep pc=0x00118D50 entry=0x00218908
+  (all 14 semaphores: waiters=0 ; no event flags)
+```
+
+So the main thread is **not blocked on anything**: no sema waiter, no event flag, no `Waiting` state. It is
+`Dormant` with `pc = 0` (later `1`). It was Running at `pc=0x001AD2D8` (CRI read step) a few seconds earlier.
+
+`[ee-park]` named the producing chain:
+
+```
+[ee-park] thread=1 ... returned-to-pc0 from=0x366168 ra=0x0 sp=0x423530 invocations=0
+  recent=0x366168, 0x20D370, 0x366138, 0x365568, 0x1C0878, 0x1C03DC, 0x366090, 0x165220, 0x151FC8, ...
+```
+
+i.e. the loader job step (`0x366090` -> caseD_0 `0x1C03DC` -> epilogue `0x1C0878` -> `0x365568` -> `0x366138` ->
+`0x20D370` -> `0x366168`) returned with `$ra == 0`, and `FUN_00151E90`'s scheduler branch does `makeDormant()`.
+
+### 2. Root cause: three more merged-row interior entries (map row entry_00205f68)
+
+The new `[retbad]` probe (in `dispatchGuestBranch`, logs any callee that leaves pc < 0x100000) named the culprit:
+
+```
+[retbad] callee=0x00205F80 from=0x00366178 kind=3 pc=0x00000000 ra=0x00000000 a0=0x0063E3D0
+```
+
+`0x205F80` is a **real one-instruction accessor** (`jr $ra ; lbu $v0,8($a0)`) but the map merged it into the
+**previous function's epilogue row** `entry_00205f68` (body starts `move v0,s1; ld ra,0x20(sp); ...; jr ra;
+addiu sp,+0x30`). Its table slot exists, the emitted switch has no case, so the dispatch restarted the row at
+`0x205F68`, ran the previous function's epilogue on the job's stack, loaded a garbage `$ra` and returned to 0.
+
+The same row swallowed three routines. All are now re-expressed natively in `tol_overrides.cpp`:
+
+| address | real code | fix |
+|---|---|---|
+| `0x205F80` | `jr $ra ; lbu $v0,8($a0)` | `readByteOffset8Fix` |
+| `0x205F90` | `lw $t9,($a0); lw $t9,0x1C($t9); jr $t9` (virtual thunk) | `vtableOffset1CThunkFix` |
+| `0x205FA0` | small release-child/clear-fields function (prologue + vtable+0x38 call + clear at 0x205FCC) | `objectResetFix`, converges on the existing `case 0x205fcc` |
+
+After these, the job-chain park is **gone** (`[retbad]` count 0) and the main thread gets further: it now runs the
+CRI/ADXF code (`recent` chain `0x1B1910 <- 0x1664A0 <- 0x199FD4 <- 0x199148 <- 0x198E0C`) before stopping.
+
+### 3. Next instance (different context)
+
+`[badpc] thread=1 pc=0x00000001 from=0x001B1910 ra=0x00000001 sp=0x01FFFF40` - the stop is now on the **async
+invocation stack** (sp = 0x01FFFF40, top of RDRAM), inside `FUN_001b18f0` (a 0x27-iteration loop). `0x1B1910` *is*
+in that function's switch, so this is not the same missing-case bug; a `jr $ra` returned `ra == 1` on an
+invocation context. That is the next thing to identify (an invocation's `$ra` should be the resume pc).
+
+### 4. Systemic conclusion
+
+Every one of the main-thread deaths so far is the same codegen gap: **a map row can be entered at an interior
+address with no switch case, and the default restarts the row at its start** (previous sessions: 0x165220,
+0x231E80/90/A0; this session: 0x205F80, 0x205F90, 0x205FA0). Targeted overrides advance the boot one entry at a
+time. The durable fix is to regenerate the corpus with the emitter really producing a case for every instruction in
+the row (Option A), which would retire all of these overrides.
+
+### Probes added
+
+| probe | where | what |
+|---|---|---|
+| `[retbad]` | `ps2_runtime.cpp` `dispatchGuestBranch` | names a callee that leaves pc < 0x100000 (0, 1, ...) |
+| `[badpc]` | `EeScheduler.cpp` run loop | same, for plain generated `jr $ra` that bypasses dispatch, with the dispatch ring |
+| `[jobepilogue]` / `[jobwraptail]` | `tol_overrides.cpp` | resume points of the job step epilogue and the step wrapper tail |

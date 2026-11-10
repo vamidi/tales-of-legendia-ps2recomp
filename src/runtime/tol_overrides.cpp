@@ -2487,6 +2487,95 @@ namespace
         runtime.replaceFunction(kGreenPumpPc, &greenPumpBodyProbe);
     }
 
+    // JOB-STEP RETURN ADDRESS (TOL_STALL_DUMP=1): the main EE thread parks because the job-step chain ends with
+    // `jr ra` and ra == 0. FUN_00366090 is that step; 0x366090 is its entry (dispatched through the step thunk)
+    // and 0x366168 is a resume target inside it. Log ra/sp at both so "was ra already 0 on entry, or lost in
+    // the frame?" is measured.
+    PS2Runtime::RecompiledFunction gJobStepEntryPrev = nullptr;
+    PS2Runtime::RecompiledFunction gJobStepResumePrev = nullptr;
+    PS2Runtime::RecompiledFunction gJobEpiloguePrev = nullptr;
+    PS2Runtime::RecompiledFunction gJobWrapperTailPrev = nullptr;
+    void jobStepEntryProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 12u)
+            std::fprintf(stderr, "[job366090] #%u ra=0x%08X sp=0x%08X s1=0x%08X s2=0x%08X\n", sCalls,
+                         GPR_U32(ctx, 31), GPR_U32(ctx, 29), GPR_U32(ctx, 17), GPR_U32(ctx, 18));
+        if (gJobStepEntryPrev != nullptr)
+            gJobStepEntryPrev(rdram, ctx, runtime);
+    }
+    void jobStepResumeProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 12u)
+            std::fprintf(stderr, "[job366168] #%u ra=0x%08X sp=0x%08X s1=0x%08X frameRa=0x%08X\n", sCalls,
+                         GPR_U32(ctx, 31), GPR_U32(ctx, 29), GPR_U32(ctx, 17),
+                         runtime->Load32(rdram, ctx, GPR_U32(ctx, 29) + 0x30u));
+        if (gJobStepResumePrev != nullptr)
+            gJobStepResumePrev(rdram, ctx, runtime);
+    }
+
+    void jobEpilogueProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 12u)
+            std::fprintf(stderr, "[jobepilogue] #%u ra=0x%08X sp=0x%08X frameRa=0x%08X\n", sCalls,
+                         GPR_U32(ctx, 31), sp,
+                         (sp >= 0x00100000u && sp + 0x34u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x30u)
+                                                                         : 0u);
+        if (gJobEpiloguePrev != nullptr)
+            gJobEpiloguePrev(rdram, ctx, runtime);
+    }
+
+    void jobWrapperTailProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29);
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 12u)
+            std::fprintf(stderr, "[jobwraptail] #%u ra=0x%08X sp=0x%08X frameRa=0x%08X\n", sCalls,
+                         GPR_U32(ctx, 31), sp,
+                         (sp >= 0x00100000u && sp + 0x4u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp) : 0u);
+        if (gJobWrapperTailPrev != nullptr)
+            gJobWrapperTailPrev(rdram, ctx, runtime);
+    }
+
+    void installJobStepReturnProbe(PS2Runtime &runtime)
+    {
+        if (std::getenv("TOL_STALL_DUMP") == nullptr)
+            return;
+        PS2Runtime::RecompiledFunction entry = runtime.lookupFunction(0x00366090u);
+        if (entry != nullptr)
+        {
+            gJobStepEntryPrev = entry;
+            runtime.replaceFunction(0x00366090u, &jobStepEntryProbe);
+        }
+        PS2Runtime::RecompiledFunction resume = runtime.lookupFunction(0x00366168u);
+        if (resume != nullptr)
+        {
+            gJobStepResumePrev = resume;
+            runtime.replaceFunction(0x00366168u, &jobStepResumeProbe);
+        }
+        // The two return points that matter: the job step's epilogue (0x3662B4, a resume target because it is
+        // reached after the two 0x15231C yields) and the step wrapper's tail (0x165238, resume after its yield).
+        PS2Runtime::RecompiledFunction epi = runtime.lookupFunction(0x003662B4u);
+        if (epi != nullptr)
+        {
+            gJobEpiloguePrev = epi;
+            runtime.replaceFunction(0x003662B4u, &jobEpilogueProbe);
+        }
+        PS2Runtime::RecompiledFunction wrapTail = runtime.lookupFunction(0x00165238u);
+        if (wrapTail != nullptr)
+        {
+            gJobWrapperTailPrev = wrapTail;
+            runtime.replaceFunction(0x00165238u, &jobWrapperTailProbe);
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------------------
     // SCRIPT CONTEXT PROBE (TOL_TRACE_SCRIPT=1) - diagnostic.
     //
@@ -3896,6 +3985,66 @@ namespace tol
     // row's internal branch/call targets, so dispatching at such an interior address falls through to the
     // default and *restarts the row at its start* - running code that belongs to a different function.
     //
+    // 0x205F80 is the sharpest case yet: the real code there is a one-instruction accessor
+    //     0x205F80  jr $ra ; lbu $v0,8($a0)
+    // but the map merged it into the *previous* function's epilogue row (entry_00205f68, whose body ends
+    // `ld ra,0x20(sp); ...; jr ra; addiu sp,+0x30`). A vtable slot (+0xC of the object at 0x63E3D0) points
+    // at the accessor; dispatching there restarted the row at 0x205F68, ran the *previous* function's
+    // epilogue with the job's stack, loaded a garbage $ra (0) and returned to pc 0 - parking EE thread 1
+    // (identified with TOL_TRACE_PARK's [ret0], which named callee=0x205F80).
+    void readByteOffset8Fix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t obj = GPR_U32(ctx, 4);
+        SET_GPR_U32(ctx, 2, (obj >= 0x00100000u && obj < PS2_RAM_SIZE) ? runtime->Load8(rdram, ctx, obj + 8u) : 0u);
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    // The same row also swallows a virtual-call thunk at 0x205F90:
+    //     0x205F90  lw $t9,($a0) ; 0x205F94 lw $t9,0x1C($t9) ; 0x205F98 jr $t9
+    // It is reachable as a callee (0x2E8FB8 -> 0x205F90), so the row restart ran the epilogue instead and the
+    // thread ended at pc 0x00000001. Re-express the thunk: the tail jump leaves $ra set by the caller, so the
+    // real method returns to that caller exactly as on hardware.
+    void vtableOffset1CThunkFix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t obj = GPR_U32(ctx, 4);
+        const uint32_t vtable = (obj >= 0x00100000u && obj < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, obj) : 0u;
+        const uint32_t target =
+            (vtable >= 0x00100000u && vtable < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, vtable + 0x1Cu) : 0u;
+        ctx->pc = target;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, target, 0x00205F90u, 0u,
+                                          PS2Runtime::GuestBranchKind::IndirectJump, "JR"))
+            return;
+    }
+
+    // Third entry in the same row: 0x205FA0 is a small "release child + clear fields" function. Its body IS in
+    // the emitted row (labels 0x205fa0..), but the switch has no case for it, so a dispatch there restarted the
+    // row at 0x205F68 and returned ra=1 (pc=1). Re-express the prologue + child call natively and converge on
+    // 0x205FCC, which *is* a case in the row (it does `v0=[s0+4]; [s0+4]=0; [s0+8]=0; ld ra; jr ra`).
+    void objectResetFix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x20u;
+        SET_GPR_U32(ctx, 29, sp);
+        WRITE64(sp + 0x10u, GPR_U64(ctx, 31));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+        const uint32_t self = GPR_U32(ctx, 4);
+        SET_GPR_U32(ctx, 16, self);
+        const uint32_t child = (self >= 0x00100000u && self < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, self + 4u) : 0u;
+        SET_GPR_U32(ctx, 4, child);
+        if (child >= 0x00100000u && child < PS2_RAM_SIZE)
+        {
+            const uint32_t vtable = runtime->Load32(rdram, ctx, child);
+            const uint32_t fn =
+                (vtable >= 0x00100000u && vtable < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, vtable + 0x38u) : 0u;
+            SET_GPR_U32(ctx, 25, fn);
+            SET_GPR_U32(ctx, 31, 0x00205FCCu);
+            ctx->pc = fn;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, fn, 0x00205FC4u, 0x00205FCCu,
+                                              PS2Runtime::GuestBranchKind::IndirectCall, "JALR"))
+                return;
+        }
+        ctx->pc = 0x00205FCCu;
+    }
+    //
     // The row 0x231E54..0x231EB0 is the sharpest example: 0x231E54 is the deleting tail of the 0x231E20
     // base destructor (`if (deleting) free(this);`), while 0x231E80 / 0x231E90 / 0x231EA0 are three empty
     // destructors (`jr $ra`) that each have their own vtable slot. Entering one of those restarted the row
@@ -3927,6 +4076,8 @@ namespace tol
         static const bool trace = std::getenv("TOL_TRACE_TASKSTEP") != nullptr;
         static uint32_t sCalls = 0u;
         const uint32_t param = GPR_U32(ctx, 4);
+        const uint32_t raIn = GPR_U32(ctx, 31);
+        const uint32_t spIn = GPR_U32(ctx, 29);
         const uint32_t obj =
             (param >= 0x00100000u && param < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, param) : 0u;
 
@@ -3941,9 +4092,13 @@ namespace tol
         if (trace)
         {
             ++sCalls;
-            if (sCalls <= 8u)
-                std::fprintf(stderr, "[taskstep] #%u param=0x%08X obj=0x%08X ra=0x%08X sp=0x%08X\n",
-                             sCalls, param, obj, GPR_U32(ctx, 31), sp);
+            if (sCalls <= 12u)
+                std::fprintf(stderr,
+                             "[taskstep] #%u param=0x%08X obj=0x%08X raIn=0x%08X spIn=0x%08X stackRa=0x%08X\n",
+                             sCalls, param, obj, raIn, spIn,
+                             (spIn >= 0x00100000u && spIn + 4u < PS2_RAM_SIZE)
+                                 ? runtime->Load32(rdram, ctx, spIn)
+                                 : 0u);
         }
 
         ctx->pc = 0x00165400u;
@@ -5233,6 +5388,7 @@ namespace tol
         // TOL_PUMP_PRIO4: mirror priority 4 after every other priority pump (see priorityPump4Mirror).
         // TOL_STALL_DUMP: time the microkernel run loop body (see greenPumpBodyProbe).
         installGreenPumpBodyProbe(runtime);
+        installJobStepReturnProbe(runtime);
         installAdxLifecycleProbe(runtime);
         installCreateThreadProbe(runtime);
         installBootTrace(runtime);
@@ -5267,6 +5423,17 @@ namespace tol
             if (runtime.lookupFunction(pc) != nullptr)
                 runtime.replaceFunction(pc, &returnToRa);
         }
+
+        // 0x205F80: one-instruction accessor merged into the previous function's epilogue row (see
+        // readByteOffset8Fix). Its vtable slot is real, so run the accessor instead of the epilogue.
+        if (runtime.lookupFunction(0x00205F80u) != nullptr)
+            runtime.replaceFunction(0x00205F80u, &readByteOffset8Fix);
+        // 0x205F90: virtual-call thunk swallowed by the same row (see vtableOffset1CThunkFix).
+        if (runtime.lookupFunction(0x00205F90u) != nullptr)
+            runtime.replaceFunction(0x00205F90u, &vtableOffset1CThunkFix);
+        // 0x205FA0: child-release/clear-fields function swallowed by the same row (see objectResetFix).
+        if (runtime.lookupFunction(0x00205FA0u) != nullptr)
+            runtime.replaceFunction(0x00205FA0u, &objectResetFix);
 
         // 0x1F8150 is the GS/VU1 worker loop:
         //     do { FUN_001f8000(); FUN_0015231c(); } while (true);
