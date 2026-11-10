@@ -3233,3 +3233,75 @@ priority 4 from `FUN_0019A080` (guarded) lets the daemon's poll finally run.
 | `[prio4]` (enter + TCB dump) | every FUN_00151FF0(4) call with slot 3 state/prio/resume/entry |
 | `[framebody]` | FUN_001516B0 call rate (main-loop body completion) |
 | `[poll]` | now prints caller `$ra` and the first 50 calls (the old key suppressed identical results from another caller) |
+
+## Session 117 (2026-11-10) - daemon run-queue state measured; injecting prio-4 pumps is unsafe
+
+### 1. The daemon is NOT lost: it is ready, linked, and counted
+
+`TOL_STALL_DUMP=1` (new) samples the guest run queue both at dispatch entries (`0x151F88`/`0x151E90`) and once
+per green-thread enter (`FUN_00152200`). Last dump of a 90 s run:
+
+```
+[runq] #5 pc=0x00151F88 tid=1 ready[0..7]=2,0,0,0,1,0,0,0 cur=0x00407160 A=1 B=464 C=448
+[runq]   slot= 0 tcb=0x00407160 state=1 prio=0 started=1 resume=0x001F8168 next=0x00000000 prev=0x00407370
+[runq]   slot= 1 tcb=0x00407370 state=1 prio=0 started=1 resume=0x001F8528 next=0x00407160 prev=0x00407580
+[runq]   slot= 2 tcb=0x00407580 state=3 prio=10 started=1 resume=0x001660EC next=0x00407370 prev=0x00407790
+[runq]   slot= 3 tcb=0x00407790 state=1 prio=4 started=0 resume=0x00164F80 next=0x00407580 prev=0x00000000
+```
+
+So while the main thread is in the run loop:
+
+- the AppCell daemon (slot 3, `0x407790`) is **state=1, prio=4, `ready[4]=1`**, and is the **head** of the doubly
+  linked run queue (`prev=0`, `next=0x407580`); the full list is `0x407790 -> 0x407580 -> 0x407370 -> 0x407160`;
+- `started=0` is not a gate: the run loop only uses `+0x1F3` for the first-dispatch branch (`0x151F68` ->
+  `0x151FB0`), not for selection;
+- the scheduler's current-context pointer (`0x48F920`, `A*B+C` = 1*464+448) points at slot 0.
+
+### 2. The pump simply stops being called
+
+`[pumpbody]` (new, also under `TOL_STALL_DUMP`) wraps `FUN_00151E90` and times it:
+
+```
+[pumpbody] #1 prio=0 us=1635 ra=0x00151F88 pc=0x001F8150
+[pumpbody] #2 .. #12 prio=0 us=98..4678 ra=0x00151F88 pc=0x001F8168
+```
+
+**12 calls in 90 s, all priority 0**, each returning with `pc=0x1F8168` (worker 1's resume). The run loop is not
+stuck - it returns normally - the guest just never asks for another priority (and never for priority 4).
+Green-thread enters also stop at ~10 turns (`[runq2] turns=10`); the daemon is never among the entered TCBs in the
+baseline (`0x407160`, `0x407370`, `0x407580` only).
+
+Tail of the run (`TOL_TRACE_EE_DISPATCH`): tid=4 (a CRI worker) runs at 1447 turns/s cycling
+`0x198EF8 / 0x1A152C / 0x198E14 / 0x166490 / 0x1A36A0 / 0x1B76F8`; the main thread is not in the top buckets
+(parked), and the read count is stationary at **75** (last: `slot 5 +19511`, 262144 bytes at `0x0067D200`).
+
+### 3. Negative result: injecting prio-4 pumps corrupts guest state
+
+Two variants were tried and both are unsafe:
+
+- **mirror**: after any `FUN_00151FF0(prio)` also run `FUN_00151FF0(4)`;
+- **ADXF entry**: pump priority 4 at the entry of `FUN_00197940`, with a full `R5900Context` snapshot/restore.
+
+The ADXF variant did schedule the daemon (`turn #12 tcb=0x00407790 resume=0x00164F80`) and ran ~270 pumps, then the
+guest died with **`Unhandled SPECIAL instruction: 0x1 at 0x393234 raw=0x00000001`** (executing data). Cause: the pump
+switches contexts through `FUN_00152200`, so the interrupted thread's registers are replaced by the scheduled thread's;
+restoring them afterwards leaves the guest scheduler mid-switch. Same family as the session 84-94 experiments.
+Both variants were **removed**; only the opt-in, safe I/O-wait pump (`ioWaitPrio4Probe`, `TOL_PUMP_PRIO4=1`) remains,
+and it is unusable after the asset chain because `FUN_0019A080` is no longer called (70 pumps in that phase, then none).
+
+### 4. Conclusion / next
+
+The daemon starvation is real but is a **symptom**: the queue and counters are correct, and the run loop works when
+called. What is missing is the caller: after the asset chain's wait loops finish, the guest stops pumping any
+priority and parks the main thread while a CRI worker loops. So the next question is *what the main thread waits on in
+the post-asset phase* (`tid=1` parked, `tid=4` looping at 0x198EF8/0x1A152C), and whether that wait is a completion
+from the pending read/stream (stream `0x39EE48` idle: `state=1 45=0 dev=0`). If the main thread is waiting for the
+AppCell loader, then the fix is to get the guest's own frame loop to its prio-4 pump, not to inject pumps.
+
+### Probes added
+
+| probe | where | what |
+|---|---|---|
+| `[runq]` / `[runq2]` | `EeScheduler.cpp` + `tol_overrides.cpp` | full TCB table (state/prio/started/yield/resume/entry/links) + `ready[0..7]`, throttled 2 s, at dispatch and at every green-thread enter |
+| `[pumpbody]` | `tol_overrides.cpp` | `FUN_00151E90` entry/return with prio, elapsed us, and the pc it leaves |
+| `[prio4]` extras | `tol_overrides.cpp` | slot-3 links and ready counters on every `FUN_00151FF0(4)` |

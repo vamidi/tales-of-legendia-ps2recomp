@@ -2379,6 +2379,115 @@ namespace
     }
 
     // ---------------------------------------------------------------------------------------------------------
+    // PRIO-4 PUMP FROM THE I/O WAIT (TOL_PUMP_PRIO4=1) - experiment.
+    //
+    // The startup asset chain (FUN_001EC670) pumps only priorities 0/1 on every wait iteration, so the AppCell
+    // loader daemon (slot 3, priority 4) cannot run while the assets load (session 116: exactly one ff0(4) in a
+    // 60 s run, and the loader row is entered once and never resumed at its poll). Every one of those wait
+    // loops calls FUN_0019A080 (the CRI/DVCI I/O wait) each iteration, so pumping priority 4 from there gives
+    // the daemon the same cadence the frame loop would. Opt-in so it can be A/B'd, and re-entry guarded
+    // because the pump itself can reach the I/O wait.
+    constexpr uint32_t kPrio4PumpPc = 0x00151FF0u;
+    constexpr uint32_t kPrio4Sentinel = 0xFFFFFFF0u;
+    PS2Runtime::RecompiledFunction gIoWaitPrio4Prev = nullptr;
+    uint32_t gPrio4Pumps = 0u;
+
+    void ioWaitPrio4Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static bool sInPump = false;
+        static const bool enabled = std::getenv("TOL_PUMP_PRIO4") != nullptr;
+        const uint32_t callerRa = GPR_U32(ctx, 31);
+
+        // Pump first, at the call boundary: the microkernel's own pumps run between guest calls, and the wait's
+        // body leaves pc at an inner call handoff when it bails, so "after prev" is not a safe point.
+        if (enabled && !sInPump)
+        {
+            PS2Runtime::RecompiledFunction pump = runtime->lookupFunction(kPrio4PumpPc);
+            if (pump != nullptr)
+            {
+                sInPump = true;
+                ++gPrio4Pumps;
+                SET_GPR_U32(ctx, 4, 4u); // FUN_00151FF0's priority argument
+                SET_GPR_U32(ctx, 31, kPrio4Sentinel);
+                ctx->pc = kPrio4PumpPc;
+                pump(rdram, ctx, runtime);
+                sInPump = false;
+                if (std::getenv("TOL_TRACE_LOAD") != nullptr)
+                {
+                    static uint32_t sLogged = 0u;
+                    ++sLogged;
+                    if (sLogged <= 8u || (sLogged % 500u) == 0u)
+                        std::fprintf(stderr, "[prio4pump] #%u total=%u ra=0x%08X pc=0x%08X\n", sLogged, gPrio4Pumps,
+                                     callerRa, ctx->pc);
+                }
+                if (ctx->pc != kPrio4Sentinel)
+                {
+                    // The pump switched to another guest context; keep that pc and do not run the wait over it.
+                    SET_GPR_U32(ctx, 31, callerRa);
+                    return;
+                }
+            }
+        }
+
+        SET_GPR_U32(ctx, 31, callerRa);
+        ctx->pc = 0x0019A080u;
+        if (gIoWaitPrio4Prev != nullptr)
+            gIoWaitPrio4Prev(rdram, ctx, runtime);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // NOTES: injecting prio-4 pumps is NOT safe (session 117).
+    //
+    // Two experiments were tried to give the AppCell daemon the cadence the frame loop would, because the boot's
+    // wait loops only pump priorities 0/1:
+    //   * mirror prio 4 after every other priority pump (wrapping FUN_00151FF0);
+    //   * pump prio 4 at the ADXF pump entry (0x197940) with a full R5900Context snapshot/restore.
+    // Both look plausible on paper but both corrupt guest state: FUN_00151FF0 switches contexts through
+    // FUN_00152200, so the interrupted thread's registers are replaced by the scheduled thread's, and restoring
+    // them afterwards leaves whatever the guest scheduler was mid-way through invalid. Measured result of the
+    // ADXF variant: the daemon was entered (turn #12, resume 0x164F80) and ~270 pumps ran, then the guest died
+    // with `Unhandled SPECIAL instruction: 0x1 at 0x393234` (executing data). Same family as the session 84-94
+    // scheduler experiments.
+    //
+    // Conclusion: do not emulate the scheduler by injecting pumps. The guest's own run loop must be driven by
+    // the guest. The remaining question is why the guest stops invoking it (see the pump-body probe below).
+    // TOL_PUMP_PRIO4 remains only for the safe I/O-wait variant (ioWaitPrio4Probe).
+
+    // PUMP-BODY TIMING (TOL_STALL_DUMP=1): FUN_00151E90 is the run loop. Log every entry/return with elapsed
+    // microseconds and the turn counter, so "the pump returned and nobody called it again" is distinguished
+    // from "the pump is still inside".
+    constexpr uint32_t kGreenPumpPc = 0x00151E90u;
+    PS2Runtime::RecompiledFunction gGreenPumpPrev = nullptr;
+    uint32_t gGreenPumpCalls = 0u;
+
+    void greenPumpBodyProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        using clock = std::chrono::steady_clock;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        ++gGreenPumpCalls;
+        const uint32_t prio = GPR_U32(ctx, 4);
+        const auto start = clock::now();
+        if (gGreenPumpPrev != nullptr)
+            gGreenPumpPrev(rdram, ctx, runtime);
+        const double us = std::chrono::duration<double, std::micro>(clock::now() - start).count();
+        if (sCalls <= 12u || (sCalls % 50u) == 0u)
+            std::fprintf(stderr, "[pumpbody] #%u prio=%u us=%.0f ra=0x%08X pc=0x%08X\n", sCalls, prio, us,
+                         GPR_U32(ctx, 31), ctx->pc);
+    }
+
+    void installGreenPumpBodyProbe(PS2Runtime &runtime)
+    {
+        if (std::getenv("TOL_STALL_DUMP") == nullptr)
+            return;
+        PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(kGreenPumpPc);
+        if (fn == nullptr)
+            return;
+        gGreenPumpPrev = fn;
+        runtime.replaceFunction(kGreenPumpPc, &greenPumpBodyProbe);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
     // SCRIPT CONTEXT PROBE (TOL_TRACE_SCRIPT=1) - diagnostic.
     //
     // A script handle is a packed 64-bit value: low 32 bits = pointer to the command block, high 32 bits = the
@@ -2599,12 +2708,17 @@ namespace
             ++sPrio4;
             const uint32_t tcb = 0x00407790u;
             std::fprintf(stderr,
-                         "[prio4] #%u slot3 state=%u prio=%u started=%u yield=0x%08X resume=0x%08X entry=0x%08X ra=0x%08X\n",
+                         "[prio4] #%u slot3 state=%u prio=%u started=%u linkNext=0x%08X linkPrev=0x%08X "
+                         "resume=0x%08X entry=0x%08X ra=0x%08X ctx=%u\n",
                          sPrio4, static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1F0u)),
                          static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1F1u)),
                          static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1F3u)),
-                         runtime->Load32(rdram, ctx, tcb + 0x1ACu), runtime->Load32(rdram, ctx, tcb + 0x1B4u),
-                         runtime->Load32(rdram, ctx, tcb + 0x1B0u), ra);
+                         runtime->Load32(rdram, ctx, tcb + 0x1F8u), runtime->Load32(rdram, ctx, tcb + 0x1FCu),
+                         runtime->Load32(rdram, ctx, tcb + 0x1B4u), runtime->Load32(rdram, ctx, tcb + 0x1B0u),
+                         ra, static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1ACu)));
+            std::fprintf(stderr, "[prio4]   ready0=%u ready4=%u table4=%u\n",
+                         runtime->Load16(rdram, ctx, 0x0048F570u), runtime->Load16(rdram, ctx, 0x0048F578u),
+                         runtime->Load16(rdram, ctx, 0x0048F570u + 4u * 2u));
         }
     }
 
@@ -3873,9 +3987,11 @@ namespace tol
 
     void dumpGreenThreads(uint8_t *rdram, PS2Runtime *runtime, R5900Context *ctx, const char *tag)
     {
-        std::fprintf(stderr, "[gthreads] %s ready0=%u ready1=%u\n", tag,
-                     runtime->Load16(rdram, ctx, kGreenReadyCounts),
-                     runtime->Load16(rdram, ctx, kGreenReadyCounts + 2u));
+        std::fprintf(stderr, "[gthreads] %s ready[0..7]=", tag);
+        for (uint32_t prio = 0u; prio < 8u; ++prio)
+            std::fprintf(stderr, "%s%u", prio ? "," : "",
+                         static_cast<unsigned>(runtime->Load16(rdram, ctx, kGreenReadyCounts + prio * 2u)));
+        std::fprintf(stderr, "\n");
         for (uint32_t i = 0; i < kGreenTcbCount; ++i)
         {
             const uint32_t tcb = kGreenTcbBase + i * kGreenTcbStride;
@@ -3885,12 +4001,14 @@ namespace tol
             const uint32_t started = runtime->Load8(rdram, ctx, tcb + 0x1F3u);
             const uint32_t yieldFlag = runtime->Load32(rdram, ctx, tcb + 0x1ACu);
             const uint32_t resumePc = runtime->Load32(rdram, ctx, tcb + 0x1B4u);
-            if (entry == 0u && state == 0u)
+            const uint32_t next = runtime->Load32(rdram, ctx, tcb + 0x1F8u);
+            const uint32_t prev = runtime->Load32(rdram, ctx, tcb + 0x1FCu);
+            if (entry == 0u && state == 0u && next == 0u && prev == 0u && resumePc == 0u)
                 continue;
             std::fprintf(stderr,
                          "[gthreads]   slot=%2u tcb=0x%08X state=%u prio=%u started=%u yield=%u entry=0x%08X "
-                         "resume=0x%08X\n",
-                         i, tcb, state, prio, started, yieldFlag, entry, resumePc);
+                         "resume=0x%08X next=0x%08X prev=0x%08X\n",
+                         i, tcb, state, prio, started, yieldFlag, entry, resumePc, next, prev);
         }
     }
 
@@ -3952,6 +4070,32 @@ namespace tol
         }
         if (gGreenEnterPrev != nullptr)
             gGreenEnterPrev(rdram, ctx, runtime);
+
+        // TOL_STALL_DUMP=1: the run loop spins *inside* one pump invocation, so a dispatch-entry probe never
+        // sees it. FUN_00152200 is called once per green-thread dispatch, which is the cadence we can sample:
+        // dump the whole run queue + priority counters every 2 s to see whether the daemon is ever entered.
+        static const bool sStallDumpEnv = std::getenv("TOL_STALL_DUMP") != nullptr;
+        if (sStallDumpEnv)
+        {
+            using clock = std::chrono::steady_clock;
+            static auto sLast = clock::now() - std::chrono::hours(1);
+            static uint32_t sDumps = 0u;
+            const auto now = clock::now();
+            const bool due =
+                sDumps < 3u ||
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - sLast).count() >= 2000;
+            if (due && sDumps < 300u)
+            {
+                ++sDumps;
+                sLast = now;
+                const uint32_t a = runtime->Load32(rdram, ctx, kGreenIndexA);
+                const uint32_t b = runtime->Load32(rdram, ctx, kGreenIndexB);
+                const uint32_t c = runtime->Load32(rdram, ctx, kGreenIndexC);
+                const uint32_t entered = runtime->Load32(rdram, ctx, kGreenContextArray + a * b + c);
+                std::fprintf(stderr, "[runq2] dump #%u turns=%u entered=0x%08X\n", sDumps, sTurns, entered);
+                dumpGreenThreads(rdram, runtime, ctx, "enter");
+            }
+        }
     }
 
     void greenYieldProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -3986,7 +4130,7 @@ namespace tol
 
     void installGreenThreadProbe(PS2Runtime &runtime)
     {
-        if (std::getenv("TOL_TRACE_GTHREADS") == nullptr)
+        if (std::getenv("TOL_TRACE_GTHREADS") == nullptr && std::getenv("TOL_STALL_DUMP") == nullptr)
             return;
         PS2Runtime::RecompiledFunction yieldFn = runtime.lookupFunction(kGreenYieldPc);
         if (yieldFn == nullptr)
@@ -5086,6 +5230,9 @@ namespace tol
         installFrameStartFix(runtime);
         installSpinRelease(runtime);
         installScriptThreadProbes(runtime);
+        // TOL_PUMP_PRIO4: mirror priority 4 after every other priority pump (see priorityPump4Mirror).
+        // TOL_STALL_DUMP: time the microkernel run loop body (see greenPumpBodyProbe).
+        installGreenPumpBodyProbe(runtime);
         installAdxLifecycleProbe(runtime);
         installCreateThreadProbe(runtime);
         installBootTrace(runtime);
@@ -5265,6 +5412,17 @@ namespace tol
             {
                 gIoPumpPrev = ioPump;
                 runtime.replaceFunction(kIoPumpPc, &ioPumpProbe);
+            }
+        }
+        else
+        {
+            // Always wrap the I/O wait so the opt-in prio-4 pump is available; with TOL_PUMP_PRIO4 unset the
+            // wrapper runs the original wait and nothing else.
+            PS2Runtime::RecompiledFunction ioWait = runtime.lookupFunction(kIoPumpPc);
+            if (ioWait != nullptr)
+            {
+                gIoWaitPrio4Prev = ioWait;
+                runtime.replaceFunction(kIoPumpPc, &ioWaitPrio4Probe);
             }
         }
 
