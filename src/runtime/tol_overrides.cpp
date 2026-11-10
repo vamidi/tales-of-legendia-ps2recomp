@@ -4263,6 +4263,24 @@ namespace tol
         const bool readable = block >= 0x00100000u && block < PS2_RAM_SIZE;
         static uint32_t sYields = 0u;
         ++sYields;
+        // TOL_TRACE_PARK=1: every save/resume of the 0x1B1910 loop, with the register file it stored. The loop
+        // resumed on a frame (sp=0x1FFFF20) its prologue never built, so the frame word it loads as $ra is
+        // leftover data (1). Log the saved sp/s0/s1 to see where that context came from.
+        static const bool sParkEnv = std::getenv("TOL_TRACE_PARK") != nullptr;
+        static uint32_t sSave1910 = 0u;
+        if (sParkEnv && readable)
+        {
+            const uint32_t savedPc = runtime->Load32(rdram, ctx, block + 0x1B4u);
+            if (savedPc == 0x001B1910u && sSave1910 < 40u)
+            {
+                ++sSave1910;
+                std::fprintf(stderr, "[y1910] #%u block=0x%08X savedPc=0x%08X code=0x%08X sp=0x%08X s0=0x%08X "
+                                     "s1=0x%08X ra=0x%08X\n",
+                             sSave1910, block, savedPc, runtime->Load32(rdram, ctx, block + 0x1A8u),
+                             runtime->Load32(rdram, ctx, block + 0xE0u), runtime->Load32(rdram, ctx, block + 0x60u),
+                             runtime->Load32(rdram, ctx, block + 0x70u), GPR_U32(ctx, 31));
+            }
+        }
         if (sYields <= 12u || (sYields % 200u) == 0u)
         {
             std::fprintf(stderr,

@@ -3382,3 +3382,63 @@ the row (Option A), which would retire all of these overrides.
 | `[retbad]` | `ps2_runtime.cpp` `dispatchGuestBranch` | names a callee that leaves pc < 0x100000 (0, 1, ...) |
 | `[badpc]` | `EeScheduler.cpp` run loop | same, for plain generated `jr $ra` that bypasses dispatch, with the dispatch ring |
 | `[jobepilogue]` / `[jobwraptail]` | `tol_overrides.cpp` | resume points of the job step epilogue and the step wrapper tail |
+
+## Session 119 (2026-11-10) - FUN_001B18F0 returns to pc 1 because its epilogue runs on a foreign frame
+
+### 1. The call path (measured, TOL_TRACE_PARK `[path]`)
+
+```
+[path] target=0x001B18F0 from=0x001A9A3C kind=3 ret=0x001A9A44 ra=0x001A9A44 sp=0x01PPP...
+```
+
+Every call into `FUN_001B18F0` comes from `0x1A9A3C` (inside `FUN_001a9a08`) with the correct return
+address `0x1A9A44`, on several stacks (`0x397B30`, `0x1FFFDxx`, ...). Its loop calls `0x1B18E8`, which is an
+empty `jr $ra` stub. So nothing in the function itself is wrong.
+
+### 2. The bad dispatch (`[loop1910]`, new probe)
+
+```
+[loop1910] #1 tid=1 ra=0x001A9A44 sp=0x01FFFF20 frameRa=0x00000001 s0=0x003ACF40 s1=0x00000002
+```
+
+The scheduler dispatches `0x1B1910` (the loop head, near its end: `s1=2` of 0x27) with the **correct `$ra`
+register**, but on a frame at `sp=0x1FFFF20` whose saved-return slot `[sp+0x10] = 0x1FFFF30` contains **1**.
+The epilogue does `ld ra,0x10(sp); jr ra` -> pc 1 -> the scheduler's `[badpc]` makes thread 1 Dormant.
+
+### 3. Why the frame is foreign (two independent proofs)
+
+- **The prologue never ran on it.** No `[path]` entry ever entered `0x1B18F0` with caller `sp=0x1FFFF40`,
+  which is the only sp that would make its frame `0x1FFFF20`.
+- **Nothing wrote the slot.** A temporary write-watch on `0x1FFFF30` (added to the inline guest-write tracer,
+  `TOL_WATCH_STACKRA`) recorded **0 writes in an 80 s run**. The `1` is leftover stack memory, not a value any
+  guest function stored this session.
+
+So the `$ra` register is fine; the *frame* is not. The epilogue is executed by a dispatch that jumps into the
+middle of the row (`0x1B1910`) without the matching prologue, and it loads a stale word.
+
+### 4. Where that dispatch comes from
+
+- `0x15231C` (the microkernel yield) never saved a context with pc `0x1B1910` (`[y1910]` probe: 0 hits).
+- `dispatchGuestBranch` never targets `0x1B1910` (`[path]`: 0 hits) and there is no `jal 0x1B1910` anywhere.
+- The `[badpc]` ring shows the previous dispatch was `0x1664A0` — a *resume* inside `FUN_00166490`, whose own
+  prologue is at `0x166490` and whose body is `FUN_0019A068(0); sync; ei; return 0`. Its `jr $ra` is the most
+  likely producer of pc `0x1B1910` (a return through a stale `$ra`), i.e. the same "row resumed mid-function"
+  family. That is the next thing to instrument (log the scheduler's saved pc at every checkpoint bail whose
+  pc is `0x1B1910`, and the `jr ra` that lands there).
+
+### 5. Build-system note (learned the hard way)
+
+Editing `ps2xRuntime/include/ps2_runtime.h` invalidates the PCH and rebuilds all **13.5k** generated TUs
+(~10 min). After such an edit: rebuild `src/runtime/CMakeFiles/tol_generated.dir/cmake_pch.cxx.obj`, then
+backdate the `.pch`/`.obj` so the corpus objects stay valid. Also, `ninja -C build/tol2` now re-runs CMake on
+every invocation (a globbed directory is newer than `build.ninja`), which costs ~5 min; a real build still
+proceeds correctly after it.
+
+### Probes added
+
+| probe | env | what |
+|---|---|---|
+| `[path]` | `TOL_TRACE_PARK` | call sites + expected return for 0x166490 / 0x1B18F0 / 0x1B18E8 / 0x1B1910 |
+| `[loop1910]` | `TOL_TRACE_PARK` | scheduler dispatch at 0x1B1910 with ra/sp/frameRa/s0/s1 |
+| `[y1910]` | `TOL_TRACE_PARK` + `TOL_STALL_DUMP` | microkernel saves whose pc is 0x1B1910 (block, saved sp/s0/s1) |
+| `TOL_WATCH_STACKRA` | (removed) | write-watch on 0x1FFFF30; proved 0 writes |
