@@ -4,6 +4,91 @@
 > `docs/state-archive/PS2_PROJECT_STATE_2026-11-01_sessions01-59.md`.
 > Everything below described the **new** tree only.
 
+---
+
+## CURRENT STATUS â€” updated 2026-11-11 (read this first; the rest is history)
+
+**Goal:** boot *Tales of Legendia* to its title screen and render it in a normal window.
+
+**Where it stands:** the game boots, initialises the IOP, loads its nine IRX modules, indexes all six AFS
+archives, runs its own file layer, completes the boot-script asset chain and streams real scene data
+(largest observed reads: 544,768 / 522,240 / 389,120 / 262,144 bytes). The AppCell loader daemon runs, the
+frame loop's first iteration completes, and the script-engine object survives. The screen still shows only the
+early `NOW LOADING` frame, and the EE main thread then goes Dormant with `pc=1` (see *Current blocker*).
+
+**Systemic defect (the one thing to fix properly):** the corpus was generated from a Ghidra map whose rows
+sometimes merge several small routines. The emitted prologue `switch (ctx->pc)` only contains the row's internal
+branch/call targets, so **dispatching at an interior entry point restarts the row at its start** and runs the
+wrong code (often the previous function's epilogue, returning a garbage `$ra`). This has caused every
+main-thread death so far. Fixed per-address so far, in `src/runtime/tol_overrides.cpp`:
+
+| address | what it really is | override |
+|---|---|---|
+| `0x139690` | shared clamp-setter epilogue (`jr ra; sw a0,-0x7b44(gp)`), missing table slots | `replaceFunction` lambda |
+| `0x1F8150` / `0x1F84B0` | GS worker 1 / worker 2 loops (legacy pumps only, off by default) | worker overrides |
+| `0x165220` | loader job thread's `step` fragment (`sp-=0x10; sd ra; jal 0x165400`) | `taskStepEntryFix` |
+| `0x231E80/90/A0` | three empty destructors (`jr $ra`) merged into the deleting-dtor row | `returnToRa` |
+| `0x205F80` | accessor `jr $ra; lbu $v0,8($a0)` merged into the previous epilogue row | `readByteOffset8Fix` |
+| `0x205F90` | virtual thunk `lw t9,(a0); lw t9,0x1C(t9); jr t9` | `vtableOffset1CThunkFix` |
+| `0x205FA0` | release-child/clear-fields function (converges on `case 0x205fcc`) | `objectResetFix` |
+
+**Durable fix (not yet done):** regenerate the corpus with the emitter producing a `case` for **every**
+instruction in a row (`Option A` in `ps2xRecomp/src/lib/ps2_recompiler.cpp`), then rebuild. That retires all of
+the address overrides above and the whole class of bugs. Verify on regeneration: dense `case` lists for
+`entry_00205f68`, `entry_00165210`, `entry_00231e54`, and `0x165220`/`0x205F80` present as cases.
+
+**Current blocker:** the EE main thread (`tid=1`) is `Dormant` with `pc=0x1`, not waiting on anything (all
+semaphores `waiters=0`, no event flags). `TOL_TRACE_PARK` showed the loader job-step chain returning with
+`$ra=0` (fixed, above) and now shows `FUN_001B18F0`'s loop head `0x1B1910` being dispatched with a **correct
+`$ra` register but a foreign stack frame** (`sp=0x1FFFF20`); its epilogue `ld ra,0x10(sp)` loads leftover
+memory `1`. Proven: no call ever entered `0x1B18F0` with the caller `sp` that would create that frame, and a
+write-watch on the saved-return slot `0x1FFFF30` recorded **zero writes** in 80 s. The dispatch does not come
+from the microkernel yield or from a guest call; the dispatch ring points at a mid-function resume of
+`FUN_00166490` (`0x1664A0`) returning through a stale `$ra`. **Next probe:** log the scheduler's saved pc at
+every checkpoint bail whose value is `0x1B1910`, and the `jr $ra` that lands there.
+
+**Rendering (deferred until the boot finishes):** `DISPFB2` stays `FBP 0` while the guest draws to `FBP 224`
+(`ctxFbp=[224,0]`), so the presenter reads a buffer that is not the draw target. `frame_000012` is the only
+non-black frame (`NOW LOADING`, 0.59 % non-black); every later frame is `max=0`. Not the current gate.
+
+**Build / run (this machine):**
+
+```
+cmd /c '"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1 && ninja -C build/tol2 -j 12 tol'
+build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
+```
+
+Run from the repo root: the runtime derives `cdRoot` from the ELF's directory (`data\CD`). `-j 12` is safe with
+clang-cl; MSVC cannot compile the corpus (four 8.7-9 MB single functions, `C1002`).
+
+**Build-system caveats (learned 2026-11-10):**
+
+- **Never edit `ps2xRuntime/include/*.h`** unless you accept a full rebuild of all ~13.5k generated TUs (~10 min)
+  and a PCH invalidation. If you must: rebuild `src/runtime/CMakeFiles/tol_generated.dir/cmake_pch.cxx.obj`, then
+  backdate that `.pch` and `.obj` so the corpus objects stay valid (clang-cl rejects a PCH whose recorded input
+  mtime differs).
+- `ninja -C build/tol2` currently re-runs CMake on every invocation (~5 min) because a globbed directory is newer
+  than `build.ninja`. It still builds correctly afterwards.
+
+**Probe index (all opt-in, no effect when unset):** `TOL_TRACE_PARK` (parks, `[retbad]`, `[badpc]`, `[path]`,
+`[loop1910]`, `[y1910]`), `TOL_TRACE_EE_THREADS` (thread/sema/event-flag table once a second),
+`TOL_TRACE_EE_DISPATCH` / `TOL_TRACE_EE_PC` (per-second turn buckets / dispatch pc samples), `TOL_STALL_DUMP`
+(run-queue + `[runq2]`, `[pumpbody]`, `[loaderspot]`, job-step return probes), `TOL_TRACE_FILEIO`,
+`TOL_TRACE_DVCI`, `TOL_TRACE_GSHIST`, `TOL_TRACE_GSPRIV`, `TOL_TRACE_LOAD`, `TOL_TRACE_SCRIPT`,
+`TOL_TRACE_TASKSTEP`, `TOL_PUMP_PRIO4` (experimental I/O-wait pump; injecting pumps from anywhere else corrupts
+guest state â€” measured), `TOL_WATCH_TASK`, `TOL_WATCH_SLOT2`.
+
+**Confirmed NOT the problem:** no skipped functions (`skip = []` in `data/config_fixed.toml`, 0 `TODO_NAMED` in
+the corpus); the 55 `stubs` are the libkernel import wrappers and all resolve to real handlers; no missing
+dispatch targets; the ADXF pump is healthy (`guard=0 blocked=0`); the audio/IOP side is up.
+
+**Working rules:** generated `.cpp` are build inputs (never edit); `thirdparty/*` is a submodule (commit the
+probe/fix inside it, then the parent gitlink); game files under `data/` are gitignored; per-address fixes go in
+`src/runtime/tol_overrides.cpp`; probes are env-gated and hoisted out of hot paths (`getenv` per guest call once
+cost 2.5x).
+
+---
+
 ## 1. What this project is
 
 A **native PC port** of *Tales of Legendia* (PS2, `SLUS_212.01`) produced by static recompilation.
@@ -20,18 +105,21 @@ Starting point is the `DQ8-Recompiled` skeleton (Sinan-Karakaya), adapted to Tal
 | `src/runtime` | entry point (`main.cpp`), overlay dispatch, ToL-specific integration | ours |
 | `src/gfx` | GS state, VRAM, transfers, trace replay, SDL-GPU renderer (`backends/sdlgpu`) | ours |
 | `src/ui` | in-game menu on F1: display, sound, controls, QoL | ours |
-| `data` | game inputs (`SLUS_212.01`, ISO, TOML) + the generated corpus in `data/output` | local, gitignored |
+| `data` | game inputs (`SLUS_212.01`, `CD\` disc tree, TOML) + the generated corpus in `data/output_fixed` | local, gitignored |
 | `thirdparty/PS2Recomp` | submodule: analyzer, recompiler, `ps2_runtime` | pinned |
 | `thirdparty/imgui` | submodule: backs the F1 overlay | pinned |
 | `thirdparty/simde` | submodule: SSE intrinsics on non-x86 hosts | pinned |
 
-Pinned commits (`git submodule status`):
+Pinned commits (`git submodule status`, 2026-11-11):
 
 ```
-e5636981  thirdparty/PS2Recomp   main
+d4b1bce8  thirdparty/PS2Recomp   main  (ToL runtime + probe commits, not yet pushed)
 391f714c  thirdparty/imgui       master
 65c15e6b  thirdparty/simde       master
 ```
+
+`thirdparty/PS2Recomp` carries local commits (runtime fixes and probes) on top of upstream; `git submodule
+update` would lose them until they are pushed to `vamidi/PS2Recomp`.
 
 ## 3. Where the generated code is imported (this was the open question)
 
@@ -106,7 +194,7 @@ cmake -S . -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release `
 cmake --build build/game --target dq8
 ```
 
-## 6. Status
+## 6. Status (historical â€” 2026-11-01 skeleton build; see CURRENT STATUS at the top for today)
 
 | Step | State |
 |---|---|
@@ -2431,13 +2519,13 @@ range taken at the first `FUN_001EE060` call (`TOL_DUMP_ENGINE=<path>`).
 | address | port | PCSX2 | meaning |
 |---|---|---|---|
 | `0x4E9D50` | `46 52 45 45` "FREE" | `52 4E 44 4D` "RNDM" | engine block freed by us, alive there |
-| `0x4E9D64` | `00…`/`70 A5 5A 00` | `FF…`/`FF…` | free-list links written on our side only |
+| `0x4E9D64` | `00ï¿½`/`70 A5 5A 00` | `FFï¿½`/`FFï¿½` | free-list links written on our side only |
 | `0x4E9DC4` | `01` | `00` | renderer step guard (`FUN_00230a50` gate) |
 | `0x4E9DBC` | `0x4EA090` | `0x53DE20` | renderer buffer[1] pointer |
 | `0x4E9DC0` | `0x53DE20` | `0x4EA070` | renderer buffer[2] pointer - **swapped, and one address differs** |
 | `0x4E9DE8/EC/F1` | `00 00 00` | `80 02 02` | renderer fields past the 4 sub-allocations |
-| `0x4E9EF6…` | `0x447A0000`, `0xBF800000` | `0` | renderer constants only we have |
-| `0x4E9F00…` | `0` | `0x43A50000`, `0x3F23D70A` | renderer constants only PCSX2 has |
+| `0x4E9EF6ï¿½` | `0x447A0000`, `0xBF800000` | `0` | renderer constants only we have |
+| `0x4E9F00ï¿½` | `0` | `0x43A50000`, `0x3F23D70A` | renderer constants only PCSX2 has |
 
 **Reading it honestly:** the guard difference alone is not conclusive. PCSX2's renderer object has
 `+0x08 = 2`, both buffer pointers set and the fields past `+0x34` populated, but `+0x14 = 0` - that is
@@ -3008,11 +3096,11 @@ Note: touching `ps2xRuntime/include/ps2_runtime.h` rebuilds all ~13.5k generated
 
 `TOL_TRACE_SCRIPT=1` installs the probe table in `installScriptThreadProbes` and enables:
 
-`[tasks]` 64-slot task table on change · `[slot2]` writes to `0x407770` · `[ptr]` writes to `0x407740`
-(job pointer, set `0x152064` / cleared `0x151B78`) · `[poll]` loader poll · `[run]` `FUN_00151cf0` for
-slot 2 · `[create]` `FUN_001518c0` · `[jobcfg]`/`[jobstep]` `0x204630`/`0x204690` · `[thunk]`
-`0x165400` · `[resume]` `FUN_00152200` · `[loop]` `FUN_00151ff0` with caller · `[engine]` `FUN_001ee060`
-· `[script]` reader advances/status.
+`[tasks]` 64-slot task table on change ï¿½ `[slot2]` writes to `0x407770` ï¿½ `[ptr]` writes to `0x407740`
+(job pointer, set `0x152064` / cleared `0x151B78`) ï¿½ `[poll]` loader poll ï¿½ `[run]` `FUN_00151cf0` for
+slot 2 ï¿½ `[create]` `FUN_001518c0` ï¿½ `[jobcfg]`/`[jobstep]` `0x204630`/`0x204690` ï¿½ `[thunk]`
+`0x165400` ï¿½ `[resume]` `FUN_00152200` ï¿½ `[loop]` `FUN_00151ff0` with caller ï¿½ `[engine]` `FUN_001ee060`
+ï¿½ `[script]` reader advances/status.
 
 `TOL_WATCH_SLOT2=1` enables the two write-watches in `ps2TraceGuestWrite`.
 
