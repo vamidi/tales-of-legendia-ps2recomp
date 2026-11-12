@@ -2,6 +2,8 @@
 
 *A hands-on tutorial for the person porting **Tales of Legendia** (`SLUS_212.01`) to PC with PS2Recomp.*
 
+> **Never written C?** Read [`part0-c-primer.md`](part0-c-primer.md) first. It teaches the language from zero using the same binary, and Part 1 assumes its vocabulary (`uint8_t *rdram`, `ctx->pc`, macros, `goto`).
+
 ---
 
 ## What you will be able to do after this tutorial
@@ -9,7 +11,7 @@
 By the end of Part 1 you can, on this machine, with this ELF:
 
 1. **Locate** any address the game uses — code, static data, `.bss`, scratchpad, hardware register — and say which subsystem owns it, using two independent tools that agree.
-2. **Read** a real Tales of Legendia function in MIPS assembly, including its stack frame, its delay slots and its `lui`/`addiu` address construction, without a decompiler.
+2. **Read** a real Tales of Legendia function in MIPS assembly — its stack frame, its delay slots, its `lui`/`addiu` address construction, and its calls and jumps (`jal`, `j`, `jr`, `jalr`, `beql`) — without a decompiler.
 3. **Decode** an instruction word by hand from its bit fields, and explain why `0x70000C28` clears a register on an R5900 but is not a MIPS instruction at all.
 4. **Name the layer** a given piece of behaviour belongs to — hardware, BIOS/kernel, SDK library, or game code — and therefore know *where a fix goes* before you write one.
 5. **Investigate** a value you have never seen before (like the ready-flags at `0x00394378`) by asking five questions that the binary can answer.
@@ -310,8 +312,22 @@ opcode  = bits 31..26 = 011100 = 0x1C
 rs      = bits 25..21 = 00000  = $zero
 rt      = bits 20..16 = 00000  = $zero
 rd      = bits 15..11 = 00001  = $at
-sa      = bits 10..6  = 00000
+sa      = bits 10..6  = 10000  = 16     <- NOT a shift amount, see below
 funct   = bits  5..0  = 0x28   = PADDUW
+```
+
+That `16` in the `sa` field is the trap in this decode. On an ordinary MIPS instruction bits 10..6 are the shift amount, so a reader expects `0` here and will "correct" it to `0` if they only half-check. On an **MMI** instruction the field is a **fixed part of the opcode**: `PADDUW` is defined as opcode `0x1C`, bits 10..6 = `0b10000`, funct `0x28`. Read it as a shift and you will believe the instruction is `padduw` with a shift of 16, which does not exist.
+
+You can confirm the decode mechanically rather than by eye — `docs/tutorial/sandbox/c/bits.c` does exactly this and prints:
+
+```
+word    0x70000C28
+opcode  0x1C  (28)
+rs      $0
+rt      $0
+rd      $1
+sa      16
+funct   0x28  (40)  = PADDUW
 ```
 
 Opcode `0x1C` is not a standard MIPS opcode at all — it is Sony's **MMI** prefix, and `funct = 0x28` under it is `PADDUW`, "parallel add unsigned word": four independent 32-bit adds, no carry between lanes. Adding zero to zero in all four lanes is the cheapest way to zero a 128-bit register, and the compiler uses it everywhere. That is why the entry point begins with 32 of these:
@@ -414,21 +430,109 @@ addiu a0, a0, 0x9437        ; wrong: 0x9437 sign-extends to 0xFFFF9437
 
 would give `0x0038FFFF9437` truncated to `0x00389437`, not `0x00399437`. The compiler knows this and emits `lui a0, 0x003A` instead — one higher. When you reconstruct an address by hand and it lands 0x10000 off, this is why. **Rule: if the low half is `>= 0x8000`, the `lui` value is one greater than the address's top half.**
 
-## 2.5 Concept: calls, returns, and indirect dispatch
+## 2.5 Concept: jumps and calls — `j`, `jal`, `jr`, `jalr` — and the branches
 
-Three ways control moves:
+Control transfer comes in two families, and the difference decides how hard the port has to work:
 
-- `jal target` — direct call, return address goes into `$ra`.
-- `jalr rd, rs` — indirect call through a register. On this console this is how virtual functions, function-pointer tables and RPC callbacks are dispatched: `lw t9, 0x1C(a0)` then `jalr t9`. **Static analysis cannot follow these** — this is the single biggest reason a recompiler needs entry-point lists and why Ghidra leaves holes where a vtable is the only reference.
-- `jr ra` — return. Almost always paired with `nop` in the delay slot, though "paired" is the compiler's choice, not the hardware's.
+- **Direct** — the target is *in the instruction*. `j`, `jal`, `beq`, `bne` and friends.
+- **Indirect** — the target is *in a register*, computed at run time. `jr`, `jalr`.
 
-The repo's own project state contains a textbook example of an indirect dispatch that ate days of debugging:
+### `j` — unconditional jump, no link
+
+Target is a 26-bit field, shifted left twice, OR-ed into the top 4 bits of `PC+4` (so a `j` cannot leave the 256 MB region it started in). The word at `0x00100144`:
+
+```
+0010012c  0F004430     andi     a0, v0, 0xf
+00100130  06008010     beq      a0, zero, 0x0010014c
+00100134  00000000     _nop
+00100138  000040A0     sb       zero, 0x0(v0)
+0010013c  01004224     addiu    v0, v0, 1
+00100140  00000000     nop
+00100144  4B000408     j        0x0010012c
+00100148  00000000     _nop
+0010014c  FFFF043C     lui      a0, 0xffff
+```
+
+Read the shape, not the purpose: `j` backwards to `0x10012c`, `beq` forwards out of the loop. That is a **`do { } while (...)` loop**, and `j` is how the compiler closes it. (`j` is never used for calls — it does not touch `$ra`.)
+
+### `jal` — jump and link, i.e. a call
+
+Identical target arithmetic, plus one side effect: **`$ra = PC + 8`**, not `PC + 4`, because the PC has already advanced past the delay slot by the time the link happens.
+
+```
+00199e88  5C51040C     jal      0x00114570
+00199e8c  0000048E     _lw      a0, 0x0(s0)
+```
+
+The callee returns with `jr $ra`, which lands on `0x00199E90` — the instruction **after** the delay slot. Get this wrong in a translator and every function returns one instruction early.
+
+`jal` is by far the most common transfer in this binary: a linear sweep of the file-backed segment finds tens of thousands of `jal` words (treat that as an order of magnitude — the segment also contains embedded data, so a raw sweep overcounts).
+
+### `jr` — jump through a register
+
+`jr $ra` is the return. `jr $t9` is a call whose target could not be known at compile time. `jr $v0` is a computed jump (state machines, jump tables).
+
+```
+00114728  0800E003     jr       ra
+0011472c  00000000     _nop
+```
+
+### `jalr` — jump and link through a register
+
+`jalr rd, rs` puts the return address in `rd` (default `$ra`) and jumps to `rs`. Ghidra prints `jalr v1` when `rd` is `$ra`. Here is a real indirect call, with the `$gp` juggling that surrounds it:
+
+```
+00101610  2D808003     move     s0, gp            ; save the current $gp
+00101614  84B8BC8E     lw       gp, -0x477c(s5)   ; load the callee's $gp
+00101618  09F86000     jalr     v1                ; call through $v1
+0010161c  6452248E     _lw      a0, 0x5264(s1)    ; first argument, in the delay slot
+00101620  2DE00002     move     gp, s0            ; restore $gp after the call
+```
+
+Two lessons in five instructions: the delay slot carries the argument, and `$gp` is *not* globally constant — position-independent code reloads it per module, which is why the surrounding `move`/`lw`/`move` exists.
+
+### The branches, and the `*l` variants that skip their delay slot
+
+`beq`, `bne`, `blez`, `bgtz`, and the REGIMM family `bltz` / `bgez` compare and branch. Their displacement is a signed 16-bit **word** count relative to `PC+4` (Part 1 Appendix A.4).
+
+`beql` and `bnel` are the same, except: **when the branch is not taken, the delay slot does not execute.** The hardware *nullifies* it. Here is `bnel` in the wild:
+
+```
+00100448  10000224     li       v0, 0x10
+0010044c  1B00C254     bnel     a2, v0, 0x001004bc
+00100450  9483828F     _lw      v0, -0x7c6c(gp)   ; skipped if a2 == v0
+00100454  9483828F     lw       v0, -0x7c6c(gp)   ; ...so load it again
+```
+
+Why is the load written twice? Because it *has* to be: if `a2 == v0` the branch is not taken, the slot is nullified, and `v0` still holds `0x10`. The compiler duplicated the load to cover the not-taken path. That duplication is your visual proof that nullification is real, and it is why a translator cannot treat `beql` as `beq` with a slot.
+
+`b` (unconditional branch) is a pseudo-instruction: `beq $zero, $zero, target`. It has a delay slot and no link, so it is used for forward gotos where `j`'s page restriction would be awkward.
+
+### Tail calls: a call that never comes back
+
+```
+0010045c  1A000010     b        0x001004c8
+```
+
+Also common: at the end of a function, `jr $t9` after the frame has been torn down. That is a **tail call** — the callee's `jr $ra` returns directly to the *original* caller, because `$ra` was never overwritten. Useful to recognise: there is no `jal` for it, so it looks like a jump out of nowhere.
+
+### Why this matters for the port: three destinations, three fates
+
+| Form | Target known statically? | What the recompiler does |
+|---|---|---|
+| `jal target` | yes | emits a call through the runtime's dispatch (`dispatchGuestBranch`) to the table slot for `target` |
+| `j target` | yes | same, without a link |
+| `jr $ra` | yes, semantically | returns to the caller |
+| `jr $t9`, `jalr $t9` | **no** | runtime lookup of a *computed* address; if no slot holds a function, the port reports a missing function |
+| `beql`/`bnel` | yes | branch **plus** conditional execution of the delay slot |
+
+And the case that ate days in this project:
 
 ```
 0x205F90 : lw t9, 0(a0) ; lw t9, 0x1C(t9) ; jr t9
 ```
 
-That is C++ virtual dispatch: load the vtable pointer from the object, load slot 7 (`0x1C/4`) from the vtable, jump. Nothing in the binary names the target.
+That is C++ virtual dispatch: load the vtable pointer from the object, load slot 7 (`0x1C/4`) from the vtable, jump. Nothing in the binary names the target, so **static analysis cannot enumerate it** — which is precisely why this project ships an `entry_points` list, why Ghidra leaves holes where a vtable is the only reference, and why a missing function at a vtable address has to be fixed by regenerating with that address, not by staring at the translation.
 
 ## 2.6 Concept: exceptions and syscalls
 
@@ -497,7 +601,9 @@ You do not have to memorise the ISA. You need to recognise these families:
 
 **Load/store.** `lb`/`lbu`/`lh`/`lhu`/`lw`/`lwu`/`ld`, `sb`/`sh`/`sw`/`sd`, plus `lq`/`sq` for 128-bit, and the unaligned pair `lwl`/`lwr` / `swl`/`swr`.
 
-**Branches.** `beq`/`bne`/`blez`/`bgtz`, the likely variants `beql`/`bnel`, and `regimm` forms `bltz`/`bgez`/`bltzal`/`bgezal`. The `*l` variants nullify the delay slot when not taken — a detail a translator must honour.
+**Branches.** `beq`/`bne`/`blez`/`bgtz`, the likely variants `beql`/`bnel`, and the REGIMM forms `bltz`/`bgez`. The `*l` variants nullify the delay slot when not taken — a detail a translator must honour; §2.5 shows the compiler's compensating duplicate load that proves it. `bgezal`/`bltzal` (branch-and-link) exist in the ISA, but I found no use of them **inside an analysed function** in this build: the handful of matching word patterns sit in data, outside every Ghidra function.
+
+**Jumps.** `j` (unconditional, no link), `jal` (direct call), `jr` (register), `jalr` (register call) — all four in §2.5, with `$ra = PC + 8`, the 26-bit page restriction, tail calls, and what each becomes in the port.
 
 **MMI.** The reason R5900 is interesting: `padduw`/`paddsw`/`psubuw`, `pcpyld`/`pcpyud`, `pextlw`/`pextuw`, `pmaddw`, `pdivw`, `psllh`/`psrlh`, `pand`/`por`/`pxor`, `pmfhi`/`pmflo`. All operate on the full 128-bit register as four 32-bit lanes or eight 16-bit lanes.
 
@@ -523,7 +629,9 @@ All four describe one instruction. Ghidra does **not** print a big-endian word �
 You are done with Module 2 when you can, without help:
 
 - look at `addiu sp,sp,-0x40` and say "this function has a 64-byte frame and almost certainly saves `$ra`";
-- see `jal X` followed by an underscored instruction and know which executes first;
+- see `jal X` followed by an underscored instruction and know which executes first, and that `$ra` becomes `PC+8`;
+- tell `j` from `jal` from `jr` from `jalr` at a glance, and say which of them the port can resolve statically;
+- see `beql`/`bnel` and remember the delay slot may be **skipped**;
 - see `lui r,0x39; addiu r,r,0x4380` and compute `0x00394380` in under five seconds;
 - see `li v1,0x44; syscall` and know it is a kernel call, not a library call;
 - explain why `0x70000C28` defeats a general-purpose MIPS disassembler.
@@ -919,6 +1027,8 @@ Six for six means you can now place any new symptom in the right box. That is th
 | Disassembly stops after one line and shows `.word` | an MMI opcode the tool does not decode | use Ghidra, or `tools/old/dismips.py`; decode by hand with the bit fields in 2.2 |
 | An address computed by hand is off by exactly `0x10000` | `addiu` sign-extended a low half `>= 0x8000` | add 1 to the `lui` immediate (2.4) |
 | A branch appears to execute one instruction late | the delay slot | the underscored instruction runs *before* the jump; check the translator's ordering |
+| A translated function returns one instruction too early, or the instruction after a `jal` runs twice | `$ra` computed as `PC+4` instead of `PC+8`, or the delay slot re-executed on return | `$ra = PC+8`; the slot runs before the transfer and must not run again when the callee returns |
+| A side effect happens on the *not-taken* path of a branch | `beql`/`bnel` translated as `beq`/`bne` | the `*l` forms nullify the delay slot when not taken (2.5) |
 | A `.bss` address shows garbage in hex, zeros in the file | `.bss` is not in the file | `p_filesz` vs `p_memsz` (Setup, 3.3) |
 | A flag is read as 0 forever | no writer executed, wrong width, or wrong address | Ghidra xrefs on the address; check `sd` vs `sw`; check the delay slot |
 | Two tools disagree about the bytes of an instruction | one prints bytes in memory order, the other prints the numeric word | compare like with like: `28 0C 00 70` ≡ `0x70000C28` (2.8) |
@@ -941,6 +1051,11 @@ Six for six means you can now place any new symptom in the right box. That is th
 | `python tools\disasm_guest.py … 0x100008 --count 4` | produced **no output** — confirmed limitation at MMI `padduw` |
 | Ghidra `disassemble 0x00100008` | 132 instructions, first 28 are `clear` of GPRs |
 | Ghidra `disassemble 0x00114720` | `li v1,0x44; syscall 0x0; jr ra; nop` |
+| Ghidra `disassemble 0x0010012c`–`0x0010014c` | a `do/while` closed by `j 0x0010012c`, exited by `beq` |
+| Ghidra `disassemble 0x00101610` | `jalr v1` with `$gp` saved/restored around it and the argument in the delay slot |
+| Ghidra `disassemble 0x00100448` | `bnel` + skipped delay slot, then the compiler's compensating duplicate `lw` |
+| Ghidra `disassemble 0x001004f8` | `beql` whose delay slot is the only store on the taken path |
+| linear opcode sweep of the file-backed segment | `jal` most frequent transfer; `j`, `beql`, `bnel` present; `bltzal`/`bgezal` matches fall **outside** every Ghidra function, i.e. data |
 | Ghidra `decompile 0x00199938` / `0x00198C60` | six-store flag setter; spin-then-`ExitDeleteThread` reader |
 | Ghidra `xrefs 0x00394378` | 2 writers (`0x19996c`, `0x199e80`, `0x199eec`), 2 reads (`0x198c74`, `0x198c90`) |
 | `python -c` on `data/SLUS_212.01[0x2DB02D:…]` | `.comment = MW MIPS C Compiler (2.4.1.01)\0PlayStation2\0` |
@@ -1020,7 +1135,7 @@ You will see the `$` dropped constantly: Ghidra prints `addiu sp, sp, -0x40`, `d
 
 ```
 bytes 28 0C 00 70  ->  word 0x70000C28
-opcode 0x1C (MMI), rs=$zero, rt=$zero, rd=$at, funct 0x28 (PADDUW)
+opcode 0x1C (MMI), rs=$zero, rt=$zero, rd=$at, bits10..6=0b10000, funct 0x28 (PADDUW)
 => padduw $at, $zero, $zero        Ghidra's pseudo-instruction: "clear at"
 ```
 
