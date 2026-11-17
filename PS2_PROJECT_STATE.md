@@ -5457,6 +5457,59 @@ Dump the task tree at the park: level 0 = `app+0x18[i]` (count `app+0x64`), leve
 per `0x305898`'s `a2=1`), level 2 likewise, printing each node's `+0`, `+4`, `+8`. The first node whose `+8` is
 0 while its parent still waits is the leaf that never reports a successor; its step is the fix site.
 
+## 7c. Continuation - the task tree walked to its leaf (all values match PCSX2)
+
+The `[tree]` probe walks level 0's list (`app+0x18`, count `app+0x64`) and then each deeper level through the
+embedded sub-object (`node+0x58`, count 1, per `0x305898`). Result - the tree is only two levels deep:
+
+```
+[tree] L1 node=0x0063E610 vtbl=0x003D7630 +4=0 busy(+8)=0 state(+38)=0 b4D=0
+[tree] L2 node=0x0063E740 vtbl=0x003D7140 +4=0 busy(+8)=0 state(+38)=1 b4D=0..1
+```
+
+`0x63E740` is the leaf. Its class: ctor `0x300E50` (sets vtable `0x3D7140`, `+0xC = 0x3D7168`), step
+`0x301B00` (vtable `+0x10`), secondary vtable `0x3D7168` (`+0x08 0x301D10`, `+0x0C/0x10/0x14 =
+0x238740/0x2387E0/0x2389B0`, `+0x18 0x301C00`, `+0x1C 0x300EC0`). Its fields look like a **streaming read
+task**: `+0x24 = 0xB10158` (an 11.5 MB file offset), `+0x2C = 0x63EB50` (buffer), `+0x50 = 7`.
+
+The step's whole decision:
+
+```c
+if ((node[0x38] - 2) < 2) {            // state == 2 or 3  -> ready
+    FUN_002eca00((*(u8*)(node+0x4E) == 0 ? 3 : 1) | 0x3c);
+    FUN_00326aa0(node[0x1D], 1);
+} else {                               // anything else -> not ready
+    FUN_002eca00(3);
+    *(u8*)(node+0x4D) = 1;
+    parent->vtable[0x14]();            // 0x205FA0: clears parent +4 and +8
+}
+node->vtable[0x18](node, parent, 1);
+```
+
+Measured: `state(+38) = 1` for the whole run - it never reaches 2, so **every step takes the "not ready"
+branch, which is what resets the parent's `+4`/`+8`**. That single fact explains the `app+4 == 0`,
+`child+8 == 0` observation of §7b.
+
+**PCSX2 comparison - every value is identical.** The same node exists at the same address with the same vtable,
+and at the equivalent point it reads `+0x38 = 1`, `+8 = 0`, `+4 = 0`. So the port is *not* in a wrong state; it
+is stuck in a transition that the reference makes. Letting PCSX2 run ~600M cycles completed the loader
+(the object memory was then recycled - `0x63E740` now holds stream data `0x012FEF2F…`), i.e. state 1 → 2 does
+happen on hardware.
+
+The port's file layer is demonstrably healthy in the same window: 119 `[fileio]` lines, reads up to
+544,768 / 522,240 / 389,120 / 262,144 bytes, `gamefile read sector 0x…` into guest buffers. So this is not
+"reads are broken"; it is the leaf's own state transition.
+
+### Next probe (exact, two options)
+
+1. **Dynamic (preferred)**: restore a loading-screen savestate in PCSX2, set a write watchpoint on the leaf's
+   state word `0x63E778` (`leaf+0x38`), and continue. The write that stores `2` names the exact function that
+   must run - then check whether the port ever enters it. (My attempt missed the window because PCSX2 had
+   already left the loading screen by then; a savestate makes it repeatable.)
+2. **Static**: decompile the leaf's own work methods - secondary vtable `+0x18 = 0x301C00`,
+   `+0x1C = 0x300EC0`, `+0x08 = 0x301D10`, and `0x326AA0` (called on the ready path) - and find the store of
+   `2` into `+0x38`; its caller is the code the port is missing.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

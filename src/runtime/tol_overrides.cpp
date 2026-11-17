@@ -2523,6 +2523,22 @@ namespace
     PS2Runtime::RecompiledFunction gOrdYieldPrev = nullptr;
     PS2Runtime::RecompiledFunction gOrdParkPrev = nullptr;
 
+    // One task node: vtable, +4 (the successor the parent acquires) and +8 (the "busy" byte read by
+    // vtable[0x0C] = 0x205F80). The tree is walked because the app only advances when a descendant produces
+    // a successor, so the first node that is idle with no successor is the leaf that fails to report.
+    void printTreeNode(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, const char *label, uint32_t node)
+    {
+        const bool ok = (node >= 0x00100000u && node + 0x60u < PS2_RAM_SIZE);
+        std::fprintf(stderr,
+                     "[tree] %s node=0x%08X vtbl=0x%08X +4=0x%08X busy(+8)=%u state(+38)=%d b4D=%u b4E=%u\n", label,
+                     node, ok ? runtime->Load32(rdram, ctx, node) : 0u,
+                     ok ? runtime->Load32(rdram, ctx, node + 4u) : 0u,
+                     ok ? static_cast<unsigned>(runtime->Load8(rdram, ctx, node + 8u)) : 0u,
+                     ok ? static_cast<int>(runtime->Load32(rdram, ctx, node + 0x38u)) : -1,
+                     ok ? static_cast<unsigned>(runtime->Load8(rdram, ctx, node + 0x4Du)) : 0u,
+                     ok ? static_cast<unsigned>(runtime->Load8(rdram, ctx, node + 0x4Eu)) : 0u);
+    }
+
     // THE resume test.
     //
     // The parked app-job thread waits at 0x3661DC, and the loop body does not spin on the wait byte - it calls
@@ -2590,6 +2606,36 @@ namespace
                              childOk ? static_cast<unsigned>(runtime->Load8(rdram, ctx, child + 8u)) : 0u,
                              runtime->Load32(rdram, ctx, jt),
                              static_cast<unsigned>(runtime->Load16(rdram, ctx, jt + 6u)));
+                // Walk the tree: level 0's list is obj+0x18 (count obj+0x64, vtable obj+0x10); every deeper level
+                // uses the embedded sub-object at +0x50 and its list at +0x58 with count 1 (see 0x305898: a1=s0+0x58,
+                // a2=1). Only the first child of each deeper level is followed.
+                if (ok)
+                {
+                    const uint32_t count0 = runtime->Load32(rdram, ctx, obj + 0x64u);
+                    const uint32_t shown = (count0 < 4u) ? count0 : 4u;
+                    for (uint32_t i = 0u; i < shown; ++i)
+                    {
+                        const uint32_t l1 = runtime->Load32(rdram, ctx, obj + 0x18u + i * 4u);
+                        printTreeNode(runtime, rdram, ctx, "L1", l1);
+                        uint32_t deeper = l1;
+                        for (uint32_t depth = 2u; depth <= 4u; ++depth)
+                        {
+                            if (deeper < 0x00100000u || deeper + 0x60u >= PS2_RAM_SIZE)
+                            {
+                                break;
+                            }
+                            const uint32_t next = runtime->Load32(rdram, ctx, deeper + 0x58u);
+                            if (next < 0x00100000u || next == deeper)
+                            {
+                                break;
+                            }
+                            char label[8];
+                            std::snprintf(label, sizeof(label), "L%u", depth);
+                            printTreeNode(runtime, rdram, ctx, label, next);
+                            deeper = next;
+                        }
+                    }
+                }
             }
         }
         if (sYields <= 30u)
