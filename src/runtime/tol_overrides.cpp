@@ -2870,6 +2870,35 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdGatePrev = nullptr;
+
+    // FUN_00126368 is the gate that decides whether 0x233E50 calls the yield:
+    //   0x233E9C jal func_126368 ; 0x233EA4 beqz $v0, +0x28 (skip yield) ; 0x233EAC jal func_15231C
+    // Caller passes a1 = 0, a2 = $s5, a3 = $s4, t0 = $s3. Its return value is the whole decision.
+    void orderGateProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        const uint32_t a1 = GPR_U32(ctx, 5);
+        const uint32_t a2 = GPR_U32(ctx, 6);
+        const uint32_t a3 = GPR_U32(ctx, 7);
+        const uint32_t t0 = GPR_U32(ctx, 8);
+        const uint32_t t1 = GPR_U32(ctx, 9);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (gOrdGatePrev != nullptr)
+        {
+            gOrdGatePrev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && sCalls <= 40u)
+        {
+            std::fprintf(stderr,
+                         "[gate] #%u a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X t0=0x%08X t1=0x%08X ret=0x%08X ra=0x%08X\n",
+                         sCalls, a0, a1, a2, a3, t0, t1, GPR_U32(ctx, 2), ra);
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6389,6 +6418,15 @@ namespace tol
             {
                 gOrdPmPrev = fn;
                 runtime.replaceFunction(0x00365700u, &orderPmProbe);
+            }
+        }
+        // The yield gate (see orderGateProbe).
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00126368u);
+            if (fn != nullptr)
+            {
+                gOrdGatePrev = fn;
+                runtime.replaceFunction(0x00126368u, &orderGateProbe);
             }
         }
 

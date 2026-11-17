@@ -4733,6 +4733,54 @@ Probe `FUN_00126368` (`0x126368`): log its arguments and its **return value**, p
 passes (`a2=$s5, a3=$s4, t0=$s3`). That single number is the gate: if it is 0 in the port and nonzero in the guest,
 the divergence is inside it or in the job state it reads - not in the scheduler, the yield, or the TCB.
 
+## Session 139 (2026-11-17) - the gate returns 0 = SUCCESS; the yield skip is by design, so that line is a dead end
+
+Probe on `0x126368`:
+
+```
+[gate] #1 a0=0x00000000 a1=0x00000000 a2=0x004E9148 a3=0x004E914C t0=0x004E9150 t1=0x002E09E0 ret=0x00000000 ra=0x00233EA4
+```
+
+Called **once**, from `0x233EA4` (the caller's `beqz`), with `a2/a3/t0` = `entry0 + 8 / + 0xC / + 0x10` (the fields
+the `0x126xxx` cluster writes) and `t1 = 0x2E09E0` (the submit entry PC).
+
+### Complete return map of `FUN_00126368` (0x126368..0x1264E8)
+
+| site | value | meaning |
+|---|---|---|
+| `0x1263B8` | `-100` (`0xFF9C`) | guard: `*(0x3E5D64) == 0` |
+| `0x1263D4` | `-200` (`0xFF38`) | `FUN_00114730` returned `< 0` |
+| `0x12640C`, `0x126428`, `0x126498` | `+1` | three distinct case paths |
+| `0x1264A8` | `-91` (`0xFFA5`) | further failure case |
+| **`0x1264B4`** | **`0`** (`daddu v0,zero,zero`) | **success / fall-through** |
+
+The observed `ret = 0` means it passed both guards and fell through the success tail. It also stores its arguments
+into the structure at `0x3E5DC0` (`0x1263E4: *(v1+4) = a0`, `0x1263E8: *(v1+8) = a1`, both 0 here).
+
+### Consequence: this is not the bug
+
+`0x233E50` calls the yield only when `FUN_00126368` returns **nonzero**, i.e. only on **failure**. A `0` result
+means "proceed normally" and the yield is *supposed* to be skipped. So:
+
+- the earlier framing ("the submit path skips the yield because the gate says no") was backwards - `0` is success;
+- the yield is an error-retry path, not the normal suspension mechanism for this call;
+- sessions 137-138's conclusion that the missing yield explains the abandonment is therefore **withdrawn**.
+
+### Corrected understanding of the stall
+
+`0x2DF590` calls `0x233E50`, which succeeds, skips the yield, and calls `0x233FC0` - and that is where control goes
+(`nextpc = 0x233FC0`). So the thread is suspended inside a **normal, successful** call, and something later is
+supposed to resume it at `0x2E0A3C`. The open question is therefore who resumes a thread that was never yielded
+from: the run loop only re-enters threads it switched out, so the resume must come from the `0x233FC0` path or from
+a queue entry.
+
+### Next (needs the emulator for the first time in this thread)
+
+Compare in PCSX2: break at `0x233EA4` and read `v0` (expect 0 as well - if so, the skip is confirmed normal), and
+break at `0x2E0A3C` to see whether the guest *does* resume the submit row there. If the guest reaches `0x2E0A3C`
+while the port never does, the divergence is in whatever `0x233FC0` leaves behind, not in the gate.
+
+
 
 
 
