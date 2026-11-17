@@ -6070,6 +6070,44 @@ Trace the guest microkernel's hand-off of that thread after `FUN_00366090` retur
 update and the run-loop selection. That is where the loader thread stops being dispatched - and therefore where
 the scene job should have been re-armed.
 
+### Session 152 - TCB + dispatch trace: the loader thread IS queued and IS resumed; it parks itself
+
+Switch-in protocol (`FUN_00152200`, called at `0x151F80`):
+
+```c
+tcb = *(0x3DB1A0 * 0x3DB1B0 + 0x48F590 + 0x3DB1C0);   // context slot -> TCB
+*(tcb + 0x1A8) = return_address;   // saved $ra
+*(tcb + 0x1AC) = 0;                // alive flag cleared: "this thread is now running"
+restore HI/LO from tcb+0x180 / +0x190
+(**(code**)(tcb + 0x1B4))(a0..a3, s0..s3, gp, tcb, ...)   // call the RESUME pc
+```
+
+`FUN_0015243C` (`0x151F78`) is the matching register save into `0x48F590 + idx`. Neither function picks the
+thread - they only read the selector triple - so the *observable* choice is which TCB gets `+0x1AC = 0`.
+
+**Ready queue at priority 4 (`[select]`, mid-run):**
+
+```
+tcb4=0x004079A0 state=1 prio=4 started=1 next=0x00407580 prev=0x00000000  pc(+1B4)=0x002043F0   <- HEAD (loader)
+tcb2=0x0040758  state=1 prio=4 started=1 next=0x00407790 prev=0x004079A0  pc(+1B4)=0x002047F8
+tcb3=0x00407790 state=1 prio=4 started=1 next=0x00407370 prev=0x00407580  pc(+1B4)=0x00164FE8
+```
+
+So the loader thread (0x4079A0) is **ready, started, and the head** of the priority-4 run queue, and its resume
+pc *changes* over the run (0x3661DC early, 0x2043F0 later) - i.e. **it is being resumed**, not skipped.
+`0x1AC` is 1 while parked and 0 while inside the switch-in, exactly as the protocol above requires.
+
+**Conclusion:** the thread is not starved by dispatch selection. It parks *inside the app loop*, because the loop
+paces itself with `jal 0x15231C` (yield, `a0 = 1.0f`) at `0x3661D4` and its exit condition is `busy(+8)`, which
+only the state-4 hand-off clears. The loader step `0x165400` therefore only runs when the loop unwinds back to it
+(4 times), not per frame.
+
+### Next
+
+Measure what the yield at `0x15231C` actually waits on and how often it returns (its cadence is the loop's
+cadence), and separately why the app loop re-enters instead of exiting after the two state-4 completions already
+observed - i.e. who re-arms `busy(+8)` after `vtable[0x20]` clears it.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

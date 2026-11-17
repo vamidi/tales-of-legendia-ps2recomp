@@ -2506,6 +2506,45 @@ namespace
     void orderDispAProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         orderEvent("dispA", ctx);
+        // 0x152200 is the switch-in: it reads the selector triple (0x3DB1A0 * 0x3DB1B0 + 0x3DB1C0) to pick the
+        // context slot, then calls TCB+0x1B4. Logging the triple and the chosen TCB names the dispatch choice,
+        // and shows whether the loader thread (TCB 0x4079A0, parked at 0x3661DC) is ever selected.
+        static const bool sSelEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sSel = 0u;
+        ++sSel;
+        if (sSelEnv && (sSel <= 10u || (sSel % 100u) == 0u))
+        {
+            const uint32_t a = runtime->Load32(rdram, ctx, 0x003DB1A0u);
+            const uint32_t b = runtime->Load32(rdram, ctx, 0x003DB1B0u);
+            const uint32_t c = runtime->Load32(rdram, ctx, 0x003DB1C0u);
+            const uint32_t slot = a * b + 0x0048F590u + c;
+            const uint32_t tcb = (slot + 4u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, slot) : 0u;
+            const bool ok = (tcb >= 0x00100000u && tcb + 0x210u < PS2_RAM_SIZE);
+            std::fprintf(stderr,
+                         "[select] #%u a=%u b=%u c=%u tcb=0x%08X pc(+1B4)=0x%08X alive(+1AC)=%u state(+1F0)=%u\n",
+                         sSel, a, b, c, tcb, ok ? runtime->Load32(rdram, ctx, tcb + 0x1B4u) : 0u,
+                         ok ? static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1ACu)) : 0u,
+                         ok ? static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1F0u)) : 0u);
+            // One-shot comparison: a TCB the dispatcher DOES pick (0x407580) versus the loader TCB it never
+            // picks (0x4079A0). Priority is at +0x1F1, queue links at +0x1F8/+0x1FC/+0x200.
+            if ((sSel % 200u) == 100u)
+            {
+                for (uint32_t slot = 2u; slot <= 4u; ++slot)
+                {
+                    const uint32_t t = 0x00407160u + slot * 0x210u;
+                    std::fprintf(stderr,
+                                 "[select]   tcb%d=0x%08X state=%u prio=%u started=%u next=0x%08X prev=0x%08X "
+                                 "self=0x%08X pc(+1B4)=0x%08X\n",
+                                 slot, t, static_cast<unsigned>(runtime->Load8(rdram, ctx, t + 0x1F0u)),
+                                 static_cast<unsigned>(runtime->Load8(rdram, ctx, t + 0x1F1u)),
+                                 static_cast<unsigned>(runtime->Load8(rdram, ctx, t + 0x1F3u)),
+                                 runtime->Load32(rdram, ctx, t + 0x1F8u),
+                                 runtime->Load32(rdram, ctx, t + 0x1FCu),
+                                 runtime->Load32(rdram, ctx, t + 0x200u),
+                                 runtime->Load32(rdram, ctx, t + 0x1B4u));
+                }
+            }
+        }
         if (gOrdDispAPrev != nullptr)
         {
             gOrdDispAPrev(rdram, ctx, runtime);
