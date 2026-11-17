@@ -2349,8 +2349,39 @@ namespace
         {
             return;
         }
+        // Classification by tag, so the log stays readable: the dispatcher spins hundreds of iterations before it
+        // dispatches anything, and "read" polls forever after the stall. Log:
+        //   spin     ("iter", "dispA", "dispB") -> first 10, then every 40th once a landmark has been seen
+        //   poll     ("read")                   -> first 12 only
+        //   landmark (everything else)          -> always
+        // Tag[1] distinguishes "iter"/"dispA"/"dispB" from "daemon"/"appjob"/"frame"/"claim"/"submit".
+        const bool isSpin = (tag[1] == 'i' || tag[1] == 't');
+        const bool isPoll = (tag[0] == 'r');
+        static uint32_t sLandmarks = 0u;
+        static uint32_t sSpinLogs = 0u;
+        static uint32_t sPollLogs = 0u;
+        if (isSpin)
+        {
+            const uint32_t n = sSpinLogs++;
+            const bool keep = (sLandmarks == 0u) ? (n < 10u) : ((n % 40u) == 0u);
+            if (!keep)
+            {
+                return;
+            }
+        }
+        else if (isPoll)
+        {
+            if (sPollLogs++ >= 12u)
+            {
+                return;
+            }
+        }
+        else
+        {
+            ++sLandmarks;
+        }
         ++sOrderSeq;
-        if (sOrderSeq > 600u)
+        if (sOrderSeq > 800u)
         {
             return;
         }
@@ -2417,6 +2448,48 @@ namespace
         if (gOrdReadPrev != nullptr)
         {
             gOrdReadPrev(rdram, ctx, runtime);
+        }
+    }
+
+    PS2Runtime::RecompiledFunction gOrdIterPrev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdDispAPrev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdDispBPrev = nullptr;
+
+    // FUN_00151E90 is one guest pump loop:
+    //   0x151F78  jal func_15243C   <- iteration top
+    //   0x151F80  jal func_152200   <- service A
+    //   0x151F88  jal func_15253C   <- service B
+    //   0x151FC0  jalr $v0          <- dispatch one TCB entry, delay slot 0x151FC4: a0 = s0 + 0x1C0
+    //   0x151FC8  b   0x151F78      <- loop back edge
+    //
+    // ra arithmetic decides which service reaches the submit row: the row was entered with ra=0x151F88, and MIPS
+    // jal sets ra = pc + 8, so that is the call at 0x151F80 (service A) tail-jumping into the 0x2E0880 chain.
+    // A dispatch at 0x151FC0 would have produced ra=0x151FC8 instead. 0x151FC8 is only a branch, so an
+    // iteration is observed through its top marker (0x151F78) rather than by hooking the branch itself.
+    void orderIterProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("iter", ctx);
+        if (gOrdIterPrev != nullptr)
+        {
+            gOrdIterPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void orderDispAProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("dispA", ctx);
+        if (gOrdDispAPrev != nullptr)
+        {
+            gOrdDispAPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void orderDispBProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("dispB", ctx);
+        if (gOrdDispBPrev != nullptr)
+        {
+            gOrdDispBPrev(rdram, ctx, runtime);
         }
     }
 
@@ -5842,6 +5915,32 @@ namespace tol
             {
                 gOrdReadPrev = fn;
                 runtime.replaceFunction(0x002E1EF0u, &orderReadProbe);
+            }
+        }
+
+        // Dispatcher progression (see the FUN_00151E90 comment): iteration top, service A, service B.
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x0015243Cu);
+            if (fn != nullptr)
+            {
+                gOrdIterPrev = fn;
+                runtime.replaceFunction(0x0015243Cu, &orderIterProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00152200u);
+            if (fn != nullptr)
+            {
+                gOrdDispAPrev = fn;
+                runtime.replaceFunction(0x00152200u, &orderDispAProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x0015253Cu);
+            if (fn != nullptr)
+            {
+                gOrdDispBPrev = fn;
+                runtime.replaceFunction(0x0015253Cu, &orderDispBProbe);
             }
         }
 

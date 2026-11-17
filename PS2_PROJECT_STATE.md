@@ -3996,6 +3996,91 @@ function or a missing store.
 2. Cheaper intermediate check: log `FUN_00151E90`'s own pc progression (`0x151F80`, `0x151F88`, `0x151FC8`) with
    `orderEvent` to see the loop shape and confirm which service runs first.
 
+## Session 125 (2026-11-17) - dispatcher progression: service A (`0x152200`) runs the submitter, by tail-jump, after the TCB dispatch round
+
+Loaded the `ps2-recomp` skill for this one; two of its prohibitions shaped the method - **no header edits** (the
+earlier `ps2_runtime.h` watch cost a 13,560-file rebuild) and **never touch `runner/*.cpp`**. The three PCs are
+logged by wrapping the functions called *at* them, which is header-free and lives in the override file.
+
+### The pump loop, from the disassembly
+
+```
+0x151F78  jal func_15243C     <- iteration top          (wrapped as "iter")
+0x151F80  jal func_152200     <- service A              (wrapped as "dispA", ra := 0x151F88)
+0x151F88  jal func_15253C     <- service B              (wrapped as "dispB", ra := 0x151F90)
+0x151FC0  jalr $v0            <- dispatch one TCB entry, delay slot 0x151FC4: a0 = s0 + 0x1C0 (ra := 0x151FC8)
+0x151FC8  b   0x151F78        <- loop back edge (only a branch, so an iteration is observed via its top marker)
+```
+
+`jal` sets `ra = pc + 8`, which makes the three paths distinguishable purely from `ra` at every event.
+
+### Measured progression
+
+```
+#1  frame   sp=0x01FFFFD0  ra=0x00165B14
+#2  iter    sp=0x01FFFF50  ra=0x00151F80  a0=1 a1=1
+#3  dispA   sp=0x01FFFF30  ra=0x00151F88  a0=1 a1=1        <- service A, nothing to do yet
+#4  dispB   sp=0x00411480  ra=0x00151F90                   <- service B, on a THREAD stack
+#5  daemon  sp=0x01FFFF80  ra=0x00151FC8  a0=0x00407950    <- TCB dispatch, slot 3
+#6  appjob  sp=0x01FFFF80  ra=0x00151FC8  a0=0x00407740    <- slot 2
+#7  appjob  sp=0x01FFFF80  ra=0x00151FC8  a0=0x00407B60    <- slot 4
+#8  claim   sp=0x00423450  ra=0x002E1F98                   <- inside slot 4's run
+#9  submit  sp=0x00417550  ra=0x00151F88  a0=0x00407D70    <- SERVICE A's ra, slot 5 context
+#10 read    sp=0x00423480  ra=0x003659BC                   <- and then polls forever
+#11 iter    sp=0x01FFFF80  ra=0x00151F80                   <- next outer iteration
+```
+
+### Confirmed: which path runs the submitter
+
+**Service A - `0x152200`, called at `0x151F80`.** The submit event carries `ra=0x00151F88`, and the only
+instruction that produces that value is the `jal` at `0x151F80` (MIPS `ra = pc + 8`). The TCB dispatch at
+`0x151FC0` produces `ra=0x00151FC8`, which is exactly what the daemon and both app jobs show - so the submit is
+*not* a TCB entry dispatched by the `jalr`.
+
+Two further facts pin the mechanism:
+
+- `FUN_00152200` contains **no `jal` at all** (grep for `dispatchGuestBranch` on a direct target: 0 matches). It
+  only calls through function pointers, so it is a **work-queue drainer**, and it reaches the
+  `0x2E0880 -> 0x2E08D0 -> 0x2E0950 -> 0x2E09E0` chain by **tail-jump** (`jr`, not `jalr`), which is why the
+  chain's `ra` is still the pump's `0x151F88` rather than something inside service A.
+- `dispB` is entered with **thread** stacks (`0x00411480`, `0x00423520`, `0x004172D0`), while `dispA` always runs
+  on the init stack (`0x01FFFF50`/`0x01FFFF80`). So the pump is **re-entered recursively from inside a guest
+  thread** - the guest's yield re-enters `FUN_00151E90` on the yielding thread's own stack.
+
+### Why the submission lands after the claim (mechanism, not mystery)
+
+The pump's per-iteration order is A -> B -> dispatch, and service A is the one that runs the submitter. In this
+pass the work dequeued by A is a "run TCB" item that recursively re-enters the pump, which dispatches slots
+3/2/4 (`ra=0x151FC8`); slot 4's phase machine claims entry 0 and parks. Only when that nested run unwinds does
+service A's own tail-jumped work item execute - the submit - at `#9`. So the inversion is **queue order inside
+service A**, not a wrong `jal` order and not a missing store.
+
+Also measured: the pump spins with `a0=1,a1=1` for hundreds of iterations before dispatching anything (that is
+why the trace now suppresses spin after 10 lines and caps `read` at 12 - otherwise 600 events were burned before
+the first TCB ran).
+
+### What this means for the port (not an emulator)
+
+PCSX2 runs this same guest code without deadlocking, so the guest's queue order is correct and the port must not
+"fix" the order. What differs is that in the guest the parked thread is **resumable**: it parks in
+`while (*(u8*)(s1+8))` at `0x3661DC`, the yield re-enters the pump on its own stack (observed at `#4`/`#17`), and
+after the submit it is re-dispatched and re-checks - now finding `entry0+6 != 0` with bit 1 still clear.
+
+So the defect is in the **port's guest-thread scheduling**: after the claim the thread stops being re-dispatched,
+the nested pump never unwinds back into it, and the payload submitted at `#9` is never observed. That is the same
+shape as the session-120 note that the main thread never yields to the worker, and it belongs in the runtime's
+guest-thread/yield support - not in the recompiled code and not in a table poke.
+
+### Next
+
+1. **Resume path:** instrument the parked thread. It is a TCB whose `state` is 1 and whose update is called from
+   `0x151FC0`; check whether the runtime ever re-enters it after `#9`. If not, that is the bug.
+2. If it is re-entered and still fails, the re-check reads a stale copy (the `&this+0x80` payload written by the
+   earlier read at `#10`), and the fix is in that buffer, not in the job table.
+3. Do **not** reorder the queue or pre-seed `entry0+6` - both would make the port diverge from the guest on a path
+   PCSX2 proves correct.
+
+
 
 
 
