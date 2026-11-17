@@ -5742,6 +5742,55 @@ instead of returning success while thread 1 continues. That is the guest's actua
 | `TOL_TRACE_THREADS` | `Thread.cpp` `CreateThread`/`StartThread` | `[cthread] entry/prio/stack -> id`, `[sthread] id/status/entry/arg` |
 | `TOL_TRACE_ORDER` | `tol_overrides.cpp` `adxDetachProbe` | `[adxdet] tid/394378/394380/TCB entry+pc` + a one-shot thread-table scan |
 
+### Session 152 - thread identity: the deadlock was manufactured by our own workaround (FIXED)
+
+The `0xDEADBEF0` in `[stop] ... ra=0xDEADBEF0` is **our sentinel**, from `spinReleaseProbe` in
+`tol_overrides.cpp`. The old code did this after 4096 spins of `0x198C48`:
+
+```cpp
+PS2Runtime::RecompiledFunction detach = runtime->lookupFunction(0x00199988u);
+SET_GPR_U32(ctx, 31, 0xDEADBEF0u);
+detach(rdram, ctx, runtime);          // runs FUN_00199988 -> ... -> FUN_00199E30 INLINE
+```
+
+`FUN_00199988` is "stop all streams" (`0x1999A8` mark flags, `0x1999B0`/`0x1999B8`/`0x1999C0` steps, then
+`0x1999C8 jal 0x199E30`), reached through `FUN_0019A2B0` (no xref - called via a pointer). Called inline from
+the spin probe it runs on the **waiter's own thread**, and its final detach handshake waits for
+`DAT_00394380` - the flag that same thread sets only *after* leaving its spin loop. Hence:
+
+- `[adxdet] curThread=2 ra=0x001999D0 sp=0x00394BD0` (sp at the top of the waiter's own stack),
+- `WakeupThread(2) -> -406` = `KE_ILLEGAL_THID`, because `id == m_currentThreadId` (the guest asks thread 2 to
+  wake itself).
+
+So the HLE wake path was never at fault; the workaround created the deadlock it was reporting.
+
+**Fix (`spinReleaseProbe`):** apply only the *state* the short-circuited audio close would have applied -
+`0x3942C4 = 0` and the six stream flags `0x394378/388/398/3A8/3B8/3C8 = 1` - and **stop hijacking guest code**.
+The waiter then sees its flag, sets `0x394380 = 1` and exits through its own `ExitDeleteThread` path.
+
+Verified (60 s): `[adxdet]` = 0 calls, `[stop]` = 0 calls, the new line
+`stream release applied after 4096 spins (refcount 0, flags set)` appears, and the regression check is
+**14/14 behaviour classes identical**.
+
+### Rendering status - the port *is* drawing
+
+`TOL_GFX_STATS_EVERY=60` on a 120 s run, after the release:
+
+```
+[gfx] 1.3 fps over 60 frames | transfers=324 (42189 KiB, 157 forced flushes) draws=4219 passes=499
+      resolves=176 (39318 Kpx) refreshes=3 | gif packets=17582 | presents composed=48
+[gfx] 60.0 fps ... draws=0 transfers=0 passes=0 ... presents composed=108..348    (idle)
+```
+
+So the GS workload is real (4,219 draws / 17,582 GIF packets / 176 resolves / 42 MB of transfers) and frames
+are composed and presented; afterwards the scene goes idle at 60 fps with zero draws - i.e. the game is waiting,
+not failing to render.
+
+**Open item:** `TOL_GFX_SCREENSHOT_DIR` produced no files in a 110 s run, and no screenshot line appears in
+either log, although `gsScreenshotEnabled()` reads the variable. Next: check the latch/writer path in
+`sdlgpu_backend.cpp` (who honours `gsScreenshotEnabled()` and whether the composed-present path reaches it), so
+the actual frame can be captured and compared with PCSX2.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

@@ -2782,6 +2782,55 @@ namespace
     }
 
     PS2Runtime::RecompiledFunction gAdxDetachPrev = nullptr;
+    PS2Runtime::RecompiledFunction gStreamStopPrev = nullptr;
+    PS2Runtime::RecompiledFunction gStreamStopWrapPrev = nullptr;
+
+    // Thread identity: the "stop all streams" chain is FUN_0019A2B0 -> FUN_00199988 -> ... -> FUN_00199E30
+    // (the detach handshake). FUN_0019A2B0 has *no* direct xref, so it is reached through a function pointer.
+    // Logging currentThreadId(), $ra (the call site) and $sp at both entries names the thread that executes the
+    // stop and the indirect site that started it - which is what must move off the worker's thread.
+    void streamStopProbeImpl(const char *tag, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                             PS2Runtime::RecompiledFunction prev)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const uint32_t sp = GPR_U32(ctx, 29);
+        const int cur = static_cast<int>(runtime->eeScheduler().currentThreadId());
+        if (prev != nullptr)
+        {
+            prev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 12u || (sCalls % 500u) == 0u))
+        {
+            std::fprintf(stderr, "[stop] %s #%u curThread=%d ra=0x%08X sp=0x%08X\n", tag, sCalls, cur, ra, sp);
+        }
+    }
+
+    void streamStopProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        streamStopProbeImpl("19988", rdram, ctx, runtime, gStreamStopPrev);
+    }
+
+    void streamStopWrapProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        streamStopProbeImpl("19a2b0", rdram, ctx, runtime, gStreamStopWrapPrev);
+    }
+
+    void installStreamStopProbes(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x00199988u) != nullptr)
+        {
+            gStreamStopPrev = runtime.lookupFunction(0x00199988u);
+            runtime.replaceFunction(0x00199988u, &streamStopProbe);
+        }
+        if (runtime.lookupFunction(0x0019A2B0u) != nullptr)
+        {
+            gStreamStopWrapPrev = runtime.lookupFunction(0x0019A2B0u);
+            runtime.replaceFunction(0x0019A2B0u, &streamStopWrapProbe);
+        }
+    }
 
     // FUN_00199E30 is the ADX stream detach handshake:
     //     while (*(0x394380) == 0) { *(0x394378) = 1; ChangeThreadPriority(t,1); WakeupThread(t); step(t); }
@@ -2801,9 +2850,14 @@ namespace
             // TCB layout: base 0x407160, stride 0x210, entry at +0x1B0, resume pc at +0x1B4.
             const uint32_t tcb = (tid < 64u) ? (0x00407160u + tid * 0x210u) : 0u;
             const bool tcbOk = (tcb >= 0x00407160u && tcb + 0x210u <= 0x00407E00u);
+            // Why does this run on the worker's thread? $ra names the caller (a guest return address means a
+            // normal call; ra == 0 means an invocation/thread entry) and currentThreadId() names the carrier.
             std::fprintf(stderr,
-                         "[adxdet] #%u tid=0x%08X wait(394378)=%u done(394380)=%u tcbEntry=0x%08X tcbPc=0x%08X\n",
-                         sCalls, tid, flagWait, flagDone, tcbOk ? runtime->Load32(rdram, ctx, tcb + 0x1B0u) : 0u,
+                         "[adxdet] #%u tid=0x%08X curThread=%d ra=0x%08X sp=0x%08X wait=%u done=%u "
+                         "tcbEntry=0x%08X tcbPc=0x%08X\n",
+                         sCalls, tid, static_cast<int>(runtime->eeScheduler().currentThreadId()), GPR_U32(ctx, 31),
+                         GPR_U32(ctx, 29), flagWait, flagDone,
+                         tcbOk ? runtime->Load32(rdram, ctx, tcb + 0x1B0u) : 0u,
                          tcbOk ? runtime->Load32(rdram, ctx, tcb + 0x1B4u) : 0u);
             // Who *is* the ADX worker (entry 0x198C60) in this port? Scan the thread table once and name every
             // live slot, so "tid 2" can be checked against the thread the guest actually created.
@@ -6119,21 +6173,24 @@ namespace tol
             gSpinReleasePrev(rdram, ctx, runtime);
         if (++gSpinReleaseCalls != 4096u)
             return;
-        // Complete the ADX lifecycle through the guest's own detach: refcount 1 -> 0, which makes
-        // FUN_00199988 run its release branch (FUN_00199938 sets the stream flags). Calling
-        // FUN_00199938 directly would set the flags but leave the refcount at 1, which is not the
-        // lifecycle the game closes and reopens with.
-        PS2Runtime::RecompiledFunction detach = runtime->lookupFunction(0x00199988u);
-        if (detach == nullptr)
-            return;
-        const int32_t before = static_cast<int32_t>(runtime->Load32(rdram, ctx, 0x003942C4u));
-        SET_GPR_U32(ctx, 31, 0xDEADBEF0u);
-        detach(rdram, ctx, runtime);
-        SET_GPR_U32(ctx, 31, 0x198C90u);
-        const int32_t after = static_cast<int32_t>(runtime->Load32(rdram, ctx, 0x003942C4u));
+        // Apply exactly the state the audio layer's close would have applied - refcount -> 0 and the six stream
+        // flags that FUN_00199938 sets - and nothing else.
+        //
+        // The previous version called FUN_00199988 inline here. That chain ends in FUN_00199E30, the detach
+        // handshake, which spins waiting for DAT_00394380 - a flag the waiter thread sets *after* it leaves its
+        // spin loop. Running it inline therefore waits for the very thread that is executing it: measured
+        // [adxdet] curThread=2 ra=0xDEADBEF0 (our sentinel), and WakeupThread(2) -> KE_ILLEGAL_THID (-406),
+        // because the guest asks thread 2 to wake itself. The deadlock was manufactured by the workaround.
+        //
+        // With the flags applied instead, the waiter's own code sees DAT_00394378 != 0, sets DAT_00394380 = 1 and
+        // exits through ExitDeleteThread - the guest's own path, on the guest's own thread. No guest function is
+        // hijacked and no teardown runs off-thread.
+        runtime->Store32(rdram, ctx, 0x003942C4u, 0u);   // refcount -> 0
+        for (uint32_t flag = 0x00394378u; flag <= 0x003943C8u; flag += 0x10u)
+            runtime->Store32(rdram, ctx, flag, 1u);      // the six stream flags of FUN_00199938
         std::fprintf(stderr,
-                     "[xfer] adx-detach after %u spins: refcount %d -> %d, stream flag 0x394378 = %u\n",
-                     gSpinReleaseCalls, before, after, runtime->Load32(rdram, ctx, 0x00394378u));
+                     "[xfer] stream release applied after %u spins (refcount 0, flags set) - waiter exits by its own code\n",
+                     gSpinReleaseCalls);
     }
 
     void installSpinRelease(PS2Runtime &runtime)
@@ -6965,6 +7022,8 @@ namespace tol
         installState4Probe(runtime);
         // The ADX detach handshake (see adxDetachProbe).
         installAdxDetachProbe(runtime);
+        // Thread identity of the "stop all streams" chain (see streamStopProbe).
+        installStreamStopProbes(runtime);
         {
             PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002E0880u);
             if (fn != nullptr)
