@@ -2341,6 +2341,23 @@ namespace
     void jobObjProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t obj = GPR_U32(ctx, 4);
+        // One-shot: what does the job table actually contain while this object waits on it? 0x4E9140 is past the
+        // ELF's file image (filesz ends at 0x3DAF80), so it is .bss and starts zero; if no guest store ever lands
+        // there (TOL_WATCH_JOBTABLE shows none) the table is still all zero at this moment and FUN_002E0820 can
+        // never report a set bit 1.
+        {
+            static bool sDumpedTable = false;
+            if (!sDumpedTable)
+            {
+                sDumpedTable = true;
+                std::fprintf(stderr, "[jobtable] dump @0x004E9140 (first wait):");
+                for (uint32_t i = 0u; i < 0x30u; i += 4u)
+                {
+                    std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, 0x004E9140u + i));
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
         if (gJobObjPrev != nullptr)
         {
             gJobObjPrev(rdram, ctx, runtime);
