@@ -2493,6 +2493,38 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdYieldPrev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdParkPrev = nullptr;
+
+    // THE resume test.
+    //
+    // The parked app-job thread waits at 0x3661DC, and the loop body does not spin on the wait byte - it calls
+    // the scheduler:   0x3661CC jalr $t9    /    0x3661D4 jal func_15231C   (ra := 0x3661DC)
+    // 0x15231C belongs to the same 0x152xxx family as service A (0x152200), service B (0x15253C) and the loop
+    // top (0x15243C), i.e. the wait is a cooperative yield into the pump.
+    //
+    // So: if 0x15231C is entered once (ra=0x3661DC) and never again, the guest thread is never re-dispatched and
+    // the port's yield/resume layer is the bug. If it is entered repeatedly, the thread is being resumed and the
+    // failure is further in (stale &this+0x80 payload). "park" counts entries into FUN_00366090 for the same
+    // reason, from the other end.
+    void orderYieldProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("yield", ctx);
+        if (gOrdYieldPrev != nullptr)
+        {
+            gOrdYieldPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void orderParkProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("park", ctx);
+        if (gOrdParkPrev != nullptr)
+        {
+            gOrdParkPrev(rdram, ctx, runtime);
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -5941,6 +5973,24 @@ namespace tol
             {
                 gOrdDispBPrev = fn;
                 runtime.replaceFunction(0x0015253Cu, &orderDispBProbe);
+            }
+        }
+
+        // Resume test: the park loop's yield (0x15231C, called from 0x3661D4) and the app-job step entry.
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x0015231Cu);
+            if (fn != nullptr)
+            {
+                gOrdYieldPrev = fn;
+                runtime.replaceFunction(0x0015231Cu, &orderYieldProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00366090u);
+            if (fn != nullptr)
+            {
+                gOrdParkPrev = fn;
+                runtime.replaceFunction(0x00366090u, &orderParkProbe);
             }
         }
 

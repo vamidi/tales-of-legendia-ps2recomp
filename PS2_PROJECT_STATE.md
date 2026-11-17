@@ -4080,6 +4080,56 @@ guest-thread/yield support - not in the recompiled code and not in a table poke.
 3. Do **not** reorder the queue or pre-seed `entry0+6` - both would make the port diverge from the guest on a path
    PCSX2 proves correct.
 
+## Session 126 (2026-11-17) - resume hypothesis FALSIFIED: the thread is scheduled, it spin-waits in the phase machine and never reaches its yield
+
+Probes: `yield` on `0x15231C` (the park loop's yield at `0x3661D4`, `ra := 0x3661DC`) and `park` on `0x366090`
+(`FUN_00366090`, the app-job step). The park loop does not spin on a word - it calls the scheduler:
+
+```
+0x3661CC  jalr $t9
+0x3661D4  jal  func_15231C     <- yield, same 0x152xxx family as service A/B and the loop top
+0x3661DC  ...                  <- the wait site seen in earlier sessions
+```
+
+### Measured (85 s, TOL_TRACE_ORDER)
+
+```
+dispA 268 | read 12 (capped) | appjob 2 | claim 1 | submit 1 | frame 1 | daemon 1 | iter 1 | park 1 | YIELD 0
+```
+
+- `yield = 0`: `0x15231C` is **never entered**, so the cooperative yield is never executed.
+- `park = 1`: `FUN_00366090` runs once.
+- `read` repeats with a constant context (`sp=0x00423480`, `ra=0x003659BC`), and `dispA` runs 268 times.
+
+**Conclusion: the app-job thread is not parked-and-forgotten.** Both it and the pump are being scheduled over and
+over; the thread simply spins in the phase machine's read path, never reaching the yield at `0x3661D4`. The
+session-125 recommendation ("resume the parked thread") was therefore wrong and is retracted here - the
+scheduler is already round-robining both contexts.
+
+### What this leaves
+
+The thread is alive, the submit happened (`#11`), and the read still returns 0 every iteration because **bit 1 is
+set**. So the fairness/resume layer is not the defect; the defect is that the phase machine takes the **claim
+branch before the read branch** in the same pass, and once claimed, the reader's contract
+(`if (bit1) return 0;`) can never deliver - no matter how many times the thread is rescheduled.
+
+That is now the single question to settle against the emulator, and it is a state question, not a scheduling one:
+at the analogous instant, what are `obj+0x70` (phase), `obj+0x74` (inner), `obj+0x78`, `obj+0x7C` in PCSX2, and
+which branch does that imply? Port values from `[jobobj]` at the park are `phase=1 next=0xFFFF inner=1
++78=0 +7C=0 +84=0`.
+
+### Emulator check (deferred - PCSX2 restarted this session)
+
+PCSX2 was found paused at `0x002DEF98` (the `sb` of the entry initialiser, i.e. a stale breakpoint on the
+initialiser, not the interesting site) and its MCP connection wedged; user restarted it. On reconnect:
+
+1. **Do not** re-arm `0x2DEF98` - it fires during entry init and only parks the VM.
+2. Arm `0x3661DC` (hit count) to confirm the guest *does* loop there and yield, and note `a0`/`s1`.
+3. At that stop, read `0x4E9140` (status + `entry+6`) and the object `0x63E3D0` fields `+0x70/+0x74/+0x78/+0x7C`,
+   then compare with the port's `[jobobj]` line at its park. The branch difference will show whether the port's
+   phase/flags diverge before the claim or the claim itself is mis-ordered.
+
+
 
 
 
