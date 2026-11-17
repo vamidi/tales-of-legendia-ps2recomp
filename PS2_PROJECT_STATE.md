@@ -5791,6 +5791,52 @@ either log, although `gsScreenshotEnabled()` reads the variable. Next: check the
 `sdlgpu_backend.cpp` (who honours `gsScreenshotEnabled()` and whether the composed-present path reaches it), so
 the actual frame can be captured and compared with PCSX2.
 
+### Session 152 - screenshots work again, and the black screen is pinned to DISPFB
+
+`writePng()` existed but **had no caller and was in no CMake target** (orphaned in the ToL adaptation), so
+`TOL_GFX_SCREENSHOT_DIR` only kept composed pixels alive and produced no files. Fixed: added
+`gsdump/gs_frame_image.cpp` to `tol_gfx_gs` and wrote a PNG every 30 composed frames from the composed-present
+path in `sdlgpu_backend.cpp`. 40 frames captured, 512x448.
+
+Measured frames (`tools/png_probe.py`, a filter-0 RGBA decoder + luminance map):
+
+| frame | non-black | content |
+|---|---|---|
+| `frame_000030` (~0.5 s) | **0.66 %** | greys 16/32/48/96/160 - the "NOW LOADING" text |
+| `frame_000060`, 090, 150, 300, 1200 | **0.00 %** | fully black |
+
+So the port renders the loading text once and then presents black, even though the same run reports
+`draws=4219 gif packets=17582` - the drawing happens, the presentation reads the wrong buffer.
+
+Every captured frame reports `displayFbp=0 sourceFbp=0 preferred=0`, and the port's GS privileged state is
+
+```
+[gspriv] PMODE     = 0x66
+[gspriv] DISPFB2   = 0x00001000  (fbp=0 fbw=8)
+[gspriv] DISPLAY2  = 0x001BF9FF0203227C
+```
+
+while the guest's draw target is FBP 224 (`ctxFbp=[224,0]`). **The display base never moves off page 0**, so
+the presenter shows an empty page. That is the black screen, and it is independent of the loader stall.
+
+Note on the guest side: **no file in the corpus writes `0x12000070`/`0x120000A0` as an immediate address** -
+the GS environment is programmed through computed register addresses, so the flip must be traced on the runtime
+side (the handler that records `DISPFB2`), not by grepping the corpus.
+
+**PCSX2 A/B limitation (measured):** the debug server returns **zeros** for GS privileged registers
+(`0x12000070`+ read back all zero), so a register-level comparison of DISPFB/DISPLAY is not possible through
+the MCP. Comparing the picture needs either a PCSX2 GS dump (`.gs`, whose embedded screenshot
+`gs_dump_file`/`gs_replay` can already extract) or a savestate-level VRAM read.
+
+### Next
+
+1. Trace the runtime's GS privileged **write** path for `DISPFB1/DISPFB2`: log `base` and `value` on every
+   write. If the guest writes fbp=224 and the runtime drops or mis-decodes it, that is a renderer fix; if the
+   guest never writes it, the flip is upstream (init/ordering) and belongs with the loader work.
+2. Independently: `sourceFbp` is 0 even though the draw target is 224 - check whether the presenter should be
+   falling back to the current FRAME_1 target when DISPFB has not been reprogrammed, which is the port-side
+   question rather than an emulation one.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

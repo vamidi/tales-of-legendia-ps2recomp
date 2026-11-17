@@ -20,6 +20,7 @@ set(TOL_GFX_GS_SOURCES
     gs/gs_vram.cpp
     gs/gs_transfer.cpp
     gs/gs_state.cpp
+    gsdump/gs_frame_image.cpp
 )
 # GsVram's pixel accessors are backed by ps2xRuntime's swizzle tables. In the
 # standalone dump-harness build nothing else compiles them, so they come in

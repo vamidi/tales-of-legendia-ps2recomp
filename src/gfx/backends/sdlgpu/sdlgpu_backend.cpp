@@ -7,6 +7,7 @@
 #include "gfx/gs/gs_state.h"
 #include "gfx/gs/gs_transfer.h"
 #include "gfx/gs/gs_vram.h"
+#include "gfx/gsdump/gs_frame_image.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
@@ -2872,6 +2873,39 @@ struct SdlGpuBackend::Impl {
                 frame.pixels.clear();
                 frame.rowPitchBytes = 0u;
                 frame.mode = GSPresentationMode::BackendNative;
+            } else {
+                // Write a PNG every N composed frames. writePng() existed but had no caller after the
+                // ToL adaptation, so TOL_GFX_SCREENSHOT_DIR only kept the pixels alive and produced no files.
+                static uint32_t sShotIndex = 0u;
+                ++sShotIndex;
+                constexpr uint32_t kShotEvery = 30u;
+                constexpr uint32_t kShotLimit = 40u;
+                const uint32_t shots = sShotIndex / kShotEvery;
+                if ((sShotIndex % kShotEvery) == 0u && shots <= kShotLimit && frame.width != 0u &&
+                    frame.height != 0u) {
+                    const size_t packedRow = static_cast<size_t>(frame.width) * 4u;
+                    const size_t srcPitch = frame.rowPitchBytes != 0u ? frame.rowPitchBytes : packedRow;
+                    if (frame.pixels.size() >= srcPitch * frame.height) {
+                        tol::gfx::FrameImage image;
+                        image.resize(frame.width, frame.height);
+                        for (uint32_t y = 0; y < frame.height; ++y) {
+                            std::memcpy(&image.rgba[static_cast<size_t>(y) * packedRow],
+                                        frame.pixels.data() + static_cast<size_t>(y) * srcPitch, packedRow);
+                        }
+                        const char *dir = std::getenv("TOL_GFX_SCREENSHOT_DIR");
+                        char path[512];
+                        std::snprintf(path, sizeof(path), "%s/frame_%06u.png", dir != nullptr ? dir : ".",
+                                      sShotIndex);
+                        std::string error;
+                        if (tol::gfx::writePng(path, image, error)) {
+                            std::fprintf(stderr, "[shot] %s (%ux%u) displayFbp=%u sourceFbp=%u preferred=%d\n", path,
+                                         frame.width, frame.height, frame.displayFbp, frame.sourceFbp,
+                                         frame.usedPreferred ? 1 : 0);
+                        } else {
+                            std::fprintf(stderr, "[shot] failed %s: %s\n", path, error.c_str());
+                        }
+                    }
+                }
             }
         }
     }
