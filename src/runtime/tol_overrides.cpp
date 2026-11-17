@@ -3005,6 +3005,33 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdD5DCPrev = nullptr;
+
+    // Interior continuation of FUN_002DF590 (0x2DF590..0x2DF6D0), immediately after `jal 0x233E50` at 0x2DF5D4.
+    // If this is dispatched and exits at 0x2E0A3C, the submit row IS resumed and the "abandoned thread" theory dies.
+    void orderD5DCProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t entryPc = static_cast<uint32_t>(ctx->pc);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && sCalls <= 10u)
+        {
+            std::fprintf(stderr, "[d5dc] #%u RESUME pc=0x%08X ra=0x%08X v0=0x%08X\n", sCalls, entryPc, ra,
+                         GPR_U32(ctx, 2));
+        }
+        if (gOrdD5DCPrev != nullptr)
+        {
+            gOrdD5DCPrev(rdram, ctx, runtime);
+        }
+        if (sEnv && sCalls <= 10u)
+        {
+            std::fprintf(stderr, "[d5dc] #%u exit_pc=0x%08X (expect 0x002E0A3C)\n", sCalls,
+                         static_cast<unsigned>(ctx->pc));
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6570,6 +6597,16 @@ namespace tol
             {
                 gOrdEf4Prev = fn;
                 runtime.replaceFunction(0x00233EF4u, &orderEf4Probe);
+            }
+        }
+        // ...and the same for 0x2DF5DC (see orderD5DCProbe)
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002DF5DCu);
+            std::fprintf(stderr, "[install] lookupFunction(0x2DF5DC) = %s\n", fn != nullptr ? "ok" : "NULL");
+            if (fn != nullptr)
+            {
+                gOrdD5DCPrev = fn;
+                runtime.replaceFunction(0x002DF5DCu, &orderD5DCProbe);
             }
         }
 

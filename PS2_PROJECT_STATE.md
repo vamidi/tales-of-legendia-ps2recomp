@@ -5002,6 +5002,40 @@ with the same pattern - entry + exit pc. Possible outcomes:
 
 Acceptance test unchanged: `0x2E0A58` writes, status returns to `0x00`.
 
+## Session 147 (2026-11-17) - FIRST BROKEN RETURN: `0x2DF5DC` resumes but exits at `0x116A6C`, not `0x2E0A3C`
+
+```
+[install] lookupFunction(0x2DF5DC) = ok
+[d5dc] #1 RESUME pc=0x002DF5DC ra=0x002DF5DC v0=0x00000000
+[d5dc] #1 exit_pc=0x00116A6C (expect 0x002E0A3C)
+```
+
+Outcome **3** from the plan: the continuation is dispatched (so the runtime does not drop it), but this invocation of
+`FUN_002DF590` ends by returning to **`0x116A6C`** instead of the submit row's continuation `0x2E0A3C`.
+
+Six layers below are verified correct against hardware, so this is the first place the port genuinely diverges:
+the `ra` planted by the submit row's `jal` at `0x2E0A34` (`0x2E0A3C`) is not the `ra` this call returns with.
+
+Two candidate explanations:
+
+1. **`ra` is clobbered** inside the `0x2DF590 -> 0x233E50 -> 0x233FC0` chain (the chain restores/fiddles registers
+   and something writes `$ra`), so the return goes to whatever was last in it.
+2. **this resumption belongs to a different invocation** - `0x2DF590` has other callers, and `0x116A6C` is
+   plausibly the return address of a call site at `0x116A64`. In that case the submit row's own call is still
+   pending and the two invocations are being conflated.
+
+Per the agreed rule this is **not** the pivot condition (it did not return to `0x2E0A3C`), so the next step stays
+on this seam - but it is now a fix socket rather than another open question.
+
+### Next
+
+1. Static: check who calls `0x2DF590` (look for a `jal`/dispatch at `0x116A64`) to decide between the two candidate
+   explanations above.
+2. Dynamic: log `$ra` at entry of `0x2DF590` for **each** invocation (it is called from `0x2E0A34` with `0x2E0A3C`);
+   if two invocations exist with different `ra`, they are being conflated and the fix is to keep them distinct.
+3. Acceptance test unchanged: `0x2E0A58` writes, status returns to `0x00`.
+
+
 
 
 
