@@ -1113,6 +1113,22 @@ struct SdlGpuBackend::Impl {
             return;
         }
 
+        // TOL_TRACE_GSFRAME=1: one line per sampled draw batch - which surface the draws actually target, its
+        // identity, its state, and the region they write. This is the draw side of "nothing renders": the
+        // presenter has already been eliminated (forcing the draw target still yields black frames).
+        if (std::getenv("TOL_TRACE_GSFRAME") != nullptr) {
+            static uint32_t sDraws = 0u;
+            ++sDraws;
+            if (sDraws <= 8u || (sDraws % 500u) == 0u)
+                std::fprintf(stderr,
+                             "[gsdraw] #%u surf base=%u psm=%u fbw=%u %ux%u scale=%u undefined=%d "
+                             "needsUpload=%d patches=%zu dirty=%d written=[%u,%u..%u,%u]\n",
+                             sDraws, color->base, color->psm, color->bufferWidth, color->width, color->height,
+                             color->scale, color->undefined ? 1 : 0, color->needsUpload.empty() ? 0 : 1,
+                             color->cpuPatches.size(), color->gpuDirty.empty() ? 0 : 1, written.x0, written.y0,
+                             written.x1, written.y1);
+        }
+
         // Distinct FRAME views can name the same GS pages. Finish the old
         // view before importing its pixels into the new one.
         const bool pendingAlias = pendingDrawsTouchOthers(color->pages, color);
@@ -1794,6 +1810,22 @@ struct SdlGpuBackend::Impl {
         GsSurface *surface = forceMemoryPath
                                  ? nullptr
                                  : targets->findColorSurface(sourceBase, sourcePsm);
+
+        // TOL_TRACE_GSFRAME=1: the read side. A surface that is undefined, or still holding pending local-memory
+        // uploads, is NOT read from the GPU texture - the presenter falls back to local memory, which may not yet
+        // contain the drawn pixels. That is the other half of "nothing renders".
+        if (std::getenv("TOL_TRACE_GSFRAME") != nullptr) {
+            static uint32_t sReads = 0u;
+            ++sReads;
+            if (sReads <= 8u || (sReads % 60u) == 0u)
+                std::fprintf(stderr,
+                             "[gsread] #%u sourceBase=%u psm=%u surface=%s undefined=%d needsUpload=%d "
+                             "scale=%u/%u forceMem=%d\n",
+                             sReads, sourceBase, sourcePsm, surface != nullptr ? "yes" : "no",
+                             (surface != nullptr && surface->undefined) ? 1 : 0,
+                             (surface != nullptr && !surface->needsUpload.empty()) ? 1 : 0,
+                             surface != nullptr ? surface->scale : 0u, factor, forceMemoryPath ? 1 : 0);
+        }
         // Host transfers can replace a cached target without another draw.
         // Read local memory until that target has consumed the new pixels.
         if (surface && !surface->undefined && surface->scale == factor &&
@@ -2679,6 +2711,44 @@ struct SdlGpuBackend::Impl {
                 stage.haveFrame = true;
                 return;
             }
+        }
+
+        // TOL_PREFER_FRAME_SOURCE=1: diagnostic experiment. Present the page the draws actually target
+        // (request.contextFrames[0]) with the display circuit's geometry, instead of DISPFB's page. This
+        // distinguishes "presenter reads the wrong VRAM page" from "the drawn page is empty too".
+        if (std::getenv("TOL_PREFER_FRAME_SOURCE") != nullptr) {
+            const GsDisplaySetup &geometry = circuit1.valid ? circuit1 : circuit2;
+            GsDisplaySetup forced = geometry;
+            forced.fbp = request.contextFrames[0].fbp;
+            if (request.contextFrames[0].fbw != 0u)
+                forced.fbw = request.contextFrames[0].fbw;
+            forced.psm = request.contextFrames[0].psm;
+            forced.originX = 0u;
+            forced.originY = 0u;
+            forced.valid = true;
+            uint32_t forcedSource = 0u;
+            bool forcedPreferred = false;
+            readCircuit(request, forced, halfHeightSource, false, factor, frame.pixels, forcedSource,
+                        forcedPreferred);
+            frame.width = geometry.width * factor;
+            frame.height = geometry.height * factor;
+            frame.rowPitchBytes = frame.width * 4u;
+            frame.displayFbp = forced.fbp;
+            frame.sourceFbp = forcedSource;
+            frame.usedPreferred = forcedPreferred;
+            stage.pmode = pmode;
+            stage.circuit1 = circuit1;
+            stage.circuit2 = circuit2;
+            stage.bgcolor = request.bgcolor;
+            stage.dualCircuit = false;
+            stage.haveFrame = true;
+            if (std::getenv("TOL_TRACE_GSPRESENT") != nullptr) {
+                static uint32_t sForced = 0u;
+                if ((sForced++ % 30u) == 0u)
+                    std::fprintf(stderr, "[gspresent] FORCED source=fbp%u fbw=%u psm=%u (display was fbp%u)\n",
+                                 forced.fbp, forced.fbw, forced.psm, geometry.fbp);
+            }
+            return;
         }
 
         if (circuit1.valid && circuit2.valid) {

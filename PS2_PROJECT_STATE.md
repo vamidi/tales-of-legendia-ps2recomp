@@ -5837,6 +5837,48 @@ the MCP. Comparing the picture needs either a PCSX2 GS dump (`.gs`, whose embedd
    falling back to the current FRAME_1 target when DISPFB has not been reprogrammed, which is the port-side
    question rather than an emulation one.
 
+### Session 152 - WHY NOTHING RENDERS: the presenter is stuck on the local-memory path
+
+Draw/read-side probe (`TOL_TRACE_GSFRAME=1`):
+
+```
+[gsdraw] #3 surf base=0 psm=0 fbw=8 512x448 scale=1 undefined=1 needsUpload=1 dirty=0 written=[0,0..65,448]
+[gsdraw] #4 surf base=0 psm=0 fbw=8 512x448 scale=1 undefined=0 needsUpload=0 dirty=1 written=[0,0..65,448]
+[gsread] #1 sourceBase=0 psm=0 surface=yes undefined=0 needsUpload=1 scale=1/1 forceMem=0
+[gsread] #2..#8  ... needsUpload=1        <- on every present
+```
+
+Three conclusions, in order of how much they overturn earlier assumptions:
+
+1. **The draws target `base 0`, not 224.** `context.frame.fbp` is 0 at draw time. The `ctxFbp=[224,224]` in `[gspresent]` comes from
+   `request.contextFrames`, which is a *different* (preferred/stale) source, not the live draw target. So the earlier
+   reading "draws to 224, displays 0" was **wrong**: draw target and DISPFB agree on page 0.
+2. **Forcing the presenter to page 224 changes nothing** (frames stay black apart from the one "NOW LOADING" frame at
+   0.5 s). The presenter was never the problem.
+3. **The present path never uses the GPU texture.** `readCircuit` downloads the texture only when
+   `surface->needsUpload.empty()`; the probe shows `needsUpload=1` on *every* present, so it always takes the
+   local-memory fallback. GPU draws write the texture, not local memory, so the presented image is black.
+
+`needsUpload` is non-empty by construction and is re-merged constantly:
+`GsTargetCache::createColorSurface` sets `needsUpload = wholeRegion()` (`sdlgpu_targets.cpp:262`), and
+`invalidate()` merges every local-memory write back into it (`:409 surface.needsUpload.merge(written)`, also `:386`,
+`:593`). It is only ever *cleared* by the VRAM -> texture upload path (`:768-822`, `:861`, `:960`), which is evidently
+not draining this surface.
+
+So the defect is: **the VRAM -> texture upload never drains `needsUpload` for the surface being presented, so the display
+path permanently prefers the empty local-memory copy. The renderer is fine; the upload bookkeeping is not.**
+
+### Next probe (exact)
+
+Instrument the drain path (`GsTargetCache` upload: `prepareColorView` / the `needsUpload` handling at
+`sdlgpu_targets.cpp:768-822`) with the same `TOL_TRACE_GSFRAME` gate:
+- is the upload called for the presented surface at all (count calls per surface base)?
+- what region does it take (`upload.x0..y1`) and what does it clear?
+- does `applyCpuPatches` / `resolveSurface` run for it?
+
+A surface whose `needsUpload` is never cleared after a successful upload is the bug; if the upload is never invoked for
+this surface, the bug is in the caller that decides which surfaces need an upload.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
