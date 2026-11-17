@@ -6030,6 +6030,46 @@ So the next thing to identify is the guest code that *re-creates or re-arms* the
 the caller of `CreateThread(0x366090)` (or the writer of `app+0x70`/`+0x72`), and what it waits on. That is the
 actual scene-job starter.
 
+### Session 152 - identified: the scene job is a vtable method, and the loader step stops being driven
+
+Correcting the earlier model (the app job is **not** a thread, so there is no second `CreateThread` to find):
+
+```
+0x165210  j 0x1653F0                       ; loader thread body (guest TCB entry)
+0x165220  jal 0x165400 ; jal 0x15231C      ; the STEP: run one app job, then yield, v0 = 1
+0x165400  (**(code**)(*(int*)(obj+0x10) + 0xc))()   ; -> vtable[0x0C] of the secondary vtable
+secondary vtable 0x3DA380: slots 0x366080, 0x366090, 0x3662D0, 0x366310
+                          -> 0x366090 = FUN_00366090 = the AppCell app-job body
+```
+
+Static confirmation: the literal `0x00366090` appears exactly once in the ELF, at data address `0x3DA38C`
+(= `0x3DA380 + 0x0C`), and `0x3DA380` is installed as `obj+0x10` by the constructors `FUN_00366040` /
+`FUN_00366310`. So the "scene job" is a **method invoked from the loader step**, not a thread entry.
+
+**Measured** (`[loaderstep]`, 60 s run):
+
+```
+[loaderstep] #1 a0=0x0063D850 v0=0
+[loaderstep] #2 a0=0x0063D890 v0=0
+[loaderstep] #3 a0=0x0063D890 v0=0
+[loaderstep] #4 a0=0x0063D890 v0=0      <- then never called again
+```
+
+The step runs the whole `FUN_00366090` body (which itself creates the 0x220-byte app object 0x63E3D0 and loops
+until `busy` clears - that is where the observed state 1 -> 3 -> 4 cycles happen) and is then **not driven
+again**. So the re-arm point is not the app object and not a thread creation: it is the **guest microkernel
+continuing to schedule the loader thread** (TCB `+0x1B4` = the step entry). After the app loop's final exit that
+thread is no longer dispatched, and nothing submits another unit.
+
+Note the `[tcb]` dump agrees: slot 4's `+0x1B4` sits at `0x003661DC` (the app loop's yield) rather than at the
+step entry `0x165220`, i.e. the thread is parked inside the job, not back at its step.
+
+### Next
+
+Trace the guest microkernel's hand-off of that thread after `FUN_00366090` returns: its TCB status/`+0x1B4`
+update and the run-loop selection. That is where the loader thread stops being dispatched - and therefore where
+the scene job should have been re-armed.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

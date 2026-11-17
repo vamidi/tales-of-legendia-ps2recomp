@@ -2741,6 +2741,34 @@ namespace
     PS2Runtime::RecompiledFunction gOrdOrchPrev = nullptr;
     PS2Runtime::RecompiledFunction gLeafStepPrev = nullptr;
     PS2Runtime::RecompiledFunction gState4Prev = nullptr;
+    PS2Runtime::RecompiledFunction gLoaderStepPrev = nullptr;
+
+    // 0x165400 is the loader thread's per-unit step. The AppCell "app job" (FUN_00366090) is invoked from it as
+    // vtable+0x0C of the secondary vtable 0x3DA380 - it is NOT a thread, so there is no CreateThread to re-arm.
+    // If this step stops being called (or stops returning success) after the app loop clears its busy flag, that
+    // is why no new scene job is submitted.
+    void loaderStepProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t arg = GPR_U32(ctx, 4);
+        if (gLoaderStepPrev != nullptr)
+        {
+            gLoaderStepPrev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 8u || (sCalls % 100u) == 0u))
+            std::fprintf(stderr, "[loaderstep] #%u a0=0x%08X v0=0x%08X\n", sCalls, arg, GPR_U32(ctx, 2));
+    }
+
+    void installLoaderStepProbe(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x00165400u) != nullptr)
+        {
+            gLoaderStepPrev = runtime.lookupFunction(0x00165400u);
+            runtime.replaceFunction(0x00165400u, &loaderStepProbe);
+        }
+    }
 
     // FUN_00365FD0 is the app's outer state 4: first call sets phase=1 and returns 0, second call invokes
     // app->vtable[0x20](app,0), sets next=0 and returns 1 - after which 0x365630 sets outer=0, a state with no
@@ -7020,6 +7048,8 @@ namespace tol
         }
         // The app's outer state 4 (see state4Probe).
         installState4Probe(runtime);
+        // The loader thread's per-unit step (see loaderStepProbe) - the real invoker of the app job.
+        installLoaderStepProbe(runtime);
         // The ADX detach handshake (see adxDetachProbe).
         installAdxDetachProbe(runtime);
         // Thread identity of the "stop all streams" chain (see streamStopProbe).
