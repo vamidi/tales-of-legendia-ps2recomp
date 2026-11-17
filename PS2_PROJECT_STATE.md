@@ -4850,6 +4850,31 @@ submit row continues at `0x2E0A3C`. Instrument `0x233FC0` (the last call in `0x2
 port and whether it returns; the port's `nextpc = 0x233FC0` at that moment says control was left *inside* that call
 rather than unwinding to `0x2E0A3C`. Acceptance test unchanged: `0x2E0A58` writes and status returns to `0x00`.
 
+## Session 142 (2026-11-17) - final link refuted: `0x233FC0` returns correctly
+
+```
+[fc0] #1 enter a0=0x003E5D40 a1=0x00000001 ra=0x00233EF4
+[fc0] #1 RETURNED v0=0x00000000 nextpc=0x00233EF4
+[fc0] #2 enter a0=0x003E5D40 a1=0x0000000D ra=0x00233CA8
+[fc0] #2 RETURNED v0=0x00000000 nextpc=0x00151F88
+```
+
+- Call #1 carries `ra = 0x233EF4`, exactly the `jal` at `0x233EEC`, and **returns to that address** - so `0x233E50`
+  does continue past its last call, and `0x233FC0` is **not** where control is lost. The earlier reading of
+  `nextpc = 0x233FC0` as "abandoned inside that call" was an artefact of the runtime's inline dispatch, not a
+  defect.
+- Call #2 is reached from `ra = 0x233CA8` (a different caller in `0x233Cxx`) and returns to **`0x151F88`**, the run
+  loop post-switch site - so *on that path* a context switch happens rather than a plain return.
+
+Still `0x2E0A3C = 0` and `0x2E0A58 = 0`, so the break lies between `0x233E50`'s continuation and the submit row's
+resume.
+
+### Next
+
+Instrument `0x2DF5DC` (the instruction in `0x2DF590` immediately after its `jal 0x233E50` at `0x2DF5D4`): if the
+port never executes it, the loss is one frame up, in `0x2DF590`'s own continuation rather than in `0x233FC0`.
+
+
 
 
 

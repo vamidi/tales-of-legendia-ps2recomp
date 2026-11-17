@@ -2899,6 +2899,36 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdFc0Prev = nullptr;
+
+    // 0x233FC0 - the last call in FUN_00233E50 (jal at 0x233EEC, ra = 0x233EF4). This is where the port's
+    // control was left when the submit row's caller was abandoned: [sub2] measured nextpc = 0x233FC0 after
+    // 0x2DF590 returned. On hardware the same chain unwinds back to 0x2E0A3C. This probe prints on entry and
+    // separately after the call, so a missing "ret" line proves it never returns.
+    void orderFc0Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        const uint32_t a1 = GPR_U32(ctx, 5);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        orderEvent("fc0", ctx);
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && sCalls <= 20u)
+        {
+            std::fprintf(stderr, "[fc0] #%u enter a0=0x%08X a1=0x%08X ra=0x%08X\n", sCalls, a0, a1, ra);
+        }
+        if (gOrdFc0Prev != nullptr)
+        {
+            gOrdFc0Prev(rdram, ctx, runtime);
+        }
+        if (sEnv && sCalls <= 20u)
+        {
+            std::fprintf(stderr, "[fc0] #%u RETURNED v0=0x%08X nextpc=0x%08X\n", sCalls, GPR_U32(ctx, 2),
+                         static_cast<unsigned>(ctx->pc));
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6427,6 +6457,15 @@ namespace tol
             {
                 gOrdGatePrev = fn;
                 runtime.replaceFunction(0x00126368u, &orderGateProbe);
+            }
+        }
+        // The final link (see orderFc0Probe).
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00233FC0u);
+            if (fn != nullptr)
+            {
+                gOrdFc0Prev = fn;
+                runtime.replaceFunction(0x00233FC0u, &orderFc0Probe);
             }
         }
 
