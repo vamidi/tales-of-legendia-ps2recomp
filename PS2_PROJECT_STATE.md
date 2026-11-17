@@ -6224,6 +6224,48 @@ zeros for GS privileged registers, so the fade is confirmed from the code and th
 transition and the destination scene never draws. That is the same conclusion as the draw tally - the guest
 issues only clears - and the remaining work is the content path (what should draw after the fade), not timing.
 
+### Session 152 - fade probe built (works), and the real blocker: an invocation loop of 0x166490
+
+**Fade probe (fixed and measuring).** `FUN_00204240` is wrapped, its wait condition `FUN_001F8480` is wrapped, and
+the alpha `*(overlay+0x5C)` is sampled every 200 switch-ins. Result:
+
+```
+[fade] #1 ENTER obj=0x0063D890 mode(+14)=1  a(+18)=0x014E29E0
+[fade] #2 ENTER obj=0x0063D890 mode(+14)=2
+[picks] 200: overlay=0x0063D970 alpha=0.600
+[picks] 400: alpha=1.000     <- fade-in complete
+[picks] 600: alpha=1.000     <- hold
+[picks] 800: alpha=0.200     <- fade-out running
+```
+
+So the fade is real, completes its ramp, and is **not** the defect. `[fadewait]` never fires, so the pre-fade
+wait (`FUN_001f8480`) is not called on this path (the probe found no slot for that thunk) - worth re-checking,
+but the alpha ramp proves the fade body runs.
+
+**The screen stays black because nothing is drawn behind the overlay** (draw tally: 5 textured of 42,716).
+
+**The real blocker, newly measured:** with `TOL_TRACE_PARK=1` the EE is saturated by an **invocation loop**:
+
+```
+[ee-park] thread=-1 entry=0x0 returned-to-pc0 from=0x166490 ra=0x0 sp=0x1fbbff0 invocations=1
+          recent=0x166490, 0x166490, 0x11f650, 0x166490, 0x166490, ...
+count = 5,720 in 120 s (~48/s)
+```
+
+`thread=-1` is an **invocation carrier**, `0x166490` is the tiny `jal 0x19A068; sync; ei; jr $ra` wrapper, and the
+Timer-2 handler `0x11f650` is interleaved. Meanwhile the loader TCB (`0x4079A0`) is parked at `pc=0x204380`, i.e.
+inside the fade, at prio 4 / state 1 / started 1.
+
+So: the guest's turns are consumed by repeated invocation callbacks, the loader thread never returns far enough to
+start the next stage, and the scene never draws. (The earlier "scheduler stopped at 800 switch-ins" reading was a
+sampling artifact - `[picks]` counts switch-ins only, not invocation entries.)
+
+### Next probe (exact)
+
+Log every `queueInvocation` (or `invokeCurrent`) with the invocation's pc, kind and the host call site, rate
+limited. That names what re-queues `0x166490` at ~48/s - the Timer-2 handler path or the CRI pump - and that is
+what has to stop for the scene to run.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

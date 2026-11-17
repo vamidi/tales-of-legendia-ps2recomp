@@ -2524,7 +2524,16 @@ namespace
         ++sPickCount[tcb];
         if (sSelEnv && (sSel % 200u) == 0u)
         {
-            std::fprintf(stderr, "[picks] after %u switch-ins:", sSel);
+            // Fade curve: loader object 0x63D890 -> overlay object at +0x20 -> alpha (float) at +0x5C.
+            float alpha = -1.0f;
+            const uint32_t loaderObj = 0x0063D890u;
+            const uint32_t overlay = runtime->Load32(rdram, ctx, loaderObj + 0x20u);
+            if (overlay >= 0x00100000u && overlay + 0x60u < PS2_RAM_SIZE)
+            {
+                const uint32_t bits = runtime->Load32(rdram, ctx, overlay + 0x5Cu);
+                std::memcpy(&alpha, &bits, sizeof(alpha));
+            }
+            std::fprintf(stderr, "[picks] after %u switch-ins: overlay=0x%08X alpha=%.3f", sSel, overlay, alpha);
             for (const auto &entry : sPickCount)
                 std::fprintf(stderr, " 0x%08X=%u", entry.first, entry.second);
             std::fprintf(stderr, "\n");
@@ -2794,6 +2803,71 @@ namespace
     PS2Runtime::RecompiledFunction gLoaderStepPrev = nullptr;
     PS2Runtime::RecompiledFunction gBusyAttachPrev = nullptr;
     PS2Runtime::RecompiledFunction gBusySetPrev = nullptr;
+    PS2Runtime::RecompiledFunction gFadePrev = nullptr;
+    PS2Runtime::RecompiledFunction gFadeWaitPrev = nullptr;
+
+    // The scene fade FUN_00204240 (vt[0x0C] of the loader object 0x63D890 after it is re-created):
+    //     while (FUN_001f8480(state) != 0) yield();          <- wait before anything is drawn
+    //     black overlay object; alpha at *(obj+0x20)+0x5C
+    //     do { alpha += 0.04; ... yield(); } while (alpha < 1.0)      // fade in
+    //     do { ... yield(); } while (i < 0x5A)                        // hold
+    //     do { alpha -= 0.04; ... yield(); } while (0 < alpha)        // fade out
+    // Probing the wait condition and the alpha is the only way to tell "stuck before drawing" from "fading".
+    void fadeProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t obj = GPR_U32(ctx, 4);
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        const bool ok = (obj + 0x28u < PS2_RAM_SIZE);
+        const uint32_t overlayBefore = ok ? runtime->Load32(rdram, ctx, obj + 0x20u) : 0u;
+        if (sEnv && sCalls <= 8u)
+            std::fprintf(stderr, "[fade] #%u ENTER obj=0x%08X mode(+14)=%d a(+18)=0x%08X overlay=0x%08X\n", sCalls, obj,
+                         ok ? static_cast<int>(runtime->Load32(rdram, ctx, obj + 0x14u)) : -1,
+                         ok ? runtime->Load32(rdram, ctx, obj + 0x18u) : 0u, overlayBefore);
+        if (gFadePrev != nullptr)
+        {
+            gFadePrev(rdram, ctx, runtime);
+        }
+        const uint32_t overlayAfter = ok ? runtime->Load32(rdram, ctx, obj + 0x20u) : 0u;
+        if (sEnv && sCalls <= 8u)
+        {
+            float alpha = -1.0f;
+            if (overlayAfter >= 0x00100000u && overlayAfter + 0x60u < PS2_RAM_SIZE)
+            {
+                const uint32_t bits = runtime->Load32(rdram, ctx, overlayAfter + 0x5Cu);
+                std::memcpy(&alpha, &bits, sizeof(alpha));
+            }
+            std::fprintf(stderr, "[fade] #%u EXIT  overlay=0x%08X alpha=%.3f\n", sCalls, overlayAfter, alpha);
+        }
+    }
+
+    void fadeWaitProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gFadeWaitPrev != nullptr)
+        {
+            gFadeWaitPrev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 12u || (sCalls % 200u) == 0u))
+            std::fprintf(stderr, "[fadewait] #%u a0=0x%08X ret=0x%08X\n", sCalls, GPR_U32(ctx, 4), GPR_U32(ctx, 2));
+    }
+
+    void installFadeProbes(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x00204240u) != nullptr)
+        {
+            gFadePrev = runtime.lookupFunction(0x00204240u);
+            runtime.replaceFunction(0x00204240u, &fadeProbe);
+        }
+        if (runtime.lookupFunction(0x001F8480u) != nullptr)
+        {
+            gFadeWaitPrev = runtime.lookupFunction(0x001F8480u);
+            runtime.replaceFunction(0x001F8480u, &fadeWaitProbe);
+        }
+    }
 
     // Only two writers touch an object's busy byte:
     //   0x20D370 (vtable+0x18):  obj+4 = a1; obj+8 = a2; if (obj+4) successor->vtable[0x34]()
@@ -7175,6 +7249,8 @@ namespace tol
         installLoaderStepProbe(runtime);
         // Who sets the app object's busy byte (see busyWriterProbeImpl).
         installBusyWriterProbes(runtime);
+        // The scene fade: entry/exit, its wait condition, and the alpha (see fadeProbe).
+        installFadeProbes(runtime);
         // The ADX detach handshake (see adxDetachProbe).
         installAdxDetachProbe(runtime);
         // Thread identity of the "stop all streams" chain (see streamStopProbe).
