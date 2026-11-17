@@ -3687,6 +3687,11 @@ dispatched into that table - the same "nobody asks" shape as session 106, now na
 
 ## Session 122 (2026-11-17) - the job table has no writers at all; the setter is a known function the port never calls
 
+> **Partly wrong, corrected in session 123.** Two claims below are mine and false: the "zero writers"
+> measurement (watched the wrong layer, so it measured nothing) and the treatment of `0x2E1D30` as a callable
+> setter (it is an interior row tail; nothing calls it because there is nothing to call). Corrections are
+> inline below and the replacement evidence is in session 123.
+
 ### Port side: zero writers (measured, with a control)
 
 `TOL_WATCH_JOBTABLE=1` (new, in `PS2Runtime::Store8/16/32/64/128`) logs every store overlapping
@@ -3704,6 +3709,14 @@ Positive control in the same run (pre-existing watch on the TCB status byte):
 ```
 
 So the store path is live and the job table genuinely has **no CPU-store writer**.
+
+> **Correction (session 123) - this measurement is invalid, and the conclusion with it.** `PS2Runtime::Store8/16/32/64`
+> is bypassed for ordinary RAM: generated code writes RAM through the `WRITE8/16/32/64/128` macros in
+> `ps2_runtime_macros.h`, which go straight to `FAST_WRITE*` and only call `ps2TraceGuestWrite`. A watch inside
+> `StoreN` therefore sees *special* addresses only, and `[jobtable] lines: 0` measured nothing at all. The
+> pre-existing `[slot2]`/`[ptr]` watches kept working only because they live in `ps2TraceGuestWrite`. Correct
+> layer for a guest-data write watch is that header path or a game-function override - session 123 uses the
+> override and immediately sees the writer.
 
 One-shot dump at the first wait (new, inside `jobObjProbe`), diffed against PCSX2 at the title:
 
@@ -3739,6 +3752,13 @@ exactly the two fields `FUN_002E0820` consumes.
 `0x2E1D30` (and `0x2E1A40`, `0x2E1700`, `0x2E1040`, `0x2E0A70`, `0x2E0950`, `0x2E0880`) are **never entered**, so
 the status bit is never set because the *setter is never called* - not because a store went missing.
 
+> **Correction (session 123) - the second wrong claim.** `0x2E1A40`/`0x2E1D30` are not entry points that
+> something fails to call; they are interior rows of one body whose real entry is `0x2E15C0`, and the reason no
+> caller exists is that there is nothing there to call (no `jal`, no pointer in the ELF image, no `lui/addiu`
+> materialisation for either address in the whole 53k-function corpus). Saying "the setter is never called"
+> understated the problem. More importantly, session 123 found the actual bit-1 writer in a *different* member of
+> the same family: `0x2E07D0` is a test-and-set of bit 1, and the port does enter it.
+
 ### Probe caveat found
 
 `0x2E0820` also shows no dispatch entry, because `0x2E1EF0` is a **tail-jump thunk** (`j FUN_002E0820`) whose
@@ -3751,6 +3771,167 @@ Watchpoint armed on `0x4E9140..0x4E9158` with `onchange` (the wide write watch h
 zero-fill loop: `s0=0x4E9140, t9=0x27, sq v0,(s0)` at `0x8000E3C8`, which clears exactly 39x16 = 624 = 26x0x18
 bytes - a decoy, it can only clear). A reset drops debugger state (watchpoints disappear), so the order must be
 reset -> arm -> resume.
+
+## Session 123 (2026-11-17) - the measured producer is a *clear*; the bit-1 writer is a test-and-set the port already reaches
+
+### The instrument was on the wrong layer (corrects session 122)
+
+`PS2Runtime::Store8/16/32/64` is **bypassed for ordinary RAM**: generated code writes RAM through the
+`WRITE8/16/32/64/128` macros in `ps2_runtime_macros.h`, which go straight to `FAST_WRITE*` and only call
+`ps2TraceGuestWrite`. `TOL_WATCH_JOBTABLE` therefore saw special addresses only, and `[jobtable] lines: 0`
+measured nothing. A guest-data write watch belongs in `ps2TraceGuestWrite` or (no PCH cost) in a
+`replaceFunction` override. Replaced with three overrides in `tol_overrides.cpp`:
+
+| override | what it logs |
+|---|---|
+| `0x2DEF60` | `a0` (entry), status byte before -> after, `ra`, change counter |
+| `0x2E1D30` | `a0`, entry-0 status, `ra` (tests whether the row tail runs at all) |
+| `0x2E07D0` | `index`, status byte before -> after, bit 1, return value |
+
+### Measured: the producer captured in PCSX2 writes zero (the clear-not-set result)
+
+```
+[jobpoke] #1 entry=0x004E9140 slot=0 status 0 -> 0 ra=0x002DEEE4 changes=0
+[jobtail]  0 calls
+```
+
+`FUN_002DEF60` runs **exactly once**, on slot 0, and writes `0`. Its masks are built from `$zero`:
+`and a1, v1, -2` clears bit 0, `or v1, v1, $zero` sets nothing, `sb v1, 0(a2)`. So it **initialises/clears
+bit 0** and is structurally incapable of setting bit 1. The chain captured from PCSX2 last session
+(`0x165E70` -> `0x2DEED0` -> `0x2DEF60`, `sb` at `0x2DEF98`) is an *init*, not the set - which is why matching
+it exactly in the port changed nothing, and why PCSX2 also reads `00` at the title. **There is no missing store
+here to find; that call site was the wrong one.**
+
+### The `0x2E1D30` hunt was chasing a row tail
+
+The rows are contiguous and each one falls into the next:
+
+```
+0x2E1040-0x2E15C0   0x2E15C0-0x2E1700   0x2E1700-0x2E1920   0x2E1920-0x2E1A40
+0x2E1A40-0x2E1D30   0x2E1D30-0x2E1EA0   0x2E1EA0-0x2E1EF0   thunk 0x2E1EF0-0x2E1F00
+```
+
+- `FUN_002E1920` ends with `ctx->pc = 0x2E1A40u;` (lines 649, 671)
+- `FUN_002E1A40` ends with `ctx->pc = 0x2e1d30u;`
+- `FUN_002E1700` ends with `ctx->pc = 0x2E1920u;`
+
+So this is **one body split into five rows**; the real entry is `0x2E15C0`, called only from `FUN_002E0A70`
+(0x2E0C28, 0x2E0F78) and `FUN_002E1040` (0x2E1184, 0x2E14D4) - and **neither of those has a `jal` caller
+either**. Nothing calls `0x2E1A40`/`0x2E1D30` by any mechanism: no `jal`, no pointer in the ELF file image, no
+`lui/addiu` materialisation.
+
+Port: `TOL_TRACE_PC` on `0x2E1700, 0x2E1920, 0x2E1A40, 0x2E1D30, 0x2E1EA0, 0x2E1F00` over 50 s -> **zero enters**.
+
+Not the module's step either: the stuck object's vtable `0x3DA320` methods live at `0x2E93xx`/`0x3656xx`, and its
+child's `0x3D7630` is all `0x30xxxx`. Neither contains the chain. The module step is `FUN_00365630`, phase 1
+`FUN_00365700`, which calls the *reader* through the thunk `0x2E1EF0 -> 0x2E0820`.
+
+### The actual bit-1 producer: `0x2E07D0` is a test-and-set
+
+Decompiled by hand from `FUN_002e07d0_0x2e07d0.cpp`:
+
+```c
+a2 = 0x4E9140 + index*0x18;          // (a0*2 + a0) << 3
+a1 = *(u8*)a2;                        // status byte
+v0 = (a1 >> 1) & 1;                   // dsll32 a1,30  /  dsrl32 v0,31
+if (v0 == 0) {
+    a1 = (a1 & ~2) | 2;               // daddiu a0,0,2 ; and v1,a1,-3 ; or v1,v1,a0
+    *(u8*)a2 = a1;                    // sb v1, 0(a2)  at 0x2E0814
+    return 1;
+}
+return 0;                             // already set
+```
+
+This is the bit the whole boot waits on, and it is a **leaf that the family's veneer calls**: every wrapper in
+`0x2E1F00, 0x2E1F80, 0x2E2000, 0x2E2090, 0x2E2120, 0x2E21B0, 0x2E2240` does `jal 0x2E07D0` as its first call
+(grep for `0x2E07D0u,` -> 7 hits, one per wrapper). That is why every earlier xref search came up empty: the
+producer is not reachable by name from the job code, it is a service routine behind a veneer.
+
+The port **does** enter it - session 122 recorded `[pc] enter 0x002E07D0 a0=0x00000000` - so by this code the
+port must leave `0x02` at `0x4E9140`. The job-table dump still reads `00`, which is the contradiction the new
+`[jobref]` probe measures.
+
+### Side notes (both corrected as requested)
+
+1. **`Option A` / dense-corpus is not implicated here.** These rows really are split, but the split is
+   *traversable*: each boundary carries an explicit `ctx->pc = <next row>` fall-through, so a body that is
+   entered runs through all five rows. The harmful variant from sessions 85-90 was a row entered from outside;
+   this one is never entered at all, which no amount of row-merging would fix.
+2. **`[jobtail] 0 calls` is expected, not a defect.** `0x2E1D30` is a row tail, unreachable by design. It stays
+   installed as a cheap assertion: if it ever fires, the row map changed.
+
+### Follow-up in the same session: the write watch named the writers, and the blocker is *ordering*
+
+Two probes were added after the first write-up, and both changed the conclusion.
+
+**1. Bit 1 is not the gate - falsified by measurement.** `[jobref]` on `0x2E07D0` showed the port
+test-and-sets entry 0 correctly (`status 00 -> 02 bit1=1 ret=1 ra=0x002E1F98`), and `[jobobj]` correlates the
+byte with the phase per frame:
+
+```
+[jobobj] #1 ... phase=1 inner=0 ret=0 jt0=00 bit1=0     <- parks
+          [jobref] sets bit 1
+[jobobj] #2+ ... phase=1 inner=1 ret=0 jt0=02 bit1=1    <- bit set, still stuck forever
+```
+
+So "the boot waits on bit 1" was the wrong reading. Reading `FUN_002E0820` properly gives the real semantics:
+
+```c
+index -> a2 = 0x4E9140 + index*0x18
+if (bit1(*(u8*)a2) == 0) { *(u32*)a1 = *(int16*)(0x4E9146 + index); return 1; }   // deliver payload
+return 0;                                                                          // bit1 set -> no payload
+```
+
+**bit 1 means *claimed/consumed*.** The payload is the `u16` at `entry+6`, handed to `&this+0x80` - the very
+field `FUN_002E1D30` writes, which closes the loop with session 121.
+
+**2. The write watch named the writers.** New `TOL_WATCH_JOBTABLE_RAM` in `ps2TraceGuestWrite`
+(`ps2_runtime.h`) - the only layer that sees RAM stores. 87 writes to `0x4E9140..0x4E93B0` in 40 s, and
+`entry0+6` has exactly three writers:
+
+| pc | writer | note |
+|---|---|---|
+| `0x002DEFC4` | `FUN_002DEF60` | entry initialiser, writes 0 |
+| `0x002E0A38` | row `0x2E09E0-0x2E0A70` | the submit API - **it does run** (`a0=0x00407D70`) |
+| `0x002DF7BC` | `FUN_002DF6D0` | delay-slot store, target `0x4E9146+s0` |
+
+**3. The timeline is inverted.**
+
+```
+177  0x2DEFC4  FUN_002DEF60 init      entry0+6 := 0
+230  jobobj #1 CONSUMER PARKS         status 00, entry0+6 = 0000
+232  0x2E0814  test-and-set           bit 1 := 1     <- claim, from FUN_002e1f80 (ra=0x2E1F98)
+235  0x2E0A38  submit                 entry0+6 written  <- payload arrives
+242  0x2DF6D0  ...                    (writes 0x9D2286, unrelated)
+246  0x2DF7BC  ...                    entry0+6 written
+```
+
+The port **claims the slot before the payload is submitted**, and the reader refuses to deliver once bit 1 is
+set - permanently. In PCSX2 the order is submit -> read (bit1 clear, payload `0xFF0E`) -> claim, which is why
+the title dump shows `00` in the status byte *and* `0xFF0E` at `+6`.
+
+Both calls are inside `FUN_00365700`: the claim at `0x365838` (`jal 0x2E1F80`, preceded by `sw $zero,0x78(s0)`)
+and the read at `0x3659B4` (`jal 0x2E1EF0`). Same function, claim path taken first, so the divergence is which
+phase branch runs and in what order relative to the `0x2E09E0` submit - not a missing function.
+
+**Probe-design lesson (repeat of an old one):** `[jobslot6]` read `s0` at function entry and therefore computed
+`0x4E9146 + 0x4E9140 = 0x009D2286`, a nonsense address. `s0` is set *inside* `FUN_002DF6D0`, so an entry-time
+probe cannot validate that store. Only the header-level write watch could.
+
+### Next
+
+Two candidate fixes, and the measurement points at the second:
+
+1. The claim at `0x365838` fires one phase too early - find its branch test and compare with the read path at
+   `0x3659B4`.
+2. The `0x2E09E0` submit is executed *after* `FUN_00365700` has already claimed; in the guest the submit belongs
+   to the frame before. Fix the ordering (who services the AppCell daemon TCB `0x407790` first), not the table.
+
+Either way the target state is checkable in one run: `entry0+6 != 0` while `bit1 == 0` at the moment the
+consumer checks, i.e. `[jobobj] jt0=00` together with a nonzero `+6`.
+
+
+
 
 
 

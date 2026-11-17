@@ -2327,7 +2327,32 @@ namespace
     }
 
     // ---------------------------------------------------------------------------------------------------------
-    // JOB-TABLE WRITE TRACE (correct layer)
+    // 0x2DF6D0 - the entry+6 producer. At 0x2DF7A0..0x2DF7BC it forms 0x4E9146 + s0 and stores v1 there
+    // (`sh $v1, 0($v0)` in the delay slot of `jal 0x233BF0`), i.e. it writes the u16 that FUN_002E0820 hands to
+    // phase 1 as *out. PCSX2 has 0xFF0E in entry0+6 at the title; the port has 0, which is why the reader
+    // returns 1 with a zero payload and phase 1 never advances.
+    PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
+
+    void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t s0 = GPR_U32(ctx, 16);
+        const uint32_t field = 0x004E9146u + s0;
+        const bool inRange = (field + 2u < PS2_RAM_SIZE);
+        const uint16_t before = inRange ? static_cast<uint16_t>(runtime->Load16(rdram, ctx, field)) : 0u;
+        if (gJobSlot6Prev != nullptr)
+        {
+            gJobSlot6Prev(rdram, ctx, runtime);
+        }
+        const uint16_t after = inRange ? static_cast<uint16_t>(runtime->Load16(rdram, ctx, field)) : 0u;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 40u || before != after || (sCalls % 2000u) == 0u)
+        {
+            std::fprintf(stderr, "[jobslot6] #%u s0=0x%X field=0x%08X %04X -> %04X v1=0x%04X a3=0x%X ra=0x%08X\n",
+                         sCalls, s0, field, static_cast<unsigned>(before), static_cast<unsigned>(after),
+                         static_cast<unsigned>(GPR_U32(ctx, 3)), GPR_U32(ctx, 7), GPR_U32(ctx, 31));
+        }
+    }
     //
     // The runtime-side watch was on the wrong path: WRITE8/16/32 macros write plain RAM through FAST_WRITE8 and
     // never call PS2Runtime::StoreN, so a watch there only sees special addresses - which is why it reported zero
@@ -2391,6 +2416,41 @@ namespace
         }
     }
 
+    // ---------------------------------------------------------------------------------------------------------
+    // 0x2E07D0(index) - the real bit-1 producer (found by reading the row, not by xref)
+    //
+    //   a2 = 0x4E9140 + index*0x18          // (a0*2 + a0) << 3
+    //   a1 = *(u8*)a2                        // status byte
+    //   v0 = bit1(a1)                        // dsll32 a1,30 / dsrl32 v0,31
+    //   if (v0 == 0) { a1 &= ~2; a1 |= 2; *(u8*)a2 = a1; return 1; }   // test-and-set, sb at 0x2E0814
+    //   return 0;                                                       // already set
+    //
+    // This is why the family was invisible to xrefs: the wrappers 0x2E1F00..0x2E2240 all `jal 0x2E07D0`, and
+    // the producer is this leaf, not the rows the table dump pointed at. The port enters it once with index 0,
+    // which by this code must leave 0x02 at 0x4E9140 - so the probe below measures whether the sb lands.
+    PS2Runtime::RecompiledFunction gJobRefPrev = nullptr;
+
+    void jobTableRefProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t index = GPR_U32(ctx, 4);
+        const uint32_t entry = 0x004E9140u + (index * 0x18u);
+        const bool inTable = (entry + 0x18u <= 0x004E93B0u);
+        const uint8_t before = inTable ? runtime->Load8(rdram, ctx, entry) : 0u;
+        if (gJobRefPrev != nullptr)
+        {
+            gJobRefPrev(rdram, ctx, runtime);
+        }
+        const uint8_t after = inTable ? runtime->Load8(rdram, ctx, entry) : 0u;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 60u || before != after)
+        {
+            std::fprintf(stderr, "[jobref] #%u index=%u entry=0x%08X status %02X -> %02X bit1=%u ret=%u ra=0x%08X\n",
+                         sCalls, index, entry, static_cast<unsigned>(before), static_cast<unsigned>(after),
+                         static_cast<unsigned>((after >> 1) & 1u), GPR_U32(ctx, 2), GPR_U32(ctx, 31));
+        }
+    }
+
     //
     // The AppCell loader polls job 0x63D850 (TCB 0x407580) and that job's step FUN_00204690 polls 0x63D890
     // (TCB 0x4079A0), so the whole boot waits on the guest tasks those blocks describe. The app job
@@ -2441,15 +2501,17 @@ namespace
             std::fprintf(stderr, "[jobobj] #%u obj=0x%08X (out of range)\n", sJobLogs, obj);
             return;
         }
+        const uint8_t jt0 = runtime->Load8(rdram, ctx, 0x004E9140u);
         std::fprintf(stderr,
                      "[jobobj] #%u obj=0x%08X vt=0x%08X state=%u phase=%u next=%u inner=%u child=0x%08X "
-                     "job=0x%08X ret=0x%08X | +78=%d +7C=%d +84=%u child+0=%08X child+4=%08X\n",
+                     "job=0x%08X ret=0x%08X jt0=%02X bit1=%u | +78=%d +7C=%d +84=%u child+0=%08X child+4=%08X\n",
                      sJobLogs, obj, runtime->Load32(rdram, ctx, obj),
                      static_cast<unsigned>(runtime->Load8(rdram, ctx, obj + 8u)),
                      static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x70u)),
                      static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x72u)),
                      runtime->Load32(rdram, ctx, obj + 0x74u), runtime->Load32(rdram, ctx, obj + 0x18u),
                      runtime->Load32(rdram, ctx, obj + 0x21Cu), GPR_U32(ctx, 2),
+                     static_cast<unsigned>(jt0), static_cast<unsigned>((jt0 >> 1) & 1u),
                      static_cast<int32_t>(runtime->Load32(rdram, ctx, obj + 0x78u)),
                      static_cast<int32_t>(runtime->Load32(rdram, ctx, obj + 0x7Cu)),
                      static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x84u)),
@@ -5626,6 +5688,25 @@ namespace tol
             {
                 gJobTailPrev = tailFn;
                 runtime.replaceFunction(0x002E1D30u, &jobTableTailProbe);
+            }
+        }
+
+        // Bit-1 producer (see jobTableRefProbe): the test-and-set leaf behind the whole 0x2E1Fxx wrapper family.
+        {
+            PS2Runtime::RecompiledFunction refFn = runtime.lookupFunction(0x002E07D0u);
+            if (refFn != nullptr)
+            {
+                gJobRefPrev = refFn;
+                runtime.replaceFunction(0x002E07D0u, &jobTableRefProbe);
+            }
+        }
+        // entry+6 producer (see jobTableSlot6Probe) - the field phase 1 actually consumes.
+        {
+            PS2Runtime::RecompiledFunction slot6Fn = runtime.lookupFunction(0x002DF6D0u);
+            if (slot6Fn != nullptr)
+            {
+                gJobSlot6Prev = slot6Fn;
+                runtime.replaceFunction(0x002DF6D0u, &jobTableSlot6Probe);
             }
         }
 
