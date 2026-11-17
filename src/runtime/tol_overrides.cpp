@@ -2738,6 +2738,27 @@ namespace
                              : (firstAt >= 0x00407000u && firstAt < 0x00408000u) ? "  <- TCB BLOCK"
                                                                                 : "  <- STACK FRAME");
             }
+            // Layout of the context save area, read from our own memory (PCSX2's copy of this address read
+            // inconsistently, so it cannot be trusted for structure).
+            const uint32_t ctxBase = 0x0048F590u;
+            for (uint32_t off = 0u; off < 0x400u; off += 16u)
+            {
+                std::fprintf(stderr, "[ctx] %08X:", ctxBase + off);
+                for (uint32_t i = 0u; i < 16u; i += 4u)
+                {
+                    std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, ctxBase + off + i));
+                }
+                std::fprintf(stderr, "\n");
+            }
+            // Locate the submit thread's block by its stack pointer (~0x417xxx, restored at block+0xE0).
+            for (uint32_t off = 0u; off < 0x400u; off += 4u)
+            {
+                const uint32_t v = runtime->Load32(rdram, ctx, ctxBase + off);
+                if ((v & 0xFFFFF000u) == 0x00417000u)
+                {
+                    std::fprintf(stderr, "[ctx] sp-like 0x%08X at block+0x%03X\n", v, off);
+                }
+            }
         }
     }
 

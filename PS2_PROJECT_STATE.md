@@ -4464,6 +4464,49 @@ context-block layout must be established from the port's own dump, not from PCSX
 2. Then implement the save: write the resume PC into that block before the switch, and verify `0x2E0A58` writes
    (i.e. the release runs) - the single check that proves the deadlock is gone.
 
+## Session 133 (2026-11-17) - `0x48F590` dumped from the port: the TCB is registered, the continuation is not
+
+One-shot dump of `0x48F590..0x48F990` at the `[sub2]` switch (our own memory, since PCSX2's read of this range was
+inconsistent).
+
+### Result
+
+```
+0048F590 .. 0048F760 : all zero
+0048F770: 000001D0 00000000 00000000 00000000
+0048F790: 00000001
+0048F7A0: 01FFFEE0            <- a stack pointer (pump/init range)
+0048F7B0: 00008000
+0048F7C0: 00407BB0            <- TCB slot 5 = the SUBMIT thread
+0048F7D0: 00000001
+...
+0048F920: 00407BB0            <- the same TCB referenced again
+0048F860+: 3E4CCCCD 3F800000 4B800000 ...   <- float constants: the tail of the range is unrelated data
+```
+
+Two conclusions:
+
+1. **`sp_like = 0`** - no `0x417xxx` value exists anywhere in the range, so the submit thread has **no saved
+   register block**. Its continuation is not stored.
+2. Its **TCB is registered**: `0x407BB0` appears twice (`0x48F7C0`, `0x48F920`). The scheduler knows the thread;
+   it simply holds no resume state for it.
+
+The table's real extent is ~`0x2D0` bytes; past that the range is ordinary float constant data, so a full
+`0x400` dump includes noise (worth remembering for any future comparison).
+
+### Mechanism note
+
+`FUN_00233E50` (the function that performs the switch, called from `0x2DF590` at `0x2DF5D4`) contains **no
+`syscall` instruction** - only the `ps2_syscalls.h` include. So the context switch is guest-implemented, and the
+missing save belongs to that guest path rather than to a runtime syscall stub.
+
+### Where the fix must go (unchanged, now with the layout evidence)
+
+The outgoing thread's resume PC (`0x2DF5DC`, and transitively `0x2E0A3C`) must be written into its context block
+before the switch, and that block must then be selectable. Today: TCB present, block absent. Acceptance test is a
+single line: `0x2E0A58` produces a write and status returns to `0x00`.
+
+
 
 
 
