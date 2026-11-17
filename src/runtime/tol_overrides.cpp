@@ -2549,9 +2549,48 @@ namespace
                          curBefore, aliveBefore);
         }
         orderEvent("yield", ctx);
+        // Captured before the callee runs: the real 0x15231C row rewrites $ra, so a post-call check would never
+        // match the caller, and $s1 is the app object only at the call site.
+        const uint32_t raIn = GPR_U32(ctx, 31);
+        const uint32_t objIn = GPR_U32(ctx, 17);
         if (gOrdYieldPrev != nullptr)
         {
             gOrdYieldPrev(rdram, ctx, runtime);
+        }
+        // Session 152: the app job's run loop yields from 0x3661D4 with $s1 holding the app object, and the loop
+        // condition is `obj->vtable[0x0C]()` = `lbu v0,8(obj)` (vtable 0x3DA320 + 0x0C -> 0x205F80). FUN_00365630
+        // is the step that advances the object: +0x70 outer state, +0x72 next/inner state, +0x74 phase, and it
+        // reads the job table through FUN_002E0820(0, ...). Dumping those fields at the park says exactly which
+        // state the loader is stuck in, instead of inferring it from the call graph.
+        if (raIn == 0x003661DCu)
+        {
+            static uint32_t sPark = 0u;
+            ++sPark;
+            static const bool sDumpEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+            if (sDumpEnv && (sPark == 1u || (sPark % 40u) == 0u))
+            {
+                const uint32_t obj = objIn;   // $s1 - the app object
+                const bool ok = (obj >= 0x00100000u && obj + 0xA0u < PS2_RAM_SIZE);
+                const uint32_t child = ok ? runtime->Load32(rdram, ctx, obj + 0x18u) : 0u;
+                const bool childOk = (child >= 0x00100000u && child + 0x20u < PS2_RAM_SIZE);
+                const uint32_t jt = 0x004E9140u;
+                std::fprintf(stderr,
+                             "[appobj] #%u obj=0x%08X +4=%u busy(+8)=%u outer(+70)=%u next(+72)=0x%04X phase(+74)=%d "
+                             "cur(+14)=%d cnt(+64)=%d res(+80)=0x%08X child=0x%08X ch4=%u ch8=%u "
+                             "jt0=[0x%08X pay=0x%04X]\n",
+                             sPark, obj, ok ? runtime->Load32(rdram, ctx, obj + 4u) : 0u,
+                             ok ? static_cast<unsigned>(runtime->Load8(rdram, ctx, obj + 8u)) : 0u,
+                             ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x70u)) : 0u,
+                             ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x72u)) : 0u,
+                             ok ? static_cast<int>(runtime->Load32(rdram, ctx, obj + 0x74u)) : 0,
+                             ok ? static_cast<int>(runtime->Load32(rdram, ctx, obj + 0x14u)) : -1,
+                             ok ? static_cast<int>(runtime->Load32(rdram, ctx, obj + 0x64u)) : -1,
+                             ok ? runtime->Load32(rdram, ctx, obj + 0x80u) : 0u, child,
+                             childOk ? runtime->Load32(rdram, ctx, child + 4u) : 0u,
+                             childOk ? static_cast<unsigned>(runtime->Load8(rdram, ctx, child + 8u)) : 0u,
+                             runtime->Load32(rdram, ctx, jt),
+                             static_cast<unsigned>(runtime->Load16(rdram, ctx, jt + 6u)));
+            }
         }
         if (sYields <= 30u)
         {
@@ -2574,6 +2613,7 @@ namespace
     }
 
     PS2Runtime::RecompiledFunction gOrdChildStepPrev = nullptr;
+    uint32_t gChildRetObj = 0u;
 
     // THE decisive measurement.
     //
@@ -2594,6 +2634,10 @@ namespace
         if (gOrdChildStepPrev != nullptr)
         {
             gOrdChildStepPrev(rdram, ctx, runtime);
+        }
+        if (gChildRetObj == 0u)
+        {
+            gChildRetObj = GPR_U32(ctx, 2);   // the object the child step hands back (0x63EB00 when it succeeds)
         }
         static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
         if (!sEnv)
@@ -2639,10 +2683,37 @@ namespace
                      static_cast<unsigned>((after >> 1) & 1u), GPR_U32(ctx, 2));
     }
 
+    PS2Runtime::RecompiledFunction gOrdOrchPrev = nullptr;
+
+    // FUN_00320D50 is the loader *orchestrator's* step: `switch (*(u16*)(obj+0x7C))` with cases 1..0xB, where
+    // case 3 is FUN_003211C0 - the reserver, the only code that reserves/reads/submits a job entry. The app
+    // object (0x63E3D0) sits in outer state 1 / phase 3 waiting for `+4` (a child) to become nonzero, and
+    // phase 3's very first test is `if (!*(int*)(param_1+4)) return 0;`. So the orchestrator's +0x7C state is
+    // the next gate: if it never reaches 3, nothing ever attaches the child the app is waiting for.
+    void orderOrchProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t obj = GPR_U32(ctx, 4);
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 6u || (sCalls % 200u) == 0u))
+        {
+            const bool ok = (obj >= 0x00100000u && obj + 0x90u < PS2_RAM_SIZE);
+            std::fprintf(stderr, "[orch] #%u obj=0x%08X state(+7C)=%u next(+7E)=0x%04X f80=0x%08X childRet=0x%08X\n",
+                         sCalls, obj,
+                         ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x7Cu)) : 0xFFFFu,
+                         ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x7Eu)) : 0xFFFFu,
+                         ok ? runtime->Load32(rdram, ctx, obj + 0x80u) : 0u, gChildRetObj);
+        }
+        if (gOrdOrchPrev != nullptr)
+        {
+            gOrdOrchPrev(rdram, ctx, runtime);
+        }
+    }
+
     void orderSubmProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        orderEvent("subm", ctx);   // ra tells whether FUN_003211C0 (ra=0x3215C0) or the pump (ra=0x151F88) drives it
-        if (gOrdSubmPrev != nullptr)
+        orderEvent("subm", ctx);   // ra tells whether FUN_003211C0 (ra=0x3215C0) or the pump (ra=0x151F88) drives it        if (gOrdSubmPrev != nullptr)
         {
             gOrdSubmPrev(rdram, ctx, runtime);
         }
@@ -6645,6 +6716,16 @@ namespace tol
             {
                 gOrdRescPrev = fn;
                 runtime.replaceFunction(0x003211C0u, &orderRescProbe);
+            }
+        }
+        // The orchestrator's step (see orderOrchProbe): its +0x7C state decides whether case 3 (the reserver)
+        // is ever reached, i.e. whether the app object ever gets a child at +4 again.
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00320D50u);
+            if (fn != nullptr)
+            {
+                gOrdOrchPrev = fn;
+                runtime.replaceFunction(0x00320D50u, &orderOrchProbe);
             }
         }
         {

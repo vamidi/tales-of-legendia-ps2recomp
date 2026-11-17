@@ -5403,6 +5403,60 @@ errors, process alive at 60 s).
 Forward movement is confined to the stall itself: `read` 12x`ret=0` (spin) -> 2x`ret=1`; `dispA` 135 -> 4;
 `yield` from `0x3661DC` 0 -> 247.
 
+## 7b. Continuation (session 152) - the app/phase gate chain, measured, and the PCSX2 cross-check
+
+After the `0x125A78` fix the boot sits in `FUN_00366090`'s run loop:
+
+```c
+while (app->vtable[0x0C]()) { manager[8](); partner->[0x1C](); app->vtable[0x38](app); manager[0xC](); yield(); }
+```
+
+`app` = `0x63E3D0`, and **the heap addresses are identical in PCSX2 and the port**, so any address can be
+compared directly between the two. `vtable[0x0C]` = `0x205F80` = `lbu v0,8(a0)` ("busy"), so the loop can only
+end when `app+8` is cleared. `vtable[0x38]` = `0x365630` = the step, which calls `FUN_002E9720` and then one of
+`FUN_00365700` (state 1) / `0x365CD0` (state 3) / `0x365FD0` (state 4) according to `app+0x70`.
+
+Measured with the `[appobj]` probe (`TOL_TRACE_ORDER`), steady state over 45 s:
+
+```
+obj=0x0063E3D0 +4=0 busy(+8)=1 outer(+70)=1 next(+72)=0xFFFF phase(+74)=3 cur(+14)=1 cnt(+64)=1
+res(+80)=0xFFFFFF0D child=0x0063E610 ch4=0 ch8=0 jt0=[0x00000001 pay=0xFF0D]
+```
+
+- **phase 3** is the fade/hand-off stage and its first test is `if (!*(int*)(param_1+4)) return 0;` - so the boot
+  now waits on `app+4`.
+- `app+4` is rewritten every step at `0x2E977C sw v0,4(s0)`: `obj+4 = acquire(obj)`, where acquire is secondary
+  vtable `0x3DA35C` + 0x14 = `FUN_002E9EB0`. It walks the child array at `obj+0x18`, cursor `obj+0x14`, count
+  `obj+0x64`, and returns the first child that is **not busy** *and* whose `vtable[0x14]` returns nonzero.
+  `child->vtable[0x14]` = `0x205F90` thunk -> `0x205FA0` = our `objectResetFix`, whose real body was verified
+  instruction-for-instruction in PCSX2:
+  `v0 = child->+4; child->+4 = 0; child->+8 = 0;` - i.e. **the acquire consumes the child and clears its busy
+  flag**.
+- With `child+4 == 0` the walk returns 0 but still advances `cur` to `cnt`, which is exactly the measured
+  `cur=1 cnt=1` - so the port executes the guest logic faithfully here; this is not a mis-dispatch.
+
+PCSX2 cross-check (paused at `0x2E0A3C`, the submit continuation the port still never reaches):
+`app 0x63E3D0` = `+4=0, +8=1, +0x18=0x63E610, +0x70=1, +0x72=0xFFFF, +0x74=1`;
+`child 0x63E610` = `+4=0, +8=0x01`; job table `0x4E9140` = `word0=2 (bit 1 set), payload=0xFFFF`.
+Two write watchpoints (`0x63E3D4`, then `0x63E614`) both resolved to `sw v0,4(s0)` sites and both wrote **0**, so
+a zero `+4` is a normal transient. The real divergence is the busy byte:
+
+| | port | PCSX2 |
+|---|---|---|
+| `child 0x63E610 +8` | **0** (idle) | **0x01** (busy) |
+| consequence | the walk consumes an already-idle child that has no successor | the walk skips a child that is still working |
+
+So the remaining defect is **below** the app/phase machinery: in the recursive task tree
+(`child+0x58` list, count 1, same shape - see `0x3058B8 sw v0,4(s0)`) a task finishes and clears its busy flag
+without ever producing the successor object its parent acquires. Everything above it - app run loop, step
+dispatch, phase machine, child walk and `objectResetFix` - is verified correct.
+
+### Next probe (exact)
+
+Dump the task tree at the park: level 0 = `app+0x18[i]` (count `app+0x64`), level 1 = `child+0x58[i]` (count 1
+per `0x305898`'s `a2=1`), level 2 likewise, printing each node's `+0`, `+4`, `+8`. The first node whose `+8` is
+0 while its parent still waits is the leaf that never reports a successor; its step is the fix site.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
