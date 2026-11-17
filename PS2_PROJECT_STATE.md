@@ -4920,6 +4920,29 @@ Instrument `0x126248` exactly as `0x126368` was: log `a0/a1/a2` and the return v
 `0x233FDC` (break there and read `v0`). If the guest returns 0 and the port returns nonzero, the fix is inside
 `FUN_00126248` (or the thread state it queries) - a small, well-bounded function rather than the scheduler.
 
+## Session 144 (2026-11-17) - `FUN_00126248` is behaving correctly (returns 1 = done); the loss is after `0x233EF4`
+
+```
+[g248] #1 a0=0 a1=0 a2=0x00000000  global388D30=0x00000000  ret=0xFFFFFFFF
+[g248] #2 a0=1 a1=0 a2=0x0041745C  global388D30=0x00000001  ret=0x00000001
+[g248] #3 a0=1 a1=0 a2=0x004172EC  global388D30=0x0000000D  ret=0x00000000
+[g248] #4..   same as #3, ret=0
+```
+
+- `#1` is an early init call before `*(0x388D30)` is set, hence the documented `-1` path (`0x126284`).
+- `#2` is the **submit path** (`a2 = 0x41745C`, the `&flag` local of `0x233FC0`): it returns **1 = completed**.
+- `#3+` are other paths (`a2 = 0x4172EC`): they return **0**, so they yield and loop as designed.
+
+So the poll is answering "done", the yield is *correctly* skipped, and `0x233FC0` returns normally into `0x233E50`
+at `0x233EF4` (session 142). The loss is therefore **after `0x233EF4`**, inside `FUN_00233E50`'s continuation -
+not in the poll and not in the yield.
+
+### Next
+
+Trace `FUN_00233E50` past `0x233EF4`: instrument the calls it makes after that point and find which one fails to
+return to `0x2DF5DC`. Acceptance test unchanged: `0x2E0A58` writes, status returns to `0x00`.
+
+
 
 
 

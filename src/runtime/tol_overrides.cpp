@@ -2929,6 +2929,33 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdG248Prev = nullptr;
+
+    // FUN_00126248 (0x126248..0x126310) - the poll that decides the 0x233FC0 loop.
+    //   0x126250 lui s3,0x39 ; 0x126268 lw v0,-0x72D0(s3)   -> *(0x388D30)
+    //   0x126278 bnez v0,...  ; 0x126284 v0 = -1             -> returns -1 when that global is zero
+    // A -1 (or any nonzero) here takes the bnez at 0x233FDC and skips the yield, so the value of *(0x388D30)
+    // is the thing to measure.
+    void orderG248Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        const uint32_t a1 = GPR_U32(ctx, 5);
+        const uint32_t a2 = GPR_U32(ctx, 6);
+        const uint32_t g388d30 = runtime->Load32(rdram, ctx, 0x00388D30u);
+        if (gOrdG248Prev != nullptr)
+        {
+            gOrdG248Prev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && sCalls <= 20u)
+        {
+            std::fprintf(stderr, "[g248] #%u a0=0x%X a1=0x%X a2=0x%X global388D30=0x%08X ret=0x%08X\n", sCalls, a0, a1, a2,
+                         g388d30, GPR_U32(ctx, 2));
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6466,6 +6493,15 @@ namespace tol
             {
                 gOrdFc0Prev = fn;
                 runtime.replaceFunction(0x00233FC0u, &orderFc0Probe);
+            }
+        }
+        // The poll behind that link (see orderG248Probe).
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00126248u);
+            if (fn != nullptr)
+            {
+                gOrdG248Prev = fn;
+                runtime.replaceFunction(0x00126248u, &orderG248Probe);
             }
         }
 
