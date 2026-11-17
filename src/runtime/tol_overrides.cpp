@@ -2671,6 +2671,45 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdSub2Prev = nullptr;
+
+    // Why the release at 0x2E0A58 never runs.
+    //
+    // The submit row does its own release, immediately after filling entry+6:
+    //   0x2E0A30 sb v1,0(s0)        status
+    //   0x2E0A34 jal func_2DF590
+    //   0x2E0A38   delay: sh v0,0(s1)   entry+6
+    //   0x2E0A4C addiu v1,zero,-3
+    //   0x2E0A50 and v1,a1,v1       status & ~2   <- clears bit 1
+    //   0x2E0A58 sb v1,0(s0)        <- THE RELEASE
+    // The write watch saw 0x2E0A30 and 0x2E0A38 but never 0x2E0A58, and everything between is straight-line.
+    // So the only way it is skipped is that func_2DF590 does not return. This probe prints on entry and
+    // (separately) after the call, so a missing "ret" line proves it.
+    void orderSub2Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        orderEvent("sub2", ctx);
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        if (sEnv)
+        {
+            ++sCalls;
+            if (sCalls <= 10u)
+            {
+                std::fprintf(stderr, "[sub2] #%u enter a0=0x%08X ra=0x%08X\n", sCalls, a0, GPR_U32(ctx, 31));
+            }
+        }
+        if (gOrdSub2Prev != nullptr)
+        {
+            gOrdSub2Prev(rdram, ctx, runtime);
+        }
+        if (sEnv && sCalls <= 10u)
+        {
+            std::fprintf(stderr, "[sub2] #%u ret  v0=0x%08X nextpc=0x%08X (caller expects 0x002E0A3C)\n", sCalls,
+                         GPR_U32(ctx, 2), static_cast<unsigned>(ctx->pc));
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6207,6 +6246,14 @@ namespace tol
             {
                 gOrdRelBPrev = fn;
                 runtime.replaceFunction(0x002E15C0u, &orderRelBProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002DF590u);
+            if (fn != nullptr)
+            {
+                gOrdSub2Prev = fn;
+                runtime.replaceFunction(0x002DF590u, &orderSub2Probe);
             }
         }
 

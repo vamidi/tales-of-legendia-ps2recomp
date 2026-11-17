@@ -4298,6 +4298,90 @@ So the job completes, the submit is queued and run, and the step that would enqu
    never observes the completion (e.g. a status word the guest sets from an interrupt or the SPU/DMA path), the
    enqueue is skipped. That is where a game override would belong, not in the job table.
 
+## Session 130 (2026-11-17) - ROOT CAUSE FOUND: the submit thread is suspended at `jal 0x2DF590` and never resumed, so the release at `0x2E0A58` never runs
+
+### Correction to session 129: `0x152200` is a context restore, not a queue drainer
+
+```
+0x152200  lui $at,0x3E ; lw $t1,-0x4E60(at)   -> index     @0x3DB1A0
+0x152208  lui $at,0x3E ; lw $t2,-0x4E50(at)   -> stride    @0x3DB1B0
+0x152214  lui $t0,0x49 ; addiu $t0,-0xA70      -> base 0x48F590
+0x152220  lw $t3,-0x4E40(at)                  -> third term @0x3DB1C0
+0x15222C  lw $t0,0($t0)                        -> context block
+0x152230  sw $ra,0x1A8($t0) ; sw $zero,0x1AC($t0)
+0x152238+ lq $v0..$fp from 0($t0)              -> restore every GPR
+0x152314  jr                                    -> resume that thread
+```
+
+So the 15 `[ind]` targets are **thread context PCs** (the TCB save area at `0x48F590`), not queued work items:
+`0x3661DC` is slot 4's suspended PC, the `0x1F8xxx` are worker threads, `0x164F80/CC/E8` the loader, and
+`0x2E09E0` is the submit running as a resumed thread context. A static pointer scan for any of these returns zero
+hits (they are all built into `.bss` at runtime), so only the dynamic trace could name them.
+
+### The release is inside the submit row - and it is skipped
+
+The submit row releases its own slot immediately after filling it:
+
+```
+0x2E0A30  sb  $v1,0($s0)        status
+0x2E0A34  jal func_2DF590
+0x2E0A38    delay: sh $v0,0($s1)   entry+6
+0x2E0A3C  sh  $v0,0($s1)
+0x2E0A4C  addiu $v1,$zero,-3
+0x2E0A50  and  $v1,$a1,$v1      status & ~2   <- clears bit 1
+0x2E0A58  sb  $v1,0($s0)        <- THE RELEASE
+0x2E0A68  jr  $ra
+```
+
+Measured writes to `entry 0` from this row:
+
+```
+pc=0x002E0A30  WRITE8  addr=0x004E9140      (1)
+pc=0x002E0A38  WRITE16 addr=0x004E9146      (1)   <- delay slot, runs before the call
+pc=0x002E0A3C  (0)   pc=0x002E0A50  (0)   pc=0x002E0A58  (0)
+```
+
+Everything after the call is straight-line, so the only way it is skipped is that control never resumes at
+`0x2E0A3C`.
+
+### The suspension, measured
+
+```
+[sub2] #1 enter a0=0x00000000 ra=0x002E0A3C
+[sub2] #1 ret  v0=0x00000001 nextpc=0x00233FC0   (caller expects 0x002E0A3C)
+```
+
+`FUN_002DF590` is called with the correct `ra`, returns `v0=1`, and leaves `ctx->pc = 0x233FC0`. That address is
+in the same function as `0x233FEC`, which appears in the scheduled-thread set - so this is a **context
+switch/yield inside the call**, not a corrupted `jr ra`. The submit thread is suspended at `0x2E0A3C` and is
+never resumed, so `0x2E0A58` never clears bit 1.
+
+### The complete causal chain (final)
+
+```
+submit thread runs (as a context at 0x2E09E0)
+  -> fills entry+6                                (0x2E0A38, observed)
+  -> calls func_2DF590                            (0x2E0A34, observed)
+       -> switches context to 0x233FC0            (observed: nextpc=0x233FC0)
+  -> submit thread NEVER resumed at 0x2E0A3C      (0x2E0A3C/0x2E0A50/0x2E0A58 = 0 writes)
+  -> release (status & ~2) never executes
+  -> bit 1 stays set forever
+  -> FUN_002E0820 returns 0 by contract ("claimed")
+  -> phase machine waits forever; resume, ordering and the job table were never the problem
+```
+
+This supersedes sessions 125-128's recommendations: the thread *is* rescheduled (0x3661DC dispatched 11x), the
+claim is legitimate, and the missing step was always this one suspended call.
+
+### Next
+
+1. Confirm the suspended context is never re-entered: probe `0x2E0A3C` (wrap the row and log `ctx->pc` at entry) or
+   check whether `0x2E0A3C` ever appears in the scheduled-context set. Expect zero - that closes the loop.
+2. Fix location: the runtime's context save/switch must record `0x2E0A3C` as the suspend PC for this thread and
+   re-schedule it. That is guest-thread support code (`EeScheduler` / context switch), not `runner/*.cpp`, not the
+   job table, and not a data poke.
+
+
 
 
 
