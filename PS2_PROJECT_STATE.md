@@ -5064,6 +5064,40 @@ granularity as used for `0x233EF4`/`0x2DF5DC`), and compare it with the `0x2E0A3
 pinpoints the overwrite to a specific sub-call, and the fix becomes "preserve `$ra` across that call" rather than
 anything in the scheduler, the gate, or the job table.
 
+## Session 149 (2026-11-17) - the corruption is at/before `0x2DF5DC`, not in the later calls
+
+`FUN_002DF590`'s final `jr $ra` is at **`0x2DF6C8`** - reached by fall-through, so it cannot be hooked directly. The
+last call before it is `0x2DF0B0` at `0x2DF6A8`, and only `b`/`nop` separate them, so the `$ra` present when that
+call returns is the value the `jr` uses. Probe on it:
+
+```
+[d0b0] #1 enter ra=0x002DF08C  exit ra=0x002DF08C
+[d0b0] #2 enter ra=0x002DF72C  exit ra=0x002DF72C
+[d5dc] #1 RESUME pc=0x002DF5DC ra=0x002DF5DC v0=0x00000000
+[d5dc] #1 exit_pc=0x00116A6C
+```
+
+**No call carries `ra = 0x2DF6B0`**, which is what a call from `0x2DF6A8` would produce. So on this path the last
+call is never reached at all: after resuming at `0x2DF5DC` the function goes straight to the `jr` with `$ra` already
+wrong (`0x116A6C`, a row end from `caseD_45_0x116a08`).
+
+Therefore the overwrite happens **at or before `0x2DF5DC`** - i.e. during the `0x233E50` inline dispatch, not in the
+later calls. Consistent with the entry/continuation picture:
+
+- submit row sets `ra = 0x2E0A3C` and calls `0x2DF590` (0x2E0A34);
+- `0x2DF590` saves that `ra` on its frame and calls `0x233E50`, which replaces `$ra` with `0x2DF5DC`;
+- the final `jr` is supposed to use the **restored** `ra` (0x2E0A3C) but instead uses `0x116A6C`.
+
+So the suspect is the **save/restore of `ra` across the `0x233E50` call** (the prologue `sd $ra` plus the matching
+`ld $ra` before the `jr`), not any deeper function.
+
+### Next
+
+Find and check that `ld $ra, N($sp)` in `FUN_002DF590` (the epilogue restore): log its value against the frame slot,
+or compare the `sp` used by the prologue `sd` with the `sp` used by the epilogue `ld`. A mismatched `sp` (stack
+switched inside the call, which we know can happen) would load a foreign value - exactly `0x116A6C`.
+
+
 
 
 

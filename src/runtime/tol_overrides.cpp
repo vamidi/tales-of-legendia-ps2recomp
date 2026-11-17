@@ -3032,6 +3032,32 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdD0B0Prev = nullptr;
+
+    // FUN_002DF590's last call is 0x2DF0B0 at 0x2DF6A8; only `b`/`nop` separate it from the final `jr $ra` at
+    // 0x2DF6C8 (which is reached by fall-through and therefore cannot be hooked). So the $ra present when this
+    // call returns is the value the jr will use - that is the comparison against the 0x2E0A3C captured at entry.
+    void orderD0B0Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t raIn = GPR_U32(ctx, 31);
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && sCalls <= 10u)
+        {
+            std::fprintf(stderr, "[d0b0] #%u enter ra=0x%08X\n", sCalls, raIn);
+        }
+        if (gOrdD0B0Prev != nullptr)
+        {
+            gOrdD0B0Prev(rdram, ctx, runtime);
+        }
+        if (sEnv && sCalls <= 10u)
+        {
+            std::fprintf(stderr, "[d0b0] #%u exit  ra=0x%08X v0=0x%08X (jr will use this ra)\n", sCalls,
+                         GPR_U32(ctx, 31), GPR_U32(ctx, 2));
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6607,6 +6633,15 @@ namespace tol
             {
                 gOrdD5DCPrev = fn;
                 runtime.replaceFunction(0x002DF5DCu, &orderD5DCProbe);
+            }
+        }
+        // $ra before FUN_002DF590's final jr (see orderD0B0Probe)
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002DF0B0u);
+            if (fn != nullptr)
+            {
+                gOrdD0B0Prev = fn;
+                runtime.replaceFunction(0x002DF0B0u, &orderD0B0Probe);
             }
         }
 
