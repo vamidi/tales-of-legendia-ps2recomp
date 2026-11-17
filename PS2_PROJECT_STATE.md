@@ -5651,6 +5651,54 @@ Before these fixes the same line was stuck at `chunk=0 win=266`. Seven distinct 
 of chunks have now completed - the DVCI/ADXF pipeline is moving data, and the app loop's "spin" is its normal
 poll-while-loading, not a deadlock.
 
+### Nested work per turn, and the real end state
+
+`g_tolGuestTransfers` (new, incremented in `dispatchGuestBranch`) counts every inter-function transfer, nesting
+included:
+
+```
+#1  enter=25329 loops=25704 xfer=5995597
+#10 enter=26622 loops=27007 xfer=6029484
+```
+
+- **Δxfer ≈ 33,887 over 40 s (847/s)** against Δloops 1,303 → **~26 transfers per scheduler turn**;
+- per app-loop iteration: ~130 turns and ~5,000 transfers (~38/turn);
+- `enter == loops == events` → every turn handles exactly one event and one guest entry: no backlog.
+
+**The 32 turns/s is host pacing, not a spin.** `EeScheduler` pulls in `EeHostPacing.h` and paces guest time to
+wall time at VBlank boundaries (`pacingNow`, `m_pacingSpeed`, `TOL_VBLANK_PACING_TRACE`). So the loop runs at
+frame rate by design.
+
+**GS backend is irrelevant to this**: `--gs=sw` and `--gs=sdlgpu` produce *byte-identical* counters
+(`#1 xfer=5995597`, `#10 xfer=6029484`), because the samples are taken at guest events and the emulation is
+deterministic. Do not read those numbers as wall-clock rates.
+
+**The app loop does not stall - it finishes.** `[appobj]` stops at #10 because outer state 4 cleared `busy(+8)`,
+so `while (app->vtable[0x0C]())` exits. The EE continues:
+
+```
+[order] #100 f1 appjob  a0=0x00407B60            <- slot 5 starts again
+[order] #101..#108 f1 iter                        <- run loop top only, no dispA/dispB
+[xfer] adx-detach after 4096 spins: refcount 1 -> 0, stream flag 0x394378 = 1
+```
+
+**Instrument-interpretation error to avoid repeating:** the counters only print *at appobj samples*, so "the
+counters froze" meant "no more app-loop yields", not "the EE stopped". Check the counter's print site before
+concluding anything about a stall.
+
+### Current end state (60 s, TOL_TRACE_ORDER + TOL_TRACE_PARK)
+
+```
+[tcb] slot2 0x00407580 alive=1 state=1   slot3 0x00407790 alive=1 state=1
+[tcb] slot4 0x004079A0 alive=1 parked 0x003661DC   slot5 0x00407BB0 alive=0
+[ee-park] thread=2 entry=0x198c60 returned-to-pc0 from=0x166490 ra=0   (repeating)
+```
+
+Thread 2 (entry `0x198C60`, a CRI worker) is re-invoked and **dies immediately** - every park is
+`from=0x166490 ra=0x0`, i.e. it executes a `jr $ra` with `$ra == 0` right after `0x166490`. That is the next
+defect to chase: `0x166490` is the "async-invocation return path around the CRI poll helper" already noted in
+`TOL_TRACE_PARK`'s `[path]` probe, so the invocation is being handed a context whose `$ra` was never set.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

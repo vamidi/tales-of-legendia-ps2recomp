@@ -30,6 +30,7 @@ extern uint32_t g_tolOrderTgt[256];
 extern uint32_t g_tolOrderRa[256];
 extern uint32_t g_tolOrderSp[256];
 extern int32_t g_tolOrderKind[256];
+extern uint64_t g_tolGuestTransfers;
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -2596,12 +2597,13 @@ namespace
                 const unsigned long long enter = g_eeEnterGuestCount.load(std::memory_order_relaxed);
                 const unsigned long long loops = g_eeRunLoopIterations.load(std::memory_order_relaxed);
                 const unsigned long long events = g_eeProcessPendingEventsCount.load(std::memory_order_relaxed);
+                const unsigned long long xfers = g_tolGuestTransfers;
                 std::fprintf(stderr,
-                             "[appobj] #%u enter=%llu loops=%llu events=%llu obj=0x%08X +4=%u busy(+8)=%u "
+                             "[appobj] #%u enter=%llu loops=%llu events=%llu xfer=%llu obj=0x%08X +4=%u busy(+8)=%u "
                              "outer(+70)=%u next(+72)=0x%04X phase(+74)=%d "
                              "cur(+14)=%d cnt(+64)=%d res(+80)=0x%08X child=0x%08X ch4=%u ch8=%u "
                              "jt0=[0x%08X pay=0x%04X]\n",
-                             sPark, enter, loops, events, obj, ok ? runtime->Load32(rdram, ctx, obj + 4u) : 0u,
+                             sPark, enter, loops, events, xfers, obj, ok ? runtime->Load32(rdram, ctx, obj + 4u) : 0u,
                              ok ? static_cast<unsigned>(runtime->Load8(rdram, ctx, obj + 8u)) : 0u,
                              ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x70u)) : 0u,
                              ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x72u)) : 0u,
