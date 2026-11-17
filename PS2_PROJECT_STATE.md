@@ -4942,6 +4942,40 @@ not in the poll and not in the yield.
 Trace `FUN_00233E50` past `0x233EF4`: instrument the calls it makes after that point and find which one fails to
 return to `0x2DF5DC`. Acceptance test unchanged: `0x2E0A58` writes, status returns to `0x00`.
 
+## Session 145 (2026-11-17) - `0x233E50` has no calls after `0x233EF4`; its exit leaves `pc = 0x233FC0`, and the blind spot is interior dispatch
+
+Static: after `0x233EF4` `FUN_00233E50` contains **no `jal`** at all - only `b` branches and `jr $ra` at
+`0x233FB8`. So "the first call that fails to return" does not exist in that range; the only way to fail is for the
+function never to reach its own `jr`.
+
+Measured with a probe on the row start (`0x233E50`):
+
+```
+[e50] #1 enter_ra=0x002DF5DC exit_pc=0x00233FC0 v0=0x00000001   (expected exit 0x002DF5DC)
+```
+
+- Entered with the correct caller continuation `ra = 0x2DF5DC`.
+- Leaves `pc = 0x233FC0`, i.e. the C++ returned at the inline dispatch of the `0x233EEC` call. So completion
+  requires the runtime to **re-dispatch at `0x233EF4`** after `0x233FC0` returns.
+- `0x233EF4` is a valid resume label (`case 0x233ef4u: goto label_233ef4;`, generated file line 63), so the
+  emitter models it correctly.
+
+**Instrumentation blind spot:** the probe is installed at the row start `0x233E50`, and `replaceFunction` patches a
+single table entry, so an interior dispatch to `0x233EF4` would bypass it. `[e50] = 1` therefore does **not** prove
+the continuation never runs - it only proves the row start was entered once.
+
+### Next
+
+Install the same probe at **`0x233EF4`** (4-byte table granularity, so this is safe and does not disturb the row
+start) and log entry + `ctx->pc` after `0x233FB8`'s `jr`. That distinguishes the last two possibilities:
+
+1. `0x233EF4` is never dispatched -> the runtime drops the continuation after the `0x233FC0` return;
+2. it is dispatched but never reaches `0x233FB8` -> the branch at `0x233EF8` (`beql $v0,-5`) diverts, and `$v0`
+   (`1` here) is the value to compare against hardware.
+
+Acceptance test unchanged: `0x2E0A58` writes, status returns to `0x00`.
+
+
 
 
 

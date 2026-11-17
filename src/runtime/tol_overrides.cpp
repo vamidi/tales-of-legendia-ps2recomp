@@ -2956,6 +2956,28 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdE50Prev = nullptr;
+
+    // FUN_00233E50: after 0x233EF4 there are no further calls - only branches and `jr $ra` at 0x233FB8. So the
+    // only failure mode is that the function never reaches its own `jr`. This probe logs the caller's ra on entry
+    // and the pc left behind on exit; a correct return must leave pc = 0x2DF5DC (the caller's continuation).
+    void orderE50Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (gOrdE50Prev != nullptr)
+        {
+            gOrdE50Prev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && sCalls <= 10u)
+        {
+            std::fprintf(stderr, "[e50] #%u enter_ra=0x%08X exit_pc=0x%08X v0=0x%08X (expect 0x002DF5DC)\n", sCalls, ra,
+                         static_cast<unsigned>(ctx->pc), GPR_U32(ctx, 2));
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6502,6 +6524,15 @@ namespace tol
             {
                 gOrdG248Prev = fn;
                 runtime.replaceFunction(0x00126248u, &orderG248Probe);
+            }
+        }
+        // Does 0x233E50 return to its caller? (see orderE50Probe)
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00233E50u);
+            if (fn != nullptr)
+            {
+                gOrdE50Prev = fn;
+                runtime.replaceFunction(0x00233E50u, &orderE50Probe);
             }
         }
 
