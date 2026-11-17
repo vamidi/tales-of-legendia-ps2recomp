@@ -4598,6 +4598,70 @@ was incomplete rather than wrong: PC-only and flag-only were each insufficient, 
 change the scheduler's behaviour. What remains is completing the resume (the register area and stack) and giving
 the run enough time, with the acceptance test unchanged: `0x2E0A58` writes and the status byte returns to `0x00`.
 
+## Session 136 (2026-11-17) - CORRECTION from `HANDOFF_LOADER.md`: there is no runnable bit; `0x400` is the PRIORITY byte
+
+The project docs already contained this subsystem, and they correct two of my readings.
+
+### `HANDOFF_LOADER.md:1052-1054` (authoritative, hardware-derived)
+
+```
+TCB: base 0x407160, stride 0x210; state +0x1F0, priority +0x1F1, entry +0x1B0,
+     entry arg +0x1C0, started flag +0x1F3, +0x1AC, +0x200.
+Context: base 0x48F590, size 0x1D0; +0x1AC state, +0x1B4 $ra, +0x1A0 $sa.
+```
+
+So the word I dumped at `+0x1F0` is `state | priority<<8 | started<<24`, and my session-135 conclusion was wrong:
+
+| slot | dumped `+0x1F0` | state | **priority** | started |
+|---|---|---|---|---|
+| 2, 3, 4 | `0x01000401` | 1 | **4** | 1 |
+| 5 | `0x01000101` | 1 | **1** | 1 |
+
+- There is **no runnable bit `0x400`** - that bit is simply priority 4 vs 1.
+- Slot 5 is a normal **priority-1** thread; its flags were never wrong.
+- Priority coverage is fine: the frame loop pumps `FUN_00151ff0(0)`, `(1)`, `(4)` (`HANDOFF_LOADER.md:715`),
+  so priority 1 is serviced.
+
+**Consequence:** the `TOL_TRY_RESUME` write `+0x1F0 := 0x01000401` changed slot 5's *priority*, i.e. it fabricated
+guest state - precisely what `HANDOFF_LOADER.md:56-60` (framing error #2) warns about. The observed behaviour
+change is real but it means "moved to another run queue", not "made runnable". That experiment must not be read as
+evidence for a flag fix, and it should not ship.
+
+### What the docs already establish about the real mechanism
+
+`HANDOFF_LOADER.md:84-90` (hardware-verified run loop):
+
+```
+0x151F78 jal FUN_0015243C    ; save
+0x151F80 jal FUN_00152200    ; switch in
+0x151F88 jal FUN_0015253C    ; <- the yield lands here
+0x151F90 lw  v0, 0x1AC(s0)   ; still alive?
+0x151F94 bnez v0, 0x151EE8   ;   yes -> next thread
+0x151F9C jal FUN_00151CF0    ;   no  -> DELETE the thread
+```
+
+`+0x1AC` is the **alive** flag: `1` = yielded and alive, `0` = the entry returned -> the thread is deleted.
+`FUN_00152200` sets it to `0` on switch-in, and the **yield `FUN_0015231C` sets it back to 1**. Our port shows
+`yield (0x15231C) = 0`, so the thread that was switched in never yields again and stays `0`.
+
+That is consistent with everything measured: slot 5 is switched out inside `jal 0x2DF590` (nextpc lands at
+`0x233FC0`), `+0x1AC` never returns to 1, and `+0x1B4` stays at the entry PC because the save
+(`FUN_0015231C`, save-only per `HANDOFF_LOADER.md:1055`) never runs.
+
+### Also corrected: D1/D2 were already refuted by the docs
+
+`HANDOFF_LOADER.md:651-698` shows the invocation queue drains and the timer is not latched (`mode=0x382`,
+`EQUF/OVFF` clear), concluding D1/D2 are "refuted hypotheses, not defects". So interrupt delivery should not be
+re-investigated from scratch.
+
+### Corrected next target
+
+`FUN_0015231C` (the yield) is the function that must run and does not. Read it and the `0x233E50` call it is
+reached through, and establish why the switch-out path (`0x2DF590 -> 0x233E50`) abandons its caller instead of
+performing the save+yield sequence. The acceptance test is unchanged: `0x2E0A58` writes and the status byte
+returns to `0x00`.
+
+
 
 
 
