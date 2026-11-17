@@ -2327,6 +2327,57 @@ namespace
     }
 
     // ---------------------------------------------------------------------------------------------------------
+    // LOADER JOB CHAIN PROBE (0x365630) - diagnosis
+    //
+    // The AppCell loader polls job 0x63D850 (TCB 0x407580) and that job's step FUN_00204690 polls 0x63D890
+    // (TCB 0x4079A0), so the whole boot waits on the guest tasks those blocks describe. The app job
+    // (step 0x366090) parks at 0x3661DC in `while (*(u8*)(s1 + 8) != 0) { ...; yield(); }`, and `s1` is the object
+    // FUN_003654B0 builds: vtable 0x3DA320 (slot +0x0C is the one-instruction accessor 0x205F80, `lbu $v0,8($a0)`),
+    // outer phase at +0x70 / next at +0x72, inner phase at +0x74, child at +0x18, and the handle from
+    // FUN_001C0390 at +0x21C. Its per-iteration update is vtable+0x38 = this function, so sampling it shows
+    // whether the phase advances at all and what the wait byte does.
+    PS2Runtime::RecompiledFunction gJobObjPrev = nullptr;
+
+    void jobObjProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t obj = GPR_U32(ctx, 4);
+        if (gJobObjPrev != nullptr)
+        {
+            gJobObjPrev(rdram, ctx, runtime);
+        }
+        static const bool sJobEnv = std::getenv("TOL_TRACE_SCRIPT") != nullptr;
+        if (!sJobEnv)
+        {
+            return;
+        }
+        static uint32_t sJobLogs = 0u;
+        ++sJobLogs;
+        if (sJobLogs > 20u && (sJobLogs % 4000u) != 0u)
+        {
+            return;
+        }
+        if (obj < 0x00100000u || obj + 0x220u >= PS2_RAM_SIZE)
+        {
+            std::fprintf(stderr, "[jobobj] #%u obj=0x%08X (out of range)\n", sJobLogs, obj);
+            return;
+        }
+        std::fprintf(stderr,
+                     "[jobobj] #%u obj=0x%08X vt=0x%08X state=%u phase=%u next=%u inner=%u child=0x%08X "
+                     "job=0x%08X ret=0x%08X | +78=%d +7C=%d +84=%u child+0=%08X child+4=%08X\n",
+                     sJobLogs, obj, runtime->Load32(rdram, ctx, obj),
+                     static_cast<unsigned>(runtime->Load8(rdram, ctx, obj + 8u)),
+                     static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x70u)),
+                     static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x72u)),
+                     runtime->Load32(rdram, ctx, obj + 0x74u), runtime->Load32(rdram, ctx, obj + 0x18u),
+                     runtime->Load32(rdram, ctx, obj + 0x21Cu), GPR_U32(ctx, 2),
+                     static_cast<int32_t>(runtime->Load32(rdram, ctx, obj + 0x78u)),
+                     static_cast<int32_t>(runtime->Load32(rdram, ctx, obj + 0x7Cu)),
+                     static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x84u)),
+                     runtime->Load32(rdram, ctx, runtime->Load32(rdram, ctx, obj + 0x18u)),
+                     runtime->Load32(rdram, ctx, runtime->Load32(rdram, ctx, obj + 0x18u) + 4u));
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
     // TRANSFER QUEUE PUMP (always installed) - fix.
     //
     // FUN_001f8be0 queues asset transfers at 0x4A72C0 and links them through the head at gp-0x7860
@@ -5467,6 +5518,17 @@ namespace tol
                 runtime.replaceFunction(pc, &returnToRa);
         }
 
+        // Loader job chain (see jobObjProbe): the app job's sub-object updates through vtable+0x38, and sampling it
+        // is what says whether the phase it is waiting on ever advances.
+        {
+            PS2Runtime::RecompiledFunction jobObjFn = runtime.lookupFunction(0x00365630u);
+            if (jobObjFn != nullptr)
+            {
+                gJobObjPrev = jobObjFn;
+                runtime.replaceFunction(0x00365630u, &jobObjProbe);
+            }
+        }
+
         // 0x1F8150 is the GS/VU1 worker loop:
         //     do { FUN_001f8000(); FUN_0015231c(); } while (true);
         // On hardware it runs as its own guest thread and the loop yields each iteration, so the game's own
@@ -5589,8 +5651,7 @@ namespace tol
         }
 
         // Pump the DVCI/ADXF engine whenever the guest yields (see yieldPump). Legacy host pump only: with the
-        // guest microkernel running, 0x15231C's real save+yield must reach the run loop at 0x151F88.
-        if (legacyWorkerPumpsEnabled())
+        // guest microkernel running, 0x15231C's real save+yield must reach the run loop at 0x151F88.        if (legacyWorkerPumpsEnabled())
         {
             PS2Runtime::RecompiledFunction yieldFn = runtime.lookupFunction(kYieldPc);
             PS2Runtime::RecompiledFunction dvciPump = runtime.lookupFunction(kDvciPumpPc);

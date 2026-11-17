@@ -40,11 +40,12 @@ instruction in a row (`Option A` in `ps2xRecomp/src/lib/ps2_recompiler.cpp`), th
 the address overrides above and the whole class of bugs. Verify on regeneration: dense `case` lists for
 `entry_00205f68`, `entry_00165210`, `entry_00231e54`, and `0x165220`/`0x205F80` present as cases.
 
-**Current blocker:** the AppCell loader's per-frame loop now runs (session 120), but the job chain reports
-`busy=1` forever (`0x63D850 -> 0x63D890 -> 0x4079A0`) and the script writer stops after 16 of 48 MIX chunks:
-slot 0 at `0x4A5840` never gets `1` again, so `FUN_001ECBE0` has nothing to dispatch. `tid=1` cycles the
-microkernel run loop `0x151F88`. The question is which guest path is supposed to enqueue the next loader task
-(the same open question as session 106, now with a live loader loop).
+**Current blocker:** the boot waits on the AppCell loader's job chain, which was traced in session 121 to a
+single bit: slot 4's task (app job, step `0x366090`) sits in a wait loop at `0x3661DC` on the sub-object
+`0x63E3D0`'s byte `+8`, and that object never leaves outer phase 1 / inner phase 1 because
+`FUN_002E0820(0, ...)` keeps returning 0 - it reads the game's 26-entry job table at `0x4E9140 + index*0x18`
+and **bit 1 of entry 0's status byte is never set**. Everything above it (`FUN_00204690` polling `0x63D890`,
+the loader polling `0x63D850`) is correct and merely reports that the task has not finished.
 
 **Also fixed in session 120:** the tree could not be built at all (the 11/13 reconfigure dropped
 `CMAKE_CXX_FLAGS` and clang-cl 22 defaults to exceptions OFF, so every `throw`/`try` in the submodule failed).
@@ -3626,4 +3627,62 @@ build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
 ```
 
 New probes: `TOL_TRACE_PREEMPT` (in-place preemption counter), `TOL_FIBER_PREEMPT` (the opt-in experiment).
+
+## Session 121 (2026-11-17) - the loader job chain traced to one status bit
+
+Question: the AppCell loader's job chain reports `busy=1` forever. Traced end to end; the runtime is not
+involved - the guest task is genuinely waiting.
+
+### The chain (all measured)
+
+1. `FUN_00164F80` (loader) calls `FUN_00165420(job=0x63D850)` -> `FUN_00152160(*(u32*)0x63D850 = 0x407580)`,
+   which scans the 64 TCB blocks at `0x407160` for `+0x200 == key` and reports busy while `+0x1F0 != 0`.
+   Slot 2 is `state=1` -> busy. 811 polls from `ra=0x0016503C`.
+2. Slot 2's step is `FUN_00204690`. At `0x2046DC` it takes `s2 = FUN_003662E0()` = job object `0x63D890`
+   (whose first word is TCB `0x4079A0`, slot 4) and sits in `do { yield(); } while (FUN_00165420(0x63D890))`
+   at `0x2047C8..0x2047B8`. Slot 4 is `state=1` -> busy. 811 polls from `ra=0x002047D8`.
+3. Slot 4 is the app job task (`entry=0x165210`, step `0x366090`). `TOL_STALL_DUMP` shows its guest resume pc
+   is **`0x3661DC` in all 14 dumps over 60 s**, while the priority-4 pump runs 813 times: it is resumed, runs,
+   and yields again from the same instruction.
+4. `0x3661DC` is inside `while (*(u8*)(s1 + 8) != 0) { global->vt[8](); s2->vt[0x1C](s2); s1->vt[0x38](s1);
+   global->vt[0x0C](); yield(); }` (the yield is at `0x3661D4`, so the resume lands right after it).
+5. `s1` = object `0x63E3D0`, built by `FUN_003654B0` (0x220 bytes, vtable **`0x3DA320`**, outer phase `+0x70`,
+   next `+0x72`, inner phase `+0x74`, child `+0x18`, job handle `+0x21C` from `FUN_001C0390(0, ..., 3, 0, 1)`).
+   Its wait byte is read through vtable `+0x0C` = **`0x205F80`** (`jr $ra; lbu $v0,8($a0)`) - one of the three
+   merged-row interior entries fixed in session 118. `vt[0x38]` = `FUN_00365630` is the per-iteration update.
+6. Live `[jobobj]` sampling (`TOL_TRACE_SCRIPT`, probe on `0x365630`) is completely frozen over 65 s:
+
+   ```
+   [jobobj] #1  obj=0x0063E3D0 vt=0x003DA320 state=1 phase=1 next=65535 inner=0 child=0x0063E610 job=0x0063E800 ret=0 | +78=0 +7C=0 +84=0
+   [jobobj] #20 obj=0x0063E3D0 vt=0x003DA320 state=1 phase=1 next=65535 inner=1 child=0x0063E610 job=0x0063E800 ret=0 | +78=0 +7C=0 +84=0
+   ```
+
+   So the wait byte `+8` is 1 forever, the outer phase stays 1 with nothing queued (`+0x72 = -1`), and
+   `FUN_00365630` returns 0 ("not done") on every call, so it never advances `+0x70` to `+0x72`.
+7. `FUN_00365630` phase 1 calls **`FUN_00365700`** (a second state machine on `+0x74`). Its inner phase 1 does
+   `*(u32*)(this+0x80) = -1; v0 = FUN_002E1EF0(0, this+0x80); if (v0 == 0) return 0;` and only then
+   `+0x74 += 1` and starts the child (`FUN_00307770(child, 1.0f)`).
+8. `0x2E1EF0` is a tail-jump to **`FUN_002E0820(index, out)`**, which reads a 26-entry table at
+   **`0x4E9140 + index*0x18`** and returns 0 when **bit 1 of the entry's status byte is clear**. With `index 0`
+   it is always 0, so the phase never advances.
+
+### Therefore
+
+`busy=1` is not a deadlock and not a poll bug: the TCBs correctly describe a guest task that has not finished.
+The whole boot is waiting on **bit 1 of the status byte of job-table entry 0 at `0x4E9140`**, which nothing
+sets. The same 0x18-stride table (26 entries) is what `FUN_001C0390`'s factory indexes, so this is the game's
+own job/worker table, and the missing piece is the producer that completes slot 0.
+
+### Probe added
+
+| probe | where | what |
+|---|---|---|
+| `[jobobj]` | `tol_overrides.cpp`, wrapper on `0x365630` | the app job's sub-object: vtable, wait byte `+8`, outer phase `+0x70`/next `+0x72`, inner `+0x74`, child `+0x18`, job `+0x21C`, the update's return value, and `+0x78/+0x7C/+0x84` |
+
+### Next
+
+Find who writes `*(u8*)0x4E9140` bit 1 (and what `FUN_002E0820`'s `out` word is consumed as), i.e. which
+subsystem completes job slot 0. If nothing ever does, the next question is which queued job should have been
+dispatched into that table - the same "nobody asks" shape as session 106, now narrowed to one table entry.
+
 
