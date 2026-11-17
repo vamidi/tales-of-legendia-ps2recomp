@@ -4381,6 +4381,51 @@ claim is legitimate, and the missing step was always this one suspended call.
    re-schedule it. That is guest-thread support code (`EeScheduler` / context switch), not `runner/*.cpp`, not the
    job table, and not a data poke.
 
+## Session 131 (2026-11-17) - both follow-ups executed: continuation is NEVER recorded in scheduler state (stack only)
+
+### Option 1 - confirmed: the suspended continuation is never scheduled
+
+The complete scheduled-context set (15 PCs, from `TOL_TRACE_INDIRECT`):
+
+```
+0x164F80 0x164FCC 0x164FE8 0x165220 0x1660A0 0x1660EC 0x1F8150 0x1F8168
+0x1F84B0 0x1F8528 0x1F86B8 0x2047D0 0x233FEC 0x2E09E0 0x3661DC
+```
+
+`0x2E0A3C`: **0 occurrences**. `0x2DF5DC`: 0. `0x233E50`: 0. So the resume point of the submit thread never
+becomes a schedulable context.
+
+### Option 2 - the save never happened, proven by scan
+
+After the switch (`nextpc=0x233FC0`), a scan of the TCB blocks (`0x407000..0x408000`), the context table
+(`0x48F000..0x490000`) and the thread's stack (`0x417000..0x418000`):
+
+```
+needle 0x002E0A3C recorded 1 time(s), first at 0x00417510  <- STACK FRAME
+needle 0x002DF5DC recorded 1 time(s), first at 0x004174C0  <- STACK FRAME
+```
+
+Both are **only** ordinary stack frames (prologue `ra` spills). Neither appears in the context table or any TCB
+block, so **no scheduler structure ever captured this thread's continuation**. `0x2DF590` -> `0x233E50` switches
+away, and the thread is left with its resume point existing solely on its own stack, which nothing re-enters.
+
+### Fix specification (now fully determined)
+
+- **Where:** the guest's context-save path reached through `func_2DF590 -> func_233E50` (the `0x233xxx` scheduler
+  module that also owns the scheduled PC `0x233FEC`), writing into the save area at `0x48F590` keyed by
+  `0x3DB1A0` (index) / `0x3DB1B0` (stride) / `0x3DB1C0` (offset). `0x152200` restores from the same table and
+  saves its own `ra` at `block+0x1A8`.
+- **What:** before switching away, the outgoing thread's resume PC (`0x2DF5DC`, and transitively `0x2E0A3C`) must
+  be written into its context block so the scheduler can select it again.
+- **Not:** `runner/*.cpp`, the job table, bit 1, `entry0+6`, or a data poke - all previously ruled out by
+  measurement.
+
+Because the table is guest RAM written by guest code, the defect is most likely a guest-side divergence inside
+that scheduler call (for example a primitive it uses returning a different result), not a missing runtime feature
+to bolt on. The next micro-step is to dump the context block for the submit thread (locate it by its saved
+`sp` ~ `0x417550`) and see which field should hold the resume PC and what value it actually contains.
+
+
 
 
 

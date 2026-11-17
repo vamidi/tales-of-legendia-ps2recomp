@@ -2707,6 +2707,37 @@ namespace
         {
             std::fprintf(stderr, "[sub2] #%u ret  v0=0x%08X nextpc=0x%08X (caller expects 0x002E0A3C)\n", sCalls,
                          GPR_U32(ctx, 2), static_cast<unsigned>(ctx->pc));
+            // Was the suspended continuation recorded anywhere? If neither 0x2E0A3C (the guest's expected resume
+            // point) nor 0x2DF5DC (the return address inside the switching call) exists in any context/stack area
+            // after the switch, then the context save never captured this thread's continuation at all.
+            static const uint32_t kNeedles[2] = {0x002E0A3Cu, 0x002DF5DCu};
+            static const uint32_t kRanges[3][2] = {{0x00407000u, 0x00408000u},   // TCB blocks
+                                                  {0x0048F000u, 0x00490000u},   // context save area (0x48F590)
+                                                  {0x00417000u, 0x00418000u}};  // the submit thread's stack
+            for (int n = 0; n < 2; ++n)
+            {
+                uint32_t hits = 0u;
+                uint32_t firstAt = 0u;
+                for (int r = 0; r < 3; ++r)
+                {
+                    for (uint32_t a = kRanges[r][0]; a + 4u <= kRanges[r][1]; a += 4u)
+                    {
+                        if (runtime->Load32(rdram, ctx, a) == kNeedles[n])
+                        {
+                            if (hits == 0u)
+                            {
+                                firstAt = a;
+                            }
+                            ++hits;
+                        }
+                    }
+                }
+                std::fprintf(stderr, "[sub2]   needle 0x%08X recorded %u time(s), first at 0x%08X%s\n", kNeedles[n], hits,
+                             firstAt,
+                             (firstAt >= 0x0048F000u && firstAt < 0x00490000u)   ? "  <- CONTEXT TABLE"
+                             : (firstAt >= 0x00407000u && firstAt < 0x00408000u) ? "  <- TCB BLOCK"
+                                                                                : "  <- STACK FRAME");
+            }
         }
     }
 
