@@ -5159,6 +5159,105 @@ Log the **control transfer** out of the row rather than guessing: widen the exis
 `kind`. The transfer that produces `0x116A6C` will name its own instruction, which is the fix socket - and it will
 also show whether that transfer is legitimate guest code or a runtime redirect.
 
+---
+
+# SESSION CLOSE 2026-11-17 (sessions 123-151) - READ THIS BEFORE PROBING ANYTHING
+
+## One-line status
+
+The loader stalls because job-table entry 0 stays **reserved** (bit 1 set) with **no payload** (`entry+6 = 0`);
+the guest clears it, the port never does. Everything downstream of that is verified; the single open question is
+one indirect control transfer.
+
+## The blocker, stated exactly
+
+| | PCSX2 (guest) | port |
+|---|---|---|
+| `entry0` status byte | `0x00` (bit 1 clear) | `0x02` (bit 1 set) |
+| `entry0+6` payload | `0xFF0E` | `0x0000` |
+| reaches `0x2E0A3C` (submit row resume) | **yes** | **no** |
+| `0x2E0A58` (the release `sb`) | runs | never runs |
+
+Reader contract (`FUN_002E0820`): `if (bit1) return 0; else *out = *(s16*)(0x4E9146+idx), return 1;` - so bit 1 =
+"claimed", and the port is stuck in the claimed state with an empty payload.
+
+## Verified correct (do NOT re-investigate)
+
+Established by measurement in the port, and cross-checked against PCSX2 where possible:
+
+- **The job table writers**: `FUN_002DEF60` (init/clear, bit 0 only), row `0x2E09E0` (fills `entry+6` at `0x2E0A38`),
+  `FUN_002E07D0` (test-and-set of bit 1 at `0x2E0814`).
+- **The gate** `FUN_00126368` returns **0 = success** (tail `0x1264B4`) in the port *and* `v0=0` in PCSX2. The
+  yield it guards is an **error-retry path**, so skipping it is correct.
+- **The poll** `FUN_00126248` returns `1` ("done") on the submit path (`a2=0x41745C`) and `0` elsewhere - correct
+  discrimination; `-1` only before `*(0x388D30)` is initialised.
+- **The yield** `FUN_0015231C` runs (30 calls, `ra` = worker loops) and sets `+0x1AC=1` when it returns nonzero.
+- **The switch** `FUN_00152200` (context restore from `0x48F590`, index/stride `0x3DB1A0/0x3DB1B0/0x3DB1C0`).
+- **Interior continuations ARE dispatched**: `0x233EF4` resumes and returns to `0x2DF5DC`; `0x2DF5DC` resumes.
+- **The TCB layout** (see below) and `sp`/saved-RA integrity: `sp` at the continuation is exactly `entry-0x50`, and
+  the saved-RA slot `0x417510` holds `0x2E0A3C` at store, resume and return.
+- **D1/D2** (timer latch, IRQ ack ordering) were already refuted in `HANDOFF_LOADER.md:651-698` - not defects.
+
+## Refuted by measurement (the recurring lesson)
+
+Each of these was a confident conclusion that a measurement killed - in order: the `StoreN` write watch (blind to
+RAM stores), "the claim is the failing-step branch" (both paths claim), "bit `0x400` is a runnable flag" (it is the
+**priority** byte), "the yield is missing" (gate returns success), "`0x233FC0` never returns" (it returns),
+"dispatch mismatched/`$ra` clobbered by a stack mismatch" (sp and slot are both correct).
+
+**Rule: distrust the instrument before the guest.** A zero count, a `nextpc`, or a u8 read of a u32 field has
+misled this project four times.
+
+## The one remaining question
+
+`FUN_002DF590` (row `0x2DF590..0x2DF6D0`) is entered correctly (`ra=0x2E0A3C`), resumes at `0x2DF5DC` with correct
+`sp` and a correct saved RA, and yet control leaves at **`0x116A6C`** - the tail of row `caseD_45_0x116a08`.
+The row has exactly **one** `jr` (`0x2DF6C8`, preceded by `ld $ra,0x40(sp)` at `0x2DF6B4`), which would return to
+`0x2E0A3C`. So the exit is **an indirect transfer inside the row**, not the epilogue.
+
+## Next probe (exact, cheap)
+
+Widen the `TOL_TRACE_INDIRECT` filter in `PS2Runtime::dispatchGuestBranch` (`ps2_runtime.cpp`, already env-gated)
+to cover `sourcePc ∈ [0x2DF590, 0x2DF6D0)` and log `targetPc` + `kind`. That names the instruction producing
+`0x116A6C` and decides between guest code and a runtime redirect. Acceptance test unchanged: `0x2E0A58` writes and
+the status byte returns to `0x00`.
+
+## Reference facts (hard-won, reuse them)
+
+```
+TCB base 0x407160, stride 0x210, 64 entries
+  +0x1A8 saved ra    +0x1AC alive flag (1 = yielded/alive, 0 = returned -> thread DELETED)
+  +0x1B0 entry       +0x1B4 resume PC      +0x1C0 entry arg
+  +0x1F0 state(u8) | priority(u8 @+0x1F1) | started(u8 @+0x1F3)
+  +0x1F8 / +0x1FC / +0x200   list links / self ;  +0x204/+0x208 stack range
+Context array 0x48F590, entry size 0x1D0 (index/stride/off at 0x3DB1A0/0x3DB1B0/0x3DB1C0)
+Current-thread pointer 0x3DB198
+Job table 0x4E9140, stride 0x18, 26 entries; reader reads 0x4E9146 (= entry0+6)
+Run loop FUN_00151E90: 0x151F78 save / 0x151F80 switch-in / 0x151F88 yield lands / 0x151F90 alive check
+                      0x151F94 bnez alive -> next thread ; 0x151F9C DELETE thread
+Submit row 0x2E09E0: 0x2E0A30 status / 0x2E0A34 jal 0x2DF590 / 0x2E0A38 entry+6 /
+                      0x2E0A50 and ~2 / 0x2E0A58 RELEASE / 0x2E0A68 jr
+Chain 0x2DF590 -> 0x233E50 -> 0x233FC0(poll 0x126248; yield 0x15231C only when poll != 0)
+```
+
+## Instrumentation inventory (all opt-in, all in `src/runtime/tol_overrides.cpp` unless noted)
+
+| env var | what it does |
+|---|---|
+| `TOL_TRACE_ORDER` | `[order]`/`[sub2]`/`[e50]`/`[ef4]`/`[d5dc]`/`[d0b0]`/`[gate]`/`[g248]`/`[fc0]`/`[yield]`/`[tcb]` chains |
+| `TOL_WATCH_JOBTABLE_RAM` | range watch on `0x4E9140..0x4E93B0` (in `ps2_runtime.h` - header edit, cost a full rebuild) |
+| `TOL_TRACE_INDIRECT` | indirect transfers with `sourcePc ∈ [0x152200,0x152700)` (in `ps2_runtime.cpp`) |
+| `TOL_TRY_RESUME` | diagnostic only: pokes `+0x1AC/+0x1B4/+0x1F0/+0x1FC` on slot 5. **Not a fix** - it changes priority and fabricates guest state |
+| `TOL_TRACE_PC` / `TOL_TRACE_SCRIPT` / `TOL_WATCH_SLOT2` | pre-existing |
+
+## Documentation already covering this area (read before re-deriving)
+
+- `HANDOFF_LOADER.md` - TCB/context layout, run loop, alive check, D1-D5, "host scheduler is the framing error".
+- `docs/ps2-static-recompilation-overview.md:161` - `EeScheduler` scope.
+- `.opencode/skills/ps2-recomp/resources/db-syscalls.md` - thread syscall table.
+- `.opencode/skills/ps2-recomp/resources/09-ps2tek.md:4767` - canonical `struct TCB`.
+
+
 
 
 
