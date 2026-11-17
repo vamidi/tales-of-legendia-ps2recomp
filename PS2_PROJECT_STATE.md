@@ -3685,4 +3685,72 @@ Find who writes `*(u8*)0x4E9140` bit 1 (and what `FUN_002E0820`'s `out` word is 
 subsystem completes job slot 0. If nothing ever does, the next question is which queued job should have been
 dispatched into that table - the same "nobody asks" shape as session 106, now narrowed to one table entry.
 
+## Session 122 (2026-11-17) - the job table has no writers at all; the setter is a known function the port never calls
+
+### Port side: zero writers (measured, with a control)
+
+`TOL_WATCH_JOBTABLE=1` (new, in `PS2Runtime::Store8/16/32/64/128`) logs every store overlapping
+`0x4E9140..0x4E93B0` with pc, op, addr, size, value, entry+offset and the bytes. Over a 55 s boot:
+
+```
+[jobtable] lines: 0
+```
+
+Positive control in the same run (pre-existing watch on the TCB status byte):
+
+```
+[slot2] pc=0x00151AC4 WRITE8   addr=0x00407770 size=1 old=0 new=1     (7 hits)
+[ptr]   pc=0x00109144 WRITE128 addr=0x00407740 size=16                 (6 hits)
+```
+
+So the store path is live and the job table genuinely has **no CPU-store writer**.
+
+One-shot dump at the first wait (new, inside `jobObjProbe`), diffed against PCSX2 at the title:
+
+| offset | port | PCSX2 |
+|---|---|---|
+| +0x00 entry0 status | `00000000` | `00000000` |
+| +0x04 | `0000FFFF` | `FF0E0000` |
+| +0x08 | `00000000` | `00000002` |
+| +0x14 | `00623100` | `00623100` |
+
+The status byte is 0 in **both**, so the table is transient state and "bit 1" is a symptom: PCSX2 sets it during
+load and clears it again. Note the port's table is not all zero (`+0x04`, `+0x14`), so something other than a
+CPU store also reached it (ELF image, DMA/IOP, or the bulk `memcpy` in `gameFileRead`).
+
+### Static xref: the whole job-table API is a 20-function cluster
+
+Every reference to the table appears as `lui 0x4F; addiu -0x6EC0` (0x4F0000-0x6EC0 = 0x4E9140). Twenty
+functions reference it; the ones around the reader form the API:
+`0x2E07D0, 0x2E0820(read), 0x2E0880, 0x2E0950, 0x2E09E0, 0x2E0A70, 0x2E1040, 0x2E1700, 0x2E1A40, 0x2E1D30`.
+`FUN_002E1D30` is a **writer**: it computes `s2 = 0x4E9140 + index*0x18` (3*index*8) and
+`s1 = entry+6`, reads the status byte, masks with `-3`, and stores both `status (s2+0)` and `entry+6 (s1+0)` -
+exactly the two fields `FUN_002E0820` consumes.
+
+### Dynamic: the port runs almost none of that API
+
+`TOL_TRACE_PC` on the ten functions over 50 s: only two entries, once each, both with **index 0**:
+
+```
+[pc] enter 0x002E07D0 a0=0x00000000 a1=0x00000001 a2=0x0000013F a3=0xFFFFFFE7
+[pc] enter 0x002E09E0 a0=0x00407D70 a1=0 a2=0 a3=0
+```
+
+`0x2E1D30` (and `0x2E1A40`, `0x2E1700`, `0x2E1040`, `0x2E0A70`, `0x2E0950`, `0x2E0880`) are **never entered**, so
+the status bit is never set because the *setter is never called* - not because a store went missing.
+
+### Probe caveat found
+
+`0x2E0820` also shows no dispatch entry, because `0x2E1EF0` is a **tail-jump thunk** (`j FUN_002E0820`) whose
+generated body calls `FUN_002e0820_0x2e0820` directly in C++, bypassing the function table - the same trap as
+the `0x1F7340` thunk in session 87. Dispatch-based probes are blind to it; hook the thunk if it must be observed.
+
+### PCSX2 side (armed, not yet caught)
+
+Watchpoint armed on `0x4E9140..0x4E9158` with `onchange` (the wide write watch had been parked on a BIOS
+zero-fill loop: `s0=0x4E9140, t9=0x27, sq v0,(s0)` at `0x8000E3C8`, which clears exactly 39x16 = 624 = 26x0x18
+bytes - a decoy, it can only clear). A reset drops debugger state (watchpoints disappear), so the order must be
+reset -> arm -> resume.
+
+
 
