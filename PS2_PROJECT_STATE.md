@@ -3930,6 +3930,73 @@ Two candidate fixes, and the measurement points at the second:
 Either way the target state is checkable in one run: `entry0+6 != 0` while `bit1 == 0` at the moment the
 consumer checks, i.e. `[jobobj] jt0=00` together with a nonzero `+6`.
 
+## Session 124 (2026-11-17) - TCB/context ordering trace: the daemon runs first and is *not* the submitter; the dispatcher is
+
+New probe: `TOL_TRACE_ORDER` (`orderEvent` + wrappers in `tol_overrides.cpp`) gives one total order across all
+probes with a sequence number, and guest `sp` as the context discriminator (each guest thread has its own
+stack). Instrumented: `0x165E70` (frame), `0x164F40` (TCB slot 3 entry, AppCell daemon), `0x165210` (generic job
+entry), `0x2E09E0` (submit row), `0x2E1EF0` (reader thunk), plus `claim` emitted from `jobTableRefProbe`.
+
+### Measured order (single init pass; the frame counter never advances past 1)
+
+```
+#1  f1 frame    sp=0x01FFFFD0  ra=0x00165B14                      <- one-shot init call, not a loop
+#2  f1 daemon   sp=0x01FFFF80  ra=0x00151FC8  a0=0x00407950      <- TCB slot 3 (0x407790), job obj slot3+0x1C0
+#3  f1 appjob   sp=0x01FFFF80  ra=0x00151FC8  a0=0x00407740      <- slot 2
+#4  f1 appjob   sp=0x01FFFF80  ra=0x00151FC8  a0=0x00407B60      <- slot 4
+#5  f1 claim    sp=0x00423450  ra=0x002E1F98                      <- phase machine, app-job stack
+#6  f1 submit   sp=0x00417550  ra=0x00151F88  a0=0x00407D70      <- different dispatch site, slot 5 job obj
+#7+ f1 read     sp=0x00423480  ra=0x003659BC  a0=0, a1=0x0063E450 <- repeats forever, identical args
+```
+
+`[tcb] f1 slot3 state=0 prio=0 | slot4 state=0 prio=0` - so at this pass the entries are dispatched through
+`FUN_00151E90` (`0x151FC8`) with the TCB blocks, and `state` only becomes 1 afterwards (as seen in earlier
+sessions).
+
+### What the daemon does and does not do
+
+- TCB slot 3 (`0x407790`, entry `0x164F40`) **does run**, once, *before* the app job, with `a0 = 0x00407950`
+  (= slot3 + `0x1C0`, the per-slot job object, same layout as `[slot2]`/`[ptr]` probes).
+- It is **not** the submitter. The submit walks a different context (`sp=0x00417550`) with
+  `a0 = 0x00407D70` = **slot 5** + `0x1C0`. So slot 5 is the thread that writes the table.
+- The claim and all reads come from one context (`sp=0x004234xx`), i.e. the app-job phase machine, which runs
+  before slot 5 is dispatched.
+
+### `0x2E09E0` is an interior row (again), and that explains the ra
+
+`FUN_002E0950` ends with `ctx->pc = 0x2E09E0u;` (lines 227, 249), so `0x2E09E0` is only the *next row* of the
+chain `0x2E0880 -> 0x2E08D0 -> 0x2E0950 -> 0x2E09E0 -> 0x2E0A70`. This is the third time in two sessions that an
+"API function with no callers" turned out to be a row boundary (cf. `0x2E1A40`/`0x2E1D30`).
+
+Consequence: `ra=0x00151F88` at the `0x2E09E0` boundary belongs to whoever entered the **chain head**, not to the
+row - and it does not match either dispatcher `jal` cleanly (`0x151F80: jal func_152200` would give
+`ra=0x151F84`; `0x151F88: jal func_15253C` would give `ra=0x151F8C`). So the submit is reached through one of
+those two dispatcher paths, via an intermediate that preserves `ra`, and the exact one is still open.
+
+### Answer to "why does submission happen after the claim"
+
+Because the two live in different dispatch services of the **same** `FUN_00151E90` pass, and the port takes them
+in the wrong order:
+
+1. the thread dispatch (`0x151FC8`) runs slots 2/3/4 to their blocking points - slot 4's phase machine claims
+   (`0x2E0814`) and then parks at `0x3661DC` in `while (*(u8*)(s1+8))`;
+2. only afterwards does the dispatcher's other path (`0x151F80`/`0x151F88` -> ... -> row `0x2E09E0`) run the
+   slot-5 submit, writing `entry0+6` at `0x2E0A38`.
+
+Since the claimant parks immediately after claiming, the payload lands after the only context that could consume
+it has stopped running. Nothing re-checks: that is the deadlock, and it is an ordering defect, not a missing
+function or a missing store.
+
+### Next
+
+1. Identify which dispatcher path reaches the `0x2E0880` chain head (`0x152200` vs `0x15253C`) and whether slot 5
+   is meant to be dispatched before slot 4 (TCB priority/ring position). `state=0/prio=0` at the pass suggests
+   the ring is walked in slot order, while the guest expects the submitter earlier - check the guest's TCB
+   priorities once `state` is 1, and the ring order in `EeScheduler.cpp`.
+2. Cheaper intermediate check: log `FUN_00151E90`'s own pc progression (`0x151F80`, `0x151F88`, `0x151FC8`) with
+   `orderEvent` to see the loop shape and confirm which service runs first.
+
+
 
 
 

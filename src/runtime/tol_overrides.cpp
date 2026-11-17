@@ -2331,6 +2331,95 @@ namespace
     // (`sh $v1, 0($v0)` in the delay slot of `jal 0x233BF0`), i.e. it writes the u16 that FUN_002E0820 hands to
     // phase 1 as *out. PCSX2 has 0xFF0E in entry0+6 at the title; the port has 0, which is why the reader
     // returns 1 with a zero payload and phase 1 never advances.
+    // ---------------------------------------------------------------------------------------------------------
+    // FRAME / CONTEXT ORDERING TRACE (TOL_TRACE_ORDER)
+    //
+    // The remaining question is not *what* writes the job table but *when*, per frame, and from which guest
+    // context. Guest sp identifies the context reliably: each guest thread has its own stack, so sp separates
+    // the loader main thread, the AppCell daemon (TCB slot 3 = 0x407790, entry 0x164F40) and the app job
+    // (TCB slot 4 = 0x4079A0, entry 0x165210). A shared sequence counter makes the log a total order across
+    // every probe, and the frame counter (bumped in the per-frame update 0x165E70) buckets it into frames.
+    static uint32_t sOrderSeq = 0u;
+    static uint32_t sOrderFrame = 0u;
+
+    void orderEvent(const char *tag, R5900Context *ctx)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        if (!sEnv)
+        {
+            return;
+        }
+        ++sOrderSeq;
+        if (sOrderSeq > 600u)
+        {
+            return;
+        }
+        std::fprintf(stderr, "[order] #%u f%u %-7s sp=0x%08X ra=0x%08X a0=0x%08X a1=0x%08X\n", sOrderSeq, sOrderFrame,
+                     tag, GPR_U32(ctx, 29), GPR_U32(ctx, 31), GPR_U32(ctx, 4), GPR_U32(ctx, 5));
+    }
+
+    PS2Runtime::RecompiledFunction gOrdFramePrev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdDaemonPrev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdAppJobPrev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdSubmitPrev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdReadPrev = nullptr;
+
+    void orderFrameProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++sOrderFrame;
+        orderEvent("frame", ctx);
+        // TCB health, so "the daemon never runs" can be told apart from "the daemon runs and does nothing".
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        if (sEnv && (sOrderFrame <= 3u || (sOrderFrame % 240u) == 0u))
+        {
+            std::fprintf(stderr, "[tcb] f%u slot3@0x407790 state=%u prio=%u | slot4@0x4079A0 state=%u prio=%u\n",
+                         sOrderFrame, static_cast<unsigned>(runtime->Load8(rdram, ctx, 0x00407790u + 0x1F0u)),
+                         runtime->Load32(rdram, ctx, 0x00407790u + 0x1F4u),
+                         static_cast<unsigned>(runtime->Load8(rdram, ctx, 0x004079A0u + 0x1F0u)),
+                         runtime->Load32(rdram, ctx, 0x004079A0u + 0x1F4u));
+        }
+        if (gOrdFramePrev != nullptr)
+        {
+            gOrdFramePrev(rdram, ctx, runtime);
+        }
+    }
+
+    void orderDaemonProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("daemon", ctx);
+        if (gOrdDaemonPrev != nullptr)
+        {
+            gOrdDaemonPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void orderAppJobProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("appjob", ctx);
+        if (gOrdAppJobPrev != nullptr)
+        {
+            gOrdAppJobPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void orderSubmitProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("submit", ctx);
+        if (gOrdSubmitPrev != nullptr)
+        {
+            gOrdSubmitPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void orderReadProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("read", ctx);
+        if (gOrdReadPrev != nullptr)
+        {
+            gOrdReadPrev(rdram, ctx, runtime);
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2436,6 +2525,7 @@ namespace
         const uint32_t entry = 0x004E9140u + (index * 0x18u);
         const bool inTable = (entry + 0x18u <= 0x004E93B0u);
         const uint8_t before = inTable ? runtime->Load8(rdram, ctx, entry) : 0u;
+        orderEvent("claim", ctx);
         if (gJobRefPrev != nullptr)
         {
             gJobRefPrev(rdram, ctx, runtime);
@@ -5707,6 +5797,51 @@ namespace tol
             {
                 gJobSlot6Prev = slot6Fn;
                 runtime.replaceFunction(0x002DF6D0u, &jobTableSlot6Probe);
+            }
+        }
+
+        // Frame / context ordering trace (TOL_TRACE_ORDER): per-frame update, the two guest TCB entries, the
+        // submit row, the reader thunk, plus the claim event emitted from jobTableRefProbe.
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00165E70u);
+            if (fn != nullptr)
+            {
+                gOrdFramePrev = fn;
+                runtime.replaceFunction(0x00165E70u, &orderFrameProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00164F40u);
+            if (fn != nullptr)
+            {
+                gOrdDaemonPrev = fn;
+                runtime.replaceFunction(0x00164F40u, &orderDaemonProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00165210u);
+            if (fn != nullptr)
+            {
+                gOrdAppJobPrev = fn;
+                runtime.replaceFunction(0x00165210u, &orderAppJobProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002E09E0u);
+            if (fn != nullptr)
+            {
+                gOrdSubmitPrev = fn;
+                runtime.replaceFunction(0x002E09E0u, &orderSubmitProbe);
+            }
+        }
+        {
+            // 0x2E1EF0 is the tail-jump thunk the phase machine actually calls; 0x2E0820 itself is reached by a
+            // direct C++ call inside it, so only the thunk is observable from the dispatch table.
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002E1EF0u);
+            if (fn != nullptr)
+            {
+                gOrdReadPrev = fn;
+                runtime.replaceFunction(0x002E1EF0u, &orderReadProbe);
             }
         }
 
