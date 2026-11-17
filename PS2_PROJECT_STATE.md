@@ -5879,6 +5879,50 @@ Instrument the drain path (`GsTargetCache` upload: `prepareColorView` / the `nee
 A surface whose `needsUpload` is never cleared after a successful upload is the bug; if the upload is never invoked for
 this surface, the bug is in the caller that decides which surfaces need an upload.
 
+### Session 152 - GsTargetCache probe: a stale shadow surface was hiding the display (FIXED)
+
+`TOL_TRACE_GSFRAME` on `refresh`/`invalidate`/`readCircuit` produced:
+
+```
+[gsrefresh] #1 ENTER base=0 psm=0 needsUpload=[]      <- clean when refresh runs (82 calls)
+[gsinval]   #1 pages=2 preserveOwned=0               <- only 13 in 45 s, not per frame
+[gsread]  #1  sourceBase=0 psm=0 surface=yes 640x896 fbw=10 undefined=0 needsUpload=1
+```
+
+So the presenter was reading the **wrong surface object**: two surfaces share `(base 0, psm 0)` - a boot-time
+clear created a **640x896 / fbw=10** view, and the real display surface is **512x448 / fbw=8**.
+`findColorSurface(base, psm)` returned the *first* match, i.e. the stale 640x896 view, and its `needsUpload` is
+permanently dirty because the other view's draws re-merge it (`sdlgpu_targets.cpp:367-370`). That pinned the
+present path to the local-memory fallback on every frame.
+
+**Fix:** `findColorSurface` takes an optional `bufferWidth` and prefers the surface whose FBW matches the
+caller's display setup (`readCircuit` passes `setup.fbw`). Verified:
+
+```
+[gsread] #1 sourceBase=0 surface=yes 512x448 fbw=8 undefined=0 needsUpload=0    <- correct surface, GPU path
+```
+
+### ...and the remaining black frame is NOT the present path
+
+The draw probe also showed the target **moves**: early draws go to `base=0`, later ones to
+`base=7168` (= `224 << 5`, page 224) with small written regions (65x34, e.g. `[447,351..512,385]`), while DISPFB
+keeps displaying page 0. Forcing the presenter to page 224 *with* the selection fix gives:
+
+```
+[gsread] sourceBase=7168 surface=yes 512x448 fbw=8 undefined=0 needsUpload=0     <- right surface, GPU path
+frames 60/300/900: 100 % black
+```
+
+So the primitives reach the GPU with non-empty bounds but **produce no visible pixels**. "Nothing renders" is
+now narrowed to the draw contents (texture/CLUT sampling or blend factors), not to page selection, surface
+selection or the readback path - all three of which are fixed or eliminated.
+
+### Next probe (exact)
+
+For a sampled draw batch, print what the primitives actually are: primitive type, TCC/TFX/ABE blend factors,
+texture `tbp/tbw/psm` (and whether that VRAM region is non-empty), the vertex colours, and the scissor. That
+separates "sprites sample an empty texture -> black modulate" from "blend factors make them invisible".
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

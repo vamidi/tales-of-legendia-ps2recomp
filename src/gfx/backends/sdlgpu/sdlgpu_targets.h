@@ -179,7 +179,7 @@ public:
     // The colour surface currently holding a display buffer, or null. Lets
     // presentation composite from the scaled texture instead of forcing a
     // resolve down to native resolution.
-    GsSurface *findColorSurface(uint32_t base, uint32_t psm) const;
+    GsSurface *findColorSurface(uint32_t base, uint32_t psm, uint32_t bufferWidth = 0u) const;
 
     // A colour surface that can stand in for a texture read of this region --
     // same base, format and buffer width, and already holding drawn content.

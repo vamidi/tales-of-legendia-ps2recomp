@@ -1809,7 +1809,7 @@ struct SdlGpuBackend::Impl {
 
         GsSurface *surface = forceMemoryPath
                                  ? nullptr
-                                 : targets->findColorSurface(sourceBase, sourcePsm);
+                                 : targets->findColorSurface(sourceBase, sourcePsm, setup.fbw);
 
         // TOL_TRACE_GSFRAME=1: the read side. A surface that is undefined, or still holding pending local-memory
         // uploads, is NOT read from the GPU texture - the presenter falls back to local memory, which may not yet
@@ -1819,9 +1819,11 @@ struct SdlGpuBackend::Impl {
             ++sReads;
             if (sReads <= 8u || (sReads % 60u) == 0u)
                 std::fprintf(stderr,
-                             "[gsread] #%u sourceBase=%u psm=%u surface=%s undefined=%d needsUpload=%d "
-                             "scale=%u/%u forceMem=%d\n",
+                             "[gsread] #%u sourceBase=%u psm=%u surface=%s %ux%u fbw=%u undefined=%d "
+                             "needsUpload=%d scale=%u/%u forceMem=%d\n",
                              sReads, sourceBase, sourcePsm, surface != nullptr ? "yes" : "no",
+                             surface != nullptr ? surface->width : 0u, surface != nullptr ? surface->height : 0u,
+                             surface != nullptr ? surface->bufferWidth : 0u,
                              (surface != nullptr && surface->undefined) ? 1 : 0,
                              (surface != nullptr && !surface->needsUpload.empty()) ? 1 : 0,
                              surface != nullptr ? surface->scale : 0u, factor, forceMemoryPath ? 1 : 0);

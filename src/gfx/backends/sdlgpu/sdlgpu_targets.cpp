@@ -266,7 +266,19 @@ GsSurface *GsTargetCache::acquire(uint32_t base,
     return m_surfaces.back().get();
 }
 
-GsSurface *GsTargetCache::findColorSurface(uint32_t base, uint32_t psm) const {
+GsSurface *GsTargetCache::findColorSurface(uint32_t base, uint32_t psm, uint32_t bufferWidth) const {
+    // Two surfaces can share (base, psm) with different geometry: the boot-time clear created a 640x896 /
+    // fbw=10 view of page 0 before the game programmed its 512x448 / fbw=8 display. Returning the first match
+    // handed the presenter the stale view, whose needsUpload is kept dirty by draws landing in the other view's
+    // pages - so the present path never used the GPU texture and every frame came out black. Prefer the surface
+    // whose FBW matches the caller's display setup.
+    if (bufferWidth != 0u) {
+        for (const auto &candidate : m_surfaces) {
+            if (!candidate->depth && candidate->base == base && candidate->psm == psm &&
+                candidate->bufferWidth == bufferWidth)
+                return candidate.get();
+        }
+    }
     for (const auto &candidate : m_surfaces) {
         if (!candidate->depth && candidate->base == base && candidate->psm == psm)
             return candidate.get();
@@ -378,6 +390,15 @@ void GsTargetCache::markDrawn(GsSurface &surface, const GsRegion &region) {
 }
 
 void GsTargetCache::invalidate(const GsPageSet &pages, bool preserveOwned) {
+    // TOL_TRACE_GSFRAME=1: who dirties local memory after a refresh? Every call here re-merges
+    // needsUpload, which is what pins the presenter to the local-memory path on the next present.
+    if (std::getenv("TOL_TRACE_GSFRAME") != nullptr) {
+        static uint32_t sInvalidate = 0u;
+        ++sInvalidate;
+        if (sInvalidate <= 10u || (sInvalidate % 100u) == 0u)
+            std::fprintf(stderr, "[gsinval] #%u pages=%zu preserveOwned=%d\n", sInvalidate,
+                         static_cast<size_t>(pages.count()), preserveOwned ? 1 : 0);
+    }
     for (auto &candidate : m_surfaces) {
         GsSurface &surface = *candidate;
         if ((surface.pages & pages).none())
@@ -763,6 +784,21 @@ void GsTargetCache::writeResolved(GsSurface &surface, GsRegion region,
 }
 
 bool GsTargetCache::refresh(GsSurface &surface, std::string &error) {
+    // TOL_TRACE_GSFRAME=1: is the VRAM -> texture upload ever invoked for the surface the presenter reads?
+    // The presenter only downloads the texture when needsUpload is empty, so an un-drained surface pins the
+    // display path to local memory on every frame.
+    const bool traceRefresh = std::getenv("TOL_TRACE_GSFRAME") != nullptr;
+    if (traceRefresh) {
+        static uint32_t sRefresh = 0u;
+        ++sRefresh;
+        if (sRefresh <= 10u || (sRefresh % 100u) == 0u)
+            std::fprintf(stderr,
+                         "[gsrefresh] #%u ENTER base=%u psm=%u needsUpload=[%u,%u..%u,%u] empty=%d depth=%d "
+                         "owned=%d\n",
+                         sRefresh, surface.base, surface.psm, surface.needsUpload.x0, surface.needsUpload.y0,
+                         surface.needsUpload.x1, surface.needsUpload.y1, surface.needsUpload.empty() ? 1 : 0,
+                         surface.depth ? 1 : 0, surface.ownedPages.any() ? 1 : 0);
+    }
     if (!applyCpuPatches(surface, error))
         return false;
     if (surface.needsUpload.empty())
