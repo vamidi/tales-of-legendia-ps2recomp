@@ -2327,7 +2327,70 @@ namespace
     }
 
     // ---------------------------------------------------------------------------------------------------------
-    // LOADER JOB CHAIN PROBE (0x365630) - diagnosis
+    // JOB-TABLE WRITE TRACE (correct layer)
+    //
+    // The runtime-side watch was on the wrong path: WRITE8/16/32 macros write plain RAM through FAST_WRITE8 and
+    // never call PS2Runtime::StoreN, so a watch there only sees special addresses - which is why it reported zero
+    // writers while 0x2DEF60 provably ran with a0 = 0x4E9140. These are game-function overrides instead, which is
+    // both the honest measurement and where a fix belongs.
+    //
+    // 0x2DEF60(entry)  - generic status poked: reads *(u8*)entry, masks, writes it back, then entry+6.
+    // 0x2E1D30         - tail row of FUN_002E1A40 (row 0x2E1A40..0x2E1D30); nothing calls it directly, it is only
+    //                    reachable by falling out of that row, so its wrapper is the test of whether the setter
+    //                    body runs at all.
+    PS2Runtime::RecompiledFunction gJobPokePrev = nullptr;
+    PS2Runtime::RecompiledFunction gJobTailPrev = nullptr;
+
+    void jobTablePokeProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t entry = GPR_U32(ctx, 4);
+        const bool inTable = (entry >= 0x004E9140u && entry < 0x004E93B0u);
+        const uint8_t before = inTable ? runtime->Load8(rdram, ctx, entry) : 0u;
+        if (gJobPokePrev != nullptr)
+        {
+            gJobPokePrev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_JOBTABLE") != nullptr;
+        if (!sEnv)
+        {
+            return;
+        }
+        const uint8_t after = inTable ? runtime->Load8(rdram, ctx, entry) : 0u;
+        static uint32_t sCalls = 0u;
+        static uint32_t sChanges = 0u;
+        ++sCalls;
+        if (before != after)
+        {
+            ++sChanges;
+        }
+        if (sCalls <= 40u || before != after || (sCalls % 2000u) == 0u)
+        {
+            std::fprintf(stderr, "[jobpoke] #%u entry=0x%08X slot=%u status %u -> %u ra=0x%08X changes=%u\n", sCalls,
+                         entry, inTable ? (entry - 0x004E9140u) / 0x18u : 0u, static_cast<unsigned>(before),
+                         static_cast<unsigned>(after), GPR_U32(ctx, 31), sChanges);
+        }
+    }
+
+    void jobTableTailProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gJobTailPrev != nullptr)
+        {
+            gJobTailPrev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_JOBTABLE") != nullptr;
+        if (!sEnv)
+        {
+            return;
+        }
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 40u || (sCalls % 2000u) == 0u)
+        {
+            std::fprintf(stderr, "[jobtail] #%u a0=0x%08X status0=%u ra=0x%08X\n", sCalls, GPR_U32(ctx, 4),
+                         static_cast<unsigned>(runtime->Load8(rdram, ctx, 0x004E9140u)), GPR_U32(ctx, 31));
+        }
+    }
+
     //
     // The AppCell loader polls job 0x63D850 (TCB 0x407580) and that job's step FUN_00204690 polls 0x63D890
     // (TCB 0x4079A0), so the whole boot waits on the guest tasks those blocks describe. The app job
@@ -5543,6 +5606,26 @@ namespace tol
             {
                 gJobObjPrev = jobObjFn;
                 runtime.replaceFunction(0x00365630u, &jobObjProbe);
+            }
+        }
+
+        // Job-table writers (see jobTablePokeProbe): the measured producer of entry 0 in a working run is
+        // FUN_002DEF60 called from the frame update at 0x165F3C, and FUN_002E1D30 is the row that writes
+        // entry->status plus entry+6 (nothing calls it directly; it is the tail of FUN_002E1A40).
+        {
+            PS2Runtime::RecompiledFunction pokeFn = runtime.lookupFunction(0x002DEF60u);
+            if (pokeFn != nullptr)
+            {
+                gJobPokePrev = pokeFn;
+                runtime.replaceFunction(0x002DEF60u, &jobTablePokeProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction tailFn = runtime.lookupFunction(0x002E1D30u);
+            if (tailFn != nullptr)
+            {
+                gJobTailPrev = tailFn;
+                runtime.replaceFunction(0x002E1D30u, &jobTableTailProbe);
             }
         }
 
