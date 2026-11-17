@@ -6,7 +6,23 @@
 
 ---
 
-## CURRENT STATUS — updated 2026-11-11 (read this first; the rest is history)
+## CURRENT STATUS — updated 2026-11-17 (session 152; read this first; the rest is history)
+
+**Session 152 — one real bug found and fixed, verified by measurement.** The op-channel stall was an
+**interior-entry defect**, not a lost continuation. `entry_00125a64` (0x125A64-0x125B48) emits
+`switch (ctx->pc)` cases for its own branch targets only (`0x125ac4/0x125b08/0x125b18`); the CRI op
+channel's **SIF end function `0x125A78`** is dispatched as an RPC completion inside that row, so the dispatch
+restarted the row at `0x125A64` — the tail of another function (`ld ra,0x10(sp) / ... / jr $ra`) — and with the
+invocation's `$ra = 0` it left `pc = 0` and parked the thread. The end function's whole body is
+`lui v0,0x39 / lw a0,-0x72c8(v0) / j 0x114710`, i.e. `SignalSema(*(0x388D38))`, so the completion semaphore was
+never signalled: `FUN_00233FC0` spun `poll(0x126248) -> yield(0x15231C)` forever and `FUN_00126248` never
+dequeued. Fixed per-address in `src/runtime/tol_overrides.cpp` (`criEndFunctionFix`, installed by
+`installCriEndFunctionFix`).
+
+Measured effect (60 s): `[g248]` went from `ret=0/0xFFFFFFFF` forever to **`ret=1`, twice**; the dequeue
+succeeds and the main thread leaves the op-channel spin for the per-frame loop. **The boot still does not reach
+the title screen**: the app job now parks at `0x3661DC` (a0=1.0f, `[order] yield ra=0x003661DC`), and one
+pre-existing `jalr`-to-null with `a0=0xFFFFFF81` (-127) at `0x301EB8` remains (present before the fix, 1 per run).
 
 **Goal:** boot *Tales of Legendia* to its title screen and render it in a normal window.
 
@@ -40,12 +56,20 @@ instruction in a row (`Option A` in `ps2xRecomp/src/lib/ps2_recompiler.cpp`), th
 the address overrides above and the whole class of bugs. Verify on regeneration: dense `case` lists for
 `entry_00205f68`, `entry_00165210`, `entry_00231e54`, and `0x165220`/`0x205F80` present as cases.
 
-**Current blocker:** the boot waits on the AppCell loader's job chain, which was traced in session 121 to a
-single bit: slot 4's task (app job, step `0x366090`) sits in a wait loop at `0x3661DC` on the sub-object
-`0x63E3D0`'s byte `+8`, and that object never leaves outer phase 1 / inner phase 1 because
-`FUN_002E0820(0, ...)` keeps returning 0 - it reads the game's 26-entry job table at `0x4E9140 + index*0x18`
-and **bit 1 of entry 0's status byte is never set**. Everything above it (`FUN_00204690` polling `0x63D890`,
-the loader polling `0x63D850`) is correct and merely reports that the task has not finished.
+**Current blocker (re-stated after session 152):** the op-channel livelock is gone, so the session-121
+description below is now history. The boot advances to the AppCell loader's **app job**, which parks at
+`0x3661DC` (`[order] yield ra=0x003661DC a0=0x3F800000`, i.e. a 1.0f timeout argument) waiting on the
+sub-object `0x63E3D0`'s byte `+8`. Its dequeue dependency (`FUN_002E0820(0, …)` / job table
+`0x4E9140 + index*0x18`) now *does* return 1 - twice, measured - so the remaining gate is whatever must set
+`0x63E3D0+8` afterwards. A second, pre-existing defect is visible in the same window:
+`[guest-branch:missing-target] kind=IndirectCall source=0x301EB8 target=0x0 a0=0xFFFFFF81` (-127) — a
+`jalr` through a null handler on an error-report path (present before the fix, 1 per run).
+
+**Historical (session 121, superseded):** the boot waited on the loader's job chain: slot 4's task (app job,
+step `0x366090`) sat in a wait loop at `0x3661DC` on `0x63E3D0`'s byte `+8`, and that object never left outer
+phase 1 / inner phase 1 because `FUN_002E0820(0, ...)` kept returning 0 - it reads the game's 26-entry job
+table at `0x4E9140 + index*0x18` and bit 1 of entry 0's status byte was never cleared. The reason it was never
+cleared was the interior-entry defect at `0x125A78` fixed in session 152 (see CURRENT STATUS above).
 
 **Also fixed in session 120:** the tree could not be built at all (the 11/13 reconfigure dropped
 `CMAKE_CXX_FLAGS` and clang-cl 22 defaults to exceptions OFF, so every `throw`/`try` in the submodule failed).
@@ -5256,6 +5280,139 @@ Chain 0x2DF590 -> 0x233E50 -> 0x233FC0(poll 0x126248; yield 0x15231C only when p
 - `docs/ps2-static-recompilation-overview.md:161` - `EeScheduler` scope.
 - `.opencode/skills/ps2-recomp/resources/db-syscalls.md` - thread syscall table.
 - `.opencode/skills/ps2-recomp/resources/09-ps2tek.md:4767` - canonical `struct TCB`.
+
+---
+
+# Session 152 (2026-11-17) - the exit at 0x116A6C was printf's jump table; the real bug is an interior entry at 0x125A78
+
+This session answered session 151's "one remaining question", refuted its conclusion, and fixed the actual
+defect. Kept in full because four separate conclusions along the way were wrong before measurement killed them.
+
+## 1. `0x116A6C` is legitimate guest code - the row never "exited" corruptly
+
+`TOL_TRACE_INDIRECT` was widened (armed-window recorder, see §5) and produced the complete transfer list of the
+`0x2DF590` call after its `0x2DF5DC` resume:
+
+```
+[0]  0x002DF624 -> 0x002DF6D0 CALL   ra=0x002DF62C sp=0x004174D0
+[1]  0x002DF718 -> 0x001312D0 CALL   ra=0x002DF720 sp=0x00417340
+...
+[11] 0x001172FC -> 0x001164C8 CALL   ra=0x00117304 sp=0x004171A0
+[12] 0x0011657C -> 0x00116A6C JR     ra=0x00117304 sp=0x00417080
+```
+
+`0x11657C` is `jr $a0` over the **printf/sprintf format-parser jump table** (`lui v0,0x3c / addiu v0,-0x1270`
+= table at `0x3BED90`, indexed by `format_char - 0x20`, 0x59 entries); `0x116A6C` is another case body of the
+same function, not a row boundary. So:
+
+- the exit was **an indirect jump inside printf**, i.e. normal guest code - not a runtime redirect;
+- session 151's premise ("the row does not execute its own epilogue, so that is the bug") was **wrong**: the row
+  took its documented "start the job" path, `s2 == 0 && (entry[0] & 1) == 0` -> `jal 0x2DF6D0(index)`
+  (`0x2DF604` `beql s2,zero,0x2DF614` -> `andi v1,v1,1` -> `beq` not taken -> `0x2DF624`);
+- `0x2DF6D0` is **not** an error printer: it builds a path from `"%s/%s%02d"` (`0x3CB578`/`0x3CB560`) and calls
+  `0x2DF0B0`, and it really ran (`[d0b0] #2 enter ra=0x002DF72C`, exit ra intact).
+- `[d5dc] exit_pc` is useless as a "did the row finish" signal: dispatch sets `ctx->pc` then unwinds, so it
+  reports the *last* transfer of the whole nested chain, not a return.
+
+## 2. Where it actually stops: a poll/yield livelock, faithfully executed
+
+After the loader ran, the guest entered `FUN_00233FC0` - a **poll-then-yield loop**:
+
+```
+0x233FCC loop: li a0,1 ; move a1,zero ; jal 0x126248 (dequeue) ; addiu a2,sp,0x1c
+0x233FDC       bne v0,zero,0x233FF8   ; done -> return *(sp+0x1c)
+0x233FE4       jal 0x15231C           ; yield
+0x233FEC       b 0x233FD0             ; retry
+```
+
+Over 40 s the thread only alternates `0x233FEC` <-> `0x151F88` (the run loop's yield landing) with the same
+`sp = 0x4172D0`, and `0x2E0A*` is never dispatched, `relA`/`relB` never run. That is a genuine guest wait, not
+a lost continuation - the dequeue simply never succeeds.
+
+`FUN_00126248` is a queue pop: `if (*(0x388D30) == 0) return -1; if (PollSema(0x388D38) < 0) return 0;`
+`*(0x388D30) = 0; *out = *(0x3E7300); SignalSema(0x388D34);`. `0x388D38` is created in `FUN_001257f8`
+(`s_sceMc_sema_timer`) and is signalled **only** by the RPC completion of the op submitter (`FUN_001260d0` and
+six siblings: fill `0x3E5DC0`, `sceSifCallRpc(client, fn, …, end)`; on success store the fn code into
+`0x388D30`). Measured: `[g248] a0=1 … global388D30=0x0000000D ret=0x00000000` - fn code stored, semaphore
+never signalled.
+
+## 3. Root cause: the RPC end function is an interior address of `entry_00125a64`
+
+The end function is `0x125A78` (measured in `$t3`: `[rpc] call client=0x003E5D40 sid=0x80000400 fn=0xD …
+t3=0x00125A78`), and its whole body is:
+
+```
+0x125A78 lui v0,0x39
+0x125A7C j   0x114710          ; iSignalSema
+0x125A80 lw  a0,-0x72c8(v0)    ; a0 = *(0x388D38)
+```
+
+`data/output_fixed/entry_00125a64_0x125a64.cpp` (row `0x125A64..0x125B48`) has
+
+```cpp
+switch (ctx->pc) {
+    case 0x125ac4u: goto label_125ac4;
+    case 0x125b08u: goto label_125b08;
+    case 0x125b18u: goto label_125b18;
+    default: break;
+}
+```
+
+**`0x125a78` has no case.** The table slot exists (Option A dense table, `register_functions.cpp:676394`), but
+dispatching there runs the row from `0x125A64` - the tail of a *different* function:
+`ld ra,0x10(sp); addiu v0,1; ld s0,0(sp); jr ra; addiu sp,+0x20`. The RPC invocation sets `$ra = 0`, so that
+`jr` leaves `pc = 0` and the thread is parked. Measured before the fix:
+
+```
+[criend] #1 ENTER a0=0x00000000 ra=0x00000000 sp=0x01FBFFF0 sema338D38=0x00000037
+[criend] #1 exit pc=0x00000000
+```
+
+So `SignalSema(0x37)` never ran. This is exactly the systemic defect in CURRENT STATUS ("dispatching at an
+interior entry point restarts the row"), and it is the first case where it was the *whole* boot gate.
+
+## 4. Fix (per-address, in `src/runtime/tol_overrides.cpp`)
+
+`criEndFunctionFix`, installed by `installCriEndFunctionFix` (`runtime.replaceFunction(0x00125A78u, …)`):
+
+```cpp
+const uint32_t semaphoreId = runtime->Load32(rdram, ctx, 0x00388D38u);
+SET_GPR_U32(ctx, 4, semaphoreId);
+ctx->pc = 0x00114710u;          // == the row's own `j 0x114710` (iSignalSema)
+```
+
+Verified: `[g248]` goes from `ret=0xFFFFFFFF`/`0` forever to `ret=0x00000001` (twice per boot), the dequeue
+succeeds, and the main thread leaves the op-channel spin.
+
+## 5. Instrumentation added (both env-gated, no effect when unset)
+
+| where | what |
+|---|---|
+| `ps2_runtime.cpp` (`dispatchGuestBranch`) | armed-window recorder `g_tolOrderArm` / `g_tolOrderSeen` / `g_tolOrder{Src,Tgt,Ra,Sp,Kind}[256]` - records every inter-function transfer made inside one guest call, including kind and `$ra`. This is the only way to see fall-through and intra-row gotos. |
+| `tol_overrides.cpp` (`orderD5DCProbe`) | arms the window, prints the transfer sequence + job-table status/payload at the exit. |
+| `tol_overrides.cpp` (`tolSifCallRpc`) | `[rpc] endfn t3/sp0/spC/sp10/mapped` and `t3=` on the call line; call-log cap 256 -> 4000 (the CRI submit was hidden past the cap and that is what made "is the end function passed?" unanswerable). |
+
+## 6. No-regression check (clean A/B, same env, 60 s each)
+
+`TOL_TRACE_ORDER=1` only, pre-fix `logs/e152b.log` vs post-fix `logs/e158.log`: **16/16 behaviour classes
+identical, 0 changed** (12 IOP modules started, 6 AFS `found` + `Total 6 files`, 3 `PS2RNA: sceSifAllocIopHeap`,
+`libdbc` warning, identical `no kernel service` set, identical `[fileio]`, SIF install, 1 pre-existing
+`missing-target`, 0 `No exact recompiled function`, 0 exceptions, `[render-cadence] enabled`, 0 drive/CRI
+errors, process alive at 60 s).
+
+Forward movement is confined to the stall itself: `read` 12x`ret=0` (spin) -> 2x`ret=1`; `dispA` 135 -> 4;
+`yield` from `0x3661DC` 0 -> 247.
+
+## 7. Next
+
+1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
+   one missing case can gate the entire boot; the per-address override list is now 8 entries long.
+2. **New stop**: the app job parks at `0x3661DC` (`a0=0x3F800000` = 1.0f) on `0x63E3D0+8`, *after* the job
+   table dequeue now succeeds - find what sets `0x63E3D0+8` next.
+3. **Pre-existing second defect**: `jalr` to null at `0x301EB8` with `a0=0xFFFFFF81` (-127); the trace ring
+   shows `0x301d20 -> 0x35c650 -> 0x2ea0c0 -> 0x238650 -> 0x238b50 -> 0x164be0 -> 0x301e30 -> 0x301f60`.
+   It predates this fix and is unrelated to it.
+
 
 
 

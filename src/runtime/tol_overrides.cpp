@@ -23,6 +23,13 @@ extern int32_t g_lastDispatchTids[32];
 extern uint32_t g_callRingSrc[16];
 extern uint32_t g_callRingTgt[16];
 extern uint32_t g_callRingCount;
+extern int g_tolOrderArm;
+extern uint32_t g_tolOrderSeen;
+extern uint32_t g_tolOrderSrc[256];
+extern uint32_t g_tolOrderTgt[256];
+extern uint32_t g_tolOrderRa[256];
+extern uint32_t g_tolOrderSp[256];
+extern int32_t g_tolOrderKind[256];
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -682,13 +689,13 @@ namespace
         if (traceRpcEnabled())
         {
             static uint32_t sLogs = 0u;
-            if (sLogs < 256u)
+            if (sLogs < 4000u)
             {
                 ++sLogs;
                 std::fprintf(stderr,
-                             "[rpc] call client=0x%08X sid=0x%08X fn=0x%X mode=0x%X send=0x%08X/%u recv=0x%08X/%u\n",
+                             "[rpc] call client=0x%08X sid=0x%08X fn=0x%X mode=0x%X send=0x%08X/%u recv=0x%08X/%u t3=0x%08X\n",
                              client, sid, function, GPR_U32(ctx, 6), sendBuffer, sendSize, receiveBuffer,
-                             receiveSize);
+                             receiveSize, GPR_U32(ctx, 11));
             }
         }
 
@@ -958,6 +965,26 @@ namespace
         uint32_t endParameter = 0u;
         if (sp + 4u <= PS2_RAM_SIZE)
             endParameter = runtime->Load32(rdram, ctx, sp);
+
+        // Session 152: the end function is documented as arriving in $t3, but the CRI middleware submits
+        // (FUN_001260d0 and friends) pass nine arguments per the standard ABI, where $a0-$a3 hold the first
+        // four and the rest sit at sp+0x00..sp+0x10. Log every candidate so the real slot is measured, not
+        // assumed: a dropped end function is a permanently unsignalled semaphore (the poll at 0x126248).
+        if (traceRpcEnabled() && endFunction != 0u)
+        {
+            static uint32_t sEndLogs = 0u;
+            if (sEndLogs < 24u)
+            {
+                ++sEndLogs;
+                const uint32_t s0 = (sp + 0x14u <= PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp) : 0u;
+                const uint32_t sC = (sp + 0x14u <= PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x0cu) : 0u;
+                const uint32_t s10 = (sp + 0x14u <= PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x10u) : 0u;
+                std::fprintf(stderr,
+                             "[rpc] endfn t3=0x%08X sp0=0x%08X spC=0x%08X sp10=0x%08X a0=0x%08X fn=0x%X mapped=%d\n",
+                             endFunction, s0, sC, s10, GPR_U32(ctx, 4), GPR_U32(ctx, 5),
+                             runtime->hasFunction(endFunction) ? 1 : 0);
+            }
+        }
 
         tolSifCallRpcBody(rdram, ctx, runtime);
 
@@ -3011,6 +3038,12 @@ namespace
 
     // Interior continuation of FUN_002DF590 (0x2DF590..0x2DF6D0), immediately after `jal 0x233E50` at 0x2DF5D4.
     // If this is dispatched and exits at 0x2E0A3C, the submit row IS resumed and the "abandoned thread" theory dies.
+    //
+    // Session 152: the single exit_pc value cannot say *which* instruction left the row, and the row's fall-through
+    // and label gotos never reach the dispatch table. So the call is executed inside an armed window
+    // (g_tolOrderArm) that records every transfer it makes: source instruction, target, kind, $ra, $sp. The
+    // transfer whose target is 0x116A6C names the instruction that actually leaves, and the job-table bytes are
+    // read at the same moment so the acceptance criterion (0x2E0A38 payload / 0x2E0A58 release) is checked directly.
     void orderD5DCProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t entryPc = static_cast<uint32_t>(ctx->pc);
@@ -3018,20 +3051,46 @@ namespace
         static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
         static uint32_t sCalls = 0u;
         ++sCalls;
-        if (sEnv && sCalls <= 10u)
+        const bool log = sEnv && sCalls <= 10u;
+        if (log)
         {
             std::fprintf(stderr, "[d5dc] #%u RESUME pc=0x%08X ra=0x%08X sp=0x%08X v0=0x%08X slot[0x417510]=0x%08X\n", sCalls,
                          entryPc, ra, GPR_U32(ctx, 29), GPR_U32(ctx, 2),
                          runtime->Load32(rdram, ctx, 0x00417510u));
         }
+
+        const uint32_t seenBefore = g_tolOrderSeen;
+        const bool outermost = (g_tolOrderArm == 0);
+        if (outermost)
+        {
+            g_tolOrderSeen = 0u;
+        }
+        ++g_tolOrderArm;
         if (gOrdD5DCPrev != nullptr)
         {
             gOrdD5DCPrev(rdram, ctx, runtime);
         }
-        if (sEnv && sCalls <= 10u)
+        --g_tolOrderArm;
+
+        if (log)
         {
-            std::fprintf(stderr, "[d5dc] #%u exit_pc=0x%08X (expect 0x002E0A3C)\n", sCalls,
-                         static_cast<unsigned>(ctx->pc));
+            const uint32_t first = outermost ? 0u : seenBefore;
+            const uint32_t last = g_tolOrderSeen < 256u ? g_tolOrderSeen : 256u;
+            static const char *kKind[5] = {"J", "CALL", "JR", "JR-CALL", "RET"};
+            std::fprintf(stderr, "[d5dc] #%u transfers=%u%s\n", sCalls, last - first,
+                         (g_tolOrderSeen >= 256u) ? " (ring full - truncated)" : "");
+            for (uint32_t i = first; i < last; ++i)
+            {
+                const int32_t k = g_tolOrderKind[i];
+                std::fprintf(stderr, "[d5dc]   [%u] 0x%08X -> 0x%08X %-7s ra=0x%08X sp=0x%08X\n", i, g_tolOrderSrc[i],
+                             g_tolOrderTgt[i], (k >= 0 && k < 5) ? kKind[k] : "?", g_tolOrderRa[i], g_tolOrderSp[i]);
+            }
+            const uint8_t status = static_cast<uint8_t>(runtime->Load8(rdram, ctx, 0x004E9140u));
+            const uint16_t payload = static_cast<uint16_t>(runtime->Load16(rdram, ctx, 0x004E9146u));
+            std::fprintf(stderr,
+                         "[d5dc] #%u exit_pc=0x%08X (expect 0x002E0A3C) job[0] status=0x%02X payload=0x%04X\n", sCalls,
+                         static_cast<unsigned>(ctx->pc), static_cast<unsigned>(status),
+                         static_cast<unsigned>(payload));
         }
     }
 
@@ -6306,6 +6365,43 @@ namespace tol
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdCriEndPrev = nullptr;
+
+    // The CRI op channel's SIF end function (0x125A78). Its whole body is
+    //     lui v0,0x39 ; lw a0,-0x72c8(v0) ; j 0x114710      -> SignalSema(*(0x388D38))
+    //
+    // This is the classic interior-entry defect, measured (session 152): the row entry_00125a64 emits a
+    // `switch (ctx->pc)` with cases for 0x125ac4/0x125b08/0x125b18 only, so dispatching at 0x125a78 falls
+    // through to the row start - which is the tail of a *different* function (`ld ra,0x10(sp) ... jr $ra`).
+    // The RPC invocation sets $ra = 0, so that jr leaves pc = 0, the thread is parked, and the completion
+    // semaphore is never signalled. The middleware then spins forever in FUN_00233FC0 (poll 0x126248 ->
+    // yield 0x15231C -> retry), which is what keeps job-table entry 0 claimed and the screen on NOW LOADING.
+    //
+    // The row's own code for these three instructions is correct (see the generated file); only the entry
+    // is missing. Re-express them here exactly as emitted: `j 0x114710` with a0 = *(0x388D38).
+    void criEndFunctionFix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t semaphoreId = runtime->Load32(rdram, ctx, 0x00388D38u);
+        static const bool sEnv = std::getenv("TOL_TRACE_RPC") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && sCalls <= 20u)
+        {
+            std::fprintf(stderr, "[criend] #%u FIX enter -> SignalSema(0x%08X) sp=0x%08X\n", sCalls, semaphoreId,
+                         GPR_U32(ctx, 29));
+        }
+        SET_GPR_U32(ctx, 4, semaphoreId);
+        ctx->pc = 0x00114710u;
+    }
+
+    void installCriEndFunctionFix(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x00125A78u) != nullptr)
+        {
+            runtime.replaceFunction(0x00125A78u, &criEndFunctionFix);
+        }
+    }
+
     void installOverrides(PS2Runtime &runtime)
     {
         // 0x0011F400 was overridden here as a "SIF command issuer". That reading was wrong: the registers it
@@ -6320,6 +6416,7 @@ namespace tol
         // recompiled body, so nothing about guest behaviour changes while the queue is being observed.
         installPcProbes(runtime);
         installSifRpcOverrides(runtime);
+        installCriEndFunctionFix(runtime);
         installXferProbes(runtime);
         // installXferStartFix is deliberately NOT called: wrapping 0x00196DB0 perturbs the submit path
         // (41 submits -> 2) even when the wrapper only observes. See HANDOFF §0o.
