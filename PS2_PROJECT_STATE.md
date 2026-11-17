@@ -4661,6 +4661,33 @@ reached through, and establish why the switch-out path (`0x2DF590 -> 0x233E50`) 
 performing the save+yield sequence. The acceptance test is unchanged: `0x2E0A58` writes and the status byte
 returns to `0x00`.
 
+## Session 137 (2026-11-17) - the yield chain is intact on paper; the "yield = 0" probe is the suspect
+
+`FUN_00233E50` (`0x233E50..0x233FC0`) is the yield wrapper and contains exactly the two sites we measured:
+
+```
+0x233EAC  jal func_15231C        <- THE YIELD  (ra = 0x233EB4)
+0x233EEC  jal func_233FC0        <- ra = 0x233EF4
+```
+
+`[sub2]` recorded `nextpc = 0x233FC0` after `0x2DF590` returned, which is the *target* of the `0x233EEC` call -
+i.e. execution passed **`0x233EAC`**, the yield. So the call is being made even though the `yield` probe reported
+zero entries.
+
+That makes the probe, not the guest, the suspect, and the docs already name the mechanism
+(`HANDOFF_LOADER.md:642-645`, D5): `replaceFunction(pc)` only sees calls routed through `dispatchGuestBranch`,
+while many internal calls are emitted as direct C++ (`FUN_xxx_0xNNN(...)`). A zero count must always be
+cross-checked against the corpus.
+
+### Next
+
+1. Verify the install: log `runtime->lookupFunction(0x0015231Cu)` at startup (non-null?) and have the wrapper print
+   unconditionally (no tag-based suppression) so a missed call cannot be disguised as a filtered one.
+2. Read `+0x1AC` immediately after `0x233EAC` returns: if it becomes 1, the yield works and the alive flag is fine;
+   if it stays 0, the yield's write is being skipped.
+3. Keep the acceptance test unchanged: `0x2E0A58` writes and status returns to `0x00`.
+
+
 
 
 
