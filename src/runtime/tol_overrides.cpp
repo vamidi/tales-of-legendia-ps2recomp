@@ -2583,7 +2583,7 @@ namespace
             static uint32_t sPark = 0u;
             ++sPark;
             static const bool sDumpEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
-            if (sDumpEnv && (sPark == 1u || (sPark % 40u) == 0u))
+            if (sDumpEnv && (sPark <= 6u || (sPark % 5u) == 0u))
             {
                 const uint32_t obj = objIn;   // $s1 - the app object
                 const bool ok = (obj >= 0x00100000u && obj + 0xA0u < PS2_RAM_SIZE);
@@ -2730,6 +2730,33 @@ namespace
     }
 
     PS2Runtime::RecompiledFunction gOrdOrchPrev = nullptr;
+    PS2Runtime::RecompiledFunction gLeafStepPrev = nullptr;
+
+    // The task tree's leaf (vtable 0x3D7140, step 0x301B00). Its step ends with
+    //     node->vtable[0x18](node, param_2, 1)          -> 0x20D370: node+4 = param_2; node+8 = 1
+    // so the a1 handed to it *is* the successor it publishes. PCSX2 at 0x2E0A3C shows a live leaf
+    // (0x63E740) with +4 = 0x63DA00 and busy = 1; the port's leaf has +4 = 0 and busy = 0, which pins the
+    // difference to this argument: either the step is never called, or it is called with a1 = 0.
+    void leafStepProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t node = GPR_U32(ctx, 4);
+        const uint32_t arg = GPR_U32(ctx, 5);
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 10u || (sCalls % 200u) == 0u))
+        {
+            const bool ok = (node >= 0x00100000u && node + 0x60u < PS2_RAM_SIZE);
+            std::fprintf(stderr, "[leafstep] #%u node=0x%08X a1=0x%08X state(+38)=%d busy(+8)=%u +4=0x%08X\n",
+                         sCalls, node, arg, ok ? static_cast<int>(runtime->Load32(rdram, ctx, node + 0x38u)) : -1,
+                         ok ? static_cast<unsigned>(runtime->Load8(rdram, ctx, node + 8u)) : 0u,
+                         ok ? runtime->Load32(rdram, ctx, node + 4u) : 0u);
+        }
+        if (gLeafStepPrev != nullptr)
+        {
+            gLeafStepPrev(rdram, ctx, runtime);
+        }
+    }
 
     // FUN_00320D50 is the loader *orchestrator's* step: `switch (*(u16*)(obj+0x7C))` with cases 1..0xB, where
     // case 3 is FUN_003211C0 - the reserver, the only code that reserves/reads/submits a job entry. The app
@@ -6519,6 +6546,49 @@ namespace tol
         }
     }
 
+    // 0x3059B0 is the child step the AppCell phase machine calls (0x365824: `t9 = child->vtable[0x10]`). Its row
+    // (entry_003059a0, 0x3059A0..0x3059D0) is emitted with **no switch (ctx->pc) prologue at all** - the body
+    // starts `ctx->pc = 0x3059a0` and runs `lw t9,(a0); lw t9,0x28(t9); jr t9`, i.e. a *different* tail jump. So
+    // dispatching at 0x3059B0 (which the phase machine does every step) executed vtable[0x28] instead of the
+    // real thunk:
+    //     0x3059B0  lw   t9,($a0)
+    //     0x3059B4  li   a2,1
+    //     0x3059B8  lw   t9,0x18(t9)
+    //     0x3059BC  jr   t9
+    // Measured consequence: with the wrong method running, the task tree's leaf step (0x301B00) is *never*
+    // called (leafStepProbe count = 0 over 45 s) while PCSX2 keeps the leaf live with a successor
+    // (leaf+4 = 0x63DA00, busy = 1) - so the tree never advances and the app parks in phase 3.
+    // Re-express the four instructions, preserving the caller's $ra exactly like the real tail jump.
+    void childStepEntryFix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t obj = GPR_U32(ctx, 4);
+        const uint32_t vtable = (obj >= 0x00100000u && obj < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, obj) : 0u;
+        const uint32_t target =
+            (vtable >= 0x00100000u && vtable < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, vtable + 0x18u) : 0u;
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 8u || (sCalls % 500u) == 0u))
+        {
+            std::fprintf(stderr, "[childstep] #%u FIX obj=0x%08X vtbl=0x%08X -> vtable[0x18]=0x%08X a1=0x%08X\n", sCalls,
+                         obj, vtable, target, GPR_U32(ctx, 5));
+        }
+        SET_GPR_U32(ctx, 6, 1u);      // 0x3059B4: li a2,1
+        SET_GPR_U32(ctx, 25, target); // t9
+        ctx->pc = target;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, target, 0x003059B8u, 0u,
+                                          PS2Runtime::GuestBranchKind::IndirectJump, "JR"))
+            return;
+    }
+
+    void installChildStepEntryFix(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x003059B0u) != nullptr)
+        {
+            runtime.replaceFunction(0x003059B0u, &childStepEntryFix);
+        }
+    }
+
     void installOverrides(PS2Runtime &runtime)
     {
         // 0x0011F400 was overridden here as a "SIF command issuer". That reading was wrong: the registers it
@@ -6534,6 +6604,8 @@ namespace tol
         installPcProbes(runtime);
         installSifRpcOverrides(runtime);
         installCriEndFunctionFix(runtime);
+        // 0x3059B0: the child step is an interior entry with no switch case (see childStepEntryFix).
+        installChildStepEntryFix(runtime);
         installXferProbes(runtime);
         // installXferStartFix is deliberately NOT called: wrapping 0x00196DB0 perturbs the submit path
         // (41 submits -> 2) even when the wrapper only observes. See HANDOFF §0o.
@@ -6745,14 +6817,12 @@ namespace tol
             }
         }
 
-        // The claim gate (see orderChildStepProbe): the child's vtable[0x10] method.
+        // The claim gate: the child's vtable[0x10] method. NOTE: 0x3059B0 is now installed by
+        // installChildStepEntryFix (it is an interior entry with no switch case in its row), so the probe that
+        // used to wrap it here would be shadowed - and its earlier reading ("ret=0x63EB00 = success") was in fact
+        // the *wrong* method's return. The fix logs [childstep] itself under TOL_TRACE_ORDER.
         {
-            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x003059B0u);
-            if (fn != nullptr)
-            {
-                gOrdChildStepPrev = fn;
-                runtime.replaceFunction(0x003059B0u, &orderChildStepProbe);
-            }
+            // Intentionally not wrapping 0x3059B0 here: installChildStepEntryFix owns that slot (see above).
         }
 
         // Reserver / orchestrator trace (see orderRescProbe).
@@ -6772,6 +6842,15 @@ namespace tol
             {
                 gOrdOrchPrev = fn;
                 runtime.replaceFunction(0x00320D50u, &orderOrchProbe);
+            }
+        }
+        // The task tree leaf's step (see leafStepProbe): its a1 is the successor it publishes into leaf+4.
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00301B00u);
+            if (fn != nullptr)
+            {
+                gLeafStepPrev = fn;
+                runtime.replaceFunction(0x00301B00u, &leafStepProbe);
             }
         }
         {

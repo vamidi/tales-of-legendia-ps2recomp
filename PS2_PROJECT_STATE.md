@@ -8,7 +8,17 @@
 
 ## CURRENT STATUS — updated 2026-11-17 (session 152; read this first; the rest is history)
 
-**Session 152 — one real bug found and fixed, verified by measurement.** The op-channel stall was an
+**Session 152 (latest) — `0x3059B0`, the AppCell child step.** `entry_003059a0` (0x3059A0..0x3059D0) is
+emitted with **no `switch (ctx->pc)` at all** (it starts `ctx->pc = 0x3059a0` and runs
+`lw t9,(a0); lw t9,0x28(t9); jr t9`), so the phase machine's every-step call to `child->vtable[0x10]`
+(= `0x3059B0`) executed `vtable[0x28]` instead of the real thunk `li a2,1; lw t9,0x18(t9); jr t9`. Fixed with
+`childStepEntryFix` in `src/runtime/tol_overrides.cpp`. Measured effect: `[leafstep]` (the tree leaf's step
+`0x301B00`) goes **0 → 1 call**, the leaf now receives `a1 = 0x63DA00` exactly as PCSX2 does, `app+4` becomes
+`0x63DA00` (was permanently 0), and the app advances from `outer=1 / phase=3` to `outer=4 / phase=0`. The
+earlier `[childstep] ret=0x63EB00 "success"` reading was the wrong method's return. No regression: 15/15
+game-visible classes identical to the pre-fix baseline.
+
+**Session 152 (earlier) — `0x125A78`, the CRI op-channel SIF end function.** The op-channel stall was an
 **interior-entry defect**, not a lost continuation. `entry_00125a64` (0x125A64-0x125B48) emits
 `switch (ctx->pc)` cases for its own branch targets only (`0x125ac4/0x125b08/0x125b18`); the CRI op
 channel's **SIF end function `0x125A78`** is dispatched as an RPC completion inside that row, so the dispatch
@@ -5509,6 +5519,54 @@ The port's file layer is demonstrably healthy in the same window: 119 `[fileio]`
 2. **Static**: decompile the leaf's own work methods - secondary vtable `+0x18 = 0x301C00`,
    `+0x1C = 0x300EC0`, `+0x08 = 0x301D10`, and `0x326AA0` (called on the ready path) - and find the store of
    `2` into `+0x38`; its caller is the code the port is missing.
+
+## 7d. Session 152 - second fix: the child step `0x3059B0` was an interior entry with NO switch case
+
+Found by following option 1 (reference-driven) as far as it went, then checking the generated row directly.
+
+```
+entry_003059a0 (0x3059A0..0x3059D0) generated body:
+
+    ctx->pc = 0x3059a0u;          // <-- no switch (ctx->pc) prologue at all
+label_3059a0:
+    lw t9,(a0); lw t9,0x28(t9); jr t9        // tail-jumps to vtable[0x28]
+    ...
+label_3059b0:                                // only reachable from the 0x3059AC delay-slot resume
+    lw t9,(a0); li a2,1; lw t9,0x18(t9); jr t9
+```
+
+The phase machine calls `child->vtable[0x10]` = **`0x3059B0`** every step (0x365824). Dispatching there ran the
+row from `0x3059A0`, i.e. **`vtable[0x28]` instead of `vtable[0x18]` with `a2 = 1`**. So the AppCell child step
+never did its real work, the task tree never published a successor, and the app stayed in phase 3.
+
+Fix: `childStepEntryFix` (installed by `installChildStepEntryFix`) re-expresses the four instructions:
+`a2 = 1; t9 = obj->vtable[0x18]; pc = t9;` and tail-jumps with the caller's `$ra` preserved.
+
+Measured (45 s, `TOL_TRACE_ORDER=1`):
+
+| signal | before | after |
+|---|---|---|
+| `[leafstep]` (tree leaf step `0x301B00`) | **0 calls** | **1 call, `a1 = 0x63DA00`** |
+| `app+4` (acquired successor) | always `0` | **`0x63DA00`** |
+| `app outer(+0x70) / phase(+0x74)` | `1 / 3` forever | **`4 / 0`** (advanced) |
+| `child 0x63E610 +4 / +8` | `0 / 0` | **`0x63DA00 / 1`** (= PCSX2 at `0x2E0A3C`) |
+
+No regression: 15/15 game-visible classes identical to the pre-fix baseline (kputs set, 12 IOP modules, 6 AFS
+archives, `no kernel service` set, 1 pre-existing `missing-target`, 0 `No exact recompiled function`,
+0 exceptions, render-cadence enabled, 0 drive/CRI errors).
+
+### Note on the earlier instrumentation
+
+`[childstep] ret=0x0063EB00 "success"` (used in earlier sessions to argue the child step was healthy) was the
+return value of **`vtable[0x28]`**, the wrong method. A probe can only report what the row actually executed.
+
+### Next
+
+The app is now in **outer state 4** (`FUN_00365FD0`), which is the next stage after the progress/fade machine.
+The kernel meanwhile spins in run-loop service B (`[order] dispB a0=0x004079A0 a1=0x00000004`). Continue from
+`FUN_00365FD0` (state 4) and check whether it needs the same interior-entry treatment - and, as always,
+regenerate with a `case` per instruction (Option A) to retire this whole class; `entry_003059a0` shows a row
+can even lack the prologue `switch` entirely.
 
 ## 7. Next
 
