@@ -4506,6 +4506,52 @@ The outgoing thread's resume PC (`0x2DF5DC`, and transitively `0x2E0A3C`) must b
 before the switch, and that block must then be selectable. Today: TCB present, block absent. Acceptance test is a
 single line: `0x2E0A58` produces a write and status returns to `0x00`.
 
+## Session 134 (2026-11-17) - TCB layout found (resume PC at `+0x1B4`), and the one-shot poke proves the field is not the whole story
+
+### The layout, from four live TCBs at the switch point
+
+```
+slot2 tcb=0x407580  sp@+0xE0=0x004154F0  ra@+0x1A8=0x00151F88  +0x1AC=1  state@+0x1F0=1
+slot3 tcb=0x407790  sp@+0xE0=0x00413530  ra@+0x1A8=0x00151F88  +0x1AC=1  state@+0x1F0=1
+slot4 tcb=0x4079A0  sp@+0xE0=0x00423500  ra@+0x1A8=0x00151F88  +0x1AC=1  state@+0x1F0=1
+                    +0x1B4 = 0x003661DC   <- its PARKED pc: a real suspension point
+slot5 tcb=0x407BB0  sp@+0xE0=0x00417550  ra@+0x1A8=0x00151F88  +0x1AC=0  state@+0x1F0=1
+                    +0x1B4 = 0x002E09E0   <- its ENTRY pc, never advanced
+```
+
+So **`TCB+0x1B4` holds the thread's resume PC**, `+0xE0` the saved sp, `+0x1A8` the saved ra, `+0x1F0` state, and
+`+0x1AC` is a per-thread flag that is `1` on every working thread and `0` on slot 5. Working slot 4 shows a
+genuine suspension PC; slot 5 still shows the entry it was created with.
+
+### The experiment (opt-in `TOL_TRY_RESUME`, one-shot)
+
+```
+[sub2] #1 enter a0=0x00000000 ra=0x002E0A3C
+[try] slot5: tcb+0x1B4 := 0x002E0A3C, tcb+0x1AC := 1
+[sub2] #1 ret  v0=0x00000001 nextpc=0x00233FC0
+```
+
+Result: `0x2E0A3C` 0 writes, `0x2E0A50` 0, `0x2E0A58` 0. **Writing the PC and the flag is not sufficient** - slot 5
+is never selected even with a correct continuation recorded.
+
+### What that rules in
+
+The field value is a symptom. Slot 5 is not in the set the scheduler picks from. Candidates, in order of
+likelihood:
+
+1. **Ready-list membership.** The `0x48F770`-style record (which at `+0x50` held the TCB pointer `0x00407BB0`) is
+   the scheduling record; slot 5's entry likely lacks the runnable marker or is not linked.
+2. **Register block emptiness.** If the scheduler restores all GPRs from the TCB on selection, a block that was
+   never filled would zero every register - so a correct resume PC alone would still not produce a sane run.
+3. The switch path (`0x2DF590 -> 0x233E50`) removes the thread instead of parking it.
+
+### Next
+
+Dump the scheduling record area (`0x48F740..0x48F940`, the two records that reference TCBs) side by side with a
+working thread's record, and identify the field that marks a thread runnable/linked. Then the fix writes both that
+membership field and `+0x1B4`, which is the pair the experiment shows is required.
+
+
 
 
 

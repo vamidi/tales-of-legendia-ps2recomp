@@ -2703,6 +2703,17 @@ namespace
         {
             gOrdSub2Prev(rdram, ctx, runtime);
         }
+        // EXPERIMENT (TOL_TRY_RESUME): the TCB dump puts the resume PC at TCB+0x1B4 - working slot 4 holds its
+        // parked PC (0x3661DC) while slot 5 still holds its ENTRY (0x2E09E0) - and +0x1AC is 1 on every working
+        // thread but 0 on slot 5. Write the continuation and the flag, then look for the release write at
+        // 0x2E0A58: that is the acceptance test for the whole diagnosis.
+        static const bool sTryResume = std::getenv("TOL_TRY_RESUME") != nullptr;
+        if (sTryResume && sCalls == 1u)
+        {
+            runtime->Store32(rdram, ctx, 0x00407BB0u + 0x1B4u, 0x002E0A3Cu);
+            runtime->Store32(rdram, ctx, 0x00407BB0u + 0x1ACu, 1u);
+            std::fprintf(stderr, "[try] slot5: tcb+0x1B4 := 0x002E0A3C, tcb+0x1AC := 1\n");
+        }
         if (sEnv && sCalls <= 10u)
         {
             std::fprintf(stderr, "[sub2] #%u ret  v0=0x%08X nextpc=0x%08X (caller expects 0x002E0A3C)\n", sCalls,
@@ -2758,6 +2769,34 @@ namespace
                 {
                     std::fprintf(stderr, "[ctx] sp-like 0x%08X at block+0x%03X\n", v, off);
                 }
+            }
+
+            // The context table points at the TCBs (0x48F7C0 -> 0x00407BB0 = slot 5), so the register save area
+            // lives inside the TCB. Find which offset holds a thread's resume PC by scanning the working threads
+            // (slot 4's parked PC 0x3661DC is dispatched 11x) against the dead one (slot 5).
+            static const uint32_t kPcs[5] = {0x003661DCu, 0x002E0A3Cu, 0x00233FC0u, 0x002DF5DCu, 0x002E09E0u};
+            static const char *kPcName[5] = {"slot4-parked-pc", "expected-resume-pc", "switch-target-pc",
+                                             "inner-return-ra", "submit-entry-pc"};
+            for (uint32_t slot = 2u; slot <= 5u; ++slot)
+            {
+                const uint32_t tcb = 0x00407160u + slot * 0x210u;
+                for (int n = 0; n < 5; ++n)
+                {
+                    for (uint32_t off = 0u; off + 4u <= 0x1D0u; off += 4u)
+                    {
+                        if (runtime->Load32(rdram, ctx, tcb + off) == kPcs[n])
+                        {
+                            std::fprintf(stderr, "[tcb] slot%u tcb=0x%08X +0x%03X = %-18s 0x%08X\n", slot, tcb, off,
+                                         kPcName[n], kPcs[n]);
+                        }
+                    }
+                }
+                // The ra/pc neighbourhood plus the saved sp, for a direct side-by-side.
+                std::fprintf(stderr, "[tcb] slot%u tcb=0x%08X sp@+0xE0=0x%08X ra@+0x1A8=0x%08X +0x1AC=0x%08X state@+0x1F0=%u\n",
+                             slot, tcb, runtime->Load32(rdram, ctx, tcb + 0xE0u),
+                             runtime->Load32(rdram, ctx, tcb + 0x1A8u),
+                             runtime->Load32(rdram, ctx, tcb + 0x1ACu),
+                             static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1F0u)));
             }
         }
     }
