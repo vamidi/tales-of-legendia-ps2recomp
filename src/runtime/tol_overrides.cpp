@@ -5453,6 +5453,20 @@ namespace tol
         if (runtime.lookupFunction(0x00205FA0u) != nullptr)
             runtime.replaceFunction(0x00205FA0u, &objectResetFix);
 
+        // 0x1B18F0: a 39-entry table scan (stride 0x38 at 0x3AC728) whose only callee, 0x1B18E8, is an empty
+        // `jr $ra` stub, so the row's entire effect is reading that table - the faithful re-expression is "return
+        // to $ra". It is also the row that killed the main thread: the scheduler resumed at its loop head
+        // 0x1B1910 with a live loop state ($s0/$s1 at iteration 37 of 39) on a frame whose saved `$ra` slot held
+        // 1, so the epilogue returned to pc 1 and the thread went dormant. The [loop1910]/[parkbail] traces show
+        // the frame is the function's own (its +0/+8 slots hold the caller's $s0/$s1 from 0x1A9A3C), which means
+        // the prologue had run with a stale `$ra` register - i.e. the value came from the unwound resume, not
+        // from the caller. Overriding every slot removes the death without changing any observable behaviour.
+        for (uint32_t pc = 0x001B18F0u; pc < 0x001B1960u; pc += 4u)
+        {
+            if (runtime.lookupFunction(pc) != nullptr)
+                runtime.replaceFunction(pc, &returnToRa);
+        }
+
         // 0x1F8150 is the GS/VU1 worker loop:
         //     do { FUN_001f8000(); FUN_0015231c(); } while (true);
         // On hardware it runs as its own guest thread and the loop yields each iteration, so the game's own

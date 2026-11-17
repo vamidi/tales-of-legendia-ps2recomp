@@ -12,9 +12,11 @@
 
 **Where it stands:** the game boots, initialises the IOP, loads its nine IRX modules, indexes all six AFS
 archives, runs its own file layer, completes the boot-script asset chain and streams real scene data
-(largest observed reads: 544,768 / 522,240 / 389,120 / 262,144 bytes). The AppCell loader daemon runs, the
-frame loop's first iteration completes, and the script-engine object survives. The screen still shows only the
-early `NOW LOADING` frame, and the EE main thread then goes Dormant with `pc=1` (see *Current blocker*).
+(largest observed reads: 544,768 / 522,240 / 389,120 / 262,144 bytes). The AppCell loader daemon runs, its
+per-frame loop runs (`[poll] busy=1`, `[prio4]` steering it), the frame loop's first iteration completes, and
+the script-engine object survives. The screen still shows only the early `NOW LOADING` frame, and everything
+now waits on the loader's job chain (`0x63D850 -> 0x63D890 -> 0x4079A0` reports `busy=1` forever) and on the
+MIX chunk producer that stops after 16 of 48 (see *Current blocker*).
 
 **Systemic defect (the one thing to fix properly):** the corpus was generated from a Ghidra map whose rows
 sometimes merge several small routines. The emitted prologue `switch (ctx->pc)` only contains the row's internal
@@ -31,21 +33,22 @@ main-thread death so far. Fixed per-address so far, in `src/runtime/tol_override
 | `0x205F80` | accessor `jr $ra; lbu $v0,8($a0)` merged into the previous epilogue row | `readByteOffset8Fix` |
 | `0x205F90` | virtual thunk `lw t9,(a0); lw t9,0x1C(t9); jr t9` | `vtableOffset1CThunkFix` |
 | `0x205FA0` | release-child/clear-fields function (converges on `case 0x205fcc`) | `objectResetFix` |
+| `0x1B18F0..0x1B195C` | side-effect-free 39-entry table scan (its only callee `0x1B18E8` is `jr $ra`); resumed at the loop head with a stale `$ra`, so the epilogue returned to pc 1 | `returnToRa` on every slot |
 
 **Durable fix (not yet done):** regenerate the corpus with the emitter producing a `case` for **every**
 instruction in a row (`Option A` in `ps2xRecomp/src/lib/ps2_recompiler.cpp`), then rebuild. That retires all of
 the address overrides above and the whole class of bugs. Verify on regeneration: dense `case` lists for
 `entry_00205f68`, `entry_00165210`, `entry_00231e54`, and `0x165220`/`0x205F80` present as cases.
 
-**Current blocker:** the EE main thread (`tid=1`) is `Dormant` with `pc=0x1`, not waiting on anything (all
-semaphores `waiters=0`, no event flags). `TOL_TRACE_PARK` showed the loader job-step chain returning with
-`$ra=0` (fixed, above) and now shows `FUN_001B18F0`'s loop head `0x1B1910` being dispatched with a **correct
-`$ra` register but a foreign stack frame** (`sp=0x1FFFF20`); its epilogue `ld ra,0x10(sp)` loads leftover
-memory `1`. Proven: no call ever entered `0x1B18F0` with the caller `sp` that would create that frame, and a
-write-watch on the saved-return slot `0x1FFFF30` recorded **zero writes** in 80 s. The dispatch does not come
-from the microkernel yield or from a guest call; the dispatch ring points at a mid-function resume of
-`FUN_00166490` (`0x1664A0`) returning through a stale `$ra`. **Next probe:** log the scheduler's saved pc at
-every checkpoint bail whose value is `0x1B1910`, and the `jr $ra` that lands there.
+**Current blocker:** the AppCell loader's per-frame loop now runs (session 120), but the job chain reports
+`busy=1` forever (`0x63D850 -> 0x63D890 -> 0x4079A0`) and the script writer stops after 16 of 48 MIX chunks:
+slot 0 at `0x4A5840` never gets `1` again, so `FUN_001ECBE0` has nothing to dispatch. `tid=1` cycles the
+microkernel run loop `0x151F88`. The question is which guest path is supposed to enqueue the next loader task
+(the same open question as session 106, now with a live loader loop).
+
+**Also fixed in session 120:** the tree could not be built at all (the 11/13 reconfigure dropped
+`CMAKE_CXX_FLAGS` and clang-cl 22 defaults to exceptions OFF, so every `throw`/`try` in the submodule failed).
+`build/tol2` is now configured with `-DCMAKE_CXX_FLAGS=/EHsc`; see *Build / run* below.
 
 **Rendering (deferred until the boot finishes):** `DISPFB2` stays `FBP 0` while the guest draws to `FBP 224`
 (`ctxFbp=[224,0]`), so the presenter reads a buffer that is not the draw target. `frame_000012` is the only
@@ -59,7 +62,9 @@ build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
 ```
 
 Run from the repo root: the runtime derives `cdRoot` from the ELF's directory (`data\CD`). `-j 12` is safe with
-clang-cl; MSVC cannot compile the corpus (four 8.7-9 MB single functions, `C1002`).
+clang-cl; MSVC cannot compile the corpus (four 8.7-9 MB single functions, `C1002`). If `build/tol2` is ever
+reconfigured from scratch, `-DCMAKE_CXX_FLAGS=/EHsc` is **mandatory** (clang-cl 22 defaults to C++ exceptions
+off and the submodule's `ps2xIOP` sources throw - session 120).
 
 **Build-system caveats (learned 2026-11-10):**
 
@@ -76,7 +81,8 @@ clang-cl; MSVC cannot compile the corpus (four 8.7-9 MB single functions, `C1002
 (run-queue + `[runq2]`, `[pumpbody]`, `[loaderspot]`, job-step return probes), `TOL_TRACE_FILEIO`,
 `TOL_TRACE_DVCI`, `TOL_TRACE_GSHIST`, `TOL_TRACE_GSPRIV`, `TOL_TRACE_LOAD`, `TOL_TRACE_SCRIPT`,
 `TOL_TRACE_TASKSTEP`, `TOL_PUMP_PRIO4` (experimental I/O-wait pump; injecting pumps from anywhere else corrupts
-guest state — measured), `TOL_WATCH_TASK`, `TOL_WATCH_SLOT2`.
+guest state — measured), `TOL_WATCH_TASK`, `TOL_WATCH_SLOT2`, `TOL_TRACE_PREEMPT` (in-place preemption counter),
+`TOL_FIBER_PREEMPT` (opt-in fiber preemption experiment — currently makes the boot stall, see session 120).
 
 **Confirmed NOT the problem:** no skipped functions (`skip = []` in `data/config_fixed.toml`, 0 `TODO_NAMED` in
 the corpus); the 55 `stubs` are the libkernel import wrappers and all resolve to real handlers; no missing
@@ -3530,3 +3536,94 @@ proceeds correctly after it.
 | `[loop1910]` | `TOL_TRACE_PARK` | scheduler dispatch at 0x1B1910 with ra/sp/frameRa/s0/s1 |
 | `[y1910]` | `TOL_TRACE_PARK` + `TOL_STALL_DUMP` | microkernel saves whose pc is 0x1B1910 (block, saved sp/s0/s1) |
 | `TOL_WATCH_STACKRA` | (removed) | write-watch on 0x1FFFF30; proved 0 writes |
+
+## Session 120 (2026-11-17) - build repaired; the 0x1B1910 death removed; the loader frame loop now runs
+
+### 0. The build was broken before anything else could be measured
+
+`build/tol2` had been reconfigured on 11/13 00:11 (Rider) with `CMAKE_CXX_FLAGS` **empty**, and clang-cl 22
+defaults to `/EHs-c-` (C++ exceptions OFF). Every `throw`/`try` in the submodule failed with
+`error: cannot use 'throw' with exceptions disabled`, so the tree could not be relinked at all (tol.exe was
+stale from 11/10 23:59). Verified the default with a one-line test: `clang-cl -std:c++20 -MD -c t.cpp` where
+`t.cpp` does `throw 1;` -> error; adding `/EHsc` compiles.
+
+Fix: configure with `-DCMAKE_CXX_FLAGS=/EHsc`. This rebuilds **all 13,669 edges** (~35 min at `-j 12`), which
+is unavoidable because the 11/13 reconfigure had already dirtied the whole graph. After that
+`ninja -C build/tol2 -j 12 tol` is incremental again (`no work to do`).
+
+### 1. The 0x1B1910 death: mechanism measured, then removed
+
+Two new probes (both `TOL_TRACE_PARK`):
+
+| probe | where | what |
+|---|---|---|
+| `[parkbail]` | `ps2_runtime.cpp` `eeCheckpointDue` | every checkpoint bail whose `ctx->pc` is in `0x1B18F0..0x1B1960`, with `sp/ra/s0/s1` |
+| dispatch ring | `EeScheduler.cpp` `run()` | `tid/pc/sp/invocations` of the last 32 dispatches, printed by `[loop1910]` and `[badpc]` |
+
+Measured (100 s run):
+
+```
+[parkbail] #1 pc=0x001B1910 ra=0x001A9A44 sp=0x01FFFF20 s0=0x003ACF40 s1=0x00000002
+[badpc]   -1 tid=1 pc=0x00000001 sp=0x01FFFF40 inv=0
+[badpc]   -2 tid=1 pc=0x001B1910 sp=0x01FFFF20 inv=0     <- resume at the loop head
+[badpc]   -3 tid=1 pc=0x00000000 sp=0x01FBFFF0 inv=1     <- invocation return, same thread
+[badpc]   -4 tid=1 pc=0x001664A0 sp=0x01FBFFE0 inv=1
+[loop1910] #1 ... sp=0x01FFFF20 frameRa=0x00000001 s0=0x003ACF40 s1=0x00000002
+           frame=00499F10/0000001F/00000001/00000036
+```
+
+The frame dump settles it: `sp+0 = 0x00499F10` and `sp+8 = 0x0000001F` are the caller's `$s0`/`$s1` from
+`FUN_001a9a08` at iteration 0 of its own `jalr` loop, so this **is** `FUN_001b18f0`'s own frame (the prologue
+ran and `s0`/`s1` advanced to 37 of 39 while the loop ran) - but its saved `$ra` slot holds **1**, i.e. the
+`$ra` register was already 1 when the prologue saved it. The caller always sets `$ra = 0x1A9A44` before the
+dispatch (`[path]` shows 120 clean entries), so the stale value came from the *unwound resume* of the thread,
+not from the call. `FUN_001b18f0` is a 39-entry scan (stride 0x38 at `0x3AC728`) whose only callee `0x1B18E8`
+is an empty `jr $ra` stub - the row has no effect beyond reading that table.
+
+Fix (`tol_overrides.cpp`): `returnToRa` on every slot of `0x1B18F0..0x1B1960`, the faithful re-expression of
+a side-effect-free scan.
+
+Result (120 s): **`[badpc]` = 0**, the main thread stays alive (`tid=1 Running pc=0x00151F88 sp=0x00421540`),
+and the AppCell loader's per-frame loop finally runs - `[poll]` 1625 times, all `busy=1`, `[prio4]` #813 with
+`resume=0x00164FE8`. All six asset loads submit and reach job state 2. The script advances 16 of 48, which is
+the same script wall sessions 103-106 hit, but with the loader loop alive instead of skipped.
+
+### 2. Negative result: fiber preemption (kept, opt-in, default off)
+
+The right long-term fix for this whole family (the unwarp re-dispatches mid-function addresses with whatever
+registers the guest left) is to preempt by **suspending the guest fiber** instead of unwinding, so the C++ call
+chain and every callee-saved register survive - the mechanism syscalls already use. Implemented in
+`EeScheduler::checkpointDue` behind `TOL_FIBER_PREEMPT=1` (preempt in place, return false so the generated
+caller just continues), plus alternation between a parked thread and the invocation carrier in `run()`.
+
+Measured with it enabled: the boot stalls in libc init,
+`tid=1 Ready prio=119/0 pc=0x00109144 sp=0x01FFFF40`, 2 threads / 2 semaphores, while the Timer-2 handler
+(`0x11F650`) runs forever on the carrier (`recent` = 16x `0x11F650`). Preferring the carrier starves the guest;
+preferring the thread starves interrupts; strict alternation still stalls. So it is off by default and the
+default stays the historical unwinding behaviour. It is **not** discarded: the missing piece is a way to nest
+an invocation on a thread whose fiber is parked mid-call (a second host stack for that thread).
+
+### 3. Reading the park log correctly
+
+`[ee-park] ... invocations=1 sp=0x1fbfff0` is the **normal invocation-return path** (the handler returns to
+pc 0, the scheduler pops the invocation and continues) - not a dead thread. `thread=-1` in those lines is the
+invocation carrier thread (`acquireInvocationThread`, negative ids). Only a park with `invocations=0` makes a
+thread dormant.
+
+### 4. Next
+
+The boot now sits in the loader's frame loop with the job chain reporting `busy=1` forever
+(`0x63D850 -> 0x63D890 -> 0x4079A0`), the script writer stops at 16 of 48 MIX chunks (sessions 103-106), and
+`tid=1` cycles the microkernel run loop `0x151F88`. The next question is the same one session 106 left open,
+now with a live loader: which guest path is supposed to enqueue the next loader task / feed slot 0 at
+`0x4A5840`.
+
+### 5. Build / run (unchanged command, exceptions flag now in the cache)
+
+```
+cmd /c '"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1 && ninja -C build/tol2 -j 12 tol'
+build\tol2\src\runtime\tol.exe .\data\CD\SLUS_212.01 --gs=sdlgpu
+```
+
+New probes: `TOL_TRACE_PREEMPT` (in-place preemption counter), `TOL_FIBER_PREEMPT` (the opt-in experiment).
+
