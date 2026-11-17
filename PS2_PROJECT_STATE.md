@@ -5035,6 +5035,36 @@ on this seam - but it is now a fix socket rather than another open question.
    if two invocations exist with different `ra`, they are being conflated and the fix is to keep them distinct.
 3. Acceptance test unchanged: `0x2E0A58` writes, status returns to `0x00`.
 
+## Session 148 (2026-11-17) - conflation theory dead: one caller only, and `0x116A6C` is a ROW BOUNDARY - `$ra` was overwritten
+
+Both cheap checks:
+
+```
+dispatch callers of 0x2DF590 : exactly ONE - 0x2E0A34, continuation 0x2E0A3C   (the submit row)
+0x116A6C                     : END of row caseD_45_0x116a08 (0x116a08..0x116a6c)
+```
+
+This kills explanation 2 (two invocations conflated): there is a single dispatched caller, and `[sub2] #1 enter
+ra=0x002E0A3C` agrees - one entry, correct `ra`.
+
+It confirms explanation 1 instead, and sharpens it: **`0x116A6C` is a row boundary, not a call site.** No `jal` can
+have planted it as a return address, so by the time `FUN_002DF590` executed its final `jr $ra`, `$ra` held a value
+that came from somewhere other than a matching call - i.e. the register was **overwritten inside the chain**.
+
+The chain in question is `0x2DF590 -> 0x233E50 -> 0x233FC0`, and every one of those layers was verified to return
+correctly in isolation (sessions 142-146). The difference now is that we know the *final* return of the outer
+function uses a corrupted `$ra`, which is only possible if something in between rewrote the register - a saved-state
+restore (the `0x152200` family restores the whole GPR file from a context block) or a register spill/refill that
+picks up another context's value.
+
+### Next
+
+Log `$ra` at the exact instruction where `FUN_002DF590` performs its final `jr` (interior address, 4-byte table
+granularity as used for `0x233EF4`/`0x2DF5DC`), and compare it with the `0x2E0A3C` that was present at entry. That
+pinpoints the overwrite to a specific sub-call, and the fix becomes "preserve `$ra` across that call" rather than
+anything in the scheduler, the gate, or the job table.
+
+
 
 
 
