@@ -2731,6 +2731,46 @@ namespace
 
     PS2Runtime::RecompiledFunction gOrdOrchPrev = nullptr;
     PS2Runtime::RecompiledFunction gLeafStepPrev = nullptr;
+    PS2Runtime::RecompiledFunction gState4Prev = nullptr;
+
+    // FUN_00365FD0 is the app's outer state 4: first call sets phase=1 and returns 0, second call invokes
+    // app->vtable[0x20](app,0), sets next=0 and returns 1 - after which 0x365630 sets outer=0, a state with no
+    // handler at all. Logging both calls (and the phase) says whether the hand-off completes or stalls halfway.
+    void state4Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t app = GPR_U32(ctx, 4);
+        const bool ok = (app >= 0x00100000u && app + 0x90u < PS2_RAM_SIZE);
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        const bool log = sEnv && (sCalls <= 12u || (sCalls % 100u) == 0u);
+        if (log)
+        {
+            std::fprintf(stderr, "[state4] #%u ENTER app=0x%08X outer(+70)=%u phase(+74)=%d next(+72)=0x%04X\n",
+                         sCalls, app, ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, app + 0x70u)) : 0u,
+                         ok ? static_cast<int>(runtime->Load32(rdram, ctx, app + 0x74u)) : -1,
+                         ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, app + 0x72u)) : 0u);
+        }
+        if (gState4Prev != nullptr)
+        {
+            gState4Prev(rdram, ctx, runtime);
+        }
+        if (log)
+        {
+            std::fprintf(stderr, "[state4] #%u EXIT  v0=%u phase(+74)=%d next(+72)=0x%04X\n", sCalls,
+                         GPR_U32(ctx, 2), ok ? static_cast<int>(runtime->Load32(rdram, ctx, app + 0x74u)) : -1,
+                         ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, app + 0x72u)) : 0u);
+        }
+    }
+
+    void installState4Probe(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x00365FD0u) != nullptr)
+        {
+            gState4Prev = runtime.lookupFunction(0x00365FD0u);
+            runtime.replaceFunction(0x00365FD0u, &state4Probe);
+        }
+    }
 
     // The task tree's leaf (vtable 0x3D7140, step 0x301B00). Its step ends with
     //     node->vtable[0x18](node, param_2, 1)          -> 0x20D370: node+4 = param_2; node+8 = 1
@@ -6853,6 +6893,8 @@ namespace tol
                 runtime.replaceFunction(0x00301B00u, &leafStepProbe);
             }
         }
+        // The app's outer state 4 (see state4Probe).
+        installState4Probe(runtime);
         {
             PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002E0880u);
             if (fn != nullptr)

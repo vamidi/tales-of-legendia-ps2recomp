@@ -5568,6 +5568,55 @@ The kernel meanwhile spins in run-loop service B (`[order] dispB a0=0x004079A0 a
 regenerate with a `case` per instruction (Option A) to retire this whole class; `entry_003059a0` shows a row
 can even lack the prologue `switch` entirely.
 
+## 7e. Session 152 - state 4 completes; "service B" is the switch-in, and the loop is idle-slow, not spinning hot
+
+**`FUN_00365FD0` (outer state 4) is healthy** - `[state4]` shows a two-call hand-off per cycle:
+
+```
+#1 ENTER outer=4 phase=0 next=0xFFFF   ->  EXIT v0=0 phase=1        (not done)
+#2 ENTER outer=4 phase=1 next=0xFFFF   ->  EXIT v0=1 phase=1 next=0 (done)
+```
+
+4 calls over 40 s = **2 complete cycles**. On completion it calls `app->vtable[0x20](app, 0)`, and
+`0x20D3C0` is literally `sb $a1, 8($a0); jr $ra` - so it **clears `busy(+8)`**, which is what lets
+`FUN_00366090`'s `while (app->vtable[0x0C]())` loop finish. `0x365630` then sets `outer = next = 0`, i.e. a
+state with no handler (the machine is idle until something re-arms `+0x72`).
+
+**`FUN_0015253C` ("service B") is not a dispatcher** - it is the switch-in accessor:
+
+```c
+idx = *(0x3DB1A0) * *(0x3DB1B0);
+HI/LO = *(0x48F710 + idx) / *(0x48F720 + idx);
+return *(u64*)(0x48F590 + idx);        // context slot
+```
+
+It takes **no arguments**, so the `a0=0x004079A0 a1=0x00000004` in the `[order] dispB` line are stale
+registers, not parameters. The run loop calls A (`0x152200`) then B (`0x15253C`) once per iteration.
+
+**Why it looks like a spin, measured:** `dispB = 73` in 45 s (~1.6 iterations/s) with ~60 EE dispatches/s.
+That is *idle-slow*, not a hot loop. The only runnable thread is slot 4:
+
+```
+[tcb] slot4 tcb=0x004079A0 +0x1B4 = 0x003661DC  +0x1AC=1 (alive)  state=1 (ready)
+```
+
+i.e. the AppCell app-job thread, parked exactly at its loop's `jal 0x15231C` (0x3661D4). Every iteration it
+yields, the run loop re-selects it, and the loop turns once more. Nothing else is runnable to make its wait
+complete, so the kernel round-trips through service B without the game advancing.
+
+**Instrument failure worth remembering:** an attempt to print the wall-clock delta between samples with
+`std::chrono` inside the probe produced nonsense (`obj=0x00000000`, a constant `+6546384 ms`, and field values
+shifted by one word) - i.e. `$s1` was 0 at those entries. That build was reverted; the `[appobj]` probe is back
+to the trustworthy version and reproduces `obj=0x63E3D0`. Lesson: a probe that suddenly reports an impossible
+object pointer is broken, not a discovery.
+
+### Next
+
+Measure the app loop's cadence **without** `std::chrono` in the probe (e.g. count Timer-2 ticks, or a host
+counter read at runtime level) to decide whether the loader is genuinely slow (a few iterations/second) or the
+samples are just sparse. If it is genuinely slow, the guest's own `yield(1.0f)` at `0x3661D4` is the suspect -
+the same family as the earlier "tick rate drops" observations.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
