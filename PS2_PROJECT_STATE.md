@@ -5699,6 +5699,49 @@ Thread 2 (entry `0x198C60`, a CRI worker) is re-invoked and **dies immediately**
 defect to chase: `0x166490` is the "async-invocation return path around the CRI poll helper" already noted in
 `TOL_TRACE_PARK`'s `[path]` probe, so the invocation is being handed a context whose `$ra` was never set.
 
+### Session 152 - the ADX detach handshake, and why the port only ever runs thread 1
+
+The stall after the loader is a handshake deadlock, and every step of it is now measured:
+
+```c
+FUN_00199E30 (on the loader thread):              worker (thread entry 0x198C60, id 2, prio 119):
+  while (*(0x394380) == 0) {                        if (*(0x394378) != 0) goto done;
+      *(0x394378) = 1;                              loop: step(); if (*(0x394378) == 0) goto loop;
+      ChangeThreadPriority(t,1);                  done:
+      WakeupThread(t);                              *(0x394380) = 1;   // releases the waiter
+      FUN_00199200(t);   // ResumeThread if 8/C     ExitThread();
+  }                                                 *(0x394378) = *(0x394380) = t = 0;
+```
+
+`t` = `*(0x394358)` = **2**. Measured facts:
+
+| evidence | value |
+|---|---|
+| `[cthread] #2` | `entry=0x198C60 prio=119 stack=0x3943F0 -> id=2` (only 6 threads created - no id wraparound) |
+| `[sthread] id=2` | `status=5` = `EeThreadStatus::Dormant`, so `StartThread` accepts it |
+| corpus | `FUN_00198c60_0x198c60.cpp` exists, slot present at `register_functions.cpp` - entry is recompiled |
+| `[adxdet] #1` | `tid=2 wait(394378)=1 done(394380)=0` - the flag is set, the worker has not answered |
+| `[eepc]` (every run, all session) | **`tid=1` only** |
+
+So `FUN_00199E30` sets the flag and wakes thread 2, but **thread 2 never executes** - and the runtime hides
+that with `[xfer] adx-detach after 4096 spins`, which writes `0x394378`/the refcount itself.
+
+The reason is scheduling, not thread creation: the port dispatches thread 1 exclusively. Thread 2 is Ready at
+priority 119 while thread 1 keeps running (it never blocks, because the waits it performs are served
+synchronously by the HLE). Under strict priority nothing at 119 can ever run, so the handshake cannot complete.
+
+**Fix direction (port-level, not emulator-level):** make thread scheduling honour what the guest asks for - a
+`WakeupThread`/`ChangeThreadPriority` on an HLE'd primitive must make the woken thread run (reschedule/yield),
+instead of returning success while thread 1 continues. That is the guest's actual contract, and it is what the
+`4096 spins` hack is standing in for. Do **not** keep the hack once the wake actually schedules.
+
+### Probes added (submodule, both env-gated)
+
+| var | where | output |
+|---|---|---|
+| `TOL_TRACE_THREADS` | `Thread.cpp` `CreateThread`/`StartThread` | `[cthread] entry/prio/stack -> id`, `[sthread] id/status/entry/arg` |
+| `TOL_TRACE_ORDER` | `tol_overrides.cpp` `adxDetachProbe` | `[adxdet] tid/394378/394380/TCB entry+pc` + a one-shot thread-table scan |
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

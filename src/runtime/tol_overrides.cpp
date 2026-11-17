@@ -2781,6 +2781,65 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gAdxDetachPrev = nullptr;
+
+    // FUN_00199E30 is the ADX stream detach handshake:
+    //     while (*(0x394380) == 0) { *(0x394378) = 1; ChangeThreadPriority(t,1); WakeupThread(t); step(t); }
+    // and the worker it wakes (thread entry 0x198C60) answers by setting *(0x394380) = 1 and exiting.
+    // If the thread it wakes is the thread currently executing this loop, the handshake can never complete -
+    // that would explain both the 4096-spin detach hack in the port and the loader stalling here.
+    void adxDetachProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 4u || (sCalls % 2000u) == 0u))
+        {
+            const uint32_t tid = runtime->Load32(rdram, ctx, 0x00394358u);
+            const uint32_t flagWait = runtime->Load32(rdram, ctx, 0x00394378u);
+            const uint32_t flagDone = runtime->Load32(rdram, ctx, 0x00394380u);
+            // TCB layout: base 0x407160, stride 0x210, entry at +0x1B0, resume pc at +0x1B4.
+            const uint32_t tcb = (tid < 64u) ? (0x00407160u + tid * 0x210u) : 0u;
+            const bool tcbOk = (tcb >= 0x00407160u && tcb + 0x210u <= 0x00407E00u);
+            std::fprintf(stderr,
+                         "[adxdet] #%u tid=0x%08X wait(394378)=%u done(394380)=%u tcbEntry=0x%08X tcbPc=0x%08X\n",
+                         sCalls, tid, flagWait, flagDone, tcbOk ? runtime->Load32(rdram, ctx, tcb + 0x1B0u) : 0u,
+                         tcbOk ? runtime->Load32(rdram, ctx, tcb + 0x1B4u) : 0u);
+            // Who *is* the ADX worker (entry 0x198C60) in this port? Scan the thread table once and name every
+            // live slot, so "tid 2" can be checked against the thread the guest actually created.
+            if (sCalls == 1u)
+            {
+                for (uint32_t i = 0u; i < 16u; ++i)
+                {
+                    const uint32_t t = 0x00407160u + i * 0x210u;
+                    const uint32_t entry = runtime->Load32(rdram, ctx, t + 0x1B0u);
+                    const uint32_t pc = runtime->Load32(rdram, ctx, t + 0x1B4u);
+                    const uint8_t alive = static_cast<uint8_t>(runtime->Load8(rdram, ctx, t + 0x1ACu));
+                    const uint8_t state = static_cast<uint8_t>(runtime->Load8(rdram, ctx, t + 0x1F0u));
+                    if (entry != 0u || pc != 0u || alive != 0u || state != 0u)
+                    {
+                        std::fprintf(stderr, "[adxdet]   slot=%u entry=0x%08X pc=0x%08X alive=%u state=%u%s\n", i,
+                                     entry, pc, static_cast<unsigned>(alive), static_cast<unsigned>(state),
+                                     (entry == 0x00198C60u) ? "   <-- ADX worker entry" : "");
+                    }
+                }
+            }
+        }
+        if (gAdxDetachPrev != nullptr)
+        {
+            gAdxDetachPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void installAdxDetachProbe(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x00199E30u) != nullptr)
+        {
+            gAdxDetachPrev = runtime.lookupFunction(0x00199E30u);
+            runtime.replaceFunction(0x00199E30u, &adxDetachProbe);
+        }
+    }
+
     // The task tree's leaf (vtable 0x3D7140, step 0x301B00). Its step ends with
     //     node->vtable[0x18](node, param_2, 1)          -> 0x20D370: node+4 = param_2; node+8 = 1
     // so the a1 handed to it *is* the successor it publishes. PCSX2 at 0x2E0A3C shows a live leaf
@@ -6904,6 +6963,8 @@ namespace tol
         }
         // The app's outer state 4 (see state4Probe).
         installState4Probe(runtime);
+        // The ADX detach handshake (see adxDetachProbe).
+        installAdxDetachProbe(runtime);
         {
             PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002E0880u);
             if (fn != nullptr)
