@@ -5923,6 +5923,38 @@ For a sampled draw batch, print what the primitives actually are: primitive type
 texture `tbp/tbw/psm` (and whether that VRAM region is non-empty), the vertex colours, and the scissor. That
 separates "sprites sample an empty texture -> black modulate" from "blend factors make them invisible".
 
+### Session 152 - primitive-content probe: the composite reads a black page 224
+
+`TOL_TRACE_GSPRIM=1` on `submit()`:
+
+```
+[gsprim] #3 type=6 iip=0 tme=1 abe=1 tcc=1 tfx=0 A=0 B=1 C=2 D=1 FIX=64
+         tex tbp0=7168 tbw=8 psm=0 tw=10 th=9   texRead=1 texel=0x00000000/0x00000000
+         v0=(1792.0,1824.0) rgba=128,128,128,128 uv=8,8 scissor=[0,0..511,447] frameFbp=0 psm=0
+         ofx=28672 ofy=29184 adj=(0.0,0.0)
+```
+
+- primitives are **sprites** (`type=6`), textured (`tme=1`), alpha-blended (`abe=1`), `tcc=1`, `tfx=0`
+  (modulate) - a normal HUD/logo composite;
+- **coordinates are correct**: `ofx=28672` -> `28672/16 = 1792`, so `adj=(0.0,0.0)` / `(64.0,0.0)` - on-screen.
+  (An earlier "12.4 fixed-point not decoded" theory was **wrong** - measured and refuted.)
+- scissor correct (`0,0..511,447`);
+- **the sampled texture is page 224 (`tbp0=7168`) and is black** (`0x00000000`) while the sprite draws into
+  `frameFbp=0` at modulate with a 128-grey vertex colour: black x grey = black.
+
+So the composite itself works; it copies **page 224 -> page 0**, and the source is empty. "Nothing renders" is
+therefore a **producer** problem for page 224, not a rasteriser/blend/coordinate problem.
+
+Corroboration from the draw probe: draws targeting `base=7168` do happen (`[gsdraw] #50000 surf base=7168`),
+but the composite sprites appear earlier in the stream - so the ordering (fill 224, then composite) may be
+reversed on this path.
+
+### Next probe (exact)
+
+Per frame, count draws into `base 7168` (page 224) and the composite sprites that sample `tbp0=7168`, in order.
+If composites precede the fills, it is ordering/timing on the present path; if page 224 is filled and still
+black, its primitives are failing (then repeat this probe filtered to `frameFbp=224`).
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

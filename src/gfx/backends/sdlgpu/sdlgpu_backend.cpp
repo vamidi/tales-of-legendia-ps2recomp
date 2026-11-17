@@ -1113,7 +1113,47 @@ struct SdlGpuBackend::Impl {
             return;
         }
 
-        // TOL_TRACE_GSFRAME=1: one line per sampled draw batch - which surface the draws actually target, its
+        // TOL_TRACE_GSPRIM=1: what the primitives actually are. Bounds are non-empty and the target surface is
+        // correct, yet the frame is black - so the question is whether the sprites sample empty texture data or
+        // blend themselves away. Prints the prim flags, the ALPHA register's blend factors, the texture setup,
+        // two sampled texels from VRAM, the first vertex's colour/coords and the scissor.
+        if (std::getenv("TOL_TRACE_GSPRIM") != nullptr) {
+            static uint32_t sPrims = 0u;
+            ++sPrims;
+            if (sPrims <= 10u || (sPrims % 1000u) == 0u) {
+                const GSTex0Reg &t0 = context.tex0;
+                const uint64_t alpha = context.alpha;
+                const GSVertex &v0 = batch.vertices[0];
+                uint32_t texelA = 0u, texelB = 0u;
+                bool texRead = false;
+                if (vram.attached() && t0.psm <= 3u) {
+                    texelA = vram.read(t0.psm, t0.tbp0, t0.tbw, 0u, 0u);
+                    texelB = vram.read(t0.psm, t0.tbp0, t0.tbw, 8u, 8u);
+                    texRead = true;
+                }
+                std::fprintf(stderr,
+                             "[gsprim] #%u type=%d iip=%d tme=%d abe=%d tcc=%d tfx=%d A=%llu B=%llu C=%llu "
+                             "D=%llu FIX=%llu texRead=%d texel=0x%08X/0x%08X\n",
+                             sPrims, static_cast<int>(state.prim.type), state.prim.iip ? 1 : 0,
+                             state.prim.tme ? 1 : 0, state.prim.abe ? 1 : 0, t0.tcc, t0.tfx,
+                             static_cast<unsigned long long>(alpha & 3ull),
+                             static_cast<unsigned long long>((alpha >> 2) & 3ull),
+                             static_cast<unsigned long long>((alpha >> 4) & 3ull),
+                             static_cast<unsigned long long>((alpha >> 6) & 3ull),
+                             static_cast<unsigned long long>((alpha >> 32) & 0xFFull), texRead ? 1 : 0, texelA,
+                             texelB);
+                std::fprintf(stderr,
+                             "[gsprim]      tex tbp0=%u tbw=%u psm=%u tw=%u th=%u cbp=%u cpsm=%u csa=%u\n",
+                             t0.tbp0, t0.tbw, t0.psm, t0.tw, t0.th, t0.cbp, t0.cpsm, t0.csa);
+                std::fprintf(stderr,
+                             "[gsprim]      v0=(%.1f,%.1f) rgba=%u,%u,%u,%u uv=%u,%u q=%.2f scissor=[%d,%d..%d,%d] "
+                             "frameFbp=%u psm=%u ofx=%u ofy=%u adj=(%.1f,%.1f)\n",
+                             v0.x, v0.y, v0.r, v0.g, v0.b, v0.a, v0.u, v0.v, v0.q, context.scissor.x0,
+                             context.scissor.y0, context.scissor.x1, context.scissor.y1, context.frame.fbp,
+                             context.frame.psm, context.xyoffset.ofx, context.xyoffset.ofy,
+                             v0.x - context.xyoffset.ofx / 16.0f, v0.y - context.xyoffset.ofy / 16.0f);
+            }
+        }
         // identity, its state, and the region they write. This is the draw side of "nothing renders": the
         // presenter has already been eliminated (forcing the draw target still yields black frames).
         if (std::getenv("TOL_TRACE_GSFRAME") != nullptr) {
