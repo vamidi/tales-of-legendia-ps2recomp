@@ -4780,6 +4780,29 @@ Compare in PCSX2: break at `0x233EA4` and read `v0` (expect 0 as well - if so, t
 break at `0x2E0A3C` to see whether the guest *does* resume the submit row there. If the guest reaches `0x2E0A3C`
 while the port never does, the divergence is in whatever `0x233FC0` leaves behind, not in the gate.
 
+## Session 140 (2026-11-17) - emulator blocked; both breakpoints armed and waiting
+
+Armed both comparison points (both accepted):
+
+```
+0x00233EA4  breakpoint set   <- the gate's beqz; read v0 here
+0x002E0A3C  breakpoint set   <- does the guest resume the submit row here?
+```
+
+The VM never reaches either: it sits at **`0x00081FC0`** (a BIOS address, i.e. not in game code), `continue` does
+not advance it, and repeated reads disagree (`0x81FC0` from `evaluate`/`pause`, `0x001271C8` from `read_registers`).
+So the instance is wedged the same way as earlier in the session and needs a GUI reset/reboot of the disc.
+
+**Resume procedure (breakpoints survive the reset in this setup, but re-arm if not):**
+1. Reset/reboot the disc in the GUI and let it return to the loader.
+2. It should stop at `0x233EA4` first -> read `v0` (expected `0`, which would confirm the yield skip is normal).
+3. Then, if the guest resumes the submit row, it stops at `0x2E0A3C` - which answers the second question by
+   itself. If it stops at `0x2E0A3C` but the port never does, the divergence is downstream of `0x233FC0`.
+
+Port-side status is unchanged and independent: the gate returns 0 = success, so the yield is an error-retry path
+(session 139), and the remaining question is who resumes a thread suspended inside a successful call.
+
+
 
 
 
