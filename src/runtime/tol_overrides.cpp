@@ -2845,13 +2845,30 @@ namespace
     void loaderStepProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t arg = GPR_U32(ctx, 4);
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        // 0x165400 dispatches through `(**(code**)(*(int*)(obj+0x10) + 0xc))()`. Dumping the object's secondary
+        // vtable and its slots at each call shows why the later units (obj 0x63D890) do not reach the app job.
+        if (sEnv && sCalls <= 8u)
+        {
+            const uint32_t vt = (arg + 0x14u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, arg + 0x10u) : 0u;
+            const bool vtOk = (vt >= 0x00100000u && vt + 0x18u < PS2_RAM_SIZE);
+            std::fprintf(stderr,
+                         "[loaderobj] #%u obj=0x%08X vt(+10)=0x%08X vt[0]=0x%08X vt[8]=0x%08X vt[C]=0x%08X "
+                         "vt[10]=0x%08X vt[14]=0x%08X obj+4=0x%08X obj+8=%u\n",
+                         sCalls, arg, vt, vtOk ? runtime->Load32(rdram, ctx, vt + 0x00u) : 0u,
+                         vtOk ? runtime->Load32(rdram, ctx, vt + 0x08u) : 0u,
+                         vtOk ? runtime->Load32(rdram, ctx, vt + 0x0cu) : 0u,
+                         vtOk ? runtime->Load32(rdram, ctx, vt + 0x10u) : 0u,
+                         vtOk ? runtime->Load32(rdram, ctx, vt + 0x14u) : 0u,
+                         (arg + 0x0cu < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, arg + 0x04u) : 0u,
+                         (arg + 0x0cu < PS2_RAM_SIZE) ? static_cast<unsigned>(runtime->Load8(rdram, ctx, arg + 0x08u)) : 0u);
+        }
         if (gLoaderStepPrev != nullptr)
         {
             gLoaderStepPrev(rdram, ctx, runtime);
         }
-        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
-        static uint32_t sCalls = 0u;
-        ++sCalls;
         if (sEnv && (sCalls <= 8u || (sCalls % 100u) == 0u))
             std::fprintf(stderr, "[loaderstep] #%u a0=0x%08X v0=0x%08X\n", sCalls, arg, GPR_U32(ctx, 2));
     }

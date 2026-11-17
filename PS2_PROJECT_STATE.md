@@ -6150,6 +6150,49 @@ Compare the two loader objects' secondary vtables (`0x63D850` and `0x63D890` at 
 the second/third/fourth `0x165400` calls dispatch somewhere that does not run the app job. That is where the next
 unit is being dropped.
 
+### Session 152 - later units are NOT dropped: they are the scene fade, and it is starved
+
+Comparing the two loader objects' secondary vtables at each `0x165400` call:
+
+| call | obj | `vt(+10)` | `vt[8]` | **`vt[C]`** | `vt[10]` | `vt[14]` | obj+4 | obj+8 |
+|---|---|---|---|---|---|---|---|---|
+| #1 | `0x63D850` | `0x3D4770` | `0x204630` | `0x204690` | `0x2048F0` | `0x204930` | 0 | 64 |
+| #2 | `0x63D890` | **`0x3DA380`** | `0x366080` | **`0x366090`** (app job) | `0x3662D0` | `0x366310` | 1 | 0 |
+| #3 | `0x63D890` | **`0x3D4750`** | `0x204200` | **`0x204240`** | `0x2045A0` | `0x204140` | 1 | 0 |
+| #4 | `0x63D890` | `0x3D4750` | same | `0x204240` | same | same | 1 | 0 |
+
+So object `0x63D890`'s `+0x10` changes from the **app-job vtable `0x3DA380`** to the **loader vtable `0x3D4750`**
+between the second and third call - i.e. the object is re-created as the next stage's class (normal object reuse;
+the addresses are identical to PCSX2's, so this is guest logic, not aliasing).
+
+`0x204240` (`FUN_00204240`) is a **scene fade-in / hold / fade-out**:
+
+```c
+while (thunk_FUN_001f8480(uVar4) != 0) FUN_0015231c();          // wait, yielding
+(*obj+0x24)->vtable[0x0C](..., 0xFFFFFFFFFFFFFF00, 0xE0);       // black overlay object
+obj+0x20+0x50/54/58 = 1.0f;  obj+0x20+0x5C = 0.0f;             // alpha
+do { f += 0.04; *(float*)(*(int*)(obj+0x20)+0x5C) = f;  FUN_0015231c(); } while (f < 1.0);   // FADE IN
+do { ... FUN_0015231c(); i++; } while (i < 0x5A);                                        // HOLD <= 90
+do { f -= 0.04; *(float*)(*(int*)(obj+0x20)+0x5C) = f;  FUN_0015231c(); } while (0 < f);      // FADE OUT
+```
+
+That is the `tme=0, rgba=0,0,0,0` full-screen black quad measured earlier, with alpha driven by `+0x5C`.
+
+**All loops are bounded - about 115 yields per fade - so the fade always completes.** But the measured yield
+cadence is ~0.2 per second (the thread is prio 4 and the higher-priority GS workers `0x407160` / `0x407370`
+take the turns), so **one fade needs ~10 minutes of wall time**. The screen is black because we never get far
+enough into the fade-out to see content.
+
+So the chain is now fully explained end to end: app job one-shot -> loader hands over to the fade -> the fade is
+correct but starved -> the visible result is a black screen for minutes.
+
+### Next
+
+The remaining defect is scheduling fairness/rate for prio-4 threads: ~32 scheduler turns/s but only ~0.2 picks/s
+for this thread while the GS workers monopolise turns. Either the GS workers are burning turns they should yield
+(the `0x1F8150` / `0x1F84B0` legacy pumps are already flagged as "off by default" suspects), or the prio-4 queue
+is not being rotated on every `0x15231C` yield (`ctx[0x6B] = 1` then next-thread).
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
