@@ -4129,6 +4129,60 @@ initialiser, not the interesting site) and its MCP connection wedged; user resta
    then compare with the port's `[jobobj]` line at its park. The branch difference will show whether the port's
    phase/flags diverge before the claim or the claim itself is mis-ordered.
 
+## Session 127 (2026-11-17) - ROOT CAUSE: the claim is a *reserve*; the release (`0x2E1D30`) never runs, so bit 1 is set and never cleared
+
+### The phase machine does not claim - measured
+
+`FUN_00365700` at `0x365818..0x365838`:
+
+```
+0x365818  a0 = *(s0+0x18)        // child object 0x63E610
+0x36581C  t9 = *(a0)             // child vtable 0x3D7630
+0x365820  t9 = *(t9+0x10)        // -> FUN_003059B0
+0x365824  jalr $t9  (a1 = *(s0+4))
+0x36582C  bnel $v0,$zero,0x365B9C   // nonzero => success path, skip the claim
+0x365834  a0 = 0 ; 0x365838 jal 0x2E1F80 ; delay *(s0+0x78) = 0
+```
+
+New probe `[childstep]` on `0x003059B0`:
+
+```
+[childstep] #1 child=0x0063E610 a1=0x0063DA00 ret=0x0063EB00 ra=0x0036582C
+```
+
+`ret` is **nonzero** (a pointer), so the `bnel` takes `0x365B9C` and `0x365838` is **never reached**. The phase
+machine is not the claimant. `0x2E1F80` has exactly two call sites - `0x365838` (dead here) and **`0x321334`** in
+`FUN_003211C0` - so the claim comes from `FUN_003211C0`.
+
+### Corrected role of each piece
+
+| role | code | effect on job-table entry 0 |
+|---|---|---|
+| reserve | `FUN_003211C0` (`0x321334`) -> `0x2E1F80` -> `0x2E07D0` | **sets bit 1** (`sb` at `0x2E0814`) |
+| fill | row `0x2E09E0` (`0x2E08D0/0x2E0950` fall-through), write at `0x2E0A38` | writes `entry0+6` |
+| consume | `FUN_002E0820` via thunk `0x2E1EF0`, called at `0x3659B4` | returns payload **only while bit 1 is clear** |
+| **release** | `0x2E1D30`: `status & ~2` (mask `-3`) + `entry+6` | **clears bit 1** - **never runs in the port** |
+
+So bit 1 means "reserved"; the reader is right to answer 0 while it is set. The port reserves and fills, but the
+release - `0x2E1D30`, the tail of the `0x2E15C0` body identified in sessions 122-123 as having no callers - never
+executes. That is the deadlock, and it re-validates those sessions' target from the other direction: the row we
+could not reach is the *release*, not a setter.
+
+### Consequence for the fix
+
+Nothing is wrong with dispatch order, the queue, the yield, or the job table. The guest must run the `0x2E15C0`
+body (the release) after the job completes, and the port never does. `0x2E15C0`'s only callers are `0x2E0A70`
+(x2) and `0x2E1040` (x2); neither has a `jal` caller, so the entry into that chain is indirect/tail - the same
+row-boundary pattern. Next: instrument `FUN_003211C0` (the reserver) to see whether it also *should* be the
+releaser's driver, and watch the status byte after the submit to confirm nothing ever clears bit 1.
+
+### Emulator status this session
+
+PCSX2 wedged at process level: DebugServer returned a parse error and Pine timed out on port 28011, and the
+reconnect still reported `PC=0x002DEF98, paused=true` - i.e. the paused save state was restored again. Needs a
+hard process kill and a fresh boot without the debugger attached. Port-side evidence above did not depend on it.
+
+
 
 
 

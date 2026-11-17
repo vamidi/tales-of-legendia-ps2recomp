@@ -2525,6 +2525,42 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdChildStepPrev = nullptr;
+
+    // THE decisive measurement.
+    //
+    // FUN_00365700 does:
+    //   0x365818  a0 = *(s0+0x18)          // child object (0x63E610)
+    //   0x36581C  t9 = *(a0)               // child vtable (0x3D7630)
+    //   0x365820  t9 = *(t9+0x10)          // -> 0x003059B0
+    //   0x365824  jalr $t9  (a1 = *(s0+4)) // child step
+    //   0x36582C  bnel $v0,$zero,0x365B9C  // nonzero = success, skip the claim
+    //   0x365834  a0 = 0 ; 0x365838 jal 0x2E1F80   // v0 == 0 -> CLAIM slot 0
+    //
+    // So the claim is the "the step returned 0" branch. If this probe reports ret=0, the claim is a symptom
+    // and the defect is inside FUN_003059B0, not in dispatch order or the job table.
+    void orderChildStepProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        const uint32_t a1 = GPR_U32(ctx, 5);
+        if (gOrdChildStepPrev != nullptr)
+        {
+            gOrdChildStepPrev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        if (!sEnv)
+        {
+            return;
+        }
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sCalls <= 20u || (sCalls % 200u) == 0u)
+        {
+            std::fprintf(stderr, "[childstep] #%u child=0x%08X a1=0x%08X ret=0x%08X ra=0x%08X\n", sCalls, a0, a1,
+                         GPR_U32(ctx, 2), GPR_U32(ctx, 31));
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -5991,6 +6027,16 @@ namespace tol
             {
                 gOrdParkPrev = fn;
                 runtime.replaceFunction(0x00366090u, &orderParkProbe);
+            }
+        }
+
+        // The claim gate (see orderChildStepProbe): the child's vtable[0x10] method.
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x003059B0u);
+            if (fn != nullptr)
+            {
+                gOrdChildStepPrev = fn;
+                runtime.replaceFunction(0x003059B0u, &orderChildStepProbe);
             }
         }
 
