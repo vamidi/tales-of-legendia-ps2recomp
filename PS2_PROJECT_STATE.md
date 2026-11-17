@@ -6266,6 +6266,48 @@ Log every `queueInvocation` (or `invokeCurrent`) with the invocation's pc, kind 
 limited. That names what re-queues `0x166490` at ~48/s - the Timer-2 handler path or the CRI pump - and that is
 what has to stop for the scene to run.
 
+### Session 152 (cont.) - the invocation mix is interrupt-driven: GS IRQ (cause 2) + Timer-2
+
+`TOL_TRACE_INVOC` tallies every queued invocation by pc and kind:
+
+```
+[invoc] total=1000  kind0(Interrupt)=867  kind3(RpcCallback)=133
+        top: 0x00166490=436   0x0011F650=64 (Timer-2)   0x00125A78=2   0x00126310=2
+```
+
+`GuestInvocationKind`: `0 = Interrupt`, `1 = Alarm`, `2 = GsCallback`, `3 = RpcCallback`, ... So **87 % of all
+queued invocations are interrupts**, and the top handler is `0x166490`.
+
+Registration found statically: `FUN_001663A0` calls `FUN_00113b50(0x166490)`, which is a wrapper around
+
+```c
+uVar3 = AddIntcHandler(2, param_1, -1);   // EE IRQ cause 2
+FUN_00115228(2);                          // enable it
+```
+
+**EE IRQ cause 2 is the GS interrupt**, and `0x166490` is its (tiny) handler: `jal 0x19A068; sync; ei; jr $ra`.
+So the guest's turns are dominated by GS-interrupt dispatch plus the Timer-2 handler, and the loader thread is
+parked inside the fade (`pc=0x204380`, prio 4, state 1, started 1).
+
+Together with the fade probe this completes the picture of "why nothing renders":
+
+1. the fade is correct and completes (alpha 0.6 -> 1.0 -> 0.2),
+2. nothing is drawn behind it (5 textured draws of 42,716 - the scene never draws),
+3. the EE spends ~87 % of its invocations on GS/Timer-2 interrupts while the loader thread sits inside the fade.
+
+So the guest is not deadlocked - it is *interrupt-bound* with no scene content, and each scheduler turn is
+expensive enough (~0.7 s per loader-thread yield) that the fade alone takes ~90 s.
+
+### Next probe (exact)
+
+Two candidates, both now sharply defined:
+1. **GS interrupt rate**: the port raises cause 2 ~7x/s while the guest is only clearing/fading. Log the raise site
+   in the runtime's GS/intc path (`signalInterrupt`/`raiseInterrupt` callers) with a per-source tally; a
+   per-packet raise where hardware raises per-DMA-completion would explain both the rate and the heavy turns.
+2. **Cost per turn**: with interrupts tallied, time (or count guest dispatches inside) one GS-interrupt
+   invocation versus one ordinary turn - if the handler's `jal 0x19A068` path is expensive, the interrupt rate is
+   what makes the whole guest crawl.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
