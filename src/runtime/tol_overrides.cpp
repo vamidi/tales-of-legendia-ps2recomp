@@ -2742,8 +2742,9 @@ namespace
         }
         if (sEnv && sCalls <= 10u)
         {
-            std::fprintf(stderr, "[sub2] #%u ret  v0=0x%08X nextpc=0x%08X (caller expects 0x002E0A3C)\n", sCalls,
-                         GPR_U32(ctx, 2), static_cast<unsigned>(ctx->pc));
+            std::fprintf(stderr, "[sub2] #%u ret  v0=0x%08X nextpc=0x%08X slot[0x417510]=0x%08X\n", sCalls,
+                         GPR_U32(ctx, 2), static_cast<unsigned>(ctx->pc),
+                         runtime->Load32(rdram, ctx, 0x00417510u));
             // Was the suspended continuation recorded anywhere? If neither 0x2E0A3C (the guest's expected resume
             // point) nor 0x2DF5DC (the return address inside the switching call) exists in any context/stack area
             // after the switch, then the context save never captured this thread's continuation at all.
@@ -3019,8 +3020,9 @@ namespace
         ++sCalls;
         if (sEnv && sCalls <= 10u)
         {
-            std::fprintf(stderr, "[d5dc] #%u RESUME pc=0x%08X ra=0x%08X sp=0x%08X v0=0x%08X\n", sCalls, entryPc, ra,
-                         GPR_U32(ctx, 29), GPR_U32(ctx, 2));
+            std::fprintf(stderr, "[d5dc] #%u RESUME pc=0x%08X ra=0x%08X sp=0x%08X v0=0x%08X slot[0x417510]=0x%08X\n", sCalls,
+                         entryPc, ra, GPR_U32(ctx, 29), GPR_U32(ctx, 2),
+                         runtime->Load32(rdram, ctx, 0x00417510u));
         }
         if (gOrdD5DCPrev != nullptr)
         {

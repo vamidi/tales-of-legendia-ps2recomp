@@ -5132,6 +5132,34 @@ distinguishes "slot overwritten" from "epilogue not executed", which are differe
 - overwritten -> the writer of `0x417510` is the culprit (find it with a range watch on the submit thread's stack);
 - epilogue skipped -> the resumed path branches past `0x2DF6B4`, and the branch condition at `0x2DF5DC` is the fix.
 
+## Session 151 (2026-11-17) - slot is CORRECT at all points: the exit is a different control transfer, not the epilogue
+
+```
+[sub2] #1 enter   ra=0x002E0A3C  sp=0x00417520
+[sub2] #1 ret     nextpc=0x00233FC0  slot[0x417510]=0x002E0A3C
+[d5dc] #1 RESUME  ra=0x002DF5DC  sp=0x004174D0  slot[0x417510]=0x002E0A3C
+[d5dc] #1 exit_pc=0x00116A6C
+```
+
+The saved-RA slot holds the correct `0x2E0A3C` at **every** sampled point, and `sp` at the continuation is correct
+(`entry - 0x50`). So:
+
+- the slot is **not** overwritten (theory 1 refuted);
+- an executed `ld $ra,0x40(sp)` at `0x2DF6B4` would load `0x2E0A3C` and the `jr` at `0x2DF6C8` would go there;
+- yet control leaves at `0x116A6C`.
+
+Conclusion: on this path the row does **not** execute its own epilogue - the transfer to `0x116A6C` comes from a
+different instruction in `FUN_002DF590`'s row (an indirect transfer / tail jump), not from the `jr $ra` at
+`0x2DF6C8`. The row contains exactly one `jr`, so the exit must be an indirect branch.
+
+### Next
+
+Log the **control transfer** out of the row rather than guessing: widen the existing `TOL_TRACE_INDIRECT` filter in
+`PS2Runtime::dispatchGuestBranch` to also cover `sourcePc` in `0x2DF590..0x2DF6D0`, and print `targetPc` plus
+`kind`. The transfer that produces `0x116A6C` will name its own instruction, which is the fix socket - and it will
+also show whether that transfer is legitimate guest code or a runtime redirect.
+
+
 
 
 
