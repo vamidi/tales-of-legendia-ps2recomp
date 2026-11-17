@@ -4802,6 +4802,55 @@ So the instance is wedged the same way as earlier in the session and needs a GUI
 Port-side status is unchanged and independent: the gate returns 0 = success, so the yield is an error-retry path
 (session 139), and the remaining question is who resumes a thread suspended inside a successful call.
 
+## Session 141 (2026-11-17) - EMULATOR CONFIRMS THE DIVERGENCE: guest reaches `0x2E0A3C`, port never does
+
+Both comparison points taken in PCSX2 at the loader.
+
+### 1. The gate: `v0 = 0` in the guest too
+
+```
+Paused at PC=0x00233EA4   ("v0" = 0x0)
+```
+
+So `FUN_00126368` returns **0 = success** on hardware as well, the yield is skipped there too, and the yield really
+is an error-retry path. Session 139's correction is confirmed against the emulator; sessions 137-138 stay
+withdrawn.
+
+One extra observation: the guest hits `0x233EA4` **repeatedly** (it stopped there twice in a row, `v0 = 0` both
+times), whereas the port hit the gate **once**. So the guest retries this path in a loop; the port does not.
+
+### 2. The resume point: the guest DOES reach `0x2E0A3C`
+
+With the gate breakpoint removed (it was masking the second one):
+
+```
+Breakpoint 0x002E0A3C
+Paused at PC=0x002E0A3C
+```
+
+So on hardware the submit row **is** resumed after `jal 0x2DF590`, and therefore executes `0x2E0A50`
+(`status & ~2`) and `0x2E0A58` (the release). This matches the hardware steady state measured earlier
+(`status = 0x00`, `entry+6 = 0xFF0E`).
+
+### The divergence, stated exactly
+
+| | gate `v0` | gate hit count | reaches `0x2E0A3C` | release `0x2E0A58` |
+|---|---|---|---|---|
+| PCSX2 (guest) | `0` | repeated (retry loop) | **YES** | runs (status -> `0x00`) |
+| port | `0` | **once** | **NO** | never |
+
+Everything upstream of the call is identical - same gate, same success value, same skipped yield. The difference is
+purely that the guest **resumes the caller at `0x2E0A3C`** and the port abandons it. And the guest does it in a
+loop, which is why the retry count differs too.
+
+### Next
+
+The resume is what to fix, and the guest shows it is normal: after `0x2DF590 -> 0x233E50 -> 0x233FC0` returns, the
+submit row continues at `0x2E0A3C`. Instrument `0x233FC0` (the last call in `0x233E50`) to see what it does in the
+port and whether it returns; the port's `nextpc = 0x233FC0` at that moment says control was left *inside* that call
+rather than unwinding to `0x2E0A3C`. Acceptance test unchanged: `0x2E0A58` writes and status returns to `0x00`.
+
+
 
 
 
