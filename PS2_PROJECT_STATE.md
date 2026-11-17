@@ -4246,6 +4246,59 @@ item (`0x2E0A70` or `0x2E15C0`) that is never dequeued.
 3. Do not "fix" this by clearing bit 1 or writing `entry0+6` from an override until the guest's own release path
    is proven unreachable for a port-specific reason (e.g. a queue entry the runtime drops).
 
+## Session 129 (2026-11-17) - ANSWER: the release job is NEVER QUEUED (not dropped); the submit is queued once
+
+Two probes: `relA` (`0x2E0A70`), `relB` (`0x2E15C0`), plus `TOL_TRACE_INDIRECT` in `PS2Runtime::dispatchGuestBranch`
+(`ps2_runtime.cpp`, env-gated, filtered to `sourcePc` in `0x152200..0x152700`).
+
+### Release heads: both dead
+
+```
+relA = 0   (0x2E0A70 never entered)
+relB = 0   (0x2E15C0 never entered)
+```
+
+### The pump's work list (81 dispatches, all from one tail-jump site)
+
+```
+[ind] from=0x00152314 -> target   kind=2   ra=0x00151F88   (ra unchanged => `jr`, not `jalr`)
+```
+
+15 distinct targets, complete set:
+
+| count | target | note |
+|---|---|---|
+| 19 | `0x1F8528` | transfer-queue worker |
+| 18 | `0x1F8168` | transfer-queue worker |
+| 11 | `0x3661DC` | **the app-job park PC - re-dispatched 11x** |
+| 10 | `0x164FE8` | AppCell loader |
+| 6 | `0x1F86B8` | transfer worker |
+| 4 | `0x2047D0` | the other park site (session 121) |
+| 3 | `0x233FEC` | |
+| 2 | `0x165220` | AppCell job |
+| 2 | `0x1660EC` | frame region |
+| 1 | `0x1F8150`, `0x164FCC`, `0x1660A0`, `0x1F84B0` | |
+| 1 | **`0x2E09E0`** | **the submit - queued exactly once** |
+| 1 | `0x164F80` | loader per-frame loop |
+| - | **no `0x2E0A70`, no `0x2E15C0`** | **the release is never queued** |
+
+### Conclusion
+
+The release is **never queued**, not dropped: the queue is drained completely (81 dispatches, every item printed),
+the submit appears in it once, and neither release head ever does. `0x3661DC` appearing 11 times also settles the
+resume question from the other side - the parked thread is re-dispatched at its wait PC repeatedly.
+
+So the job completes, the submit is queued and run, and the step that would enqueue the release never executes.
+
+### Next
+
+1. Find the **enqueue** counterpart of `0x152314` (whose `jr` drains the list) and instrument it, then identify which
+   producer should push a release item. `0x15231C` (the yield) and `0x15243C` (loop top) are the likely siblings.
+2. Compare against the guest: the release enqueue is almost certainly tied to the submit completing - if the port
+   never observes the completion (e.g. a status word the guest sets from an interrupt or the SPU/DMA path), the
+   enqueue is skipped. That is where a game override would belong, not in the job table.
+
+
 
 
 

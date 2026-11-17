@@ -2647,6 +2647,30 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdRelAPrev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdRelBPrev = nullptr;
+
+    // The two release-chain heads. 0x2E15C0 is the body whose tail (0x2E1D30) clears bit 1 with `status & ~2`;
+    // 0x2E0A70 is its only other caller. Both were expected to be dead in the port - these probes make that a
+    // measurement instead of an inference from the call graph.
+    void orderRelAProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("relA", ctx);
+        if (gOrdRelAPrev != nullptr)
+        {
+            gOrdRelAPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void orderRelBProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("relB", ctx);
+        if (gOrdRelBPrev != nullptr)
+        {
+            gOrdRelBPrev(rdram, ctx, runtime);
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6165,6 +6189,24 @@ namespace tol
             {
                 gOrdPmPrev = fn;
                 runtime.replaceFunction(0x00365700u, &orderPmProbe);
+            }
+        }
+
+        // Release-chain heads (see orderRelAProbe).
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002E0A70u);
+            if (fn != nullptr)
+            {
+                gOrdRelAPrev = fn;
+                runtime.replaceFunction(0x002E0A70u, &orderRelAProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002E15C0u);
+            if (fn != nullptr)
+            {
+                gOrdRelBPrev = fn;
+                runtime.replaceFunction(0x002E15C0u, &orderRelBProbe);
             }
         }
 
