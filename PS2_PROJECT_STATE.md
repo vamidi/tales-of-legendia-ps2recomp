@@ -5097,6 +5097,42 @@ Find and check that `ld $ra, N($sp)` in `FUN_002DF590` (the epilogue restore): l
 or compare the `sp` used by the prologue `sd` with the `sp` used by the epilogue `ld`. A mismatched `sp` (stack
 switched inside the call, which we know can happen) would load a foreign value - exactly `0x116A6C`.
 
+## Session 150 (2026-11-17) - stack-mismatch theory REFUTED: `sp` is correct at the continuation
+
+Static: the store and load are the **same slot**, with a symmetric frame:
+
+```
+0x2DF590  addiu sp, sp, -0x50
+0x2DF598  sd    ra, 0x40(sp)      ; store  -> slot = sp+0x40
+0x2DF6B4  ld    ra, 0x40(sp)      ; load   <- same slot
+0x2DF6C8  jr    ra
+0x2DF6CC    addiu sp, sp, 0x50    ; delay slot, symmetric
+```
+
+Dynamic (sp logged on both sides):
+
+```
+[sub2] #1 enter  sp=0x00417520    ; at 0x2DF590 entry
+[d5dc] #1 RESUME sp=0x004174D0    ; at 0x2DF5DC, after the 0x233E50 call
+```
+
+Delta = `0x50`, exactly the frame size, so the continuation runs with the **correct** post-prologue `sp`. There is no
+double-decrement, no lost frame, and the prologue store / epilogue load address the same slot
+(`0x4174D0 + 0x40 = 0x417510`, which is exactly where the earlier needle scan found `0x2E0A3C`).
+
+**So the wrong `$ra` at the `jr` is not a stack-pointer bug.** Either the slot at `0x417510` is overwritten between
+store and load, or the resumed path does not execute the epilogue `ld` at all.
+
+### Next
+
+Log the **content of the slot** `0x417510` at three points - at `0x2DF590` entry (just after the store), at the
+`0x2DF5DC` resume, and after the call returns - to see whether it still holds `0x2E0A3C` at the end. That
+distinguishes "slot overwritten" from "epilogue not executed", which are different fixes:
+
+- overwritten -> the writer of `0x417510` is the culprit (find it with a range watch on the submit thread's stack);
+- epilogue skipped -> the resumed path branches past `0x2DF6B4`, and the branch condition at `0x2DF5DC` is the fix.
+
+
 
 
 

@@ -2717,7 +2717,8 @@ namespace
             ++sCalls;
             if (sCalls <= 10u)
             {
-                std::fprintf(stderr, "[sub2] #%u enter a0=0x%08X ra=0x%08X\n", sCalls, a0, GPR_U32(ctx, 31));
+                std::fprintf(stderr, "[sub2] #%u enter a0=0x%08X ra=0x%08X sp=0x%08X\n", sCalls, a0, GPR_U32(ctx, 31),
+                         GPR_U32(ctx, 29));
             }
         }
         if (gOrdSub2Prev != nullptr)
@@ -3018,8 +3019,8 @@ namespace
         ++sCalls;
         if (sEnv && sCalls <= 10u)
         {
-            std::fprintf(stderr, "[d5dc] #%u RESUME pc=0x%08X ra=0x%08X v0=0x%08X\n", sCalls, entryPc, ra,
-                         GPR_U32(ctx, 2));
+            std::fprintf(stderr, "[d5dc] #%u RESUME pc=0x%08X ra=0x%08X sp=0x%08X v0=0x%08X\n", sCalls, entryPc, ra,
+                         GPR_U32(ctx, 29), GPR_U32(ctx, 2));
         }
         if (gOrdD5DCPrev != nullptr)
         {
