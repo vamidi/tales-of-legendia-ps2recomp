@@ -4874,6 +4874,53 @@ resume.
 Instrument `0x2DF5DC` (the instruction in `0x2DF590` immediately after its `jal 0x233E50` at `0x2DF5D4`): if the
 port never executes it, the loss is one frame up, in `0x2DF590`'s own continuation rather than in `0x233FC0`.
 
+## Session 143 (2026-11-17) - FOUND IT: `0x233FC0` is a poll-and-yield loop, and the poll returns nonzero so the yield never runs
+
+### `FUN_00233FC0` (0x233FC0..0x234010)
+
+```
+0x233FC8  sw   $zero, 0x1C($sp)      ; local flag = 0
+0x233FCC  a0 = 1 ; a1 = 0
+0x233FD4  jal  func_126248           ; (1, 0, &flag)
+0x233FDC  bnez $v0, +0x18            ; nonzero -> SKIP the yield, leave the loop
+0x233FE4  jal  func_15231C           ; THE YIELD (the save that writes ctx[0x1B4] = $ra)
+0x233FEC  b    -0x20                 ; -> back to 0x233FD0, poll again
+```
+
+So it is a **poll-until-ready, yielding each iteration** loop. `FUN_00126248` is called as `(1, 0, &flag)` - a
+thread/status query - and the yield only happens while it returns 0.
+
+### Measured: the yield from here never executes
+
+```
+yield calls: 30   ra values: 0x1F8168 x14, 0x1F8528 x8, 0x1660EC x2, 0x1F86B8 x6
+ra = 0x233FEC : 0        <- the call at 0x233FE4 is never reached
+```
+
+`FUN_00233FC0` itself is entered twice and returns through `0x233EF4` correctly, but it always takes the
+`bnez $v0` exit at `0x233FDC`. Therefore **`FUN_00126248` returns nonzero in the port on the first poll**, so the
+loop never yields, the save never runs, `ctx[0x1B4]` is never updated, and the thread is parked with a stale resume
+PC and `+0x1AC = 0` - exactly the state measured on slot 5.
+
+### Why this closes the chain
+
+```
+0x2DF590 -> 0x233E50 -> 0x233FC0 -> poll FUN_00126248
+                                       port: nonzero  -> exit loop, no save, no yield
+                                       guest: 0        -> yield (save ctx[0x1B4]) -> poll again
+```
+
+Every earlier layer is now verified correct against the emulator (gate `v0 = 0`, plain returns, thread re-dispatched
+11x). The single remaining difference is **the value `FUN_00126248` returns**, and it gates the only save in the
+path.
+
+### Next
+
+Instrument `0x126248` exactly as `0x126368` was: log `a0/a1/a2` and the return value, then compare against PCSX2 at
+`0x233FDC` (break there and read `v0`). If the guest returns 0 and the port returns nonzero, the fix is inside
+`FUN_00126248` (or the thread state it queries) - a small, well-bounded function rather than the scheduler.
+
+
 
 
 
