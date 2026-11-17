@@ -6108,6 +6108,48 @@ Measure what the yield at `0x15231C` actually waits on and how often it returns 
 cadence), and separately why the app loop re-enters instead of exiting after the two state-4 completions already
 observed - i.e. who re-arms `busy(+8)` after `vtable[0x20]` clears it.
 
+### Session 152 - the yield waits on nothing, and `busy` is set exactly once
+
+**(1) `0x15231C` is not a wait - it is the cooperative save.** `FUN_0015231C` does:
+
+```c
+ctx = *(0x3DB1A0 * 0x3DB1B0 + 0x48F590 + 0x3DB1C0);   // current thread's context
+ctx[0x6B] = 1;                                        // +0x1AC = 1  -> "yielded, alive"
+... saves the whole register file (gpr/vf/HI/LO/sa) ...
+ctx[0x6D] = return_address;                           // +0x1B4 = resume pc
+return;                                               // straight back into the run loop
+```
+
+No semaphore, no timer, no condition. So the app loop's cadence is exactly "how often the scheduler picks this
+thread again", and the thread is the head of the prio-4 ready queue (see previous entry) - i.e. nothing in the
+yield is slowing it down.
+
+**(2) `busy(+8)` is written exactly once in each direction, by two different callers** (`[busy]`, 45 s):
+
+```
+[busy] attach20D370 app a1=0x0063DA00 a2=0x00000001 -> busy=1  ra=0x00366168   // inside FUN_00366090 (startup attach)
+[busy] set20D3C0   app a1=0x00000000               -> busy=0  ra=0x0036600C   // inside FUN_00365FD0 (state 4 -> vtable[0x20])
+```
+
+So:
+
+- the only `busy = 1` comes from the app job's **own startup** (`vtable[0x18]` on the app with the partner
+  0x63DA00 and mode 1), not from an external re-arm;
+- the only `busy = 0` comes from the **state-4 hand-off** (`FUN_00365FD0 -> vtable[0x20]`, ra 0x36600C);
+- **nothing sets it again.** The app job is strictly one-shot: it starts itself, runs until state 4 completes,
+  clears its own flag, and returns.
+
+That closes the question: the "black-fill loop" is not a loop at the app level at all - one unit runs, hands off,
+and the pipeline stops. Although the loader step `0x165400` is called 4 times, only the **first** call reaches
+the app job (`0x366090`); the later calls target a different loader object (`a0=0x63D890` vs `0x63D850`) whose
+`vtable[0x0C]` is not the app-job entry, so no second unit is ever started.
+
+### Next
+
+Compare the two loader objects' secondary vtables (`0x63D850` and `0x63D890` at +0x10) and their `[0x0C]` slots:
+the second/third/fourth `0x165400` calls dispatch somewhere that does not run the app job. That is where the next
+unit is being dropped.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

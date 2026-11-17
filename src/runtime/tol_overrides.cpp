@@ -2781,6 +2781,62 @@ namespace
     PS2Runtime::RecompiledFunction gLeafStepPrev = nullptr;
     PS2Runtime::RecompiledFunction gState4Prev = nullptr;
     PS2Runtime::RecompiledFunction gLoaderStepPrev = nullptr;
+    PS2Runtime::RecompiledFunction gBusyAttachPrev = nullptr;
+    PS2Runtime::RecompiledFunction gBusySetPrev = nullptr;
+
+    // Only two writers touch an object's busy byte:
+    //   0x20D370 (vtable+0x18):  obj+4 = a1; obj+8 = a2; if (obj+4) successor->vtable[0x34]()
+    //   0x20D3C0 (vtable+0x20):  obj+8 = a1
+    // State 4 clears it through the second one. Logging both for the app object (0x63E3D0) names the code that
+    // sets it again - the $ra is the caller.
+    void busyWriterProbeImpl(const char *tag, uint32_t valueReg, uint8_t *rdram, R5900Context *ctx,
+                             PS2Runtime *runtime, PS2Runtime::RecompiledFunction prev)
+    {
+        const uint32_t obj = GPR_U32(ctx, 4);
+        const uint32_t value = GPR_U32(ctx, valueReg);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const uint32_t a1 = GPR_U32(ctx, 5);
+        const uint32_t a2 = GPR_U32(ctx, 6);
+        if (prev != nullptr)
+        {
+            prev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && obj == 0x0063E3D0u && (sCalls <= 24u || (sCalls % 200u) == 0u))
+        {
+            const uint32_t busy = (obj + 8u < PS2_RAM_SIZE) ? runtime->Load8(rdram, ctx, obj + 8u) : 0u;
+            std::fprintf(stderr, "[busy] %s app a1=0x%08X a2=0x%08X set=%u -> busy=%u ra=0x%08X\n", tag, a1, a2,
+                         value, busy, ra);
+        }
+    }
+
+    void busyAttachProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // 0x20D370(obj, a1 -> +4, a2 -> +8)
+        busyWriterProbeImpl("attach20D370", 6u, rdram, ctx, runtime, gBusyAttachPrev);
+    }
+
+    void busySetProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // 0x20D3C0(obj, a1 -> +8)
+        busyWriterProbeImpl("set20D3C0", 5u, rdram, ctx, runtime, gBusySetPrev);
+    }
+
+    void installBusyWriterProbes(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x0020D370u) != nullptr)
+        {
+            gBusyAttachPrev = runtime.lookupFunction(0x0020D370u);
+            runtime.replaceFunction(0x0020D370u, &busyAttachProbe);
+        }
+        if (runtime.lookupFunction(0x0020D3C0u) != nullptr)
+        {
+            gBusySetPrev = runtime.lookupFunction(0x0020D3C0u);
+            runtime.replaceFunction(0x0020D3C0u, &busySetProbe);
+        }
+    }
 
     // 0x165400 is the loader thread's per-unit step. The AppCell "app job" (FUN_00366090) is invoked from it as
     // vtable+0x0C of the secondary vtable 0x3DA380 - it is NOT a thread, so there is no CreateThread to re-arm.
@@ -7089,6 +7145,8 @@ namespace tol
         installState4Probe(runtime);
         // The loader thread's per-unit step (see loaderStepProbe) - the real invoker of the app job.
         installLoaderStepProbe(runtime);
+        // Who sets the app object's busy byte (see busyWriterProbeImpl).
+        installBusyWriterProbes(runtime);
         // The ADX detach handshake (see adxDetachProbe).
         installAdxDetachProbe(runtime);
         // Thread identity of the "stop all streams" chain (see streamStopProbe).
