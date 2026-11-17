@@ -2561,6 +2561,92 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdRescPrev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdSubmPrev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdEnt0Prev = nullptr;
+    PS2Runtime::RecompiledFunction gOrdClm2Prev = nullptr;
+
+    // FUN_003211C0 (the reserver/orchestrator) - does it reach a release?
+    //
+    // Its complete direct call graph (grep of 0x3211c0) contains 0x2E1F80 (reserve, 0x321334),
+    // 0x2E1EF0 (read, 0x3214B0) and 0x2E0880 (submit chain head, 0x3215B8) - and *no* 0x2E0A70,
+    // 0x2E1040 or 0x2E15C0, which are the only callers of the release. So it cannot reach the release;
+    // these probes measure how far it actually gets and which site drives the reserve/submit.
+    void orderRescProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint8_t before = static_cast<uint8_t>(runtime->Load8(rdram, ctx, 0x004E9140u));
+        orderEvent("resc", ctx);
+        if (gOrdRescPrev != nullptr)
+        {
+            gOrdRescPrev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        if (!sEnv)
+        {
+            return;
+        }
+        const uint8_t after = static_cast<uint8_t>(runtime->Load8(rdram, ctx, 0x004E9140u));
+        std::fprintf(stderr, "[resc] status0 %02X -> %02X  bit1 %u -> %u  ret=0x%08X\n", static_cast<unsigned>(before),
+                     static_cast<unsigned>(after), static_cast<unsigned>((before >> 1) & 1u),
+                     static_cast<unsigned>((after >> 1) & 1u), GPR_U32(ctx, 2));
+    }
+
+    void orderSubmProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("subm", ctx);   // ra tells whether FUN_003211C0 (ra=0x3215C0) or the pump (ra=0x151F88) drives it
+        if (gOrdSubmPrev != nullptr)
+        {
+            gOrdSubmPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void orderEnt0Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("ent0", ctx);   // 0x1C8660 - the last call in FUN_003211C0
+        if (gOrdEnt0Prev != nullptr)
+        {
+            gOrdEnt0Prev(rdram, ctx, runtime);
+        }
+    }
+
+    void orderClm2Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        orderEvent("clm2", ctx);   // 0x2E1F80 entry: ra distinguishes 0x32133C (reserver) from 0x365840 (phase)
+        if (gOrdClm2Prev != nullptr)
+        {
+            gOrdClm2Prev(rdram, ctx, runtime);
+        }
+    }
+
+    PS2Runtime::RecompiledFunction gOrdPmPrev = nullptr;
+
+    // Entry-PC probe for FUN_00365700 (the phase machine).
+    //
+    // The emitted dispatch table makes interior pcs legal entry points, and the resume-at-delay-slot path is
+    // special-cased:
+    //     label_365830: if (ctx->pc == 0x365830) { <delay slot>; ctx->pc = 0x365834; goto label_365834; }
+    // i.e. entering with pc == 0x365830 jumps straight into the CLAIM path without ever evaluating
+    // `bnel $v0,$zero,0x365B9C`. Since the child step provably returned nonzero once and the claim still ran,
+    // this probe checks whether the function is being re-entered at an interior pc.
+    void orderPmProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        if (sEnv)
+        {
+            ++sCalls;
+            if (sCalls <= 24u || (sCalls % 200u) == 0u)
+            {
+                std::fprintf(stderr, "[pm] #%u entrypc=0x%08X ra=0x%08X\n", sCalls,
+                             static_cast<unsigned>(ctx->pc), GPR_U32(ctx, 31));
+            }
+        }
+        if (gOrdPmPrev != nullptr)
+        {
+            gOrdPmPrev(rdram, ctx, runtime);
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6037,6 +6123,48 @@ namespace tol
             {
                 gOrdChildStepPrev = fn;
                 runtime.replaceFunction(0x003059B0u, &orderChildStepProbe);
+            }
+        }
+
+        // Reserver / orchestrator trace (see orderRescProbe).
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x003211C0u);
+            if (fn != nullptr)
+            {
+                gOrdRescPrev = fn;
+                runtime.replaceFunction(0x003211C0u, &orderRescProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002E0880u);
+            if (fn != nullptr)
+            {
+                gOrdSubmPrev = fn;
+                runtime.replaceFunction(0x002E0880u, &orderSubmProbe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x001C8660u);
+            if (fn != nullptr)
+            {
+                gOrdEnt0Prev = fn;
+                runtime.replaceFunction(0x001C8660u, &orderEnt0Probe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x002E1F80u);
+            if (fn != nullptr)
+            {
+                gOrdClm2Prev = fn;
+                runtime.replaceFunction(0x002E1F80u, &orderClm2Probe);
+            }
+        }
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00365700u);
+            if (fn != nullptr)
+            {
+                gOrdPmPrev = fn;
+                runtime.replaceFunction(0x00365700u, &orderPmProbe);
             }
         }
 

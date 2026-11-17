@@ -4182,6 +4182,71 @@ PCSX2 wedged at process level: DebugServer returned a parse error and Pine timed
 reconnect still reported `PC=0x002DEF98, paused=true` - i.e. the paused save state was restored again. Needs a
 hard process kill and a fresh boot without the debugger attached. Port-side evidence above did not depend on it.
 
+## Session 128 (2026-11-17) - FUN_003211C0 is never entered; the claim is on BOTH paths (session-127 reading corrected); the release is still the only missing piece
+
+### FUN_003211C0: instrumented, never runs
+
+Probes `resc` (`0x3211C0`), `subm` (`0x2E0880`), `ent0` (`0x1C8660`), `clm2` (`0x2E1F80`, to capture the outer ra):
+
+```
+[resc]  0 lines        <- FUN_003211C0 is NEVER entered
+[subm]  never          <- 0x2E0880 never entered
+[ent0]  never          <- 0x1C8660 never entered
+[clm2]  #10 ra=0x00365840   <- the reserve comes from the PHASE MACHINE (jal at 0x365838)
+```
+
+Statically it could not have reached the release anyway: its complete direct call graph is
+`0x153120, 0x324C10, 0x3240D0, 0x324700, 0x281F50, 0x1F31E0, 0x1F32C0, 0x1F3370, 0x3076F0, 0x307710, 0x307760,
+0x307770, 0x3076E0, 0x1EC540, 0x1EE2A0, 0x2E1F80 (reserve), 0x2E1EF0 (read), 0x2E0880 (submit), 0x1C8660,
+0x324B50, 0x300000` - and **no `0x2E0A70`, `0x2E1040` or `0x2E15C0`**, the only callers of the release.
+
+### No interior re-entry (resume-at-delay-slot theory falsified)
+
+`[pm]` on `0x365700`: 25+ entries, **every one** `entrypc=0x00365700 ra=0x0036567C`. So the emitted special case
+`label_365830: if (ctx->pc == 0x365830) { delay; goto label_365834; }` is never exercised, and the phase machine
+is not being re-entered at an interior pc.
+
+### Why the child step returned nonzero yet the claim still ran
+
+`0x365838` is reachable from **two** directions, and the second one is the success path:
+
+```
+0x36582C  bnel $v0,$zero,0x365B9C      // success
+0x365B9C  ... jalr  (ra = 0x365BA8)
+0x365BA8  b   0x365834                 // unconditional, .+4+(-0xDE<<2) -> 0x365834
+0x365BAC    delay: *(s0+4) = 0
+0x365834  a0 = 0
+0x365838  jal 0x2E1F80                 // claim
+```
+
+Failure falls into `0x365834`; success loops back to it after clearing `*(s0+4)`. **Both paths claim.** So the
+claim is normal guest behaviour on every iteration, and session 127's "claim is the failing-step fallback" is
+wrong and corrected here. `FUN_003059B0` returning `0x63EB00` is consistent with what follows.
+
+### What is actually left
+
+The claim sets bit 1 every iteration (test-and-set, so only the first one matters), the submit fills
+`entry0+6`, and the reader correctly refuses while bit 1 is set. The guest must therefore clear bit 1 between
+iterations - the release (`0x2E1D30`, mask `-3`) - and in the port nothing ever does:
+
+```
+guest loop:  claim(bit1=1) -> fill(entry+6) -> read -> release(bit1=0) -> read succeeds
+port loop:   claim(bit1=1) -> fill(entry+6) -> read(0) -> read(0) -> read(0) ...
+```
+
+Note also that `0x2E0880` was never entered, so the write at `0x2E0A38` comes from a work item the pump
+tail-jumps into **directly at `0x2E09E0`**, not from the chain head. The release is presumably another such work
+item (`0x2E0A70` or `0x2E15C0`) that is never dequeued.
+
+### Next
+
+1. Probe `0x2E0A70` and `0x2E15C0` entries (expected 0) to confirm the release work item is never dequeued.
+2. Instrument `FUN_00152200` (service A, the queue drainer) to log the function pointer it dequeues - that names
+   the work item that *is* dequeued (`0x2E09E0`) and shows whether a release item is ever queued behind it.
+3. Do not "fix" this by clearing bit 1 or writing `entry0+6` from an override until the guest's own release path
+   is proven unreachable for a port-specific reason (e.g. a queue entry the runtime drops).
+
+
 
 
 
