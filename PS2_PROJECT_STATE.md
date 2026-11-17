@@ -4975,6 +4975,34 @@ start) and log entry + `ctx->pc` after `0x233FB8`'s `jr`. That distinguishes the
 
 Acceptance test unchanged: `0x2E0A58` writes, status returns to `0x00`.
 
+## Session 146 (2026-11-17) - `0x233EF4` IS resumed and returns to `0x2DF5DC`; the chain is clean one frame further
+
+```
+[install] lookupFunction(0x233EF4) = ok
+[e50] #1 enter_ra=0x002DF5DC exit_pc=0x00233FC0 v0=0x00000001
+[ef4] #1 RESUME entry_pc=0x00233EF4 ra=0x00233EF4 v0=0x00000000 v1=0x00000000
+[ef4] #1 exit_pc=0x002DF5DC
+```
+
+- The interior continuation **is dispatched** (so the runtime does not drop it after the `0x233FC0` return).
+- It resumes with `v0 = 0` (the value `0x233FC0` returned), so `beql $v0,-5` at `0x233EF8` does not divert.
+- It ends at `0x233FB8`'s `jr` with **`exit_pc = 0x2DF5DC`**, i.e. `0x233E50` returns correctly to its caller.
+
+So `0x233E50` and everything below it are verified end to end. The abandonment is now **one frame up**: `0x2DF590`
+resumes at `0x2DF5DC` and must then return to the submit row at `0x2E0A3C`, which never happens.
+
+### Next
+
+Probe **`0x2DF5DC`** (interior continuation of `FUN_002DF590`, immediately after its `jal 0x233E50` at `0x2DF5D4`)
+with the same pattern - entry + exit pc. Possible outcomes:
+
+1. never dispatched -> the continuation is dropped at this level;
+2. dispatched and exits at `0x2E0A3C` -> then the submit row *is* resumed and the fault is in what follows it;
+3. dispatched but exits elsewhere -> the first genuinely diverging return, and the fix socket.
+
+Acceptance test unchanged: `0x2E0A58` writes, status returns to `0x00`.
+
+
 
 
 

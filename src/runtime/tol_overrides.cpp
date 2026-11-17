@@ -2978,6 +2978,33 @@ namespace
         }
     }
 
+    PS2Runtime::RecompiledFunction gOrdEf4Prev = nullptr;
+
+    // Does the runtime RESUME FUN_00233E50 at its interior continuation 0x233EF4 after 0x233FC0 returns?
+    // The table is indexed per 4 bytes, so patching this address leaves the row start (0x233E50) untouched - the
+    // row-start probe could never see an interior dispatch, which is exactly the blind spot being closed here.
+    void orderEf4Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t entryPc = static_cast<uint32_t>(ctx->pc);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && sCalls <= 10u)
+        {
+            std::fprintf(stderr, "[ef4] #%u RESUME entry_pc=0x%08X ra=0x%08X v0=0x%08X v1=0x%08X\n", sCalls, entryPc, ra,
+                         GPR_U32(ctx, 2), GPR_U32(ctx, 3));
+        }
+        if (gOrdEf4Prev != nullptr)
+        {
+            gOrdEf4Prev(rdram, ctx, runtime);
+        }
+        if (sEnv && sCalls <= 10u)
+        {
+            std::fprintf(stderr, "[ef4] #%u exit_pc=0x%08X\n", sCalls, static_cast<unsigned>(ctx->pc));
+        }
+    }
+
     PS2Runtime::RecompiledFunction gJobSlot6Prev = nullptr;
 
     void jobTableSlot6Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6533,6 +6560,16 @@ namespace tol
             {
                 gOrdE50Prev = fn;
                 runtime.replaceFunction(0x00233E50u, &orderE50Probe);
+            }
+        }
+        // Is the interior continuation 0x233EF4 ever dispatched? (see orderEf4Probe)
+        {
+            PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x00233EF4u);
+            std::fprintf(stderr, "[install] lookupFunction(0x233EF4) = %s\n", fn != nullptr ? "ok" : "NULL");
+            if (fn != nullptr)
+            {
+                gOrdEf4Prev = fn;
+                runtime.replaceFunction(0x00233EF4u, &orderEf4Probe);
             }
         }
 
