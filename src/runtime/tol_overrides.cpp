@@ -2509,10 +2509,31 @@ namespace
     // reason, from the other end.
     void orderYieldProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // Deliberately NOT routed through orderEvent's tag-based suppression: this probe exists to prove whether
+        // the call happens at all, and a filtered probe cannot distinguish "never called" from "suppressed".
+        const uint32_t curBefore = runtime->Load32(rdram, ctx, 0x003DB198u);
+        const bool curOk = (curBefore >= 0x00407160u && curBefore + 0x210u <= 0x00407E00u);
+        const unsigned aliveBefore = curOk ? static_cast<unsigned>(runtime->Load8(rdram, ctx, curBefore + 0x1ACu)) : 0u;
+        static uint32_t sYields = 0u;
+        ++sYields;
+        if (sYields <= 30u)
+        {
+            std::fprintf(stderr, "[yield] #%u enter ra=0x%08X cur=0x%08X alive_before=%u\n", sYields, GPR_U32(ctx, 31),
+                         curBefore, aliveBefore);
+        }
         orderEvent("yield", ctx);
         if (gOrdYieldPrev != nullptr)
         {
             gOrdYieldPrev(rdram, ctx, runtime);
+        }
+        if (sYields <= 30u)
+        {
+            const uint32_t curAfter = runtime->Load32(rdram, ctx, 0x003DB198u);
+            const bool ok2 = (curAfter >= 0x00407160u && curAfter + 0x210u <= 0x00407E00u);
+            const unsigned aliveAfter =
+                ok2 ? static_cast<unsigned>(runtime->Load8(rdram, ctx, curAfter + 0x1ACu)) : 0u;
+            std::fprintf(stderr, "[yield] #%u exit  cur=0x%08X alive_after=%u v0=0x%08X\n", sYields, curAfter, aliveAfter,
+                         GPR_U32(ctx, 2));
         }
     }
 
@@ -6303,6 +6324,7 @@ namespace tol
         // Resume test: the park loop's yield (0x15231C, called from 0x3661D4) and the app-job step entry.
         {
             PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(0x0015231Cu);
+            std::fprintf(stderr, "[install] lookupFunction(0x15231C) = %s\n", fn != nullptr ? "ok" : "NULL");
             if (fn != nullptr)
             {
                 gOrdYieldPrev = fn;

@@ -4687,6 +4687,53 @@ cross-checked against the corpus.
    if it stays 0, the yield's write is being skipped.
 3. Keep the acceptance test unchanged: `0x2E0A58` writes and status returns to `0x00`.
 
+## Session 138 (2026-11-17) - yield verified working; the submit path SKIPS it because `FUN_00126368` returns 0
+
+### Both checks done
+
+```
+[install] lookupFunction(0x15231C) = ok        <- wrapper IS installed
+yield_lines = 60                                <- the yield IS called (earlier "yield = 0" was an artefact)
+A58 = 0                                         <- the release still does not run
+```
+
+Alive-flag behaviour across the call (`+0x1AC` of the current TCB, from `0x3DB198`):
+
+```
+[yield] #1 ra=0x001F8168  alive_before=0 -> alive_after=0  v0=0x00000000
+[yield] #3 ra=0x001660EC  alive_before=0 -> alive_after=1  v0=0x00000002
+[yield] #5 ra=0x001F86B8  alive_before=1 -> alive_after=1  v0=0x00000002
+```
+
+So the yield mechanism is healthy and **does** set `+0x1AC = 1` whenever it returns nonzero. The alive flag was
+never the defect.
+
+### The actual gap: the submit path never reaches the yield
+
+Every observed call site is a worker loop: `ra = 0x1F8168, 0x1F8528, 0x1660EC, 0x1F86B8`. **No `ra = 0x233EB4`**,
+i.e. `0x233EAC` is never executed. The guard explains why:
+
+```
+0x233E9C  jal func_126368       (a1=0, a2=s5, a3=s4, t0=s3)
+0x233EA4  beqz $v0, +0x28       ; v0 == 0 -> skip the yield entirely (target 0x233ED0)
+0x233EAC  jal func_15231C       ; the yield, only when v0 != 0
+```
+
+Since the yield is skipped on this path, `FUN_00126368` returned **0**. Everything follows from that: no save, no
+`+0x1AC := 1`, `+0x1B4` stays at the entry PC, the run loop sees a non-yielded thread, and the caller of
+`0x2DF590` is abandoned.
+
+Supporting detail: the `0x126xxx` cluster also wrote job-table fields earlier
+(`pc=0x00126328/0x00126340/0x00126358` -> `entry0+8/+0xC/+0x10`), so `FUN_00126368` is job-related - its condition
+is plausibly "is the job still pending?", which is still true here.
+
+### Next
+
+Probe `FUN_00126368` (`0x126368`): log its arguments and its **return value**, plus the same arguments the caller
+passes (`a2=$s5, a3=$s4, t0=$s3`). That single number is the gate: if it is 0 in the port and nonzero in the guest,
+the divergence is inside it or in the job state it reads - not in the scheduler, the yield, or the TCB.
+
+
 
 
 
