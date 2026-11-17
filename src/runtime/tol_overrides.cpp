@@ -2712,7 +2712,11 @@ namespace
         {
             runtime->Store32(rdram, ctx, 0x00407BB0u + 0x1B4u, 0x002E0A3Cu);
             runtime->Store32(rdram, ctx, 0x00407BB0u + 0x1ACu, 1u);
-            std::fprintf(stderr, "[try] slot5: tcb+0x1B4 := 0x002E0A3C, tcb+0x1AC := 1\n");
+            // The runnable flag: working threads carry 0x01000401 at TCB+0x1F0, slot 5 has 0x01000101
+            // (differing bit 0x400). Also relink it: working threads have a non-null +0x1FC.
+            runtime->Store32(rdram, ctx, 0x00407BB0u + 0x1F0u, 0x01000401u);
+            runtime->Store32(rdram, ctx, 0x00407BB0u + 0x1FCu, 0x004079A0u);
+            std::fprintf(stderr, "[try] slot5: +0x1B4:=0x002E0A3C +0x1AC:=1 +0x1F0:=0x01000401 +0x1FC:=0x004079A0\n");
         }
         if (sEnv && sCalls <= 10u)
         {
@@ -2797,6 +2801,50 @@ namespace
                              runtime->Load32(rdram, ctx, tcb + 0x1A8u),
                              runtime->Load32(rdram, ctx, tcb + 0x1ACu),
                              static_cast<unsigned>(runtime->Load8(rdram, ctx, tcb + 0x1F0u)));
+            }
+
+            // Scheduler records, located by TCB pointer. Every record stores its thread's TCB somewhere; finding
+            // each one and dumping the same window makes the runnable/linked difference a field-by-field diff
+            // between a working thread (slots 2-4) and slot 5.
+            static const uint32_t kTcbs[4] = {0x00407580u, 0x00407790u, 0x004079A0u, 0x00407BB0u};
+            for (int t = 0; t < 4; ++t)
+            {
+                for (uint32_t a = 0x0048F000u; a + 4u <= 0x00490000u; a += 4u)
+                {
+                    if (runtime->Load32(rdram, ctx, a) != kTcbs[t])
+                    {
+                        continue;
+                    }
+                    const uint32_t base = (a >= 0x0048F040u) ? (a - 0x40u) : 0x0048F000u;
+                    std::fprintf(stderr, "[rec] slot%d tcb=0x%08X found at 0x%08X (window from 0x%08X)\n", t + 2,
+                                 kTcbs[t], a, base);
+                    for (uint32_t r = 0u; r < 0xA0u; r += 16u)
+                    {
+                        std::fprintf(stderr, "[rec]   %08X:", base + r);
+                        for (uint32_t i = 0u; i < 16u; i += 4u)
+                        {
+                            std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, base + r + i));
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
+
+            // The threads form a list embedded in the TCBs (references land at +0x1F8/+0x1FC/+0x200), and
+            // 0x3DB198 names the CURRENT thread. Dump each TCB's tail so the links and state fields can be
+            // compared side by side: that is where runnable-membership is expressed.
+            std::fprintf(stderr, "[tail] current-thread@0x3DB198 = 0x%08X | index@0x3DB1A0 = 0x%08X stride@0x3DB1B0 = 0x%08X off@0x3DB1C0 = 0x%08X\n",
+                         runtime->Load32(rdram, ctx, 0x003DB198u), runtime->Load32(rdram, ctx, 0x003DB1A0u),
+                         runtime->Load32(rdram, ctx, 0x003DB1B0u), runtime->Load32(rdram, ctx, 0x003DB1C0u));
+            for (uint32_t slot = 2u; slot <= 5u; ++slot)
+            {
+                const uint32_t tcb = 0x00407160u + slot * 0x210u;
+                std::fprintf(stderr, "[tail] slot%u %08X:", slot, tcb + 0x1E0u);
+                for (uint32_t off = 0x1E0u; off < 0x210u; off += 4u)
+                {
+                    std::fprintf(stderr, " %08X", runtime->Load32(rdram, ctx, tcb + off));
+                }
+                std::fprintf(stderr, "\n");
             }
         }
     }

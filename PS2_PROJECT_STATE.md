@@ -4551,6 +4551,54 @@ Dump the scheduling record area (`0x48F740..0x48F940`, the two records that refe
 working thread's record, and identify the field that marks a thread runnable/linked. Then the fix writes both that
 membership field and `+0x1B4`, which is the pair the experiment shows is required.
 
+## Session 135 (2026-11-17) - RUNNABLE FIELD FOUND: `TCB+0x1F0` bit `0x400` (and the `+0x1FC` link); setting it unblocks the next stage
+
+### The field
+
+`0x48Fxxx` holds no per-thread records (only slot 5 appears there), so the threads are tracked by a **list
+embedded in the TCBs**. TCB tail for all four threads at the switch point:
+
+```
+offset:     +1F0       +1F8       +1FC       +200      +204       +208
+slot2     01000401  00407790   004079A0   00407580  00413560   00415550
+slot3     01000401  00407370   00407580   00407790  00411560   00413550
+slot4     01000401  00407580   00407BB0   004079A0  00421560   00423550
+slot5     01000101  004079A0   00000000   00407BB0  00415560   00417550
+```
+
+- **`+0x1F0` is the flags word.** Working threads: `0x01000401`. Slot 5: `0x01000101` - the difference is **bit
+  `0x400`**. This is the runnable/ready bit.
+- **`+0x1FC` is the next-link**, and it is **null** on slot 5 (unlinked; it is the tail of the chain).
+- `+0x204/+0x208` are stack-range words (`0x00413560/0x00415550` style); `+0x1E0` on slot 5 is ASCII
+  (`"...LoadInfoThread"`), i.e. a name field, not state.
+
+**Instrumentation lesson:** the long-standing `state@+0x1F0` probe read a **u8**, which returns `0x01` for both
+values and hid this for several sessions. The field must be read as u32.
+
+### Experiment: writing the field changes behaviour
+
+With `TOL_TRY_RESUME`, slot 5 gets `+0x1B4 := 0x002E0A3C`, `+0x1AC := 1`, `+0x1F0 := 0x01000401`,
+`+0x1FC := 0x004079A0`:
+
+```
+[jobtabram] pc=0x002DF788 WRITE16 addr=0x004E9142 off=0x2
+[jobtabram] pc=0x002DF798 WRITE16 addr=0x004E9144 off=0x4
+[jobtabram] pc=0x002DF7B4 WRITE16 addr=0x004E9140 off=0x0
+[jobtabram] pc=0x002DF7BC WRITE16 addr=0x004E9146 off=0x6   <- entry+6
+```
+
+`FUN_002DF6D0` is called from `FUN_002DF590` at `0x2DF624`, so **`0x2DF590` now continues past the switch point**
+instead of abandoning its caller - a behaviour change caused solely by the flag writes. `0x2E0A3C`/`0x2E0A58`
+still did not execute inside the 75 s window (the run was still inside that call chain when killed).
+
+### Conclusion
+
+The membership field is `+0x1F0` bit `0x400` (plus a non-null `+0x1FC`). The earlier "poke insufficient" result
+was incomplete rather than wrong: PC-only and flag-only were each insufficient, and PC+flag+link together do
+change the scheduler's behaviour. What remains is completing the resume (the register area and stack) and giving
+the run enough time, with the acceptance test unchanged: `0x2E0A58` writes and the status byte returns to `0x00`.
+
+
 
 
 
