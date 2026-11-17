@@ -6193,6 +6193,37 @@ for this thread while the GS workers monopolise turns. Either the GS workers are
 (the `0x1F8150` / `0x1F84B0` legacy pumps are already flagged as "off by default" suspects), or the prio-4 queue
 is not being rotated on every `0x15231C` yield (`ctx[0x6B] = 1` then next-thread).
 
+### Session 152 - candidate tests: the scheduler is fair; the fade never brightens the screen
+
+**Candidate (a) "GS workers monopolise turns" - REFUTED.** Per-TCB pick tally at the switch-in:
+
+```
+[picks] after 200:  0x407160=47  0x407370=47  0x407580=37  0x407790=34  0x4079A0=33  0x407BB0=2
+[picks] after 800:  0x407160=167 0x407370=167 0x407580=157 0x407790=154 0x4079A0=153 0x407BB0=2
+```
+
+Round-robin is fair: the loader thread (`0x4079A0`) receives 153/800 = **19 %** of turns. Nothing monopolises.
+
+**Candidate (b) "prio-4 queue not rotated on yield" - REFUTED.** All three prio-4 threads
+(`0x407580`, `0x407790`, `0x4079A0`) receive near-identical shares (157/154/153), i.e. the `ctx[0x6B] = 1` yield
+does rotate the queue every time.
+
+**The fade is not slow - it never brightens the screen.** 153 captured frames over 200 s:
+
+```
+frame_000060 .. frame_009060 : nonblack = 0.00 %  meanLum = 0.0     (every sampled frame)
+max over all 153 frames      : 0.00 %
+```
+
+So either `FUN_00204240` holds at alpha = 1 (fade-out never runs), or the fade-out completes and reveals
+**nothing** - which matches the draw tally (`fillTex = 5` of 42,716): no content is drawn behind the overlay.
+The emulator-side picture was not verified visually: PCSX2's debug server exposes no screenshot and returns
+zeros for GS privileged registers, so the fade is confirmed from the code and the overlay draws, not from an image.
+
+**Where it stands:** scheduling and the fade mechanism are both exonerated. The game fades to black on a
+transition and the destination scene never draws. That is the same conclusion as the draw tally - the guest
+issues only clears - and the remaining work is the content path (what should draw after the fade), not timing.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

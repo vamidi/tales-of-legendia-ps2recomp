@@ -3021,8 +3021,8 @@ struct SdlGpuBackend::Impl {
                 // ToL adaptation, so TOL_GFX_SCREENSHOT_DIR only kept the pixels alive and produced no files.
                 static uint32_t sShotIndex = 0u;
                 ++sShotIndex;
-                constexpr uint32_t kShotEvery = 30u;
-                constexpr uint32_t kShotLimit = 40u;
+                constexpr uint32_t kShotEvery = 60u;
+                constexpr uint32_t kShotLimit = 400u;
                 const uint32_t shots = sShotIndex / kShotEvery;
                 if ((sShotIndex % kShotEvery) == 0u && shots <= kShotLimit && frame.width != 0u &&
                     frame.height != 0u) {

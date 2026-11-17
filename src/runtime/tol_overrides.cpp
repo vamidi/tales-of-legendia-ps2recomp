@@ -2512,14 +2512,25 @@ namespace
         static const bool sSelEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
         static uint32_t sSel = 0u;
         ++sSel;
+        const uint32_t a = runtime->Load32(rdram, ctx, 0x003DB1A0u);
+        const uint32_t b = runtime->Load32(rdram, ctx, 0x003DB1B0u);
+        const uint32_t c = runtime->Load32(rdram, ctx, 0x003DB1C0u);
+        const uint32_t slot = a * b + 0x0048F590u + c;
+        const uint32_t tcb = (slot + 4u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, slot) : 0u;
+        const bool ok = (tcb >= 0x00100000u && tcb + 0x210u < PS2_RAM_SIZE);
+        // Candidate test for the starvation: which TCB actually receives the scheduler turns? A tally per TCB
+        // distinguishes "the GS workers monopolise turns" from "the prio-4 queue is not rotated".
+        static std::map<uint32_t, uint32_t> sPickCount;
+        ++sPickCount[tcb];
+        if (sSelEnv && (sSel % 200u) == 0u)
+        {
+            std::fprintf(stderr, "[picks] after %u switch-ins:", sSel);
+            for (const auto &entry : sPickCount)
+                std::fprintf(stderr, " 0x%08X=%u", entry.first, entry.second);
+            std::fprintf(stderr, "\n");
+        }
         if (sSelEnv && (sSel <= 10u || (sSel % 100u) == 0u))
         {
-            const uint32_t a = runtime->Load32(rdram, ctx, 0x003DB1A0u);
-            const uint32_t b = runtime->Load32(rdram, ctx, 0x003DB1B0u);
-            const uint32_t c = runtime->Load32(rdram, ctx, 0x003DB1C0u);
-            const uint32_t slot = a * b + 0x0048F590u + c;
-            const uint32_t tcb = (slot + 4u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, slot) : 0u;
-            const bool ok = (tcb >= 0x00100000u && tcb + 0x210u < PS2_RAM_SIZE);
             std::fprintf(stderr,
                          "[select] #%u a=%u b=%u c=%u tcb=0x%08X pc(+1B4)=0x%08X alive(+1AC)=%u state(+1F0)=%u\n",
                          sSel, a, b, c, tcb, ok ? runtime->Load32(rdram, ctx, tcb + 0x1B4u) : 0u,
