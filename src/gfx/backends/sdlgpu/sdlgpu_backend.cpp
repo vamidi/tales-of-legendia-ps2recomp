@@ -1113,7 +1113,38 @@ struct SdlGpuBackend::Impl {
             return;
         }
 
-        // TOL_TRACE_GSPRIM=1: what the primitives actually are. Bounds are non-empty and the target surface is
+        // TOL_TRACE_GSORDER=1: per-frame ordering. Page 224 (base 7168) is both a draw target and the texture the
+        // composite sprites sample, and the composite reads black - so either the fills come after the composite
+        // (ordering/timing) or the fills themselves render nothing. Every event carries the running counts, and a
+        // fill also prints its own primitive so "filled but still black" can be judged without another run.
+        if (std::getenv("TOL_TRACE_GSORDER") != nullptr) {
+            static uint32_t sSeq = 0u, sFills = 0u, sComps = 0u;
+            const bool fill = (context.frame.fbp == 224u);
+            const bool composite = (state.prim.tme != 0) && (context.tex0.tbp0 == 7168u);
+            if (fill) ++sFills;
+            if (composite) ++sComps;
+            if (fill || composite) {
+                ++sSeq;
+                static uint32_t sFillTextured = 0u, sFillColored = 0u;
+                if (fill) {
+                    if (state.prim.tme != 0)
+                        ++sFillTextured;
+                    if ((batch.vertices[0].r | batch.vertices[0].g | batch.vertices[0].b) != 0u)
+                        ++sFillColored;
+                }
+                if (sSeq <= 24u || (sSeq % 200u) == 0u)
+                {
+                    const GSVertex &v0 = batch.vertices[0];
+                    std::fprintf(stderr,
+                                 "[gsorder] #%u %s target=%u tbp0=%u tme=%d tcc=%d tfx=%d rgba=%u,%u,%u,%u "
+                                 "adj=(%.0f,%.0f) written=[%u,%u..%u,%u] fills=%u comps=%u fillTex=%u fillRGB=%u\n",
+                                 sSeq, fill ? "FILL224" : "COMPOSITE", context.frame.fbp, context.tex0.tbp0,
+                                 state.prim.tme ? 1 : 0, context.tex0.tcc, context.tex0.tfx, v0.r, v0.g, v0.b, v0.a,
+                                 v0.x - context.xyoffset.ofx / 16.0f, v0.y - context.xyoffset.ofy / 16.0f, written.x0,
+                                 written.y0, written.x1, written.y1, sFills, sComps, sFillTextured, sFillColored);
+                }
+            }
+        }
         // correct, yet the frame is black - so the question is whether the sprites sample empty texture data or
         // blend themselves away. Prints the prim flags, the ALPHA register's blend factors, the texture setup,
         // two sampled texels from VRAM, the first vertex's colour/coords and the scissor.

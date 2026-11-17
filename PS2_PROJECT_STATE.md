@@ -5955,6 +5955,38 @@ Per frame, count draws into `base 7168` (page 224) and the composite sprites tha
 If composites precede the fills, it is ordering/timing on the present path; if page 224 is filled and still
 black, its primitives are failing (then repeat this probe filtered to `frameFbp=224`).
 
+### Session 152 - the black-fill loop: the guest only ever clears (42,716 draws, 5 textured)
+
+`TOL_TRACE_GSORDER` with per-target tallies:
+
+```
+fills=42716  comps=6084  fillTex=5  fillRGB=5
+[gsorder] #48200 FILL224 target=224 tbp0=7168 tme=0 tcc=1 tfx=0 rgba=0,0,0,0 adj=(192,224) written=[191,223..257,257]
+```
+
+- **42,716** draws into page 224, of which only **5** are textured (`tme=1`) and only **5** have any non-zero
+  RGB - the rest are `tme=0, rgba=0,0,0,0` **black clears** in a 64x32 tile grid (8 x 14 = 112 tiles = one full
+  512x448 clear), i.e. ~380 full-screen clears;
+- **6,084** composite blits copy that page into the display page (64-px columns, modulate, 128-grey);
+- ordering: the first 18 page-224 events are composites with `fills=0` (the boot frame blits an empty buffer),
+  after which every frame is clear-then-blit.
+
+So the port is **not** mis-rendering: the guest is issuing a per-frame black clear and nothing else. There is no
+scene/content draw to display. The "black-fill loop" is the **loading screen's clear**, and it ends only when the
+loader finishes and the game switches to its scene renderer - the same progression stall isolated earlier
+(the app job reaches outer state 4 and clears `busy`, then the kernel idles and no content is ever drawn).
+
+Conclusion for the graphics work: the renderer is exonerated. The three real defects found along the way were
+`0x125A78` (CRI end function interior entry), `0x3059B0` (AppCell child step interior entry) and
+`findColorSurface` (stale 640x896 view of page 0 pinning the present path to local memory) - all fixed and
+verified. The screen stays black because **nothing is being drawn**, and what should end that is the loader
+completing, not a GS change.
+
+### Next
+
+Return to progression: after the app job finishes (outer state 4 -> busy cleared), what is supposed to issue the
+next job / start the scene renderer? The kernel idles at that point, and no content draw is ever submitted.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
