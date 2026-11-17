@@ -2590,11 +2590,18 @@ namespace
                 const uint32_t child = ok ? runtime->Load32(rdram, ctx, obj + 0x18u) : 0u;
                 const bool childOk = (child >= 0x00100000u && child + 0x20u < PS2_RAM_SIZE);
                 const uint32_t jt = 0x004E9140u;
+                // Cadence without a clock: the host already maintains these atomics, so the ratio between
+                // app-loop iterations, run-loop turns and guest entries answers "is the EE throttled, or is this
+                // thread waiting?" without any chrono (the chrono attempt returned garbage).
+                const unsigned long long enter = g_eeEnterGuestCount.load(std::memory_order_relaxed);
+                const unsigned long long loops = g_eeRunLoopIterations.load(std::memory_order_relaxed);
+                const unsigned long long events = g_eeProcessPendingEventsCount.load(std::memory_order_relaxed);
                 std::fprintf(stderr,
-                             "[appobj] #%u obj=0x%08X +4=%u busy(+8)=%u outer(+70)=%u next(+72)=0x%04X phase(+74)=%d "
+                             "[appobj] #%u enter=%llu loops=%llu events=%llu obj=0x%08X +4=%u busy(+8)=%u "
+                             "outer(+70)=%u next(+72)=0x%04X phase(+74)=%d "
                              "cur(+14)=%d cnt(+64)=%d res(+80)=0x%08X child=0x%08X ch4=%u ch8=%u "
                              "jt0=[0x%08X pay=0x%04X]\n",
-                             sPark, obj, ok ? runtime->Load32(rdram, ctx, obj + 4u) : 0u,
+                             sPark, enter, loops, events, obj, ok ? runtime->Load32(rdram, ctx, obj + 4u) : 0u,
                              ok ? static_cast<unsigned>(runtime->Load8(rdram, ctx, obj + 8u)) : 0u,
                              ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x70u)) : 0u,
                              ok ? static_cast<unsigned>(runtime->Load16(rdram, ctx, obj + 0x72u)) : 0u,

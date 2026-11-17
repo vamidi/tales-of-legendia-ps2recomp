@@ -5617,6 +5617,40 @@ counter read at runtime level) to decide whether the loader is genuinely slow (a
 samples are just sparse. If it is genuinely slow, the guest's own `yield(1.0f)` at `0x3661D4` is the suspect -
 the same family as the earlier "tick rate drops" observations.
 
+### Measured cadence (runtime counters, no clock)
+
+`[appobj]` now prints the host's own atomics (`g_eeEnterGuestCount`, `g_eeRunLoopIterations`,
+`g_eeProcessPendingEventsCount`) instead of a timestamp:
+
+```
+#1  enter=25329 loops=25704 events=25704   outer=1 phase=1
+#10 enter=26622 loops=27007 events=27007   outer=4 phase=0
+```
+
+- over 40 s: Δenter ≈ 1293, Δloops = Δevents ≈ 1303 → **~32 scheduler turns/s**;
+- `enter ≈ loops` exactly → **no invocation backlog**; every turn dispatches one guest entry;
+- between two app-loop iterations: **~130 turns**, i.e. the app thread yields only ~10 times in 40 s.
+
+So the app loop is *not* the spin: its step runs for seconds of host time, and ~130 scheduler turns
+(mostly Timer-2 ticks and their handlers) happen inside it. Note `enter` counts **scheduler** entries only -
+nested `dispatchGuestBranch` calls run inside one entry - so it cannot be read as "guest instructions/s".
+
+Guest time base is healthy: `[tick]` logs the first 6 Timer-2 dispatches then every 64th, and 13 lines in 40 s
+means ≈450 ticks ≈ 11 Hz (nominal ~16 Hz).
+
+### The loader is now actually streaming
+
+`[xfer] tick-pump` in the same run (device `0x0039EE48`):
+
+```
+#1 st=2 done=0    win=266      #2 st=3 done=255  win=255      #3 done=25   win=25
+#4 done=39     #5 done=190   #6 done=128   #7 done=17   #8 done=17
+```
+
+Before these fixes the same line was stuck at `chunk=0 win=266`. Seven distinct transfer windows and hundreds
+of chunks have now completed - the DVCI/ADXF pipeline is moving data, and the app loop's "spin" is its normal
+poll-while-loading, not a deadlock.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
