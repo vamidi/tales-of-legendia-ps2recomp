@@ -4425,6 +4425,46 @@ that scheduler call (for example a primitive it uses returning a different resul
 to bolt on. The next micro-step is to dump the context block for the submit thread (locate it by its saved
 `sp` ~ `0x417550`) and see which field should hold the resume PC and what value it actually contains.
 
+## Session 132 (2026-11-17) - emulator corroborates: guest steady state is "filled AND released"; port never reaches it
+
+PCSX2 back up and running this time (`paused=false`). Breakpoint armed at `0x2E0A34` (the submit row's
+`jal 0x2DF590`). Job table at the loader stage, read via Pine:
+
+```
+004e9140  00 00 00 00 00 00 0e ff 02 00 00 00 00 00 00 00 00 00 00 00 00 31 62 00
+```
+
+| field | PCSX2 (guest) | port at its stall |
+|---|---|---|
+| `entry0` status byte | **`0x00`** (bit 1 **clear**) | **`0x02`** (bit 1 **set**) |
+| `entry0+6` (the payload the reader returns) | **`0xFF0E`** | **`0x0000`** |
+| `entry0+8` | `2` | `0` |
+
+So the guest's steady state is **filled and released** - the exact state the port never reaches - and it matches
+the session-122 reference dump byte for byte.
+
+### What this confirms
+
+The guest does clear bit 1 (the release runs), and `entry0+6` holds a real payload. The port sets the bit, writes a
+zero payload, and never releases. Combined with session 131 (the submit thread's continuation `0x2E0A3C` exists
+only as a stack frame and is never scheduled), the chain is closed end to end.
+
+### Caveat on the context table read
+
+`0x48F590` reads were **inconsistent**: one read returned bytes byte-identical to the job table
+(`00 00 00 00 00 00 0e ff…`), which cannot be right for a context save area, so that path returns wrong data
+intermittently. The DebugServer side also fails parse on roughly half of calls (`list_breakpoints`,
+`read_registers` both errored with `reading 'length'` / argument type errors). Until that stabilises, the
+context-block layout must be established from the port's own dump, not from PCSX2.
+
+### Next
+
+1. Port-side: dump `0x48F590` (`0x400` bytes) at the `[sub2]` event so the layout can be read from a source we
+   trust, and locate the submit thread's block by its saved `sp` (`~0x417550`).
+2. Then implement the save: write the resume PC into that block before the switch, and verify `0x2E0A58` writes
+   (i.e. the release runs) - the single check that proves the deadlock is gone.
+
+
 
 
 
