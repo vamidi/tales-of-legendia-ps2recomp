@@ -5987,6 +5987,49 @@ completing, not a GS change.
 Return to progression: after the app job finishes (outer state 4 -> busy cleared), what is supposed to issue the
 next job / start the scene renderer? The kernel idles at that point, and no content draw is ever submitted.
 
+### Session 152 - what should start the next scene job: priority 0 was illegal (FIXED), but it is not the gate
+
+Traced the one concrete anomaly in the creation log: the **first** `CreateThread` failed.
+
+```
+[cthread] #1 entry=0x001153E0 prio=0 stack=0x003DE020 size=1024 -> id=-403
+```
+
+`-403` = `KE_ILLEGAL_PRIORITY`. `FUN_001154b8` creates a thread named **"SceKerneltopThread"** with
+`initial_priority = 0` (`uStack_7c = 0`) running `FUN_001153E0`, which is a **deferred thread-command dispatcher**:
+it waits on semaphore `0x3DE420` and applies ring-buffer commands - `0 -> WakeupThread`,
+`1 -> RotateThreadReadyQueue`, `2 -> SuspendThread`, else an assert.
+
+The port rejected priority 0:
+
+```cpp
+if (params.priority < 1 || params.priority >= kPriorityCount) return KE_ILLEGAL_PRIORITY;   // createThread
+if (priority < 1 || ...)                                     return KE_ILLEGAL_PRIORITY;   // changePriority
+if (priority < 0 || ...)                                     return KE_ILLEGAL_PRIORITY;   // rotateReadyQueue (already correct)
+```
+
+On the EE kernel priority **0 is legal** (it is the *top* priority - hence the thread's name), so both checks were
+wrong and inconsistent with `rotateReadyQueue`. **Fixed**: both now accept 0.
+
+Verified: `[cthread] #1 ... prio=0 -> id=2` (was `-403`), i.e. "SceKerneltopThread" now exists.
+
+**But it is not the scene gate**: the draw tally is *identical* with the fix
+(`fills=42716 comps=6084 fillTex=5 fillRGB=5`), so the guest still issues only clears. The deferred-op dispatcher
+was being created incorrectly all along - a real defect, now fixed - but the missing scene job has another cause.
+
+### Where the "no new scene job" question stands
+
+- The app job is **one-shot**: `FUN_00366090` creates its objects, runs `while (app->vtable[0x0C]())`, and after
+  the state-4 hand-off (`vtable[0x20]` = `0x20D3C0` = `sb a1,8(a0)`) clears `busy`, exits and tears down.
+- `0x365630`'s switch has handlers only for outer states 4, 3 and 1; **outer 0 has none**, so once the hand-off
+  sets `outer = 0` the step is inert.
+- Nothing re-arms it: no second `CreateThread` for `0x366090` appears, and no draw with content is ever submitted
+  (`fillTex = 5` out of 42,716 draws).
+
+So the next thing to identify is the guest code that *re-creates or re-arms* the app job after a load unit, i.e.
+the caller of `CreateThread(0x366090)` (or the writer of `app+0x70`/`+0x72`), and what it waits on. That is the
+actual scene-job starter.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
