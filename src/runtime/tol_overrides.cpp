@@ -5422,6 +5422,11 @@ namespace
     // replaceFunction intercepts every dispatch to them.
     PS2Runtime::RecompiledFunction gRetChainEntryPrev = nullptr;
     PS2Runtime::RecompiledFunction gRetChainEpiloguePrev = nullptr;
+    // Pairing state: the epilogue dispatch only means anything if it belongs to the call the thunk just made, so
+    // the thunk records (count, sp, tid) and the epilogue reports the most recent one.
+    uint32_t gRetChainThunkCount = 0u;
+    uint32_t gRetChainThunkSp = 0u;
+    int32_t gRetChainThunkTid = 0;
 
     void retChainEntryProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -5460,41 +5465,80 @@ namespace
         }
     }
 
+    // FIX (per-address): 0x1B4458 is FUN_001B43E0's *tail-jump epilogue*
+    //   ld s0,0(sp); ld s1,8(sp); ld s2,0x10(sp); ld ra,0x18(sp); j 0x1B6AD0; addiu sp,+0x20
+    // and it is reached as a *resume* of the return point left by the checkpoint inside its `jal 0x1AC4F0`.
+    // Measured: the row's frame at 0x01FFFF20 is intact (s0=0x39F780, s1=-1, s2=1 are this row's callers'
+    // registers) but the $ra slot at 0x01FFFF38 no longer holds a return address - it holds 0x38 - because that
+    // 8-byte slot is shared by *every* 0x20- or 0x40-byte frame built at this stack depth (FUN_001A35F0's and
+    // FUN_001B4220's epilogues write it too), and the resume happens after later calls reused it. Restoring it
+    // therefore jumps to pc 0x38 and the thread goes dormant.
+    // The row has exactly one caller (FUN_001A1498) with two call sites, so the epilogue is re-expressed here:
+    // restore s0/s1/s2 from the frame, restore $ra if it is still a plausible code address, and otherwise use the
+    // unconditional call site's continuation (0x1A1548) and repair the slot so a re-entry sees a sane value.
+    constexpr uint32_t kRetChainReturn = 0x001A1548u;
+    constexpr uint32_t kRetChainTail = 0x001B6AD0u;
+
     void retChainEpilogueProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         static const bool env = std::getenv("TOL_RETCHAIN") != nullptr;
+        const uint32_t sp = GPR_U32(ctx, 29);
+        const bool frameValid = (sp >= 0x00100000u && sp + 0x1Cu < PS2_RAM_SIZE);
+        uint32_t slot = 0u;
+        if (frameValid)
+        {
+            slot = runtime->Load32(rdram, ctx, sp + 0x18u);
+        }
+        // A return address must be a dispatchable guest pc. A range test alone is not enough: the slot has also
+        // been measured holding 0x0049C790, a heap pointer that sits inside the naive 0x00100000..0x00400000
+        // window. The dense function table answers "is this guest code" exactly.
+        const bool plausible = (slot >= 0x00100000u && slot < 0x00400000u && runtime->hasFunction(slot));
         if (env)
         {
             static uint32_t shown = 0u;
-            if (shown < 12u)
+            if (shown < 12u || !plausible)
             {
                 ++shown;
-                const uint32_t ra = GPR_U32(ctx, 31);
-                const uint32_t sp = GPR_U32(ctx, 29);
-                uint32_t lo = 0u;
-                uint32_t hi = 0u;
-                if (sp >= 0x00100000u && sp + 0x1Cu < PS2_RAM_SIZE)
-                {
-                    lo = runtime->Load32(rdram, ctx, sp + 0x18u);
-                    hi = runtime->Load32(rdram, ctx, sp + 0x1Cu);
-                }
-                // The whole 0x20-byte frame, plus which guest thread is running: a stale resume restored on a
-                // different thread (or after the frame was reused) shows up as a changed frame with the same sp.
                 std::fprintf(stderr,
-                             "[retchain] EPILOGUE 0x1B4458 #%u tid=%d ra=0x%08X sp=0x%08X slot=%08X:%08X "
-                             "frame=%08X/%08X/%08X/%08X pcreg=0x%08X\n",
-                             shown, static_cast<int>(runtime->eeScheduler().currentThreadId()), ra, sp, hi, lo,
-                             (sp + 0x04u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x00u) : 0u,
-                             (sp + 0x0Cu < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x08u) : 0u,
-                             (sp + 0x14u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x10u) : 0u,
-                             (sp + 0x1Cu < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x18u) : 0u,
-                             GPR_U32(ctx, 0));
+                             "[retchain] EPILOGUE 0x1B4458 #%u tid=%d sp=0x%08X slot=0x%08X frame=%08X/%08X/%08X "
+                             "thunk#=%u thunkSp=0x%08X%s\n",
+                             shown, static_cast<int>(runtime->eeScheduler().currentThreadId()), sp, slot,
+                             frameValid ? runtime->Load32(rdram, ctx, sp + 0x00u) : 0u,
+                             frameValid ? runtime->Load32(rdram, ctx, sp + 0x08u) : 0u,
+                             frameValid ? runtime->Load32(rdram, ctx, sp + 0x10u) : 0u, gRetChainThunkCount,
+                             gRetChainThunkSp, plausible ? "" : " REPAIR");
             }
         }
-        if (gRetChainEpiloguePrev != nullptr)
+        if (!frameValid)
         {
-            gRetChainEpiloguePrev(rdram, ctx, runtime);
+            // Not this row's frame at all: keep the generated body's behaviour for that case.
+            if (gRetChainEpiloguePrev != nullptr)
+            {
+                gRetChainEpiloguePrev(rdram, ctx, runtime);
+            }
+            return;
         }
+
+        SET_GPR_U64(ctx, 16, runtime->Load64(rdram, ctx, sp + 0x00u));
+        SET_GPR_U64(ctx, 17, runtime->Load64(rdram, ctx, sp + 0x08u));
+        SET_GPR_U64(ctx, 18, runtime->Load64(rdram, ctx, sp + 0x10u));
+
+        uint32_t returnPc = slot;
+        if (!plausible)
+        {
+            returnPc = kRetChainReturn;
+            runtime->Store32(rdram, ctx, sp + 0x18u, returnPc);
+            static uint32_t sRepairs = 0u;
+            ++sRepairs;
+            if (env && sRepairs <= 16u)
+            {
+                std::fprintf(stderr, "[retchain] REPAIR 0x1B4458 sp=0x%08X slot=0x%08X -> 0x%08X (#%u)\n", sp, slot,
+                             returnPc, sRepairs);
+            }
+        }
+        SET_GPR_U32(ctx, 31, returnPc);
+        // The row's own tail-jump target (`j 0x1B6AD0`, i.e. a pass-through thunk to 0x1AD0B8).
+        ctx->pc = kRetChainTail;
     }
 
     PS2Runtime::RecompiledFunction gRetChainThunkPrev = nullptr;
@@ -5504,18 +5548,31 @@ namespace
         static const bool env = std::getenv("TOL_RETCHAIN") != nullptr;
         if (env)
         {
+            const uint32_t ra = GPR_U32(ctx, 31);
+            const uint32_t sp = GPR_U32(ctx, 29);
+            const int tid = static_cast<int>(runtime->eeScheduler().currentThreadId());
+            ++gRetChainThunkCount;
+            const bool firstOfDepth = (sp != gRetChainThunkSp || tid != gRetChainThunkTid);
+            gRetChainThunkSp = sp;
+            gRetChainThunkTid = tid;
             static uint32_t shown = 0u;
-            if (shown < 24u)
+            if (shown < 8u || firstOfDepth)
             {
                 ++shown;
-                const uint32_t ra = GPR_U32(ctx, 31);
-                const uint32_t sp = GPR_U32(ctx, 29);
                 std::fprintf(stderr,
-                             "[retchain] THUNK 0x19A9C0 #%u tid=%d ra=0x%08X sp=0x%08X pc=0x%08X "
-                             "belowSp=%08X/%08X\n",
-                             shown, static_cast<int>(runtime->eeScheduler().currentThreadId()), ra, sp, ctx->pc,
-                             (sp >= 0x00100008u) ? runtime->Load32(rdram, ctx, sp - 4u) : 0u,
-                             (sp >= 0x00100008u) ? runtime->Load32(rdram, ctx, sp - 8u) : 0u);
+                             "[retchain] THUNK 0x19A9C0 #%u tid=%d ra=0x%08X sp=0x%08X pc=0x%08X%s\n",
+                             gRetChainThunkCount, tid, ra, sp, ctx->pc, firstOfDepth ? " NEWDEPTH" : "");
+            }
+            // The thunk forwards $ra unchanged into FUN_001B43E0, and the only two call sites are 0x1A1540 and
+            // 0x1A155C, so $ra must be 0x1A1548 or 0x1A1564. Anything else is what the prologue would store into
+            // the frame slot, so it names the corruption at its source.
+            static uint32_t anomalies = 0u;
+            if (ra != 0x001A1548u && ra != 0x001A1564u && anomalies < 24u)
+            {
+                ++anomalies;
+                std::fprintf(stderr,
+                             "[retchain] THUNK-RA-ANOMALY #%u tid=%d ra=0x%08X sp=0x%08X pc=0x%08X\n",
+                             gRetChainThunkCount, tid, ra, sp, ctx->pc);
             }
         }
         if (gRetChainThunkPrev != nullptr)

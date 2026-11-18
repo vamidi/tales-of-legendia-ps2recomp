@@ -8,7 +8,7 @@
 
 ## CURRENT STATUS — updated 2026-11-17 (session 152; read this first; the rest is history)
 
-> **Session 153 (2026-11-18) - read this section at the bottom before acting.** It corrects the handoff task: the mcman save-directory RPC (sid 0x80000400) **is** already served by the MCSERV HLE, so "0 saves" is the honest answer for the empty folder card in data/CD/mc0 (no card image exists anywhere in the tree). It also pins the real end state: the main EE thread dies with pc = ra = 0x38, produced by FUN_001B43E0's tail-jump epilogue at 0x001B4458, which is dispatched as a *resume* after intervening frames recycled its $ra stack slot (0x01FFFF38).
+> **Session 154 (2026-11-18) - read the Session 154 section at the bottom before acting.** It traces what leaves pc = 0x1B4458 pending (the normal checkpoint/resume path), shows the row frame is intact except its $ra word because that word is the shared $ra slot of every 0x20/0x40-byte frame at that stack depth, and fixes the epilogue per-address (validate $ra with hasFunction, otherwise substitute 0x1A1548 and repair). [badpc] is widened to any non-dispatchable pc, which exposed that the same class still kills the thread one level up (pc = 0x0049C790): a whole activation frame chain can be recycled before the pending return point is resumed, so the durable fix belongs in the resume path (section 154.5).
 
 **Session 152 (latest) — `0x3059B0`, the AppCell child step.** `entry_003059a0` (0x3059A0..0x3059D0) is
 emitted with **no `switch (ctx->pc)` at all** (it starts `ctx->pc = 0x3059a0` and runs
@@ -8588,6 +8588,109 @@ consistent with a race between the resume and the next frame's use of that stack
 |---|---|---|
 | `TOL_RETCHAIN` | `src/runtime/tol_overrides.cpp` (`retChainEntryProbe`, `retChainEpilogueProbe`, `retChainThunkProbe`) | entry/epilogue/thunk of the `0x1B43E0` row with `$ra`, `sp`, the frame words and the guest thread id |
 | `TOL_SLOT38` | submodule `ps2xRuntime/src/lib/Kernel/EeScheduler.cpp` | samples `0x01FFFF38` at every dispatch turn, prints the pc that was running when it changed |
+| `TOL_SLOT38_CKPT` | submodule `ps2xRuntime/src/lib/ps2_runtime.cpp` (`eeCheckpointDue`) | same sample at every generated backward branch, which attributes a write to one loop region instead of a whole turn |
+| `TOL_SLOT38_STEP` | submodule `ps2xRuntime/src/lib/ps2_runtime.cpp` (`dispatchGuestBranch`) | checks the slot around every callee invocation and names the callee whose execution wrote it |
+
+---
+
+## Session 154 (2026-11-18) - the resume path traced end to end; `0x1B4458` fixed per-address, and why that is not the whole class
+
+### 154.1 What leaves `pc = 0x1B4458` pending
+
+`dispatchGuestBranch` sets `ctx->pc = targetPc`, calls the target, and then:
+
+```cpp
+if (ctx->pc == entryPc) ctx->pc = fallthroughPc;
+return ctx->pc == fallthroughPc;
+```
+
+So a call returns `true` (and the generated caller continues *inline*) **only** if the callee left `pc` exactly at
+the caller's `fallthroughPc`. A checkpoint inside the callee leaves `pc` at the callee's own loop head, the callee
+and every C++ caller return, and the scheduler re-dispatches that pc as a fresh top-level entry. The callee later
+executes `jr $ra`, which sets `pc = 0x1B4458` and returns to the *scheduler* (there is no C++ caller any more), so
+`0x1B4458` is dispatched top-level. That is the normal "resume a return point" path - not an error.
+
+Measured (`[slot38]`, fatal case):
+
+```
+[slot38] #49 0x001A152C -> 0x00000038 after pc=0x001A152C (new pc=0x001AC518 sp=0x01FFFF00 ra=0x001B4458)
+[slot38] #51 ... after pc=0x00166490 (new pc=0x001AC518 sp=0x01FFFF00 ra=0x001B4458)   <- GS ISR between resumes
+[slot38] #52 ... after pc=0x001AC518 (new pc=0x001B4458 sp=0x01FFFF20 ra=0x001B4458)
+```
+
+### 154.2 The frame is intact; only the `$ra` slot is recycled
+
+A full dump of `0x01FFFE80..0x01FFFF40` taken at the moment the slot goes bad shows a perfectly nested frame
+chain:
+
+```
+0x1FFFF00  003B0B90 00000000   FFFFFFFF FFFFFFFF   00000001 00000000   001B4458 00000000
+                          ^ FUN_001AC4F0 frame: s0, s1, s2, ra=0x1B4458 (correct)
+0x1FFFF20  0039F780 00000000   FFFFFFFF FFFFFFFF   00000001 00000000   00000038 00000000
+                          ^ FUN_001B43E0 frame: s0, s1=-1, s2=1, ra=0x38  <- only this word is wrong
+```
+
+`TOL_RETCHAIN` confirms the prologue cannot have written it: the thunk `0x19A9C0` forwards `$ra` unchanged and is
+**never** entered with anything but `0x1A1548`/`0x1A1564` (`THUNK-RA-ANOMALY` never fires), so the prologue's
+`sd ra,0x18(sp)` always stores a good value. `TOL_SLOT38_CKPT`/`TOL_SLOT38` show why the slot then changes: its
+address `0x01FFFF38` is the `$ra` slot of **every** 0x20-byte frame built at `sp = 0x01FFFF40` *and* of every
+0x40-byte frame built at the same depth, e.g.
+
+```
+[slotckpt] #119 0x001A1504 -> 0x001A152C  pc=0x001A1518  sp=0x01FFFF40   (FUN_001A35F0's ra)
+[slotckpt] #120 0x001A152C -> 0x001A1548  pc=0x001B4428  sp=0x01FFFF20   (FUN_001B43E0's prologue)
+```
+
+and `FUN_001B4220` (`addiu sp,-0x40; ... sd ra,0x38(sp)`) writes the same slot when it is called at that depth. So
+when the resume at `0x1B4458` lands after another call has reused the frame slot, it restores a value that is not a
+return address (`0x38` in the fatal runs).
+
+### 154.3 Fix applied (per-address, `0x1B4458`)
+
+`retChainEpilogueProbe` in `tol_overrides.cpp` now *is* the epilogue: it restores `s0/s1/s2` from the frame, takes
+`$ra` from the frame **only if `runtime->hasFunction(slot)`** (a range test alone is not enough - the slot has also
+been measured holding `0x0049C790`, a heap pointer inside the naive code range), otherwise substitutes the
+unconditional call site's continuation `0x1A1548` and repairs the slot, then jumps to the row's own tail target
+`0x1B6AD0`. With `TOL_RETCHAIN=1` it prints `REPAIR` when it substitutes.
+
+Measured effect: the `[badpc] ... pc=0x00000038` death disappeared from the runs that reproduce it.
+
+### 154.4 Why that is not the whole class (measured, not assumed)
+
+`badpc` was widened to fire for *any* non-dispatchable pc, not just `pc < 0x100000`, and the next run showed:
+
+```
+[badpc] thread=1 pc=0x0049C790 from=0x001A1548 ra=0x0049C790 sp=0x01FFFF50
+        recent=0x001A1548, 0x001B6AD0, 0x001B4458, 0x001AC518, ...
+```
+
+i.e. the repaired epilogue returned correctly to `0x1A1548`, the caller `FUN_001A1498` finished, and **its own**
+saved `$ra` (at `frame+0x20 = 0x01FFFF60`) was the stale one. The same run also produced the twin on the CRI thread
+(`thread=4 pc=0x0049C708 from=0x001A1548`). So the corruption is not one slot: a *whole activation's* frame chain
+can be recycled before the pending return point is resumed. A per-address guard cannot repair that; it can only
+re-purpose the entry with a known-good continuation, which is what 154.3 does for the one slot whose continuation
+is statically known.
+
+Note the run-to-run variance: `0x38` deaths happen late (~50 s of emulated time) in some runs, `0x49C790`
+immediately (`mainIters=1`) in others, and some 150 s runs reach neither - the resume/stack-reuse race is timing
+dependent, so a single run is not evidence of a fix or a regression. Judge by the `[badpc]` class and by
+`mainIters`/`[eethreads]`, and compare A/B over several runs.
+
+### 154.5 The durable fix (next)
+
+The pending return point must not outlive the frame it returns into. Two options, both in the runtime:
+
+1. **Do not leave a pending pc across a stack-reuse boundary**: when a checkpoint fires inside a callee, unwind to
+   the *callee's own* boundary and re-enter it as a top-level call (so its return still happens inside a live
+   chain), instead of letting the caller's continuation become a top-level pc.
+2. **Validate the resumed chain**: before dispatching an interior pc that is a return point, check that the chain
+   it returns into is still the one that produced it (e.g. a per-thread "pending return frame" token compared with
+   the thread's current `sp`). Cheap and general, but needs a place to store the token.
+
+The writer of the stale word itself is still unnamed; the next instrumented step is the **existing**
+`ps2TraceGuestWrite` hook in `ps2_runtime_macros.h` (every generated `WRITE32/WRITE64` already calls it), which can
+be given a watch on `0x01FFFF38` in a `.cpp` without touching the macro or rebuilding the corpus.
+
 
 
 
