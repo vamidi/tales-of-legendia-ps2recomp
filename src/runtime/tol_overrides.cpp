@@ -3247,6 +3247,14 @@ namespace
                          static_cast<unsigned long long>(now - sT0), runtime->Load32(rdram, ctx, 0x003DB31Cu));
     }
 
+    // Shared logger for the create/destroy call sites of the manager at 0x3DB31C.
+    void logSceneSite(const char *tag, uint32_t n, uint32_t ra, uint32_t a0, uint32_t mgr)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        if (sEnv && (n <= 10u || (n % 100u) == 0u))
+            std::fprintf(stderr, "[scenetest] site %s #%u ra=0x%08X a0=0x%08X mgr=0x%08X\n", tag, n, ra, a0, mgr);
+    }
+
     void installSceneStartProbes(PS2Runtime &runtime)
     {
         // FUN_00232110 is the engine's per-frame step: it calls vtable[0x1C] on the engine's three children at
@@ -3999,6 +4007,153 @@ namespace
                                         });
             }
             std::fprintf(stderr, "[scenetest] manager-clear probes installed\n");
+        }
+
+        // FUN_002055b0 is the scene driver (loader vt+0x4C). Its $ra at entry is the exact call site of the indirect
+        // dispatch, and its return time tells us whether it is ever re-entered.
+        if (runtime.lookupFunction(0x002055B0u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sDrvPrev = runtime.lookupFunction(0x002055B0u);
+            runtime.replaceFunction(0x002055B0u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t calls = 0u;
+                                        static uint64_t t0 = 0u;
+                                        const uint64_t now = GetTickCount64();
+                                        if (t0 == 0u)
+                                        {
+                                            t0 = now;
+                                        }
+                                        ++calls;
+                                        const uint32_t ra = GPR_U32(ctx, 31);
+                                        const uint32_t a0 = GPR_U32(ctx, 4);
+                                        const uint32_t vt = runtime->Load32(rdram, ctx, a0);
+                                        if (env && calls <= 12u)
+                                            std::fprintf(stderr,
+                                                         "[scenetest] sceneDriver ENTER #%u t=%llums ra=0x%08X "
+                                                         "self=0x%08X vt=0x%08X slot4C=0x%08X\n",
+                                                         calls, static_cast<unsigned long long>(now - t0), ra, a0,
+                                                         vt, runtime->Load32(rdram, ctx, vt + 0x4Cu));
+                                        if (sDrvPrev != nullptr)
+                                        {
+                                            sDrvPrev(rdram, ctx, runtime);
+                                        }
+                                        if (env && calls <= 12u)
+                                            std::fprintf(stderr,
+                                                         "[scenetest] sceneDriver EXIT  #%u t=%llums "
+                                                         "mgr=0x%08X\n",
+                                                         calls,
+                                                         static_cast<unsigned long long>(GetTickCount64() - t0),
+                                                         runtime->Load32(rdram, ctx, 0x003DB31Cu));
+                                    });
+        }
+
+        // Which of the manager's create/destroy call sites actually run? FUN_00366090, FUN_003367b0 and
+        // FUN_00338800 appear in BOTH lists (they create and destroy), and FUN_00169850 destroys.
+        {
+            static uint64_t sA = 0u;
+            static uint64_t sB = 0u;
+            static uint64_t sC = 0u;
+            static uint64_t sD = 0u;
+            static PS2Runtime::RecompiledFunction sAPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sBPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sCPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sDPrev = nullptr;
+            if (sAPrev == nullptr && runtime.lookupFunction(0x00366090u) != nullptr)
+            {
+                sAPrev = runtime.lookupFunction(0x00366090u);
+                runtime.replaceFunction(0x00366090u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sA;
+                                            logSceneSite("366090", static_cast<uint32_t>(sA), GPR_U32(ctx, 31),
+                                                         GPR_U32(ctx, 4),
+                                                         runtime->Load32(rdram, ctx, 0x003DB31Cu));
+                                            if (sAPrev != nullptr)
+                                            {
+                                                sAPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sBPrev == nullptr && runtime.lookupFunction(0x003367B0u) != nullptr)
+            {
+                sBPrev = runtime.lookupFunction(0x003367B0u);
+                runtime.replaceFunction(0x003367B0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sB;
+                                            logSceneSite("3367b0", static_cast<uint32_t>(sB), GPR_U32(ctx, 31),
+                                                         GPR_U32(ctx, 4),
+                                                         runtime->Load32(rdram, ctx, 0x003DB31Cu));
+                                            if (sBPrev != nullptr)
+                                            {
+                                                sBPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sCPrev == nullptr && runtime.lookupFunction(0x00338800u) != nullptr)
+            {
+                sCPrev = runtime.lookupFunction(0x00338800u);
+                runtime.replaceFunction(0x00338800u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sC;
+                                            logSceneSite("338800", static_cast<uint32_t>(sC), GPR_U32(ctx, 31),
+                                                         GPR_U32(ctx, 4),
+                                                         runtime->Load32(rdram, ctx, 0x003DB31Cu));
+                                            if (sCPrev != nullptr)
+                                            {
+                                                sCPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sDPrev == nullptr && runtime.lookupFunction(0x00169850u) != nullptr)
+            {
+                sDPrev = runtime.lookupFunction(0x00169850u);
+                runtime.replaceFunction(0x00169850u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sD;
+                                            logSceneSite("169850", static_cast<uint32_t>(sD), GPR_U32(ctx, 31),
+                                                         GPR_U32(ctx, 4),
+                                                         runtime->Load32(rdram, ctx, 0x003DB31Cu));
+                                            if (sDPrev != nullptr)
+                                            {
+                                                sDPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            std::fprintf(stderr, "[scenetest] create/destroy site probes installed\n");
+        }
+
+        // FUN_00165400(obj) is the generic dispatcher (*(obj+0x10))->vt[0x0C](). Tracing it shows every vt+0x0C
+        // dispatch (including the loader's scene driver FUN_00366090) and exactly when it stops happening.
+        if (runtime.lookupFunction(0x00165400u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sDispPrev = runtime.lookupFunction(0x00165400u);
+            runtime.replaceFunction(0x00165400u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t calls = 0u;
+                                        static uint64_t t0 = 0u;
+                                        const uint64_t now = GetTickCount64();
+                                        if (t0 == 0u)
+                                        {
+                                            t0 = now;
+                                        }
+                                        ++calls;
+                                        const uint32_t obj = GPR_U32(ctx, 4);
+                                        const uint32_t vp = runtime->Load32(rdram, ctx, obj + 0x10u);
+                                        const uint32_t vt = runtime->Load32(rdram, ctx, vp);
+                                        if (env && (calls <= 16u || (calls % 200u) == 0u))
+                                            std::fprintf(stderr,
+                                                         "[scenetest] vt0C #%u t=%llums obj=0x%08X vptr(+10)=0x%08X "
+                                                         "vt=0x%08X target=0x%08X ra=0x%08X mgr=0x%08X\n",
+                                                         calls, static_cast<unsigned long long>(now - t0), obj, vp,
+                                                         vt, runtime->Load32(rdram, ctx, vt + 0xCu),
+                                                         GPR_U32(ctx, 31),
+                                                         runtime->Load32(rdram, ctx, 0x003DB31Cu));
+                                        if (sDispPrev != nullptr)
+                                        {
+                                            sDispPrev(rdram, ctx, runtime);
+                                        }
+                                    });
         }
 
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",

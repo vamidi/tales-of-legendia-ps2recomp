@@ -7084,6 +7084,59 @@ machine step that should re-enter it after `FUN_00285E80`'s scene start: the loa
 `0x3D4750`, so read its state fields after the scene start and find the guard/branch that ends the sequence instead of
 looping back to `+0x4C`. That branch is the fix site.
 
+### Session 152 - CORRECTION: the driver is FUN_00366090 (not FUN_002055b0); vt+0x0C is dispatched only 4 times total
+
+**My previous attribution was wrong.** `FUN_002055b0` (stored at `0x3D479C`) **never runs** - probed directly, zero entries.
+The real scene driver, found by capturing `$ra` at the manager factory's call site, is:
+
+```
+[scenetest] site 366090 #1 ra=0x00165230 a0=0x0063D890 mgr=0x00000000
+```
+
+- **`FUN_00366090`** is the driver: it calls both the manager **create** (`FUN_001ea850`) and the **destroy**
+  (`FUN_001ea8b0`), and it appears in both caller lists.
+- **`a0 = 0x0063D890` is the loader object** (vtable `0x3D4750`) - so the loader is what it drives.
+- `ra = 0x165230` -> the `jal` at `0x165228`, which is `jal 0x165400`; this code uses **tail jumps** (`j`, see
+  `0x165210`), which preserve `ra`, so the driver was entered through a tail jump from the loader step.
+
+**The dispatch chain, decompiled:**
+
+```c
+FUN_00165400(obj)   { (*(obj + 0x10))->vt[0x0C](); }    // generic "call vt+0x0C" dispatcher
+FUN_00165220(obj)   { FUN_00165400(*(obj)); FUN_0015231c(); return 1; }   // step one object + yield
+FUN_00165150(p, m)  { node = FUN_00164e40(...); *node = p; link node into list at piGpffff8608; }  // list append
+```
+
+So the loader's **`vt+0x0C` = `0x204240` = the fade**, and the whole scene phase is driven by repeatedly stepping objects
+through `FUN_00165220` -> `FUN_00165400` -> `(*obj[0x10])->vt[0x0C]()`.
+
+**Measured: that dispatcher runs exactly 4 times in the whole session, the last at t = 10.156 s.**
+
+```
+[scenetest] vt0C #1 t=0ms      obj=0x0063D850 vptr(+10)=0x003D4770
+[scenetest] vt0C #2 t=0ms      obj=0x0063D890 vptr(+10)=0x003DA380
+[scenetest] vt0C #3 t=1390ms   obj=0x0063D890 vptr(+10)=0x003D4750
+[scenetest] vt0C #4 t=10156ms  obj=0x0063D890 vptr(+10)=0x003D4750
+total = 4
+```
+
+`vptr(+10)=0x3DA380 -> 0x3D4750` is exactly the loader's recorded vtable switch, and `0x3D4750 + 0x0C = 0x204240` (the
+fade). After t = 10.156 s **nothing dispatches `vt+0x0C` again**, so the loader is never stepped after the scene start
+(which happens at ~36 s), the scene driver is never re-entered, the manager stays null from ~17.6-28.6 s onward, and no
+script/map/field code (all `vt+0x0C` methods) ever runs.
+
+**The guard is therefore not a branch inside the driver** - it is that the *object-step loop* (the code that calls
+`FUN_00165220` on each list node) stops after 4 iterations. That loop is the fix site.
+
+### Next probe (exact)
+
+Instrument `FUN_00165220` (`0x165220`) - the "step one object + yield" wrapper - logging `*(a0)` and `ra` at every call,
+and instrument the list head `piGpffff8608` (`gp - 0x79F8` = `0x3DB1F8`... verify: `0xFFFF8608` signed = `-0x79F8`, so
+`gp - 0x79F8`). Then the loop that calls `FUN_00165220` will be identified by its `ra`, and the guard that ends it
+(fewer than 4 objects in the list, or an early exit) will be visible in one run. That loop is where the port fix belongs:
+the loader object still exists with vtable `0x3D4750`, so it must be kept in that step list after the scene start -
+exactly what the guest does, with no emulation involved.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
