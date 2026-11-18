@@ -7768,6 +7768,51 @@ approaches 27 MB x (passes/s) then (A) holds and a repeated ~27 MB clear is the 
 ~324 ms gaps persist then (B) holds and the period is intrinsic to the boot loop. No conclusion until that ratio is
 measured - the last four entries show how expensive it is to skip this step.
 
+### Session 152 - the ratio decides: (A) refuted, (B) holds; steady state is healthy
+
+Aggregated per second from the event-loop pass: passes/s, memset calls/s and **bytes/s**, printed as `[agg]`.
+
+```
+[agg] evloopPasses/s=31.6  memsetCalls/s=2.0  memsetMB/s=27.03  lastGap=325ms     boot
+[agg] evloopPasses/s=6.0   memsetCalls/s=0.0  memsetMB/s=0.00   lastGap=325ms     boot - gap with NO memset
+[agg] evloopPasses/s=16.9  memsetCalls/s=1.0  memsetMB/s=27.15  lastGap=324ms     boot
+[agg] evloopPasses/s=13.9  memsetCalls/s=2.0  memsetMB/s=0.00   lastGap=64ms      boot
+[agg] evloopPasses/s=2001.6 memsetCalls/s=64.4 memsetMB/s=0.07  lastGap=13ms      transition
+[agg] evloopPasses/s=927.2 memsetCalls/s=0.0  memsetMB/s=0.00   lastGap=16ms      steady state
+[agg] evloopPasses/s=918.2 memsetCalls/s=0.0  memsetMB/s=0.00   lastGap=16ms      steady state
+```
+
+**Applying the pre-stated test literally:**
+
+- If each pass were preceded by a 27 MB clear, bytes/s would equal `27 MB x passes/s` = 27 x 31.6 = **853 MB/s**. Measured
+  **27 MB/s** - i.e. about **one clear per second** against **6-32 passes/s**, so roughly **one clear per 32 passes**.
+- One sample shows a **325 ms gap with `memsetMB/s = 0.00`**, so a long gap occurs with no memset at all.
+
+**Verdict: (A) is refuted** - repeated 27 MB clears are not what produces the gaps. **The boot-phase gaps are intrinsic to
+the boot loop; the .bss clears ride along as boot work.** The 27 MB clear is real (`dst=0x4E9B80`, .bss start, `ra` in CRT
+start-up) but occurs ~1/s during boot only and **disappears entirely in steady state**.
+
+**And steady state is healthy:** `evloopPasses/s ~ 920` with `lastGap ~ 16 ms` (one VBlank) and **zero memset traffic**.
+The event loop is not starved once the game is running.
+
+**Where this leaves the investigation**
+
+Measured correct: renderer, GS backend, presenter, pacer, VBlank raise path, scheduler fairness, TCB arming/linking/waiter
+count, fade, scene start, frame-loop per-call cost, and now event-loop pass rate in steady state (~920/s, 16 ms gaps).
+Boot-phase slowness is intrinsic boot work, not a defect in the port's event loop.
+
+The single unchanging defect remains functional: **no model/scene load is ever requested**, so no geometry is streamed
+and the GS receives clears only.
+
+### Next probe (exact)
+
+Leave the timing/question of *rate* behind and attack the functional gap directly at the point it should happen. The
+earlier chain established `FUN_002311b0` (the entry kick) is never called and the field/scene classes (vtables
+`0x3D2580`, `0x3D5030`, `0x3D51A0`) are never constructed. Pick the nearest never-called site and instrument its
+**required preconditions** rather than its callers: for `FUN_00230ad0` that is `(entity[0x18] || entity[0x1C]) &&
+entity[0x160] == 1`, measured as `0/0/0` on the only entity stepped. Find who is supposed to write `entity[0x18]`
+(source handle) - that writer is the fix site, and it is guest logic.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

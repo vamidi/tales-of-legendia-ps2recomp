@@ -54,6 +54,9 @@ namespace tol_state
 
 // VBlank event counter owned by EeScheduler.cpp.
 extern std::atomic<uint64_t> g_tolVBlankTicks;
+// memset traffic counters owned by EeScheduler.cpp, aggregated per second there.
+extern std::atomic<uint64_t> g_tolMemsetCalls;
+extern std::atomic<uint64_t> g_tolMemsetBytes;
 
 namespace
 {
@@ -4699,6 +4702,8 @@ namespace
                                         static const bool env = std::getenv("TOL_MEMSET") != nullptr;
                                         static uint64_t big = 0u, total = 0u;
                                         ++total;
+                                        g_tolMemsetCalls.fetch_add(1u, std::memory_order_relaxed);
+                                        g_tolMemsetBytes.fetch_add(size, std::memory_order_relaxed);
                                         if (size >= 0x1000u)
                                         {
                                             ++big;
