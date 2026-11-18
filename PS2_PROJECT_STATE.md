@@ -7658,6 +7658,61 @@ precise: **why can a single `dispatch(4)` run for ~22 VBlank periods (~370 ms) w
 That is a port-side scheduler question (the event loop must preempt long guest runs), and it is the mechanism behind the
 1-5/s VBlank rates measured during boot and the regime instability.
 
+### Session 152 - measuring it better: unified per-second line + four rules; starvation is a BOOT-phase fact
+
+**Why the previous claim was unreliable.** The `vblank=0` per-iteration samples and the "60/60/60 healthy" samples came
+from *different phases of the same run*. The existing `max_late_us` time series already showed it, and I had read only the
+tail of it:
+
+```
+tick=1 203002us  tick=14 1141730us  tick=53 2787544us  tick=54 2897712us   <- boot
+tick=230 2027us  tick=350 1497us    tick=470 1983us    tick=591 1441us     <- steady state
+```
+
+**Four measurement rules derived from the actual failures:**
+
+1. **Never report a rate without its time series.** `max_late_us` spanned 2 ms -> 2.9 s in one run; a single value cannot
+   describe it. (This caused the "VBlank starved" claim to be stated for the whole run.)
+2. **Verify a counter's semantics before comparing.** `c2` in `[eeirq]` is *cumulative*; `max_late_us` is
+   *per-window*. Confusing them produced a fictitious 3.6x deficit, then hid a phase change.
+3. **Never derive a mechanism from a ratio of aggregates.** `60/17.5 = 3.43 -> "3.4 VBlanks/iteration"` was arithmetic
+   dressed as physics; the direct measurement (0 or 1 per iteration) refuted it.
+4. **Prefer metrics anchored to absolute time over counters incremented where events are processed.** A counter that only
+   advances in the event-processing path can never prove events are not being processed.
+
+**Rule 1 implemented** - `TOL_PACING_RATIO` now prints one line per second carrying the rate, the lateness, the regime
+and the frame-loop rate together, so a phase change cannot hide:
+
+```
+[ratio] vblank/s=.. start/s=.. end/s=.. timer/s=.. raises/s=.. maxLate=..us mainIters/s=.. | loader=state/chan/alive
+```
+
+**What it shows (45 s run):**
+
+```
+[ratio] vblank/s=1 start/s=1 end/s=1 raises/s=2 maxLate=948810us  mainIters/s=0  | loader=0/0/0
+[ratio] vblank/s=1 ...                 maxLate=953497us  mainIters/s=0  | loader=0/0/0
+[ratio] vblank/s=1 ...                 maxLate=922371us  mainIters/s=10 | loader=1/4/1
+[ratio] vblank/s=0 ...                 maxLate=3992101us mainIters/s=16 | loader=1/4/1
+```
+
+- **Boot phase: VBlank is serviced at 1-3/s with 0.4-4.0 s lateness.** `maxLate` is measured against an absolute host
+  deadline, so this is genuine: the event loop is serviced roughly once per second while the guest runs uninterrupted.
+- **The loader TCB is `0/0/0` throughout that phase** and only becomes `1/4/1` once the main loop starts.
+- In a longer run the same metric recovers to **60/s with ~2 ms lateness** (tick 230+ above), so the starvation is a
+  **boot-phase** phenomenon, not a steady-state one.
+
+**So the corrected statement**: VBlank starvation is real but *phase-specific* (boot), and it is not what keeps the screen
+black in steady state - the steady state is healthy at 60/s. The unchanging functional defect remains: no model/scene
+load is ever requested.
+
+### Next probe (exact)
+
+Find what the guest is doing during the boot phase that blocks the event loop for ~1 s at a time: log, per second, the
+current guest PC (and its containing function) at the moment the event loop finally runs, plus the elapsed wall time since
+the previous event-loop pass. That names the long-running guest region directly, with the same absolute-time anchoring
+that made the lateness number trustworthy.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
