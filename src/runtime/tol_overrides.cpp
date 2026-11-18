@@ -2892,17 +2892,34 @@ namespace
                         std::fprintf(stderr, " s%u=%u", i, stateHist[i]);
                 std::fprintf(stderr, "\n");
             }
-            // The walk's `a2` comes from FUN_0027B870(1, idx): bits 1, 3, 5 of the mode byte at gp+0x4A86D9.
+            // The walk's `a2` comes from FUN_0027B870(1, idx):
+            //     *(u8*)(iGpffff87bc * 0x12D8 + 0x4A86D9)
+            // where iGpffff87bc is the int at gp-0x7844. Bits 1/3/5 of that byte gate processing for
+            // types 16/17/18. Sample it (and detect changes) rather than assuming the scaled index is zero.
             {
                 const uint32_t gp = GPR_U32(ctx, 28);
-                const uint32_t addr = gp + 0x4A86D9u;
-                if (gp >= 0x00100000u && addr + 1u < PS2_RAM_SIZE)
+                const uint32_t indexAddr = gp - 0x7844u;
+                if (gp >= 0x00100000u && indexAddr + 4u < PS2_RAM_SIZE)
                 {
-                    const uint32_t mode = runtime->Load8(rdram, ctx, addr);
-                    std::fprintf(stderr,
-                                 "[queue]   modeByte gp=0x%08X [0x%08X]=0x%02X which0=[%u,%u,%u] which1=[%u,%u,%u]\n",
-                                 gp, addr, mode & 0xFFu, mode & 1u, (mode >> 2) & 1u, (mode >> 4) & 1u,
-                                 (mode >> 1) & 1u, (mode >> 3) & 1u, (mode >> 5) & 1u);
+                    const uint32_t index = runtime->Load32(rdram, ctx, indexAddr);
+                    const uint32_t modeAddr = index * 0x12D8u + 0x4A86D9u;
+                    if (modeAddr + 4u < PS2_RAM_SIZE && index < 0x1000u)
+                    {
+                        const uint32_t mode = runtime->Load8(rdram, ctx, modeAddr);
+                        static uint32_t sLastMode = 0xFFFFFFFFu;
+                        static uint32_t sChanges = 0u;
+                        const bool changed = (mode != sLastMode);
+                        if (changed)
+                        {
+                            ++sChanges;
+                            sLastMode = mode;
+                        }
+                        std::fprintf(stderr,
+                                     "[queue]   mode byte idx=0x%08X addr=0x%08X val=0x%02X changes=%u "
+                                     "which1=[%u,%u,%u]\n",
+                                     index, modeAddr, mode & 0xFFu, sChanges, (mode >> 1) & 1u, (mode >> 3) & 1u,
+                                     (mode >> 5) & 1u);
+                    }
                 }
             }
         }

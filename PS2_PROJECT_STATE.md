@@ -6474,6 +6474,48 @@ Find the writer of `gp+0x4A86D9` - the scene-mode setter that should run when a 
 happen rather than a per-field bug. Watch the byte (range watch on a 4-byte window around it) and log the PC that
 writes it; if nothing ever writes it, the init path is the missing piece.
 
+### Session 152 - REFUTED by the reference: the mode byte is 0x14 on hardware too
+
+Corrected the address first: `FUN_0027B870` reads `*(u8*)(index * 0x12D8 + 0x4A86D9)` where
+`index = *(gp - 0x7844)`; the index is 0, so the byte is the **static** address `0x004A86D9` (not the
+`gp + 0x4A86D9` I first printed). Watched over 30 s:
+
+```
+[queue] mode byte idx=0x00000000 addr=0x004A86D9 val=0x14 changes=1 which1=[0,0,0]
+```
+
+`0x14` = `0001 0100` -> idx0 which0/which1 = 0/0, idx1 = 1/0, idx2 = 1/0. The `which1` bits (1, 3, 5) - exactly
+what `a2` reads - are 0, and `changes=1` means **nothing writes the byte in the port**.
+
+**PCSX2 reads the same bytes:**
+
+```
+PCSX2 [0x4A86D9] = 0x14
+```
+
+So the guest *legitimately* leaves `which1` clear: the walk's `a1 == 1 && a2 == 1` gate for types 16/17/18 is
+simply not enabled at this point on hardware either. The earlier "root cause = uninitialised mode byte" note is
+**withdrawn**; the 8 matches are normal and the 60 Hz poll is normal.
+
+What remains true from this line of work: the 233-slot table is **populated** (230/233, types 1-5, one type-2 entry
+each in states 16/17/18), the walk runs at a normal 60 Hz, and `matches` stays at 8 *by design*.
+
+### Where the investigation turns next
+
+The measured anomaly that is still unexplained is the fade's **first wait**:
+
+```c
+uVar4 = FUN_001f72f0(obj+0x14, obj+0x18, 0);
+while (thunk_FUN_001f8480(uVar4) != 0) FUN_0015231c();     // <- before anything is drawn
+```
+
+The loader TCB (`0x4079A0`) was parked at `pc=0x204380`, i.e. **inside `FUN_00204240`**, and the loader step
+`0x165400` is invoked only 4 times - consistent with the thread sitting in that wait loop rather than returning to
+its step. My probe on `0x1F8480` never fired, which means that address is not the function behind
+`thunk_FUN_001f8480` (the thunk targets something else). Naming the real target and probing its return value is
+the next concrete step: if it never returns 0, the fade never draws, the thread never returns, and the pipeline
+never re-arms - which would tie every observation together without touching the renderer or the guest's fade.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
