@@ -6824,6 +6824,71 @@ entries: probe the scene setup methods (`0x285150`, `0x285280`, `0x285330`, `0x2
 `+0x14C`, and check whether the kick is gated on `FUN_001a1460(entry[0x30])` or on the entry being "visible"
 (a camera/frustum test) - a scene that is never marked visible would leave every entry at 0.
 
+### Session 152 - the writer of entry+0x14C: a complete table, and every load request is dead
+
+Every write to `entry+0x14C` in the scene cluster, with its caller and what it was measured doing:
+
+| state | writer | who calls it | measured |
+|---|---|---|---|
+| **1** | `FUN_002928b0` (`FUN_0010b7e8(entry+0x40)` then `1`) | `FUN_002311b0` | **0 calls** |
+| **2** | `FUN_00292930` (stores a2/a3 at +0x38/+0x3C, then `2`) | `FUN_002311b0`, `FUN_00285bc0` | **0 calls** |
+| **4** | `FUN_00292a40` (same, then `4`) | `FUN_00285c90` | **0 calls** |
+| 5 | `FUN_00292990` / `FUN_00292a60` (open the stream, size > 0) | handlers of state 3 / 4 | n/a - states never reached |
+| 6 | `FUN_002855e0` (chunk read) | handler of state 5 | n/a |
+| 7 | `FUN_002928f0` / `FUN_00292950` | handlers of state 1 / 2 | n/a |
+| 0 | `FUN_00292610` (reset: state 0, close stream, clear model) | `FUN_002854a0` when the visibility test passes | **14 calls, on entries 0x4EA090 / 0x53DE20 only** |
+
+**The kick chain, statically:**
+
+```
+engine child +0x0C (0x4E9DB0, vtable 0x3D4AC0) -> vt[+0x1C] = FUN_00230a50
+   if (*(char*)(entity+0x14) == 1) {
+       FUN_00230ad0(entity)                 <-- gate:
+          if ((entity[0x18] || entity[0x1C]) && entity[0x160] == 1) {
+             if ((entity[0x158]==2 || entity[0x158]==3) && FUN_00197668()==3 && entity[0x28]==1) {
+                 FUN_00231be0(...); FUN_002311b0(entity); entity[0x28]=0;   <-- the only kick
+```
+
+```
+scene vt[+0xFC] (0x3D51CC) = FUN_0029ce60 -> FUN_00285bc0 -> FUN_00292930  (state 2)
+FUN_0027d0f0 -> FUN_001ed680 -> FUN_00285c90 -> FUN_00292a40              (state 4)
+scene vt[+0x28] (0x2895f0) - no references at all, never dispatched
+```
+
+**Measured (90 s, `TOL_TRACE_SCENE`):**
+
+```
+[scenetest] entstep #1..#10  entity=0x004E9DB0  mode(+14)=1  RUNS
+                            f158=0 f160=0 pending(+28)=0 src(+18)=0x00000000 src(+1C)=0x00000000
+                            entry(+0C)=0x004EA090
+[scenetest] vis #1..#500     obj=0x003933C8/...  status(+1)=0  => keep
+counts: entstep=10  kick=0  sceneReq2=0  sceneReq4=0  sceneVt28=0
+```
+
+**So the answer to "why do the entries sit at 0": no load request is ever issued.**
+
+- The entity step `FUN_00230a50` *does* run (10x) and its mode gate `entity[+0x14] == 1` *does* pass.
+- But the one entity being stepped is **unconfigured**: `entity+0x18 = entity+0x1C = 0` (no data source) and
+  `entity+0x160 = 0` (mode 0, where the kick needs 1, and the commit branch needs 2).
+- `FUN_00230ad0` therefore fails its very first test and returns without touching anything.
+- The scene's own requesters are never reached either: `FUN_00285bc0` (state 2) is only reachable through scene
+  vtable **+0xFC**, and `FUN_00285c90` (state 4) only through `FUN_0027d0f0 -> FUN_001ed680`; both are 0 calls.
+  The scene's `+0x28` slot (`0x2895f0`) has no references at all.
+
+Neither the visibility/camera test (`FUN_001a1460`: `drawObj[+1] == 5`) nor the reset path is responsible - it
+reads `0` ("keep") on all four draw objects and only ever fires on two other entries.
+
+The four scene entries are therefore healthy but never handed work: each has a draw object (`+0x30`), a file
+(`+0x34`) and a 0.5 scale (`+0x140`), and stays at state 0 forever.
+
+### Next probe (exact)
+
+Find who is supposed to write `entity+0x18` / `entity+0x1C` (the data source) and `entity+0x158` / `entity+0x160`
+(mode/variant) on the stepped entity, and why that never happens: trace `FUN_0027d0f0` (the state-4 requester's
+root) and the scene's `+0xFC` slot `FUN_0029ce60`, and check whether the scene definition that should configure
+the entity is the same data that the 27 accepted TLPS chunks carry - i.e. whether the definition arrives and is
+dropped, or never arrives at all.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

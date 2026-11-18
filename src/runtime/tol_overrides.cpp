@@ -3434,6 +3434,192 @@ namespace
             }
         }
 
+        // The step resets an entry (state -> 0, stream closed) whenever FUN_001a1460(entry[0x30]) says the draw
+        // object's status byte is 5. Sample that byte and count the resets - if it is always 5, every entry is
+        // wiped every frame and the pipeline can never advance.
+        {
+            static uint64_t sVisChecks = 0u;
+            static uint64_t sResets = 0u;
+            static PS2Runtime::RecompiledFunction sVisPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sResetPrev = nullptr;
+            if (sVisPrev == nullptr && runtime.lookupFunction(0x001A1460u) != nullptr)
+            {
+                sVisPrev = runtime.lookupFunction(0x001A1460u);
+                runtime.replaceFunction(0x001A1460u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            const uint32_t obj = GPR_U32(ctx, 4);
+                                            uint32_t status = 0xFFFFFFFFu;
+                                            if (obj >= 0x00100000u && obj + 8u < PS2_RAM_SIZE)
+                                                status = runtime->Load8(rdram, ctx, obj + 1u) & 0xFFu;
+                                            ++sVisChecks;
+                                            if (sVisPrev != nullptr)
+                                            {
+                                                sVisPrev(rdram, ctx, runtime);
+                                            }
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sVisChecks <= 8u || (sVisChecks % 500u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] vis #%llu obj=0x%08X status(+1)=%u "
+                                                             "=> %s (resets so far %llu)\n",
+                                                             static_cast<unsigned long long>(sVisChecks), obj,
+                                                             status, status == 5u ? "RESET entry" : "keep",
+                                                             static_cast<unsigned long long>(sResets));
+                                        });
+            }
+            if (sResetPrev == nullptr && runtime.lookupFunction(0x00292610u) != nullptr)
+            {
+                sResetPrev = runtime.lookupFunction(0x00292610u);
+                runtime.replaceFunction(0x00292610u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sResets;
+                                            const uint32_t entry = GPR_U32(ctx, 4);
+                                            if (sResetPrev != nullptr)
+                                            {
+                                                sResetPrev(rdram, ctx, runtime);
+                                            }
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sResets <= 6u || (sResets % 200u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] RESET #%llu entry=0x%08X\n",
+                                                             static_cast<unsigned long long>(sResets), entry);
+                                        });
+            }
+        }
+
+        // FUN_002311B0 is the kick: when entity[0x160]==2 and entity[0x2A8]!=1, entity[0x158]==2 sets the entry to
+        // state 1 (FUN_002928b0) then runs the state-1 handler (FUN_002928f0 -> 7); ==3 does the 2 -> 7 pair.
+        // Sample the three gates and which entry each entity owns.
+        if (runtime.lookupFunction(0x002311B0u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sKickPrev = runtime.lookupFunction(0x002311B0u);
+            runtime.replaceFunction(0x002311B0u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        const uint32_t e = GPR_U32(ctx, 4);
+                                        uint32_t f158 = 0u, f160 = 0u, f2A8 = 0u, entry = 0u;
+                                        if (e >= 0x00100000u && e + 0x2B0u < PS2_RAM_SIZE)
+                                        {
+                                            f158 = runtime->Load32(rdram, ctx, e + 0x158u);
+                                            f160 = runtime->Load32(rdram, ctx, e + 0x160u);
+                                            f2A8 = runtime->Load8(rdram, ctx, e + 0x2A8u) & 0xFFu;
+                                            entry = runtime->Load32(rdram, ctx, e + 0x0Cu);
+                                        }
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t calls = 0u;
+                                        ++calls;
+                                        if (env && (calls <= 10u || (calls % 200u) == 0u))
+                                            std::fprintf(stderr,
+                                                         "[scenetest] kick #%u entity=0x%08X entry=0x%08X "
+                                                         "f158=%u f160=%u f2A8=%u -> %s\n",
+                                                         calls, e, entry, f158, f160, f2A8,
+                                                         (f160 == 2u && f2A8 != 1u && (f158 == 2u || f158 == 3u))
+                                                             ? "KICKS"
+                                                             : "no-op");
+                                        if (sKickPrev != nullptr)
+                                        {
+                                            sKickPrev(rdram, ctx, runtime);
+                                        }
+                                    });
+        }
+
+        // FUN_00230a50 is engine child +0x0C's vtable[0x1C]: the entity step. It is gated on
+        // *(char*)(entity+0x14) == 1, then calls FUN_00230ad0 -> FUN_002311b0 (the entry kick). Sample the gate
+        // and everything downstream so a single run says which condition stops the chain.
+        if (runtime.lookupFunction(0x00230A50u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sEntPrev = runtime.lookupFunction(0x00230A50u);
+            runtime.replaceFunction(0x00230A50u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        const uint32_t e = GPR_U32(ctx, 4);
+                                        uint32_t mode14 = 0xFFFFFFFFu, f158 = 0u, f160 = 0u, f28 = 0u, entry = 0u;
+                                        uint32_t f18 = 0u, f1C = 0u;
+                                        if (e >= 0x00100000u && e + 0x2B0u < PS2_RAM_SIZE)
+                                        {
+                                            mode14 = runtime->Load8(rdram, ctx, e + 0x14u) & 0xFFu;
+                                            f158 = runtime->Load32(rdram, ctx, e + 0x158u);
+                                            f160 = runtime->Load32(rdram, ctx, e + 0x160u);
+                                            f28 = runtime->Load8(rdram, ctx, e + 0x28u) & 0xFFu;
+                                            f18 = runtime->Load32(rdram, ctx, e + 0x18u);
+                                            f1C = runtime->Load32(rdram, ctx, e + 0x1Cu);
+                                            entry = runtime->Load32(rdram, ctx, e + 0x0Cu);
+                                        }
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t calls = 0u;
+                                        ++calls;
+                                        if (env && (calls <= 10u || (calls % 200u) == 0u))
+                                            std::fprintf(stderr,
+                                                         "[scenetest] entstep #%u entity=0x%08X mode(+14)=%u %s | "
+                                                         "f158=%u f160=%u pending(+28)=%u src(+18)=0x%08X "
+                                                         "src(+1C)=0x%08X entry(+0C)=0x%08X\n",
+                                                         calls, e, mode14,
+                                                         mode14 == 1u ? "RUNS" : "SKIPPED", f158, f160, f28, f18,
+                                                         f1C, entry);
+                                        if (sEntPrev != nullptr)
+                                        {
+                                            sEntPrev(rdram, ctx, runtime);
+                                        }
+                                    });
+        }
+
+        // The scene's own load requests: FUN_00285bc0 sets entry state 2 (FUN_00292930) and FUN_00285c90 sets
+        // state 4 (FUN_00292a40). If these never run, the scene's four entries can never enter the pipeline.
+        {
+            static uint64_t sReqA = 0u;
+            static uint64_t sReqB = 0u;
+            static uint64_t sSlot28 = 0u;
+            static PS2Runtime::RecompiledFunction sReqAPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sReqBPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sSlot28Prev = nullptr;
+            if (sReqAPrev == nullptr && runtime.lookupFunction(0x00285BC0u) != nullptr)
+            {
+                sReqAPrev = runtime.lookupFunction(0x00285BC0u);
+                runtime.replaceFunction(0x00285BC0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sReqA;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sReqA <= 5u || (sReqA % 200u) == 0u))
+                                                std::fprintf(stderr, "[scenetest] sceneReq2 #%llu a0=0x%08X\n",
+                                                             static_cast<unsigned long long>(sReqA), GPR_U32(ctx, 4));
+                                            if (sReqAPrev != nullptr)
+                                            {
+                                                sReqAPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sReqBPrev == nullptr && runtime.lookupFunction(0x00285C90u) != nullptr)
+            {
+                sReqBPrev = runtime.lookupFunction(0x00285C90u);
+                runtime.replaceFunction(0x00285C90u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sReqB;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sReqB <= 5u || (sReqB % 200u) == 0u))
+                                                std::fprintf(stderr, "[scenetest] sceneReq4 #%llu a0=0x%08X\n",
+                                                             static_cast<unsigned long long>(sReqB), GPR_U32(ctx, 4));
+                                            if (sReqBPrev != nullptr)
+                                            {
+                                                sReqBPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sSlot28Prev == nullptr && runtime.lookupFunction(0x002895F0u) != nullptr)
+            {
+                sSlot28Prev = runtime.lookupFunction(0x002895F0u);
+                runtime.replaceFunction(0x002895F0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sSlot28;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sSlot28 <= 5u || (sSlot28 % 200u) == 0u))
+                                                std::fprintf(stderr, "[scenetest] sceneVt28 #%llu a0=0x%08X\n",
+                                                             static_cast<unsigned long long>(sSlot28),
+                                                             GPR_U32(ctx, 4));
+                                            if (sSlot28Prev != nullptr)
+                                            {
+                                                sSlot28Prev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+        }
+
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
                      runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",
                      runtime.lookupFunction(0x00285E80u) != nullptr ? "ok" : "NULL",
