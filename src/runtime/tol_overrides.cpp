@@ -3104,6 +3104,42 @@ namespace
                          static_cast<unsigned long long>(gSceneStep38Calls), GPR_U32(ctx, 4));
     }
 
+    PS2Runtime::RecompiledFunction gSceneStep1CPrev = nullptr;
+    uint64_t gSceneStep1CCalls = 0u;
+    uint64_t gSceneStep1CSceneCalls = 0u;
+
+    void sceneStep1CProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gSceneStep1CCalls;
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        // Count calls whose receiver IS the scene object: logging only the first N calls hid them last run (the
+        // first ten belonged to another object that shares this entry).
+        if (a0 == gSceneObj)
+        {
+            ++gSceneStep1CSceneCalls;
+        }
+        if (gSceneStep1CPrev != nullptr)
+        {
+            gSceneStep1CPrev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        if (sEnv)
+        {
+            const bool isScene = (a0 == gSceneObj);
+            if (isScene && gSceneStep1CSceneCalls <= 5u)
+                std::fprintf(stderr, "[scenestep] vt+1C SCENE #%llu (total %llu) a0=0x%08X\n",
+                             static_cast<unsigned long long>(gSceneStep1CSceneCalls),
+                             static_cast<unsigned long long>(gSceneStep1CCalls), a0);
+            else if (!isScene && gSceneStep1CCalls <= 3u)
+                std::fprintf(stderr, "[scenestep] vt+1C other  #%llu a0=0x%08X\n",
+                             static_cast<unsigned long long>(gSceneStep1CCalls), a0);
+            if ((gSceneStep1CCalls % 200u) == 0u)
+                std::fprintf(stderr, "[scenestep] vt+1C SUMMARY total=%llu sceneObject=%llu\n",
+                             static_cast<unsigned long long>(gSceneStep1CCalls),
+                             static_cast<unsigned long long>(gSceneStep1CSceneCalls));
+        }
+    }
+
     // Called from sceneBProbe (FUN_00285E80) with the scene object in a0.
     void sceneObjectDiscovery(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t obj)
     {
@@ -3119,6 +3155,20 @@ namespace
             return;
         const uint32_t step10 = runtime->Load32(rdram, ctx, gSceneVtable + 0x10u);
         const uint32_t step38 = runtime->Load32(rdram, ctx, gSceneVtable + 0x38u);
+        // The engine (FUN_00232110) steps its children through vtable[0x1C], so +0x1C is the slot a pump actually
+        // calls. Instrument it too - the earlier +0x38-only count could have been the wrong slot.
+        const uint32_t step1C = runtime->Load32(rdram, ctx, gSceneVtable + 0x1Cu);
+        const uint32_t engine = 0x004E9D70u;
+        std::fprintf(stderr, "[scenestep] engine 0x%08X children: +0C=0x%08X +10=0x%08X +18=0x%08X\n", engine,
+                     runtime->Load32(rdram, ctx, engine + 0x0Cu),
+                     runtime->Load32(rdram, ctx, engine + 0x10u),
+                     runtime->Load32(rdram, ctx, engine + 0x18u));
+        if (step1C >= 0x00100000u && runtime->lookupFunction(step1C) != nullptr)
+        {
+            gSceneStep1CPrev = runtime->lookupFunction(step1C);
+            runtime->replaceFunction(step1C, &sceneStep1CProbe);
+            std::fprintf(stderr, "[scenestep] installed vt+1C = 0x%08X\n", step1C);
+        }
         if (step10 >= 0x00100000u && runtime->lookupFunction(step10) != nullptr)
         {
             gSceneStep10Prev = runtime->lookupFunction(step10);
@@ -3182,6 +3232,208 @@ namespace
 
     void installSceneStartProbes(PS2Runtime &runtime)
     {
+        // FUN_00232110 is the engine's per-frame step: it calls vtable[0x1C] on the engine's three children at
+        // +0x0C, +0x10, +0x18. Sampling those fields at step time says whether the scene (0x5AA170) is present
+        // when the pump runs.
+        if (runtime.lookupFunction(0x00232110u) != nullptr)
+        {
+            static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+            static PS2Runtime::RecompiledFunction sPrev = runtime.lookupFunction(0x00232110u);
+            static uint32_t sCalls = 0u;
+            runtime.replaceFunction(0x00232110u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        const uint32_t engine = GPR_U32(ctx, 4);
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t calls = 0u;
+                                        ++calls;
+                                        if (env && (calls <= 12u || (calls % 50u) == 0u))
+                                        {
+                                            // The pump calls (*child->vt[0x1C])(child) for +0x0C, +0x10, +0x18.
+                                            // Resolve each child's vtable and the exact vt[0x1C] target here, at step
+                                            // time - that names the function the scene's dispatch really reaches.
+                                            const uint32_t c0 = runtime->Load32(rdram, ctx, engine + 0x0Cu);
+                                            const uint32_t c1 = runtime->Load32(rdram, ctx, engine + 0x10u);
+                                            const uint32_t c2 = runtime->Load32(rdram, ctx, engine + 0x18u);
+                                            std::fprintf(stderr,
+                                                         "[enginestep] #%u engine=0x%08X "
+                                                         "+0C=0x%08X(vt=0x%08X,vt1C=0x%08X) "
+                                                         "+10=0x%08X(vt=0x%08X,vt1C=0x%08X) "
+                                                         "+18=0x%08X(vt=0x%08X,vt1C=0x%08X)\n",
+                                                         calls, engine, c0, runtime->Load32(rdram, ctx, c0),
+                                                         runtime->Load32(rdram, ctx,
+                                                                         runtime->Load32(rdram, ctx, c0) + 0x1Cu),
+                                                         c1, runtime->Load32(rdram, ctx, c1),
+                                                         runtime->Load32(rdram, ctx,
+                                                                         runtime->Load32(rdram, ctx, c1) + 0x1Cu),
+                                                         c2, runtime->Load32(rdram, ctx, c2),
+                                                         runtime->Load32(rdram, ctx,
+                                                                         runtime->Load32(rdram, ctx, c2) + 0x1Cu));
+                                        }
+                                        if (sPrev != nullptr)
+                                        {
+                                            sPrev(rdram, ctx, runtime);
+                                        }
+                                        if (env && (calls <= 12u || (calls % 50u) == 0u))
+                                            std::fprintf(stderr, "[enginestep] #%u after children +18=0x%08X\n", calls,
+                                                         runtime->Load32(rdram, ctx, engine + 0x18u));
+                                    });
+        }
+
+        // FUN_00164F80 is the game's frame loop and it calls the engine tick FUN_001ee060 only inside
+        // `while (taskIsBusy)`. Sampling the tick's wall-clock spacing says whether the loop is spinning with no
+        // busy task (rare bursts) or blocked per iteration (a slow wait) - the difference between a queue bug and
+        // a wait bug.
+        if (runtime.lookupFunction(0x001EE060u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sTickPrev = runtime.lookupFunction(0x001EE060u);
+            runtime.replaceFunction(0x001EE060u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint64_t first = 0u;
+                                        static uint64_t prev = 0u;
+                                        static uint32_t calls = 0u;
+                                        const uint64_t now = GetTickCount64();
+                                        if (first == 0u)
+                                        {
+                                            first = now;
+                                        }
+                                        ++calls;
+                                        if (env && (calls <= 25u || (calls % 50u) == 0u))
+                                            std::fprintf(stderr,
+                                                         "[tick] #%u t=%llums dt=%llums task=0x%08X\n", calls,
+                                                         static_cast<unsigned long long>(now - first),
+                                                         static_cast<unsigned long long>(now - prev),
+                                                         runtime->Load32(rdram, ctx, 0x003DB1F8u));
+                                        prev = now;
+                                        if (sTickPrev != nullptr)
+                                        {
+                                            sTickPrev(rdram, ctx, runtime);
+                                        }
+                                    });
+        }
+
+        // The scene's streaming step skips every entry unless FUN_00197668(entry[0x2C]) == 3. Sample the live
+        // status byte and the handle's header so we can see which state the reader actually sits in.
+        if (runtime.lookupFunction(0x00197668u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sStatPrev = runtime.lookupFunction(0x00197668u);
+            runtime.replaceFunction(0x00197668u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        const uint32_t h = GPR_U32(ctx, 4);
+                                        if (sStatPrev != nullptr)
+                                        {
+                                            sStatPrev(rdram, ctx, runtime);
+                                        }
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t calls = 0u;
+                                        ++calls;
+                                        if (env && (calls <= 20u || (calls % 500u) == 0u))
+                                        {
+                                            std::fprintf(stderr,
+                                                         "[ioread] #%u handle=0x%08X status=%u hdr=", calls, h,
+                                                         GPR_U32(ctx, 2) & 0xFFu);
+                                            for (uint32_t i = 0u; i < 8u; ++i)
+                                                std::fprintf(stderr, "%02X",
+                                                             runtime->Load8(rdram, ctx, h + i) & 0xFFu);
+                                            std::fprintf(stderr, "\n");
+                                        }
+                                    });
+        }
+
+        // FUN_002855E0 only accepts a streamed chunk when its magic is 0x53504C54 ("TLPS") - counted here via
+        // FUN_00108F50, the accept path. FUN_002857C0 then commits each entry via FUN_00292800/00292810 per step.
+        {
+            static uint64_t sMagic = 0u;
+            static uint64_t sCommit0 = 0u;
+            static uint64_t sCommit1 = 0u;
+            static uint64_t sStep = 0u;
+            static PS2Runtime::RecompiledFunction sMagicPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sCommit0Prev = nullptr;
+            static PS2Runtime::RecompiledFunction sCommit1Prev = nullptr;
+            static PS2Runtime::RecompiledFunction sStepPrev = nullptr;
+            if (sMagicPrev == nullptr && runtime.lookupFunction(0x00108F50u) != nullptr)
+            {
+                sMagicPrev = runtime.lookupFunction(0x00108F50u);
+                runtime.replaceFunction(0x00108F50u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sMagic;
+                                            if (sMagicPrev != nullptr)
+                                            {
+                                                sMagicPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sCommit0Prev == nullptr && runtime.lookupFunction(0x00292810u) != nullptr)
+            {
+                sCommit0Prev = runtime.lookupFunction(0x00292810u);
+                runtime.replaceFunction(0x00292810u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sCommit0;
+                                            // FUN_00292810 takes ONE argument: a0 = entry (see its disassembly:
+                                            // lwc1 f1,0x140(a0); lw a0,0x30(a0)). It drives entry[0x30], the drawable
+                                            // object. If entry[0x30] is null every per-frame update is a no-op.
+                                            const uint32_t entry = GPR_U32(ctx, 4);
+                                            uint32_t e30 = 0u, e140 = 0u, e14C = 0u, e34 = 0u;
+                                            if (entry >= 0x00100000u && entry + 0x150u < PS2_RAM_SIZE)
+                                            {
+                                                e30 = runtime->Load32(rdram, ctx, entry + 0x30u);
+                                                e140 = runtime->Load32(rdram, ctx, entry + 0x140u);
+                                                e14C = runtime->Load32(rdram, ctx, entry + 0x14Cu);
+                                                e34 = runtime->Load32(rdram, ctx, entry + 0x34u);
+                                            }
+                                            if (sCommit0Prev != nullptr)
+                                            {
+                                                sCommit0Prev(rdram, ctx, runtime);
+                                            }
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sCommit0 <= 8u || (sCommit0 % 200u) == 0u))
+                                            {
+                                                float scale = 0.0f;
+                                                std::memcpy(&scale, &e140, sizeof(scale));
+                                                std::fprintf(stderr,
+                                                             "[scenestream] commit #%llu entry=0x%08X "
+                                                             "drawObj(e30)=0x%08X file(e34)=0x%08X "
+                                                             "state(e14C)=%u scale(e140)=%.3f\n",
+                                                             static_cast<unsigned long long>(sCommit0), entry, e30,
+                                                             e34, e14C, scale);
+                                            }
+                                        });
+            }
+            if (sCommit1Prev == nullptr && runtime.lookupFunction(0x00292800u) != nullptr)
+            {
+                sCommit1Prev = runtime.lookupFunction(0x00292800u);
+                runtime.replaceFunction(0x00292800u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sCommit1;
+                                            if (sCommit1Prev != nullptr)
+                                            {
+                                                sCommit1Prev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sStepPrev == nullptr && runtime.lookupFunction(0x00285410u) != nullptr)
+            {
+                sStepPrev = runtime.lookupFunction(0x00285410u);
+                runtime.replaceFunction(0x00285410u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sStep;
+                                            if (sStepPrev != nullptr)
+                                            {
+                                                sStepPrev(rdram, ctx, runtime);
+                                            }
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sStep % 100u) == 0u)
+                                                std::fprintf(stderr,
+                                                             "[scenestream] steps=%llu tlpsAccept=%llu "
+                                                             "commit810=%llu commit800=%llu\n",
+                                                             static_cast<unsigned long long>(sStep),
+                                                             static_cast<unsigned long long>(sMagic),
+                                                             static_cast<unsigned long long>(sCommit0),
+                                                             static_cast<unsigned long long>(sCommit1));
+                                        });
+            }
+        }
+
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
                      runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",
                      runtime.lookupFunction(0x00285E80u) != nullptr ? "ok" : "NULL",

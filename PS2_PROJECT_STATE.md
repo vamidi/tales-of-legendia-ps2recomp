@@ -6741,6 +6741,89 @@ Find what should call the scene's `+0x38`: locate every site that walks scene ob
 `FUN_00232190` returns is presumably registered somewhere). Either the registration never happens (guest state) or
 the pump loop runs but skips this object - and the same instrument decides it in one run.
 
+### Session 152 - engine update traced end-to-end; the scene IS pumped, and its entries sit at state 0
+
+**The engine's per-frame update, fully traced:**
+
+```
+FUN_00164F80   frame loop
+  while (taskIsBusy) {
+    FUN_0015231c(); dispatch channel 7; 9; 8;  do { flag=0; dispatch 6 } while (flag)
+    FUN_0016e3b0();
+    FUN_001ee060();                    <-- engine tick
+    FUN_0016d230();
+  }
+    |  obj = FUN_001ed0c0()  = 0x4E9D70
+    v
+  (*obj->vt[0x1C])(obj) = FUN_00232110
+      (*engine[+0x0C]->vt[0x1C])()   0x4E9DB0  vt 0x3D4AC0 -> 0x230A50
+      (*engine[+0x10]->vt[0x1C])()   0x5AA140  vt 0x3D4B00 -> 0x231EA0
+      (*engine[+0x18]->vt[0x1C])()   0x5AA170  vt 0x3D50D0 -> 0x2853D0   <- the SCENE
+```
+
+`FUN_00151ff0(id)` is not a sleep: it is `FUN_00151e90(id)`, which walks the ready queue and switches to
+every thread whose `+0x1F1` equals `id` - i.e. "run everyone waiting on channel `id`".
+
+**Tick rate measured (`[tick]`, wall clock):** ~24.4 s with *no* tick at all after the first one (boot/loader
+window), then a steady **~9 Hz** (92-125 ms), `task=0x00497050` from about t=27.6 s. The scene is first stepped at
+**t ~ 36 s**, right after `FUN_00285E80`, at that ~9 Hz - fast enough for its own 9-step cooldown.
+
+**Xref of the +0x38 slot (`0x3D50D0+0x38 = 0x3D5108` -> `0x292520`):** zero static references (vtable-only), and
+the function is the **destructor** (`*this = &DAT_003d5100`, frees +0x04/+0x0C/+0x10/+0x18, optional self-free).
+It is correctly never called while the scene lives. It is **not** the pump.
+
+**Correction to the previous session's answer:** the pump slot is `+0x1C`, not `+0x38`, and the scene **is**
+pumped. With per-object counting (the earlier probe logged only its first ten calls, all belonging to another
+object that shares the entry):
+
+```
+[scenestep] vt+1C SCENE #1 (total 1) a0=0x005AA170
+[scenestep] vt+1C SCENE #2..#5       a0=0x005AA170
+```
+
+**What the scene step does** (`0x2853D0` -> `0x285410`, `0x2855E0`, `0x2854A0`, `0x2857C0`) is a per-entry
+streaming state machine, not a renderer:
+
+| function | role |
+|---|---|
+| `FUN_002855E0` | per entry, only if `FUN_00197668(entry[0x2C]) == 3`: state 5 -> read chunk, accept when magic == `0x53504C54` ("TLPS"); state 6 -> size |
+| `FUN_002854A0` | per entry, gated on `scene[0x1C] == 0` (cooldown 8): state 1/2/3/4 -> `0x2928F0/292950/292990/292A60` |
+| `FUN_002857C0` | per entry: `FUN_00292800(entry[0xC])` (an empty stub) and `FUN_00292810(entry)` |
+| `FUN_00292810` | takes **one** argument (`lwc1 f1,0x140(a0)`, `lw a0,0x30(a0)`); drives the drawable `entry[0x30]` |
+
+**Measured (75-90 s runs):**
+
+```
+[scenestream] steps=100  tlpsAccept=27  commit810=396  commit800=396
+```
+
+- the I/O gate is **open**: handle `0x390738` reports status `3` in 17/20 samples (2 transiently),
+- **27 TLPS chunks** were read off the disc and accepted - real data, real file layer,
+- **396** per-entry commits ran.
+
+**Where it stops:** all four scene entries are alive and wired, but idle:
+
+```
+entry=0x005AA1B0 drawObj(+30)=0x003933C8 file(+34)=0x003B1C18 state(+14C)=0 scale(+140)=0.500
+entry=0x005C7E80 drawObj(+30)=0x0039348C file(+34)=0x003B1CD8 state(+14C)=0 scale(+140)=0.500
+entry=0x005E5B50 drawObj(+30)=0x00393550 file(+34)=0x003B1D98 state(+14C)=0 scale(+140)=0.500
+entry=0x00603820 drawObj(+30)=0x00393614 file(+34)=0x003B1E58 state(+14C)=0 scale(+140)=0.500
+```
+
+`state(+0x14C) = 0` is "idle": `FUN_002854A0` only acts on **1..4**, `FUN_002855E0` only on **5..6**. Nothing ever
+kicks an entry out of 0, so no entry ever enters the load pipeline through this path - the four draw objects are
+never fed, and the GS only ever sees clears.
+
+Refuted this session: "the scene is never pumped" (wrong slot + throttled log), "scene master alpha is 0"
+(`FUN_00292810`'s first parameter is an object pointer, not a float - the Ghidra prototype is wrong).
+
+### Next probe (exact)
+
+Find the writer of `entry+0x14C` that sets it to `1` (the load kick) and why it never runs for these four
+entries: probe the scene setup methods (`0x285150`, `0x285280`, `0x285330`, `0x2853D0`'s callees) for stores to
+`+0x14C`, and check whether the kick is gated on `FUN_001a1460(entry[0x30])` or on the entry being "visible"
+(a camera/frustum test) - a scene that is never marked visible would leave every entry at 0.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
