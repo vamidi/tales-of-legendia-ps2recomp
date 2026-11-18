@@ -7559,6 +7559,60 @@ Identify what drives the `FUN_0015fb60` label table continuously and what those 
 them at ~2000/s. Then find the producer that should fill the queue they poll - that producer is the fix site, and it is
 guest logic, not runtime, not rendering.
 
+### Session 152 - RETRACTION: the "guest spin" was a misreading of what guestEntries counts
+
+Decoded the four tables (they install labels in `0x15C7E0-0x15CF40`):
+
+| table | entries |
+|---|---|
+| `0x389210` | `15C7E0 15C7E0 15C7E0 15C7F0 15C830 15C8C0` (x2 modes) |
+| `0x389240` | `15C7E0 x6 15C9B0 15C9F0 15CA80 15C9B0 15C9F0 15CA80` |
+| `0x389270` | `15CB70 15CBB0 15CC00 15CC50` |
+| `0x389280` | `15CCB0 15CD70 15CE70 15CF40` |
+
+**The hot PCs are not polls.** Disassembly of the hot address shows it is a loop back-edge:
+
+```
+0x15FC10  addiu a2, a2, 0x1
+0x15FC14  slti  a3, a2, 0x8
+0x15FC18  bne   a3, zero, 0x0015FB7C      <- branch back to the hot PC
+```
+
+`0x15FB7C` is the top of `FUN_0015fb60`'s own `do { switch (uVar1) ... } while (uVar1 < 8)` loop.
+
+**And `enterGuest` samples every dispatched guest branch, not every function call** - backward branches go through
+`dispatchGuestBranch`. So `guestEntries` counts *loop iterations*, and:
+
+```
+2000 entries/s  ~=  8 iterations x ~4 calls/frame x 60 Hz  =  1920/s
+```
+
+which is exactly what a normal 60 Hz game looks like. `FUN_0015fb60` has **16 call sites**
+(`FUN_00153780`, `FUN_001ebb60`, `FUN_0015d8f0`, `FUN_001c9410` x4, `FUN_0023bf10`, `FUN_002dd560`, `FUN_0032e7a0`,
+`FUN_00330e20`, ...) and **one of them, `FUN_00153780`, is called once per `FUN_00165ad0` inner-loop iteration.**
+
+**Retraction:** the previous entry's conclusion - "a guest spin consumes ~99% CPU and starves the frame loop" - is
+withdrawn. It was based on treating branch-entries as function entries. `guest=99%` in the turn-cost line means only
+"the CPU is executing guest code", which is expected for a recompiled game. Nothing here is a poll loop.
+
+**What is actually still unexplained:**
+
+1. `mainIters` advances only ~17.5/s (measured `+7` per 200 presents, four consecutive identical samples), where a
+   60 Hz frame loop should be ~60/s. Ratio vs VBlank: **60 / 17.5 = 3.43**.
+2. The two regimes remain unreconciled: run A `paceWaits=1871` (guest sleeps on VBlank), run B `paceWaits=0`
+   (never sleeps). Same binary, back-to-back.
+3. The established functional defect is unchanged: no model/scene load is ever requested.
+
+### Next probe (exact)
+
+Measure **one `FUN_00165ad0` iteration's wait composition**, not the aggregate: for each iteration, record how many
+VBlank boundaries elapse inside it (VBlank counter delta between `52b70` entry and `153180` entry). The ratio 60/17.5 =
+3.43 predicts **~3.4 VBlanks consumed per iteration**; if that holds, the loop is deliberately waiting on 3-4 VBlanks
+per pass and the question becomes "which call inside the iteration waits on multiple VBlanks" - traceable by bracketing
+the VBlank counter at each call. If instead iterations are spread evenly over single VBlanks, the loop is being sampled
+rarely and `mainIters` is under-counted. This distinguishes a real wait from a measurement artifact before any further
+conclusion is drawn.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
