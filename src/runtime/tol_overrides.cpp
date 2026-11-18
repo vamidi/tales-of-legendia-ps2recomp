@@ -4897,6 +4897,52 @@ namespace
                          sO8350 ? "ok" : "NULL");
         }
 
+        // Constructors of the classes owning vtables 0x3D9340 and 0x3D9360 (found via data xrefs to the vtables).
+        // Direct-call check: both have 0 direct-call sites in the corpus, so these probes intercept every call.
+        {
+            static uint64_t sC9340 = 0u, sC9360 = 0u;
+            static PS2Runtime::RecompiledFunction sP9340 = nullptr, sP9360 = nullptr;
+            static bool sO9340 = false, sO9360 = false;
+            if (!sO9340 && runtime.lookupFunction(0x00335EC0u) != nullptr)
+            {
+                sP9340 = runtime.lookupFunction(0x00335EC0u);
+                runtime.replaceFunction(0x00335EC0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sC9340;
+                                            static const bool env = std::getenv("TOL_CTOR") != nullptr;
+                                            if (env && sC9340 <= 6u)
+                                                std::fprintf(stderr, "[depthN] ctor 0x3D9340 #%llu this=0x%08X ra=0x%08X\n",
+                                                             static_cast<unsigned long long>(sC9340), GPR_U32(ctx, 4),
+                                                             GPR_U32(ctx, 31));
+                                            if (sP9340 != nullptr)
+                                            {
+                                                sP9340(rdram, ctx, runtime);
+                                            }
+                                        });
+                sO9340 = true;
+            }
+            if (!sO9360 && runtime.lookupFunction(0x00338200u) != nullptr)
+            {
+                sP9360 = runtime.lookupFunction(0x00338200u);
+                runtime.replaceFunction(0x00338200u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sC9360;
+                                            static const bool env = std::getenv("TOL_CTOR") != nullptr;
+                                            if (env && sC9360 <= 6u)
+                                                std::fprintf(stderr, "[depthN] ctor 0x3D9360 #%llu this=0x%08X ra=0x%08X\n",
+                                                             static_cast<unsigned long long>(sC9360), GPR_U32(ctx, 4),
+                                                             GPR_U32(ctx, 31));
+                                            if (sP9360 != nullptr)
+                                            {
+                                                sP9360(rdram, ctx, runtime);
+                                            }
+                                        });
+                sO9360 = true;
+            }
+            std::fprintf(stderr, "[depthN] INSTALL 0x335ec0=%s 0x338200=%s\n", sO9340 ? "ok" : "NULL",
+                         sO9360 ? "ok" : "NULL");
+        }
+
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
                      runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",
                      runtime.lookupFunction(0x00285E80u) != nullptr ? "ok" : "NULL",

@@ -8196,6 +8196,63 @@ Walk upward until a constructor **is** called. That object is the last live poin
 whatever guard stops it - is the fix site. The method is now reliable: install-verified probe, direct-call check, receiver
 identity, and no conclusion stated before the measurement.
 
+### Session 152 - COURSE CORRECTION: the live scene driver found; I was walking the wrong chain
+
+Read the one function that actually executes for 17-28 s. The chain is:
+
+```
+loader 0x63D890 (vt 0x3DA380) --vt+0x0C--> FUN_00366090          the live stage driver
+   creates A = FUN_002eefe0(alloc 0x104)
+   creates B = FUN_002ed210(alloc 0x50)                          per-frame context (vt+0x1C)
+   FUN_001ea850(0,0)                                             <- creates the manager 0x63E290
+   creates C = FUN_003654b0(alloc 0x220)                         <- APP JOB, vtable 0x3DA320
+   while ((*C->vt[0x0C])(C)) { (*mgr->vt[8])(); (*B->vt[0x1C])(B); (*C->vt[0x38])(C); (*mgr->vt[0xC])(); yield(); }
+```
+
+`FUN_003654b0` is the app-job constructor (vtable `0x3DA320`, secondary `0x3DA35C`), and it sets **`app+0x70 = 1`**.
+
+**Vtable `0x3DA320`** mapped: `+08` dtor, `+0C` is-busy, `+10` bind-context, `+14` stop, `+30` start, `+34` finalise,
+**`+38` = `FUN_00365630` = the per-frame scene update**.
+
+`FUN_00365630` is a 3-way state machine on `app+0x70`:
+`1 -> FUN_00365700`, `3 -> FUN_00365cd0`, `4 -> FUN_00365fd0`; on success `app[0x70]=app[0x72]; app[0x72]=-1`.
+
+**So the app spent the whole 17-28 s in state 1 inside `FUN_00365700`** (the 592-slot, ~9.5 KB function). Reading it
+shows a *sub*-state machine on `app+0x74` that drives a **different world system than the classes I had been crawling**:
+
+```
+sub-state 0: fonts/text (glyphs 0x5E, 0x62), build the message/credit system,
+             (*app[0x18]->vt[0x10])(app[0x18], app[4])
+sub-state 1: read GLOBAL scene parameters sRam004e9142 / sRam004e9144
+sub-state 3: count = FUN_002e0880(0)
+             for i in 0..99: e = FUN_002e08d0(0,i);
+                 if (e && *e > 0) { if (e[1]) flag = 1; if (i+1 == sRam004e9144) FUN_0027a160(e+0x10); }
+             if (flag) FUN_0027ad40();
+             status = FUN_00153120(0,-1,0) -> app[0x80]; branch on -0xF0/-0xF1/-0xF2/-0xF3/-0xF4/-0xF8/-0xEE
+```
+
+**Course correction.** The world path that matters is **`0x27Axxx`** (`FUN_0027a160`, `FUN_0027ad40`) fed from a
+**99-slot entry array** via `FUN_002e08d0(0, i)`, entered from `FUN_00365700` - **not** the `0x3D51A0` / `0x3D9340` /
+`0x3D9360` classes I spent the last rounds proving unreachable. Those belong to a different subsystem that this scene type
+does not use, and their unreachability, while correctly measured, is **not the defect**. The earlier "correct idle scene,
+everything absent" conclusion was therefore drawn from the wrong chain.
+
+This also reconciles the session's very first measurement: the app **does** draw (5 textured draws of 42,716) - the live
+path runs, it just produces almost nothing.
+
+### Next probe (exact)
+
+Instrument `FUN_00365700`'s own control state, install-verified (and direct-call checked):
+
+1. `app+0x74` (sub-state) and `app+0x80` (status) on every entry,
+2. `FUN_002e0880(0)` (entry count) and, per call, how many of the 99 slots from `FUN_002e08d0(0,i)` are occupied
+   (`*e > 0`) and have `e[1] != 0`,
+3. whether `FUN_0027a160` and `FUN_0027ad40` are reached at all.
+
+That yields the app's actual trajectory (which sub-state, which status code, how many live map entries) and shows whether
+the scene is empty because the entry array is empty, because a status code aborts first, or because the 0x27Axxx
+functions run and produce nothing.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
