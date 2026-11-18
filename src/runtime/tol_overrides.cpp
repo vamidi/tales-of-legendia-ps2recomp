@@ -3724,6 +3724,74 @@ namespace
                                     });
         }
 
+        // Script-actor class: vtable 0x3D5030 (ctor FUN_0027c3f0, step FUN_0027d0f0 at +0x0C), constructed only
+        // from FUN_0016cfe0. Map/field class: vtable 0x3D51A0, step FUN_0029cc60 at +0x1C, stream FUN_0029ce60 at
+        // +0x2C. If the constructors/steppers never run, both classes simply do not exist at runtime.
+        {
+            static uint64_t sActorCtor = 0u;
+            static uint64_t sActorCaller = 0u;
+            static uint64_t sMapStep = 0u;
+            static PS2Runtime::RecompiledFunction sActorCtorPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sActorCallerPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sMapStepPrev = nullptr;
+            if (sActorCtorPrev == nullptr && runtime.lookupFunction(0x0027C3F0u) != nullptr)
+            {
+                sActorCtorPrev = runtime.lookupFunction(0x0027C3F0u);
+                runtime.replaceFunction(0x0027C3F0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sActorCtor;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sActorCtor <= 5u || (sActorCtor % 100u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] actorCtor #%llu this=0x%08X -> vptr "
+                                                             "becomes 0x003D5030\n",
+                                                             static_cast<unsigned long long>(sActorCtor),
+                                                             GPR_U32(ctx, 4));
+                                            if (sActorCtorPrev != nullptr)
+                                            {
+                                                sActorCtorPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sActorCallerPrev == nullptr && runtime.lookupFunction(0x0016CFE0u) != nullptr)
+            {
+                sActorCallerPrev = runtime.lookupFunction(0x0016CFE0u);
+                runtime.replaceFunction(0x0016CFE0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sActorCaller;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sActorCaller <= 5u || (sActorCaller % 100u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] actorCtorCaller #%llu a0=0x%08X "
+                                                             "ctorCalls=%llu\n",
+                                                             static_cast<unsigned long long>(sActorCaller),
+                                                             GPR_U32(ctx, 4),
+                                                             static_cast<unsigned long long>(sActorCtor));
+                                            if (sActorCallerPrev != nullptr)
+                                            {
+                                                sActorCallerPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sMapStepPrev == nullptr && runtime.lookupFunction(0x0029CC60u) != nullptr)
+            {
+                sMapStepPrev = runtime.lookupFunction(0x0029CC60u);
+                runtime.replaceFunction(0x0029CC60u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sMapStep;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sMapStep <= 5u || (sMapStep % 100u) == 0u))
+                                                std::fprintf(stderr, "[scenetest] mapStep #%llu self=0x%08X\n",
+                                                             static_cast<unsigned long long>(sMapStep),
+                                                             GPR_U32(ctx, 4));
+                                            if (sMapStepPrev != nullptr)
+                                            {
+                                                sMapStepPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+        }
+
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
                      runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",
                      runtime.lookupFunction(0x00285E80u) != nullptr ? "ok" : "NULL",

@@ -6953,6 +6953,75 @@ created. Both are "who calls the thing that was never called" questions now, wit
 the registry entry `0x3D5038`, the instantiation sites that store it into an object, and the object that owns
 `0x3D51CC`.
 
+### Session 152 - the registry instrumented: neither class is ever constructed, and the field-load loop is never dispatched
+
+**Corrected addresses for the registry at `0x3D5038`.** It is not a flat registry: `0x3D5030` is a **vtable** (two leading
+nulls, destructor at `+0x08`, the same shape as the scene's `0x3D50D0`). So:
+
+```
+vtable 0x3D5030 = { +0x00: 0, +0x04: 0, +0x08: FUN_0027c5f0 (dtor), +0x0C: FUN_0027d0f0 (the script VM) }
+ctor            = FUN_0027c3f0   (the only other site that builds 0x3D5030)
+```
+
+**Instantiation chain, all of it dead:**
+
+```
+FUN_00168810   field-load loop; ZERO static refs; lives at vtable slot 0x3D258C (base 0x3D2580, +0x0C)
+  -> FUN_00168460 -> FUN_00166a10 -> FUN_0016cfe0 -> FUN_0027c3f0 (script-actor ctor, vptr = 0x3D5030)
+  (FUN_0016cfe0 is also called from FUN_0020c610, itself only reachable from 0x208bfc)
+```
+
+Measured (90 s, `TOL_TRACE_SCENE`):
+
+```
+actorCtor (FUN_0027c3f0)        = 0     <- the script-actor class is NEVER constructed
+actorCtorCaller (FUN_0016cfe0)  = 0     <- its only caller never runs
+mapStep (FUN_0029cc60)          = 0
+scriptVM (FUN_0027d0f0)         = 0
+OPCODE18 (FUN_00285b60)         = 0
+```
+
+**Correction to the previous session's "scene vtable +0xFC".** `0x3D51CC` is *not* the scene's slot. Decoding the table
+gives base **`0x3D51A0`** (two nulls, dtor at `+0x08`), so `0x3D51CC` is slot **`+0x2C`** of a *different* class:
+
+```
+vtable 0x3D51A0: +08=0x29CAF0  +0C=0x29CB80  +10=0x29CBC0  +14=0x29CC40  +18=0x29CC50
+                 +1C=0x29CC60 (step)  +2C=0x29CE60 (the map/field streamer)
+```
+
+Confirmed independently: the ELF stores `0x0029CC60` at `0x3D51BC` = `0x3D51A0 + 0x1C`. The scene's own `+0x2C`
+(and `+0xFC`) are **zero**; `0x3D50D0` only runs to about `+0x3C`.
+
+So "whether any object ever gets the `+0xFC` slot populated" has a precise answer: the slot does not exist on the scene
+at all, and the class that does own the streamer (`vtable 0x3D51A0`) is never created or stepped - `0x29CC60` = 0 and
+`0x29CE60` = 0.
+
+**Full dead chain for the black screen:**
+
+```
+scene built, pumped each tick, 4 entries healthy
+  -> no model-load request: script VM class (vtable 0x3D5030) never constructed
+  -> no map/field stream: class (vtable 0x3D51A0) never constructed or stepped
+  -> the field-load loop FUN_00168810 that would drive both is itself never dispatched
+     (it is vtable-only at 0x3D258C, exactly like the VM and the streamer)
+  -> entries stay at state 0, GS receives clears only
+```
+
+**Port framing (not emulation):** every one of these is *guest* code that should run. The defect is not a missing
+emulator feature but a **missing guest dispatch**: the objects carrying vtables `0x3D2580` (field-load loop),
+`0x3D5030` (script actor) and `0x3D51A0` (map/field) are never created, so their methods never run. The port fix will
+be either (a) find the guest task/app-queue step that should construct them - note the app job was previously measured
+one-shot, busy set once and never re-armed, which fits a dropped task hand-off - or (b) a faithful port-side override
+that performs the same construction at the same point in guest state, which is legitimate only once we know the guest
+call site's contract.
+
+### Next probe (exact)
+
+Find the object that owns vtable `0x3D2580` (the field-load loop `FUN_00168810` at `+0x0C`): search the ELF for pointer
+stores of `0x003D2580`, identify the constructor, and instrument it plus its callers. If that object is also never
+created, walk one more level; if it *is* created, then the field-load loop is being skipped by a guard inside the
+dispatcher and that guard is the fix site.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
