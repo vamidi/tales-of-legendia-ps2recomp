@@ -4802,6 +4802,51 @@ namespace
                          sVmOk ? "ok" : "NULL", sMapOk ? "ok" : "NULL");
         }
 
+        // Verify the world-construction chain directly, install-verified. FUN_0012f2b0 constructs objects in place
+        // (it calls the ctor `count` times), so FUN_002988a0 running would force 4 map-class ctor calls - it does not,
+        // so probe the chain levels themselves.
+        {
+            static uint64_t sC988 = 0u, sC985 = 0u;
+            static PS2Runtime::RecompiledFunction sP988 = nullptr, sP985 = nullptr;
+            static bool sO988 = false, sO985 = false;
+            if (!sO988 && runtime.lookupFunction(0x002988A0u) != nullptr)
+            {
+                sP988 = runtime.lookupFunction(0x002988A0u);
+                runtime.replaceFunction(0x002988A0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sC988;
+                                            static const bool env = std::getenv("TOL_CTOR") != nullptr;
+                                            if (env && sC988 <= 4u)
+                                                std::fprintf(stderr, "[chain] FUN_002988a0 #%llu this=0x%08X\n",
+                                                             static_cast<unsigned long long>(sC988), GPR_U32(ctx, 4));
+                                            if (sP988 != nullptr)
+                                            {
+                                                sP988(rdram, ctx, runtime);
+                                            }
+                                        });
+                sO988 = true;
+            }
+            if (!sO985 && runtime.lookupFunction(0x00298570u) != nullptr)
+            {
+                sP985 = runtime.lookupFunction(0x00298570u);
+                runtime.replaceFunction(0x00298570u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sC985;
+                                            static const bool env = std::getenv("TOL_CTOR") != nullptr;
+                                            if (env && sC985 <= 4u)
+                                                std::fprintf(stderr, "[chain] FUN_00298570 #%llu this=0x%08X\n",
+                                                             static_cast<unsigned long long>(sC985), GPR_U32(ctx, 4));
+                                            if (sP985 != nullptr)
+                                            {
+                                                sP985(rdram, ctx, runtime);
+                                            }
+                                        });
+                sO985 = true;
+            }
+            std::fprintf(stderr, "[chain] INSTALL 0x2988a0=%s 0x298570=%s\n", sO988 ? "ok" : "NULL",
+                         sO985 ? "ok" : "NULL");
+        }
+
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
                      runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",
                      runtime.lookupFunction(0x00285E80u) != nullptr ? "ok" : "NULL",

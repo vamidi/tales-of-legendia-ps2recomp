@@ -8051,6 +8051,52 @@ and probe it install-verified. Two outcomes:
 That distinguishes "nothing asks" from "asking fails", and it is the last mechanical gap between the valid idle scene and
 geometry being requested.
 
+### Session 152 - no pool exists: FUN_0012f2b0 constructs in place; the chain is dead one level higher
+
+**Correction to the previous entry.** `FUN_0012f2b0` is **not** a registration helper and there is no pool or free list:
+
+```c
+void FUN_0012f2b0(base, ctor, dtor, stride, count) {
+    for (i = 0; i < count; ++i)
+        (*ctor)(base + i*stride, 1);      // constructs `count` objects IN PLACE, immediately
+    ...                                   // second half only unwinds on partial failure
+}
+```
+
+`FUN_0012f230` is its destroy-in-place sibling. So `FUN_0012f2b0(obj+0x70, 0x29ca90, 0x29caf0, 0x80, 4)` **builds four
+map-class objects right there** - there is nothing to "allocate later", and therefore **no pool-allocation function to
+probe**.
+
+**Install-verified chain measurement:**
+
+```
+[ctor]  INSTALL scriptVM-ctor(0x27c3f0)=ok  map-ctor(0x29ca90)=ok
+[chain] INSTALL 0x2988a0=ok  0x298570=ok
+chain FUN_002988a0 = 0        chain FUN_00298570 = 0
+map-class = 0                 scriptVM-class = 0
+```
+
+All four levels are never entered. Since `FUN_002988a0` would force four map-ctor calls through `FUN_0012f2b0`, observing
+zero ctor calls is consistent - and the *direct* measurement pins the break one level higher: **`FUN_00298570` is never
+called either**.
+
+Its only callers are **`FUN_003367b0`** and **`FUN_00338800`**, so those never run. Both appear in the manager's
+(`0x3DB31C`) create *and* destroy caller lists, which reconciles with an earlier measurement: the manager **was** created
+once (`0x63E290`) and the single observed entry was `FUN_00366090` (site #1, `a0=0x63D890`, `ra=0x165230`). So the
+manager came from `FUN_00366090`, while the world-construction path (`FUN_003367b0` / `FUN_00338800` -> `FUN_00298570` ->
+`FUN_002988a0` -> four map objects) was never entered.
+
+### Next probe (exact)
+
+Probe **`FUN_003367b0`** and **`FUN_00338800`** install-verified - they are the last unmeasured links and the only remaining
+callers in this chain. Two outcomes:
+
+- **both zero** -> the entire world-construction path is unreachable in the port; the next question is what guards the
+  two call sites that should reach them (they are also manager create/destroy participants, so their guard may be the same
+  one that gates the scene hand-off).
+- **either non-zero** -> then `FUN_00298570` *is* reached and the break is inside it, which makes `FUN_00298570` itself the
+  fix site.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
