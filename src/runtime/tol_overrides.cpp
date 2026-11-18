@@ -2806,6 +2806,81 @@ namespace
     PS2Runtime::RecompiledFunction gFadePrev = nullptr;
     PS2Runtime::RecompiledFunction gFadeWaitPrev = nullptr;
     PS2Runtime::RecompiledFunction gGsIsrPrev = nullptr;
+    PS2Runtime::RecompiledFunction gQueueWalkPrev = nullptr;
+    PS2Runtime::RecompiledFunction gQueueNextPrev = nullptr;
+    PS2Runtime::RecompiledFunction gQueueMatchPrev = nullptr;
+
+    // The spin: FUN_00349C00 is a queue walk
+    //     FUN_003341a0(&it, 0,0,0, 2, type)
+    //     while (FUN_003343e0(&it) == 0) { item = FUN_00334400(&it); v = FUN_003344e0(item);
+    //                                      switch (type) { ... thunk_FUN_00334530(item) ... }
+    //                                      FUN_003341e0(&it, ...); }
+    // Counting the walk entry, every item yielded (0x3343E0) and every predicate match (0x334530) shows whether
+    // the queue is permanently non-empty while nothing ever matches.
+    uint64_t gQueueCalls = 0u;
+    uint64_t gQueueYields = 0u;
+    uint64_t gQueueMatches = 0u;
+    uint32_t gQueueLastType = 0xFFFFFFFFu;
+
+    void queueWalkProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t type = GPR_U32(ctx, 4);
+        static const bool sEnv = std::getenv("TOL_TRACE_QUEUE") != nullptr;
+        ++gQueueCalls;
+        gQueueLastType = type;
+        if (sEnv && (gQueueCalls <= 8u || (gQueueCalls % 200u) == 0u))
+            std::fprintf(stderr, "[queue] walk #%llu type=%u (yields=%llu matches=%llu)\n",
+                         static_cast<unsigned long long>(gQueueCalls), type,
+                         static_cast<unsigned long long>(gQueueYields),
+                         static_cast<unsigned long long>(gQueueMatches));
+        if (gQueueWalkPrev != nullptr)
+        {
+            gQueueWalkPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void queueNextProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gQueueNextPrev != nullptr)
+        {
+            gQueueNextPrev(rdram, ctx, runtime);
+        }
+        ++gQueueYields;
+        static const bool sEnv = std::getenv("TOL_TRACE_QUEUE") != nullptr;
+        if (sEnv && (gQueueYields % 500u) == 0u)
+            std::fprintf(stderr, "[queue] yields=%llu ret=0x%08X matches=%llu type=%u walks=%llu\n",
+                         static_cast<unsigned long long>(gQueueYields), GPR_U32(ctx, 2),
+                         static_cast<unsigned long long>(gQueueMatches), gQueueLastType,
+                         static_cast<unsigned long long>(gQueueCalls));
+    }
+
+    void queueMatchProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gQueueMatchPrev != nullptr)
+        {
+            gQueueMatchPrev(rdram, ctx, runtime);
+        }
+        ++gQueueMatches;
+    }
+
+    void installQueueProbes(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x00349C00u) != nullptr)
+        {
+            gQueueWalkPrev = runtime.lookupFunction(0x00349C00u);
+            runtime.replaceFunction(0x00349C00u, &queueWalkProbe);
+        }
+        if (runtime.lookupFunction(0x003343E0u) != nullptr)
+        {
+            gQueueNextPrev = runtime.lookupFunction(0x003343E0u);
+            runtime.replaceFunction(0x003343E0u, &queueNextProbe);
+        }
+        if (runtime.lookupFunction(0x00334530u) != nullptr)
+        {
+            gQueueMatchPrev = runtime.lookupFunction(0x00334530u);
+            runtime.replaceFunction(0x00334530u, &queueMatchProbe);
+        }
+    }
 
     // Cost per turn, part 1: how much guest work happens inside one GS interrupt handler (0x166490, cause 2).
     // g_tolGuestTransfers counts every inter-function transfer, so the delta across the handler is its cost in
@@ -7288,6 +7363,8 @@ namespace tol
         installFadeProbes(runtime);
         // GS interrupt handler cost (see gsIsrProbe).
         installGsIsrProbe(runtime);
+        // The 0x3498xx-0x349Dxx queue walk that consumes the guest (see queueWalkProbe).
+        installQueueProbes(runtime);
         // The ADX detach handshake (see adxDetachProbe).
         installAdxDetachProbe(runtime);
         // Thread identity of the "stop all streams" chain (see streamStopProbe).

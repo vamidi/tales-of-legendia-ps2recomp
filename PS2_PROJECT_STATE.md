@@ -6400,6 +6400,45 @@ Identify the queue `FUN_00349C00` walks and why it never drains: log its `param_
 by `FUN_003343E0`, and how many items hit `thunk_FUN_00334530` per call. A queue that is always non-empty and
 never matches the predicate is a permanent spin - and that would be the thing to fix rather than the pacer.
 
+### Session 152 - the queue walk is an empty-queue poll: nothing is enqueued (8 matches ever)
+
+Instrumented the walk (`0x349C00`), its iterator (`0x3343E0`) and its match callback (`0x334530`) behind
+`TOL_TRACE_QUEUE`:
+
+```
+[queue] walk #1 type=1 (yields=10 matches=8)
+[queue] yields=500  ret=0x00000001 matches=8  type=16 walks=231
+[queue] yields=5000 ret=0x00000001 matches=8  type=16 walks=2481
+```
+
+| metric | value | meaning |
+|---|---|---|
+| walks | 2,481 / 40 s = **62/s** | the guest polls 18 queues at ~60 Hz |
+| items yielded | 5,000 (~2 per walk) | each queue holds 1-2 entries |
+| **predicate matches** | **8, all at the very start** | nothing work-worthy was ever queued again |
+| `FUN_003343E0` return | **1** on every sample | "no more items" - the walk exits immediately |
+
+So this is **not a spin**: it is a normal 60 Hz poll of empty queues. The stall is that **nothing is enqueued** -
+the producers stopped after the first 8 items. That matches the rest of the chain measured today: one app job ran
+and never re-armed (`busy` written once each way), the fade completed and revealed nothing, and the loader stage
+never invoked the app job again.
+
+### Answer to "do we need a native fade override?" - NO
+
+There is no reason to override the fade and several against:
+
+1. **It works.** Measured: alpha 0.6 -> 1.0 (hold) -> 0.2, two invocations (modes 1 and 2), driven by the guest's
+   own `FUN_00204240`. A native replacement would substitute fabricated behaviour for correct guest logic - the
+   port rule broken for no gain.
+2. **It is not the blocker.** The screen is black because the guest draws nothing behind the overlay
+   (5 textured draws of 42,716), not because the fade misbehaves. Overriding the fade would hide the symptom and
+   leave the actual defect (empty queues / no scene submitted) unfixed.
+3. **Its timing is guest state.** The ramp is 0.04 per iteration against the guest's own frame counter; a native
+   fade would have to guess the same rate and would drift from what the game expects.
+
+So: keep the guest's fade, fix the producer side. The next probe is the enqueue path - who submits to these
+queues and why they stop after 8 entries.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
