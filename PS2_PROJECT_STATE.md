@@ -6598,6 +6598,44 @@ Sample `f20` (from the live `R5900Context`) at `0x204380` on each hit, together 
   and the fix is in the resume path (context restore), not in the fade;
 - if `f20` advances past 1.0 but the branch still loops -> `c.lt.s` is mis-evaluating, which is an FPU issue.
 
+### Session 152 - f20 is fine: the fade advances 0.04 -> 1.00 across yields; the thread is slow, not stuck
+
+Probe on `0x204380` (the fade-in loop condition), sampling the live FPU register `ctx->f[20]` and the overlay's
+stored alpha:
+
+```
+[fadef20] #1  f20=0.0400 alpha(+5C)=0.0400 overlay=0x0063D970
+[fadef20] #2  f20=0.0800 alpha(+5C)=0.0800
+...                                            (+0.04 per hit)
+[fadef20] #25 f20=1.0000 alpha(+5C)=1.0000     <- fade-in completes
+[fadef20] #26 f20=0.0400 alpha(+5C)=0.0400     <- the NEXT fade starts
+[fadef20] #27 f20=0.0800 ... #30 f20=0.2000
+```
+
+Three hypotheses die here:
+
+- **`f20` survives the `0x15231C` yield** - it advances by exactly 0.04 per iteration and reaches 1.0;
+- **`c.lt.s` evaluates correctly** - the loop always exits at 1.0 (so the row's dense case for `0x204380` is fine
+  too: `case 0x204380u` exists, checked statically);
+- **the thread is not parked forever** - after the first fade-in completes, the game starts the *next* fade
+  (`fades` went 1 -> 2), which is why the TCB was repeatedly sampled at `0x204380` at the end of a 60 s run.
+
+**So there is no deadlock**: the fade needs ~140 scheduler turns (25 in + up to 90 hold + 25 out) and the game
+performs two fades, ~280 turns. At the measured rate that is minutes of wall time, which looks identical to being
+stuck over any run length tried so far.
+
+That collapses the whole investigation to one number: **the cost of a scheduler turn** (~0.7 s, ~40x slower than
+the guest's own 60 Hz frame). Everything downstream - the fade taking minutes, "no scene job", the black screen -
+is that one rate.
+
+### Next probe (exact)
+
+Account for the ~0.7 s per turn directly: the GS backend is only 4 % of wall (measured), so instrument the three
+other consumers on the turn path - (a) the interrupt/invocation dispatch (`dispatchIrq` -> `queueInvocation` ->
+`enterGuest`), (b) the VBlank boundary emitter, (c) the presenter's per-frame work - with a shared counter of
+cumulative microseconds each. Whichever dominates is the thing to fix; the guest logic, the fade and the renderer
+are all behaving correctly.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

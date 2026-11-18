@@ -3054,6 +3054,36 @@ namespace
             std::fprintf(stderr, "[fadewait] #%u a0=0x%08X ret=0x%08X\n", sCalls, GPR_U32(ctx, 4), GPR_U32(ctx, 2));
     }
 
+    PS2Runtime::RecompiledFunction gFadeLoopPrev = nullptr;
+
+    // 0x204380 is the fade-in loop condition (`lui v0,0x3F80; mtc1; c.lt.s f20,f0; bc1t body`). The loader TCB
+    // parks here forever on the second fade, so sample the live FPU accumulator f20 next to the overlay's stored
+    // alpha: a stuck f20 means the accumulator does not survive the 0x15231C yield, an advancing f20 with a
+    // looping branch means c.lt.s mis-evaluates.
+    void fadeLoopProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint32_t sHits = 0u;
+        ++sHits;
+        if (sEnv && (sHits <= 30u || (sHits % 20u) == 0u))
+        {
+            const uint32_t loader = 0x0063D890u;
+            const uint32_t overlay = runtime->Load32(rdram, ctx, loader + 0x20u);
+            float alpha = -1.0f;
+            if (overlay >= 0x00100000u && overlay + 0x60u < PS2_RAM_SIZE)
+            {
+                const uint32_t bits = runtime->Load32(rdram, ctx, overlay + 0x5Cu);
+                std::memcpy(&alpha, &bits, sizeof(alpha));
+            }
+            std::fprintf(stderr, "[fadef20] #%u f20=%.4f alpha(+5C)=%.4f overlay=0x%08X\n", sHits,
+                         static_cast<double>(ctx->f[20]), static_cast<double>(alpha), overlay);
+        }
+        if (gFadeLoopPrev != nullptr)
+        {
+            gFadeLoopPrev(rdram, ctx, runtime);
+        }
+    }
+
     void installFadeProbes(PS2Runtime &runtime)
     {
         if (runtime.lookupFunction(0x00204240u) != nullptr)
@@ -3068,6 +3098,11 @@ namespace
         {
             gFadeWaitPrev = runtime.lookupFunction(0x001F7310u);
             runtime.replaceFunction(0x001F7310u, &fadeWaitProbe);
+        }
+        if (runtime.lookupFunction(0x00204380u) != nullptr)
+        {
+            gFadeLoopPrev = runtime.lookupFunction(0x00204380u);
+            runtime.replaceFunction(0x00204380u, &fadeLoopProbe);
         }
     }
 
