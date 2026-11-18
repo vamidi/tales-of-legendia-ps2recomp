@@ -62,7 +62,9 @@ extern std::atomic<uint64_t> g_tolMemsetBytes;
 // The overlay draws the port's own "Checking memory card (8MB)" boot panel while this is true; the PS2 BIOS draws
 // that panel on hardware and a direct-ELF port never executes the BIOS. External linkage on purpose: the overlay
 // (src/ui/ui_overlay.cpp) reads it.
-bool g_tolShowMcBootPanel = (std::getenv("TOL_NOMCBOOT") == nullptr);
+bool g_tolShowMcBootPanel = false;
+// Set once the save-directory read has returned: the panel finishes its sweep and hands the screen to the guest.
+bool g_tolMcBootPanelQueryDone = false;
 
 namespace
 {
@@ -5177,9 +5179,13 @@ namespace
                 sRdPrev = runtime.lookupFunction(0x00126558u);
                 runtime.replaceFunction(0x00126558u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
                     ++sRd;
-                    // The game has issued its memory-card save-directory read: show the port's own BIOS-style
-                    // "Checking memory card (8MB)" panel from here on (see g_tolShowMcBootPanel).
-                    g_tolShowMcBootPanel = true;
+                    // The game has issued its memory-card save-directory read. Arm the port's BIOS-style
+                    // "Checking memory card (8MB)" panel here, exactly where the BIOS would show it, and let it
+                    // run its sweep once; it disarms itself after the read returns (g_tolMcBootPanelQueryDone).
+                    if (sRd == 1u && std::getenv("TOL_NOMCBOOT") == nullptr) {
+                        g_tolShowMcBootPanel = true;
+                        g_tolMcBootPanelQueryDone = false;
+                    }
                     const uint32_t part = GPR_U32(ctx, 4);
                     const uint32_t pathPtr = GPR_U32(ctx, 6);
                     const uint32_t dest = GPR_U32(ctx, 9);
@@ -5188,6 +5194,8 @@ namespace
                     {
                         sRdPrev(rdram, ctx, rt);
                     }
+                    // The check is finished: the panel completes and gets out of the way.
+                    g_tolMcBootPanelQueryDone = true;
                     const uint32_t ret = GPR_U32(ctx, 2);
                     static const bool env = std::getenv("TOL_STAGE") != nullptr;
                     if (env && sRd <= 8u)

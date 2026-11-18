@@ -18,6 +18,7 @@
 
 // Port-drawn memory-card boot panel flag, defined in src/runtime/tol_overrides.cpp.
 extern bool g_tolShowMcBootPanel;
+extern bool g_tolMcBootPanelQueryDone;
 
 namespace tol::ui {
 namespace {
@@ -468,7 +469,13 @@ void Overlay::drawFrame() {
     // panel before the game's ELF runs; a direct-ELF port never executes the BIOS, so the panel is reproduced here
     // with the port's own font. It is a port feature, not a recompiled asset: the strings are not on the disc.
     {
-        if (g_tolShowMcBootPanel) {
+        static double sPanelArmTime = -1.0;
+        if (!g_tolShowMcBootPanel) {
+            sPanelArmTime = -1.0;
+        } else {
+            if (sPanelArmTime < 0.0)
+                sPanelArmTime = ImGui::GetTime();
+            const double elapsed = ImGui::GetTime() - sPanelArmTime;
             ImDrawList *draw = ImGui::GetBackgroundDrawList();
             // Anchor on the draw list's clip rect, not ImGui::GetIO().DisplaySize: the SDL-GPU backend renders into
             // the swapchain, whose size/scale does not match the logical display size.
@@ -500,20 +507,17 @@ void Overlay::drawFrame() {
             const ImVec2 bar0(lane.x + pad * 2.0f, barY);
             const ImVec2 bar1(lane.x + laneWidth - pad * 2.0f, barY + lineHeight * 0.45f);
             draw->AddRectFilled(bar0, bar1, IM_COL32(214, 165, 133, 255), 2.0f);
-            static float sFill = 0.0f;
-            static float sDir = 1.0f;
-            sFill += 0.008f * sDir;
-            if (sFill > 1.0f) {
-                sFill = 1.0f;
-                sDir = -1.0f;
-            }
-            if (sFill < 0.0f) {
-                sFill = 0.0f;
-                sDir = 1.0f;
-            }
-            const float fill = sFill;
+            // Fill once and stay full. The real check does not bounce; a bar that reverses is what made it look
+            // like it stalled near the end.
+            const float fill = (elapsed >= 1.2) ? 1.0f : static_cast<float>(elapsed / 1.2);
             draw->AddRectFilled(bar0, ImVec2(bar0.x + (bar1.x - bar0.x) * fill, bar1.y),
                                 IM_COL32(206, 122, 96, 255), 2.0f);
+            // The save-directory read is served synchronously by the port's MCSERV HLE, so the panel gets its
+            // sweep plus the BIOS's hand-over pause and then yields to whatever the guest draws next.
+            if (g_tolMcBootPanelQueryDone && elapsed > 1.6) {
+                g_tolShowMcBootPanel = false;
+                sPanelArmTime = -1.0;
+            }
         }
     }
     if (m_closePopups) {
