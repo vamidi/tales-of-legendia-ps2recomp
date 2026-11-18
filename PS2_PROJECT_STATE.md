@@ -7915,6 +7915,82 @@ Decompile **`FUN_001961a8`** - the one remaining caller of the open primitive - 
 point. If it does not, then the handle is opened through the *other* primitive (`FUN_00196B88`, used by the scene entry
 state-4 path as `FUN_00196b88(entry[0x38], entry[0x3c])`), and the next enumeration is that primitive's callers.
 
+### Session 152 - open-primitive enumeration EXHAUSTED: no guest code stores a handle at entity+0x18
+
+Completed the caller enumeration of both file-open primitives. **All eight call sites are excluded**, each for a concrete,
+verified reason:
+
+| caller | primitive | fate of the handle |
+|---|---|---|
+| `FUN_00292990` | `FUN_00196A10` | stored at **`entry+0x2C`** (scene entry, state 3) |
+| `FUN_00206140` | `FUN_00196A10` | reads the whole file into a buffer at `+0x420`, then **closes** |
+| `FUN_0019fb10` | `FUN_00196A10` | builds a path string, opens, **no store** |
+| `FUN_001961a8` | `FUN_00196A10` + `FUN_00196B88` | **singleton async loader** - handle goes to the global `DAT_003910a8` (guarded by `DAT_003910ac < 0`) |
+| `FUN_00292a60` | `FUN_00196B88` | stored at **`entry+0x2C`** (scene entry, state 4) |
+| `FUN_001f8530` | `FUN_00196B88` | **decompression worker** - its `+0x18` is a *temporary read buffer* (`alloc(0, n<<11, 0x40)` -> async read -> `free`), handle is a local |
+| `FUN_001f87c0` | `FUN_00196B88` | **seek+wait worker** - `FUN_00197408` seek, poll `FUN_00197520`, close, no store |
+| `FUN_001961a8` | (same entry as above) | - |
+
+**Conclusion: no guest code anywhere stores an opened file handle at `+0x18` of a `0x2BC`-byte object.** The
+"enumerate the open primitive's callers" axis is exhausted and yields nothing.
+
+**This is therefore not a missing *open* call - the setter, if it exists in this build's reachable graph, receives an
+already-open handle as a parameter** (so it would not call the open primitive at all). Combined with the earlier
+measurement that `entity+0x18` never changes from 0 for 45 s, the practical statement is: **the entity is never
+configured**, exactly like every other scene-layer action in this port (loader stepped once, no model-load request, no
+TLPS geometry, `FUN_002311b0` never called).
+
+### Next probe (exact)
+
+Change axis from "who opens files" to "who writes this class". Use the entity's *distinctive* field as the signature: it
+is the only object with a byte at `+0x2A8` and a 4-slot pointer array at `+0x298` (written by `FUN_00230810`). Find every
+function that writes `+0x2A8` (`WRITE8 ..., 680`), then intersect with functions that write `+0x18`. That isolates the
+entity API regardless of where the handle originates, and names the setter - or proves that no setter exists in the
+binary, which would mean the configuration is data-driven (written by a table walker rather than a dedicated function).
+
+### Session 152 - RESULT: the entity class has no source setter; the field is written exactly once, to zero
+
+Second axis complete. Using the entity's distinctive byte `+0x2A8` as the class signature, **only four functions in the
+entire binary write it**:
+
+| function | writes `+0x18` |
+|---|---|
+| `FUN_00230810` (the init hook) | **1 store - of `0`** |
+| `FUN_002314c0` | none |
+| `FUN_002315d0` | none |
+| `FUN_002316e0` | none |
+
+Combined with the earlier findings this is exhaustive on three independent axes:
+
+1. **Within the entity's own code clusters** (`FUN_00230*`, `FUN_00231*`), `+0x18` is only ever **zeroed**
+   (`0x2308C8` init, `0x231AF4` teardown) or **read** (`0x230AE8`, `0x230B70`, `0x231AE0`).
+2. **All eight call sites of both file-open primitives** (`FUN_00196A10`, `FUN_00196B88`) are excluded - each stores
+   either at `entry+0x2C`, into a global, or into a temporary buffer it then frees.
+3. **The class's complete writer set is four functions**, and the only one touching `+0x18` writes zero.
+
+**Therefore: no source setter exists.** `entity+0x18` is written exactly once in the program's entire life - by the
+constructor's init hook, to `0` - and never again. This matches the runtime proof (a 45 s change-detector emitted a single
+unchanged line).
+
+**Interpretation (and its limit).** The empty entity is the *correctly constructed* initial state, and nothing in the
+reachable guest graph ever configures it. That is consistent with every other finding in this investigation: the port
+reaches a valid idle scene (`loader` stepped once, `FUN_002311b0` never called, no model-load request, no `TLPS` geometry
+accepted, GS receives clears only). What is missing is the **subsystem that would drive entity configuration** - the script
+VM `FUN_0027d0f0` and the map streamer `FUN_0029ce60`, both measured as never dispatched.
+
+**What this rules out going forward:** it is *not* a missing setter call that a small port-side override could restore;
+there is no setter to call. The fix must restore the *dispatch* of the subsystem that performs configuration, which is a
+guest-logic call-path problem, not a field-initialisation one.
+
+### Next probe (exact)
+
+Stop searching for writers. Determine **why `FUN_0027d0f0` (script VM) and `FUN_0029ce60` (map streamer) are never
+dispatched**, using the one rigorous method established in this session: for each, find the object that owns its vtable
+slot and instrument the *object's construction*. `FUN_0029ce60` is slot `+0x2C` of vtable `0x3D51A0`; `FUN_0027d0f0` is
+slot `+0x0C` of vtable `0x3D5030`. Identify both constructors, probe them (install-verified), and if either constructs
+successfully, trace the first dispatch attempt and the guard that rejects it. That is the last gap between "valid idle
+scene" and "geometry requested".
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
