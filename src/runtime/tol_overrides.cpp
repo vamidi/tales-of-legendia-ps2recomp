@@ -46,6 +46,9 @@ namespace
 {
     // Shared timeline counters. Every probe stamps these, so submits, polls and frames sit on one axis.
     uint32_t gFrameTicks = 0u;
+    // Cross-probe counters (see loaderStepProbe / fadeProbe / the [tcb4] sample in orderDispAProbe).
+    uint64_t gLoaderStepCalls = 0u;
+    uint64_t gFadeCalls = 0u;
 
     // ---------------------------------------------------------------------------------------------------------
     // NATIVE SIF RPC (the game's own libsif is statically linked, so its API entry points are guest code)
@@ -2522,6 +2525,20 @@ namespace
         // distinguishes "the GS workers monopolise turns" from "the prio-4 queue is not rotated".
         static std::map<uint32_t, uint32_t> sPickCount;
         ++sPickCount[tcb];
+        // Loader TCB sample: +0x1AC alive, +0x1F0 state, +0x1B4 resume pc, +0x1A8 saved ra, plus how many times the
+        // loader step and the fade have run. This is what says whether the thread survives the fade's return.
+        if (sSelEnv && (sSel % 20u) == 0u)
+        {
+            const uint32_t loader = 0x004079A0u;
+            std::fprintf(stderr,
+                         "[tcb4] sel=%u alive=%u state=%u pc=0x%08X savedRa=0x%08X loaderSteps=%llu fades=%llu\n",
+                         sSel, static_cast<unsigned>(runtime->Load8(rdram, ctx, loader + 0x1ACu)),
+                         static_cast<unsigned>(runtime->Load8(rdram, ctx, loader + 0x1F0u)),
+                         runtime->Load32(rdram, ctx, loader + 0x1B4u),
+                         runtime->Load32(rdram, ctx, loader + 0x1A8u),
+                         static_cast<unsigned long long>(gLoaderStepCalls),
+                         static_cast<unsigned long long>(gFadeCalls));
+        }
         if (sSelEnv && (sSel % 200u) == 0u)
         {
             // Fade curve: loader object 0x63D890 -> overlay object at +0x20 -> alpha (float) at +0x5C.
@@ -3000,6 +3017,7 @@ namespace
         static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
         static uint32_t sCalls = 0u;
         ++sCalls;
+        ++gFadeCalls;
         const bool ok = (obj + 0x28u < PS2_RAM_SIZE);
         const uint32_t overlayBefore = ok ? runtime->Load32(rdram, ctx, obj + 0x20u) : 0u;
         if (sEnv && sCalls <= 8u)
@@ -3117,6 +3135,7 @@ namespace
         static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
         static uint32_t sCalls = 0u;
         ++sCalls;
+        ++gLoaderStepCalls;
         // 0x165400 dispatches through `(**(code**)(*(int*)(obj+0x10) + 0xc))()`. Dumping the object's secondary
         // vtable and its slots at each call shows why the later units (obj 0x63D890) do not reach the app job.
         if (sEnv && sCalls <= 8u)

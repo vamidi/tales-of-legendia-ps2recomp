@@ -6555,6 +6555,49 @@ Watch the loader TCB (`0x4079A0`) across the moment the last fade returns: `+0x1
 If the thread's alive flag drops to 0, the loader thread ends after the fade and the missing piece is whatever
 should re-create it; if it stays alive with a pc outside the step, the re-arm is a guest state nobody sets.
 
+### Session 152 - the loader thread parks in the fade-in loop at 0x204380; the step never runs a 5th time
+
+Sampled TCB `0x4079A0` (`[tcb4]`, every 20th switch-in) together with the loader-step and fade counters:
+
+```
+[tcb4] sel=20  alive=0 state=0 pc=0x00000000 loaderSteps=0 fades=0
+[tcb4] sel=40  alive=1 state=1 pc=0x003661DC loaderSteps=2 fades=0     <- app loop yield
+[tcb4] sel=100 alive=1 state=1 pc=0x003662AC loaderSteps=2 fades=0
+[tcb4] sel=820 alive=1 state=1 pc=0x00204568 loaderSteps=3 fades=1
+[tcb4] sel=840 alive=0 state=0 pc=0x00165238 loaderSteps=3 fades=1     <- mid switch-in (alive cleared while running)
+[tcb4] sel=860 alive=1 state=1 pc=0x00204380 loaderSteps=4 fades=2
+[tcb4] sel=880..900 alive=1 state=1 pc=0x00204380 loaderSteps=4 fades=2   <- frozen
+```
+
+So the thread is **not dead**: `+0x1AC` = 1 (yielded/alive), `+0x1F0` = 1 (ready), and it is dispatched normally at
+prio 4. It simply stays at `pc = 0x00204380` for the rest of the run, and `loaderSteps` never reaches 5.
+
+`0x204380` disassembles to the **fade-in loop condition**:
+
+```asm
+0x204378  jal 0x0015231C        ; yield
+0x204380  lui v0,0x3F80         ; f0 = 1.0f
+0x20438C  c.lt.s f20, f0        ; f20 < 1.0 ?
+0x204390  bc1t 0x0020433C       ; loob back into the fade-in body
+```
+
+So the second fade's **fade-in never converges**: `f20` (the alpha accumulator at +0x5C's source register) does
+not reach 1.0, the loop never exits, the fade never returns, the loader step is never re-entered, no further unit
+is submitted, and the screen stays black.
+
+That is the concrete end of the chain - and note it is *not* the fade's design (the first fade completed,
+alpha 0.6 -> 1.0 -> 0.2). The suspicion is that `f20` does not survive the `0x15231C` yield/resume for this
+second invocation: the switch-in (`0x152200`) restores only HI/LO and calls `TCB+0x1B4`; the full GPR/FPU context
+is saved by `0x15243C` into `0x48F590+idx`, so a resume that does not go through the context-restore trampoline
+would leave `f20` holding another thread's value.
+
+### Next probe (exact)
+
+Sample `f20` (from the live `R5900Context`) at `0x204380` on each hit, together with `+0x5C` of the overlay object:
+- if `f20` is constant or does not advance by 0.04 per iteration -> the accumulator is not surviving the yield,
+  and the fix is in the resume path (context restore), not in the fade;
+- if `f20` advances past 1.0 but the branch still loops -> `c.lt.s` is mis-evaluating, which is an FPU issue.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
