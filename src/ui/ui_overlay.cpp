@@ -16,6 +16,9 @@
 #include <ctime>
 #include <filesystem>
 
+// Port-drawn memory-card boot panel flag, defined in src/runtime/tol_overrides.cpp.
+extern bool g_tolShowMcBootPanel;
+
 namespace tol::ui {
 namespace {
 constexpr double kCaptureSeconds = 6.0;
@@ -461,6 +464,58 @@ void Overlay::updateNavigation() {
 }
 
 void Overlay::drawFrame() {
+    // Port-drawn memory-card boot panel (see g_tolShowMcBootPanel in tol_overrides.cpp). The PS2 BIOS draws this
+    // panel before the game's ELF runs; a direct-ELF port never executes the BIOS, so the panel is reproduced here
+    // with the port's own font. It is a port feature, not a recompiled asset: the strings are not on the disc.
+    {
+        if (g_tolShowMcBootPanel) {
+            ImDrawList *draw = ImGui::GetBackgroundDrawList();
+            // Anchor on the draw list's clip rect, not ImGui::GetIO().DisplaySize: the SDL-GPU backend renders into
+            // the swapchain, whose size/scale does not match the logical display size.
+            const ImVec2 cmin = draw->GetClipRectMin();
+            const ImVec2 cmax = draw->GetClipRectMax();
+            const ImVec2 size(cmax.x - cmin.x, cmax.y - cmin.y);
+            const float laneWidth = size.x * 0.62f;
+            const float laneHeight = laneWidth * 0.42f;
+            const ImVec2 lane(cmin.x + (size.x - laneWidth) * 0.5f, cmin.y + (size.y - laneHeight) * 0.5f);
+            draw->AddRectFilled(cmin, cmax, IM_COL32(0, 0, 0, 255));
+            draw->AddRectFilled(lane, ImVec2(lane.x + laneWidth, lane.y + laneHeight), IM_COL32(246, 201, 168, 255),
+                                6.0f);
+            const float pad = laneWidth * 0.06f;
+            const float lineHeight = laneHeight * 0.12f;
+            const float scale = lineHeight / 13.0f;
+            const char *lines[] = {
+                "Checking memory card (8MB)",
+                "(for PlayStation 2) in MEMORY CARD slot 1.",
+                "Do not remove memory card (8MB) (for",
+                "PlayStation 2), controller, or",
+                "reset/switch off the console.",
+            };
+            for (int i = 0; i < 5; ++i) {
+                draw->AddText(ImGui::GetFont(), scale,
+                              ImVec2(lane.x + pad, lane.y + pad + lineHeight * static_cast<float>(i)),
+                              IM_COL32(146, 57, 48, 255), lines[i]);
+            }
+            const float barY = lane.y + laneHeight - pad - lineHeight * 0.55f;
+            const ImVec2 bar0(lane.x + pad * 2.0f, barY);
+            const ImVec2 bar1(lane.x + laneWidth - pad * 2.0f, barY + lineHeight * 0.45f);
+            draw->AddRectFilled(bar0, bar1, IM_COL32(214, 165, 133, 255), 2.0f);
+            static float sFill = 0.0f;
+            static float sDir = 1.0f;
+            sFill += 0.008f * sDir;
+            if (sFill > 1.0f) {
+                sFill = 1.0f;
+                sDir = -1.0f;
+            }
+            if (sFill < 0.0f) {
+                sFill = 0.0f;
+                sDir = 1.0f;
+            }
+            const float fill = sFill;
+            draw->AddRectFilled(bar0, ImVec2(bar0.x + (bar1.x - bar0.x) * fill, bar1.y),
+                                IM_COL32(206, 122, 96, 255), 2.0f);
+        }
+    }
     if (m_closePopups) {
         ImGui::ClosePopupsExceptModals();
         m_closePopups = false;

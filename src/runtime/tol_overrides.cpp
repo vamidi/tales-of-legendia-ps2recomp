@@ -58,6 +58,12 @@ extern std::atomic<uint64_t> g_tolVBlankTicks;
 extern std::atomic<uint64_t> g_tolMemsetCalls;
 extern std::atomic<uint64_t> g_tolMemsetBytes;
 
+// Set once the game's memory-card save-directory query has been served (see the FUN_00126558 probe below).
+// The overlay draws the port's own "Checking memory card (8MB)" boot panel while this is true; the PS2 BIOS draws
+// that panel on hardware and a direct-ELF port never executes the BIOS. External linkage on purpose: the overlay
+// (src/ui/ui_overlay.cpp) reads it.
+bool g_tolShowMcBootPanel = false;
+
 namespace
 {
     // Shared timeline counters. Every probe stamps these, so submits, polls and frames sit on one axis.
@@ -5171,6 +5177,9 @@ namespace
                 sRdPrev = runtime.lookupFunction(0x00126558u);
                 runtime.replaceFunction(0x00126558u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
                     ++sRd;
+                    // The game has issued its memory-card save-directory read: show the port's own BIOS-style
+                    // "Checking memory card (8MB)" panel from here on (see g_tolShowMcBootPanel).
+                    g_tolShowMcBootPanel = true;
                     const uint32_t part = GPR_U32(ctx, 4);
                     const uint32_t pathPtr = GPR_U32(ctx, 6);
                     const uint32_t dest = GPR_U32(ctx, 9);
