@@ -8339,7 +8339,95 @@ and `app+0x72` on entry, and direct-call check first. Then follow whichever of t
 and identify the first link that should create/draw the scene. No fix is proposed until that link is measured - the last
 three retractions all came from acting on an unverified premise.
 
-## 7. Next
+## 7. SESSION HANDOFF - START HERE (next session: wire the memory-card state)
+
+### 7.1 The screen you see is NORMAL - do not re-derive it
+The port boots, shows the loading screen and then the **memory-card promo**, then the save-directory query returns 0
+entries and the app job advances. This boot sequence was identified earlier and marked as ignorable. It is **not** the
+defect. (A previous session round wasted effort "solving" it; do not repeat that.)
+
+### 7.2 Verified live chain (all install-verified unless noted)
+```
+loader 0x63D890 (vtable 0x3DA380)
+  -> vt+0x0C = FUN_00366090                live stage driver, runs ONCE
+       creates manager           FUN_001ea850(0,0)      -> manager 0x63E290 (destroyed by FUN_001ea8b0 at end)
+       creates ctx B            FUN_002ed210(alloc 0x50), stepped via vt+0x1C
+       creates app job C        FUN_003654b0(alloc 0x220), vtable 0x3DA320, C[0x70]=1
+       loop: (*mgr->vt[8])() ; (*B->vt[0x1C])(B) ; (*C->vt[0x38])(C) ; (*mgr->vt[0xC])() ; yield
+```
+
+App job vtable `0x3DA320`: `+08` dtor, `+0C` is-busy, `+10` bind-ctx, `+14` stop, `+30` start, `+34` finalise,
+**`+38` = FUN_00365630** (per-frame update).
+
+`FUN_00365630` dispatches on `app[+0x70]`:
+`1 -> FUN_00365700` | `3 -> FUN_00365cd0` | `4 -> FUN_00365fd0` | on success `app[0x70]=app[0x72]; app[0x72]=-1`.
+
+`FUN_00365700` (state 1) is a sub-state machine on `app[+0x74]`:
+`0` fonts/messages (glyphs 0x5E, 0x62) · `1` read scene params (`sRam004e9142/44`) · `3` **save-directory check**.
+
+### 7.3 What the save check does (measured)
+```
+FUN_00365700 sub-state 3
+  -> FUN_002e0880(0)                        count check
+  -> FUN_002df590 -> FUN_002df6d0           save-file enumerator
+       -> FUN_00233bf0
+            -> FUN_00126558(part,0,path,0,99, part*0x18C0 + 0x4D41C0)
+                 copies path to 0x3E5E04, clears 99*0x40 bytes at dest,
+                 issues SIF RPC fn 13 via FUN_00118628(...,0x3E7300,4,0x125a78)
+            -> FUN_00233fc0 -> FUN_00126248   poll; returns uRam003e7300
+            -> RETURNS THAT AS THE ENTRY COUNT
+```
+Measured path: **`/BASLUS-21201TOL-S??`** — the memory-card save listing (`BASLUS-21201` = game id, `TOL-S` = save prefix).
+With **no memory card**, count = **0**, so `FUN_00365700` sets `app[0x72] = 4` and the app advances. **That is correct
+behaviour**, not a bug.
+
+### 7.4 TASK: wire the memory-card state (so the boot flow proceeds as on hardware)
+Do this with **real data only** — a real memory-card image and a real directory read. Do **not** return a constant count
+and do **not** synthesise save names; that fabricates asset data.
+
+1. **Provide/mount the card.** The port has no memory card mounted. Find the runtime's mc0 path:
+   `grep -ri "mc0\|memory card\|mcd\|ps2mc" thirdparty/PS2Recomp/ps2xRuntime/src`. If a device exists, point it at a
+   real 8 MB card image; if not, one must be added (read-only listing is enough to start).
+2. **Service the RPC.** All SIF RPCs currently report unhandled with `loadedModules=[]`:
+   ```
+   [IOP/RPC trace:unhandled] sid=0x80000593 rpc=0x.. loadedModules=[]
+   [ps2xIOP] [iop] started IO/File_Manager at 65536
+   ```
+   Dispatch path: `SifCallRpc` -> `PS2IopTransport::handleRpc` (`Rpc.cpp:566`) -> `IopSubsystem::handleRpc`
+   (`ps2_runtime.cpp:668`). Add a branch for the save-directory RPC that:
+   - reads the path from `0x3E5E04`,
+   - enumerates the card directory matching the wildcard,
+   - writes up to `count` entries of **0x40 bytes each** into `uRam003e5e00` (the entry name is what
+     `FUN_002df6d0` copies to `slot+0x200` via `FUN_00233cf0`/`FUN_002df420`/`FUN_0010b7e8`),
+   - writes the **real** entry count to `0x3E7300`.
+3. **Validate** with the existing probe: `TOL_STAGE=1` prints
+   `[stage] read #n part=… path="…" dest=… n=… ret=…`. Expect `ret` 0 on submit and a non-zero count once a card with
+   matching saves is mounted. Also watch `TOL_SCENE=1` → `[scene] entryCount FUN_002e0880 -> N`.
+
+### 7.5 Then continue the live chain
+After the save check, `FUN_00365630` dispatches **state 4 -> `FUN_00365fd0`** (and state 3 -> `FUN_00365cd0`) — both
+unread. Probe them install-verified logging `app+0x74`, `app+0x80`, `app+0x72`, and **direct-call check first**
+(see 7.6). That is where the scene must start.
+
+### 7.6 Measurement discipline (each rule cost a retraction this session — do not skip)
+- **Install-verify every probe**, and check the target's **direct-call sites** in `data/output_fixed`
+  (`grep -c "<FUN_NAME>(rdram"`) — 1732 direct calls exist and **bypass** `replaceFunction`.
+- Report **rates with their time series**; never divide a cumulative counter by total runtime (`c2` bit us).
+- Never compare **wall-clock latency** with **CPU cost** (`"83% unaccounted"` bit us).
+- Never derive a mechanism from a **ratio of aggregates**.
+- **State the premise, then measure it, then conclude.** Six conclusions were retracted here for skipping that order.
+
+### 7.7 Instrumentation already committed (all env-gated)
+`TOL_TRACE_SCENE` (TCB / entity / scene / ctor-links) · `TOL_CTOR` · `TOL_SCENE` (live scene path) · `TOL_STAGE`
+(save-list read + path) · `TOL_IO` (RPC completion) · `TOL_EVENTLOOP` · `TOL_PACING_RATIO` · `TOL_TURN_COST` ·
+`TOL_VBLANK_GAP` · `TOL_GUEST_HOT` · `TOL_MEMSET` · `TOL_WAIT_MAP`.
+
+### 7.8 Already measured CORRECT - do not re-investigate
+Renderer, GS backend, presenter, pacer cadence (60/s), VBlank raise path (60/s start+end), scheduler fairness, TCB
+arming / linking / waiter count, event-loop pass rate in steady state (~920/s, 16 ms gaps), the fade, the scene start
+(`232190/285E80/2321B0`), the frame loop's per-call cost (~10 ms, constant), and the `0x3D51A0` / `0x3D9340` / `0x3D9360`
+classes (a **different** subsystem — their unreachability is correct, not the defect).
+
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
    one missing case can gate the entire boot; the per-address override list is now 8 entries long.
