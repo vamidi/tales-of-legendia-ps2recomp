@@ -6889,6 +6889,70 @@ root) and the scene's `+0xFC` slot `FUN_0029ce60`, and check whether the scene d
 the entity is the same data that the 27 accepted TLPS chunks carry - i.e. whether the definition arrives and is
 dropped, or never arrives at all.
 
+### Session 152 - who should populate the entity fields, and what the "TLPS" accepts really are
+
+**Two and only two triggers can start a model load, and both are dead:**
+
+```
+1) script bytecode opcode 0x18        FUN_0027d0f0 (the script VM)
+     case 0x18:
+        scene = FUN_00232190(FUN_001ed0c0())      <- the 232190 call we saw 100+ times
+        if (FUN_00285b60(scene, id))              <- find entry by id
+            FUN_001ed680(0, id) -> FUN_00285c90 -> FUN_00292a40   (entry state 4)
+
+2) map streamer                      FUN_0029ce60 (scene vtable +0xFC = 0x3D51CC)
+     FUN_00285840(scene, ...) then FUN_00285bc0(scene, id, handle, 1) -> FUN_00292930 (state 2)
+```
+
+**Measured: `scriptVM (FUN_0027d0f0) = 0`, `OPCODE18 (FUN_00285b60) = 0`, `MAP-STREAM (FUN_0029ce60) = 0`.**
+
+`FUN_0027d0f0` has **zero static references** in the whole image. Searching the ELF for its pointer finds exactly one store,
+at **vaddr `0x003D503C`**, inside a class-method registry whose entries are four pointers on a `0x20` stride:
+
+```
+0x3D4FB8: 0x00278490 0x00278510 0x00278590 0x002786F0
+0x3D4FD8: 0x00278A80 0x00278BB0 0x00278C10 0x00278C20
+0x3D4FF8: 0x002791F0 0x00279250 0x00279260 0x00279270
+0x3D5018: 0x002792F0 0x00279370 0x002793F0 0x00279580
+0x3D5038: 0x0027C5F0 0x0027D0F0 0x0027D0D0 0x00000000      <- the script VM is slot 1
+0x3D5058: 0x0027C5A0 ...
+```
+
+So the script VM is a class's *step(dt, self)* method — the same shape as `FUN_0029ce60(float, int)` — reached only through
+that registry, and no dispatcher ever reaches it. Its own first line is a delta gate (`if (param_1 < 1.0) return;`).
+
+**The entity fields themselves** (`+0x18`/`+0x1C` source, `+0x158` variant, `+0x160` mode) are written by the load path
+(`FUN_00231be0(...)` inside `FUN_00230ad0`) and committed by `FUN_002311b0`; `FUN_002311b0` also sets the pending byte
+`entity+0x28 = 1` for `+0x160 == 1`. Since neither trigger runs, nothing ever writes them: measured `+0x18 = +0x1C = 0`,
+`+0x158 = +0x160 = 0`.
+
+**And the accepted "TLPS" chunks are not scene data — my earlier reading was wrong.** `FUN_00108f50` is a generic
+string/param handler; its actual traffic is configuration and archive paths:
+
+```
+magic='thpr'  head=74687072693D3430                -> "thpr i=40"
+magic='vag='  head=7661673D31303234006B65793D313032  -> "vag=1024", "key=102"
+magic='MFS'   / magic='CDV'
+magic='\AFS'  head=5C4146535C5359535F5245472E414653 -> "\AFS\SYS_REG.AFS"
+magic='\AFS'  head=5C4146535C4649454C442E4146530A  -> "\AFS\FIELD.AFS"
+```
+
+So the engine reaches the point of *naming* `FIELD.AFS`, but **no scene-definition / geometry chunk is ever accepted**.
+The genuine chunk accept in `FUN_002855e0` (entry state 5, magic `"TLPS"` = `0x53504C54`) can never run, because state 5
+is only reachable from state 3/4, which the two dead triggers above are the only way to reach.
+
+Conclusion for the black screen: the scene is fully built, pumped, and its four entries are healthy - but the
+**game logic that asks for models (script VM opcode 0x18) and the map streamer are never dispatched**, so no entry is
+ever loaded and the GS only ever receives clears.
+
+### Next probe (exact)
+
+Find who is supposed to dispatch the class registry at `0x3D5038` (i.e. instantiate that class and call slot 1 with a
+delta) - and whether the map streamer `FUN_0029ce60`'s object (whatever holds vtable `0x3D50D0`'s `+0xFC`) is ever
+created. Both are "who calls the thing that was never called" questions now, with exact addresses to instrument:
+the registry entry `0x3D5038`, the instantiation sites that store it into an object, and the object that owns
+`0x3D51CC`.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

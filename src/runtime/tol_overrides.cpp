@@ -3620,6 +3620,110 @@ namespace
             }
         }
 
+        // Two-and-only-two triggers can start a load: script opcode 0x18 (FUN_0027d0f0 -> FUN_00285b60 ->
+        // FUN_001ed680 -> FUN_00285c90, state 4) and the map streamer FUN_0029ce60 (scene vt+0xFC ->
+        // FUN_00285bc0, state 2). Count both, and sample the VM's own delta gate (it returns unless param_1 >= 1.0).
+        {
+            static uint64_t sVm = 0u;
+            static uint64_t sOp18 = 0u;
+            static uint64_t sMap = 0u;
+            static PS2Runtime::RecompiledFunction sVmPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sOp18Prev = nullptr;
+            static PS2Runtime::RecompiledFunction sMapPrev = nullptr;
+            if (sVmPrev == nullptr && runtime.lookupFunction(0x0027D0F0u) != nullptr)
+            {
+                sVmPrev = runtime.lookupFunction(0x0027D0F0u);
+                runtime.replaceFunction(0x0027D0F0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sVm;
+                                            const uint32_t d = GPR_U32(ctx, 4);
+                                            float dt = 0.0f;
+                                            std::memcpy(&dt, &d, sizeof(dt));
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sVm <= 6u || (sVm % 200u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] scriptVM #%llu dt=%.5f (0x%08X) %s | "
+                                                             "op18=%llu map=%llu\n",
+                                                             static_cast<unsigned long long>(sVm), dt, d,
+                                                             dt < 1.0f ? "RETURNS EARLY" : "steps",
+                                                             static_cast<unsigned long long>(sOp18),
+                                                             static_cast<unsigned long long>(sMap));
+                                            if (sVmPrev != nullptr)
+                                            {
+                                                sVmPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sOp18Prev == nullptr && runtime.lookupFunction(0x00285B60u) != nullptr)
+            {
+                sOp18Prev = runtime.lookupFunction(0x00285B60u);
+                runtime.replaceFunction(0x00285B60u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sOp18;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sOp18 <= 8u || (sOp18 % 100u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] OPCODE18 lookup #%llu scene=0x%08X "
+                                                             "id=%u\n",
+                                                             static_cast<unsigned long long>(sOp18),
+                                                             GPR_U32(ctx, 4), GPR_U32(ctx, 5));
+                                            if (sOp18Prev != nullptr)
+                                            {
+                                                sOp18Prev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sMapPrev == nullptr && runtime.lookupFunction(0x0029CE60u) != nullptr)
+            {
+                sMapPrev = runtime.lookupFunction(0x0029CE60u);
+                runtime.replaceFunction(0x0029CE60u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sMap;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sMap <= 8u || (sMap % 100u) == 0u))
+                                                std::fprintf(stderr, "[scenetest] MAP-STREAM #%llu a0=0x%08X a1=0x%08X\n",
+                                                             static_cast<unsigned long long>(sMap), GPR_U32(ctx, 4),
+                                                             GPR_U32(ctx, 5));
+                                            if (sMapPrev != nullptr)
+                                            {
+                                                sMapPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+        }
+
+        // What do the accepted TLPS chunks actually carry? Dump the header and the entry that owns them.
+        if (runtime.lookupFunction(0x00108F50u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sAccPrev = runtime.lookupFunction(0x00108F50u);
+            runtime.replaceFunction(0x00108F50u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t accepts = 0u;
+                                        ++accepts;
+                                        if (env && accepts <= 6u)
+                                        {
+                                            const uint32_t a0 = GPR_U32(ctx, 4);
+                                            const uint32_t a1 = GPR_U32(ctx, 5);
+                                            const uint32_t a2 = GPR_U32(ctx, 6);
+                                            char magic[5] = {0};
+                                            for (uint32_t i = 0u; i < 4u; ++i)
+                                                magic[i] = static_cast<char>(runtime->Load8(rdram, ctx, a1 + i) & 0xFFu);
+                                            std::fprintf(stderr, "[scenetest] TLPS accept #%u arg0=0x%08X chunk=0x%08X size=%u "
+                                                                 "magic='%s' head=",
+                                                         accepts, a0, a1, a2, magic);
+                                            for (uint32_t i = 0u; i < 16u; ++i)
+                                                std::fprintf(stderr, "%02X",
+                                                             runtime->Load8(rdram, ctx, a1 + i) & 0xFFu);
+                                            std::fprintf(stderr, "\n");
+                                        }
+                                        if (sAccPrev != nullptr)
+                                        {
+                                            sAccPrev(rdram, ctx, runtime);
+                                        }
+                                    });
+        }
+
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
                      runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",
                      runtime.lookupFunction(0x00285E80u) != nullptr ? "ok" : "NULL",
