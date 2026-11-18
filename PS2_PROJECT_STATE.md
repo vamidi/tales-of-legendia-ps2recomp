@@ -6439,6 +6439,41 @@ There is no reason to override the fade and several against:
 So: keep the guest's fade, fix the producer side. The next probe is the enqueue path - who submits to these
 queues and why they stop after 8 entries.
 
+### Session 152 - ROOT CAUSE of the stalled load: the mode byte at gp+0x4A86D9 is zero
+
+Instrumented the walk's caller and its argument chain:
+
+```
+[queue] walk #1   type=1  a1=0x00000001 a2=0x00000000
+[queue] walk #200 type=18 a1=0x00000001 a2=0x00000000
+[queue] table=0x01562FA0 active=230 hist= t1=61 t2=62 t3=8 t4=91 t5=8 t6=3
+[queue] type2 states: s0=1 s1=5 s2=5 s3=5 s4=5 s5=5 s6=4 s7=4 s8=3 ... s16=1 s17=1 s18=1 ...
+[queue] modeByte gp=0x003E2BF0 [0x0088B2C9]=0x00  which0=[0,0,0]  which1=[0,0,0]
+```
+
+The chain, verified end to end:
+
+1. `FUN_0027B390` (the 60 Hz poller) calls the walk three times:
+   `FUN_00349C00(0x10, FUN_0027B870(0,0), FUN_0027B870(1,0))` and the same for `0x11`/`0x12`.
+2. `FUN_0027B870(which, idx)` decodes **one byte at `gp + 0x4A86D9`** as six 2-bit fields
+   (idx0: bits 0/1, idx1: bits 2/3, idx2: bits 4/5). `a2` is the `which=1` bit of each pair -> bits **1, 3, 5**.
+3. `FUN_00349C00`'s switch processes types 16/17/18 **only if `a1 == 1 && a2 == 1`**.
+4. The walk *does* find candidates - the 233-slot table (`*(0x3DB660)`, stride 0x18, type nibble at +0x24, code at
+   +0x25) holds **230 active slots**, and exactly one type-2 entry in each of states **16, 17 and 18**.
+5. But the mode byte is **0x00**, so `a2 == 0` always, the `&&` fails, and those three entries are found and
+   **skipped on every one of the 2,481 walks**. `matches` stays at 8 (the boot-time ones) forever.
+
+So the loading is not stalled by a spin, an empty queue, the scheduler, the fade or the renderer: **it is gated on a
+single mode byte, `gp+0x4A86D9`, which nothing ever sets.** The three waiting entries (states 16/17/18) can only
+advance when bits 1/3/5 of that byte are set.
+
+### Next probe (exact)
+
+Find the writer of `gp+0x4A86D9` - the scene-mode setter that should run when a scene starts. Its bits 0/2/4 (the
+`which0` fields) are also clear, so the whole "mode" is uninitialised, which points at an init call that did not
+happen rather than a per-field bug. Watch the byte (range watch on a 4-byte window around it) and log the PC that
+writes it; if nothing ever writes it, the init path is the missing piece.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

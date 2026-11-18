@@ -2829,8 +2829,8 @@ namespace
         ++gQueueCalls;
         gQueueLastType = type;
         if (sEnv && (gQueueCalls <= 8u || (gQueueCalls % 200u) == 0u))
-            std::fprintf(stderr, "[queue] walk #%llu type=%u (yields=%llu matches=%llu)\n",
-                         static_cast<unsigned long long>(gQueueCalls), type,
+            std::fprintf(stderr, "[queue] walk #%llu type=%u a1=0x%08X a2=0x%08X (yields=%llu matches=%llu)\n",
+                         static_cast<unsigned long long>(gQueueCalls), type, GPR_U32(ctx, 5), GPR_U32(ctx, 6),
                          static_cast<unsigned long long>(gQueueYields),
                          static_cast<unsigned long long>(gQueueMatches));
         if (gQueueWalkPrev != nullptr)
@@ -2848,10 +2848,64 @@ namespace
         ++gQueueYields;
         static const bool sEnv = std::getenv("TOL_TRACE_QUEUE") != nullptr;
         if (sEnv && (gQueueYields % 500u) == 0u)
-            std::fprintf(stderr, "[queue] yields=%llu ret=0x%08X matches=%llu type=%u walks=%llu\n",
+        {
+            // The 233-slot resource table behind *(0x3DB660): slot i's type is (*(u8*)(i*0x18 + base + 0x24) & 0xF)
+            // per FUN_003344A0. A histogram says whether the guest registered anything and which types exist.
+            const uint32_t base = runtime->Load32(rdram, ctx, 0x003DB660u);
+            uint32_t hist[16] = {};
+            uint32_t active = 0u;
+            if (base >= 0x00100000u && base + 0xE9u * 0x18u < PS2_RAM_SIZE)
+            {
+                for (uint32_t i = 0u; i <= 0xE8u; ++i)
+                {
+                    const uint8_t type = static_cast<uint8_t>(runtime->Load8(rdram, ctx, base + i * 0x18u + 0x24u)) & 0x0Fu;
+                    ++hist[type];
+                    if (type != 0u && type != 6u)
+                        ++active;
+                }
+            }
+            std::fprintf(stderr,
+                         "[queue] yields=%llu ret=0x%08X matches=%llu type=%u walks=%llu table=0x%08X active=%u "
+                         "hist=",
                          static_cast<unsigned long long>(gQueueYields), GPR_U32(ctx, 2),
                          static_cast<unsigned long long>(gQueueMatches), gQueueLastType,
-                         static_cast<unsigned long long>(gQueueCalls));
+                         static_cast<unsigned long long>(gQueueCalls), base, active);
+            for (uint32_t i = 0u; i < 16u; ++i)
+                if (hist[i] != 0u)
+                    std::fprintf(stderr, " t%u=%u", i, hist[i]);
+            // The walk's own filter: type nibble (+0x24) == 2 and the byte at +0x25 == the queried code.
+            // Histogram +0x25 for the type-2 entries to see which states they actually hold.
+            if (base >= 0x00100000u && base + 0xE9u * 0x18u < PS2_RAM_SIZE)
+            {
+                uint32_t stateHist[256] = {};
+                for (uint32_t i = 0u; i <= 0xE8u; ++i)
+                {
+                    const uint8_t type = static_cast<uint8_t>(runtime->Load8(rdram, ctx, base + i * 0x18u + 0x24u)) & 0x0Fu;
+                    if (type != 2u)
+                        continue;
+                    const uint8_t state = static_cast<uint8_t>(runtime->Load8(rdram, ctx, base + i * 0x18u + 0x25u));
+                    ++stateHist[state];
+                }
+                std::fprintf(stderr, "[queue]   type2 states:");
+                for (uint32_t i = 0u; i < 256u; ++i)
+                    if (stateHist[i] != 0u)
+                        std::fprintf(stderr, " s%u=%u", i, stateHist[i]);
+                std::fprintf(stderr, "\n");
+            }
+            // The walk's `a2` comes from FUN_0027B870(1, idx): bits 1, 3, 5 of the mode byte at gp+0x4A86D9.
+            {
+                const uint32_t gp = GPR_U32(ctx, 28);
+                const uint32_t addr = gp + 0x4A86D9u;
+                if (gp >= 0x00100000u && addr + 1u < PS2_RAM_SIZE)
+                {
+                    const uint32_t mode = runtime->Load8(rdram, ctx, addr);
+                    std::fprintf(stderr,
+                                 "[queue]   modeByte gp=0x%08X [0x%08X]=0x%02X which0=[%u,%u,%u] which1=[%u,%u,%u]\n",
+                                 gp, addr, mode & 0xFFu, mode & 1u, (mode >> 2) & 1u, (mode >> 4) & 1u,
+                                 (mode >> 1) & 1u, (mode >> 3) & 1u, (mode >> 5) & 1u);
+                }
+            }
+        }
     }
 
     void queueMatchProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
