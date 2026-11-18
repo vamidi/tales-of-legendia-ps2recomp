@@ -5413,6 +5413,144 @@ namespace
         }
     }
 
+    // ---------------------------------------------------------------------------------------------------------
+    // TOL_RETCHAIN: the main EE thread (tid=1, entry crt0) died with pc = ra = 0x38. The scheduler's dispatch ring
+    // names 0x001B4458 (FUN_001B43E0's tail-jump epilogue) as the last non-zero pc, and that epilogue restores $ra
+    // from its own frame slot at sp+0x18. Logging (a) the row's entry together with the value already sitting in the
+    // slot it is about to write and (b) the epilogue's entry together with the slot it is about to load separates
+    // "the caller passed a garbage $ra" from "the slot was never written / was clobbered". Both are table slots, so
+    // replaceFunction intercepts every dispatch to them.
+    PS2Runtime::RecompiledFunction gRetChainEntryPrev = nullptr;
+    PS2Runtime::RecompiledFunction gRetChainEpiloguePrev = nullptr;
+
+    void retChainEntryProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool env = std::getenv("TOL_RETCHAIN") != nullptr;
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const uint32_t sp = GPR_U32(ctx, 29);
+        if (env)
+        {
+            static uint32_t shown = 0u;
+            static uint32_t anomalies = 0u;
+            const bool odd = ra < 0x00100000u;
+            if (shown < 8u || (odd && anomalies < 24u))
+            {
+                ++shown;
+                if (odd)
+                {
+                    ++anomalies;
+                }
+                // The prologue stores $ra at (sp-0x20)+0x18 == sp-0x08; a non-zero value there at entry means the
+                // frame is being reused (i.e. the row was dispatched without its caller's frame).
+                uint32_t lo = 0u;
+                uint32_t hi = 0u;
+                if (sp >= 0x00100008u && sp + 4u < PS2_RAM_SIZE)
+                {
+                    lo = runtime->Load32(rdram, ctx, sp - 8u);
+                    hi = runtime->Load32(rdram, ctx, sp - 4u);
+                }
+                std::fprintf(stderr,
+                             "[retchain] ENTRY 0x1B43E0 #%u ra=0x%08X sp=0x%08X pc=0x%08X futureSlot=%08X:%08X\n",
+                             shown, ra, sp, ctx->pc, hi, lo);
+            }
+        }
+        if (gRetChainEntryPrev != nullptr)
+        {
+            gRetChainEntryPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void retChainEpilogueProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool env = std::getenv("TOL_RETCHAIN") != nullptr;
+        if (env)
+        {
+            static uint32_t shown = 0u;
+            if (shown < 12u)
+            {
+                ++shown;
+                const uint32_t ra = GPR_U32(ctx, 31);
+                const uint32_t sp = GPR_U32(ctx, 29);
+                uint32_t lo = 0u;
+                uint32_t hi = 0u;
+                if (sp >= 0x00100000u && sp + 0x1Cu < PS2_RAM_SIZE)
+                {
+                    lo = runtime->Load32(rdram, ctx, sp + 0x18u);
+                    hi = runtime->Load32(rdram, ctx, sp + 0x1Cu);
+                }
+                // The whole 0x20-byte frame, plus which guest thread is running: a stale resume restored on a
+                // different thread (or after the frame was reused) shows up as a changed frame with the same sp.
+                std::fprintf(stderr,
+                             "[retchain] EPILOGUE 0x1B4458 #%u tid=%d ra=0x%08X sp=0x%08X slot=%08X:%08X "
+                             "frame=%08X/%08X/%08X/%08X pcreg=0x%08X\n",
+                             shown, static_cast<int>(runtime->eeScheduler().currentThreadId()), ra, sp, hi, lo,
+                             (sp + 0x04u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x00u) : 0u,
+                             (sp + 0x0Cu < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x08u) : 0u,
+                             (sp + 0x14u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x10u) : 0u,
+                             (sp + 0x1Cu < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, sp + 0x18u) : 0u,
+                             GPR_U32(ctx, 0));
+            }
+        }
+        if (gRetChainEpiloguePrev != nullptr)
+        {
+            gRetChainEpiloguePrev(rdram, ctx, runtime);
+        }
+    }
+
+    PS2Runtime::RecompiledFunction gRetChainThunkPrev = nullptr;
+
+    void retChainThunkProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool env = std::getenv("TOL_RETCHAIN") != nullptr;
+        if (env)
+        {
+            static uint32_t shown = 0u;
+            if (shown < 24u)
+            {
+                ++shown;
+                const uint32_t ra = GPR_U32(ctx, 31);
+                const uint32_t sp = GPR_U32(ctx, 29);
+                std::fprintf(stderr,
+                             "[retchain] THUNK 0x19A9C0 #%u tid=%d ra=0x%08X sp=0x%08X pc=0x%08X "
+                             "belowSp=%08X/%08X\n",
+                             shown, static_cast<int>(runtime->eeScheduler().currentThreadId()), ra, sp, ctx->pc,
+                             (sp >= 0x00100008u) ? runtime->Load32(rdram, ctx, sp - 4u) : 0u,
+                             (sp >= 0x00100008u) ? runtime->Load32(rdram, ctx, sp - 8u) : 0u);
+            }
+        }
+        if (gRetChainThunkPrev != nullptr)
+        {
+            gRetChainThunkPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void installRetChainProbes(PS2Runtime &runtime)
+    {        PS2Runtime::RecompiledFunction entry = runtime.lookupFunction(0x001B43E0u);
+        if (entry != nullptr)
+        {
+            gRetChainEntryPrev = entry;
+            runtime.replaceFunction(0x001B43E0u, &retChainEntryProbe);
+        }
+        PS2Runtime::RecompiledFunction epilogue = runtime.lookupFunction(0x001B4458u);
+        if (epilogue != nullptr)
+        {
+            gRetChainEpiloguePrev = epilogue;
+            runtime.replaceFunction(0x001B4458u, &retChainEpilogueProbe);
+        }
+        // The row's prologue is reached through the thunk 0x19A9C0, which calls the corpus function directly
+        // (bypassing replaceFunction), so log the thunk instead: whatever $ra it is entered with is what the
+        // prologue stores into the frame slot.
+        PS2Runtime::RecompiledFunction thunk = runtime.lookupFunction(0x0019A9C0u);
+        if (thunk != nullptr)
+        {
+            gRetChainThunkPrev = thunk;
+            runtime.replaceFunction(0x0019A9C0u, &retChainThunkProbe);
+        }
+        std::fprintf(stderr, "[retchain] INSTALL entry=%s epilogue=%s thunk=%s\n",
+                     entry != nullptr ? "ok" : "NULL", epilogue != nullptr ? "ok" : "NULL",
+                     thunk != nullptr ? "ok" : "NULL");
+    }
+
     PS2Runtime::RecompiledFunction gAdxDetachPrev = nullptr;
     PS2Runtime::RecompiledFunction gStreamStopPrev = nullptr;
     PS2Runtime::RecompiledFunction gStreamStopWrapPrev = nullptr;
@@ -9652,6 +9790,8 @@ namespace tol
         }
         // The app's outer state 4 (see state4Probe).
         installState4Probe(runtime);
+        // The main thread's fatal tail-jump epilogue (see retChainEntryProbe).
+        installRetChainProbes(runtime);
         // The loader thread's per-unit step (see loaderStepProbe) - the real invoker of the app job.
         installLoaderStepProbe(runtime);
         // Who sets the app object's busy byte (see busyWriterProbeImpl).

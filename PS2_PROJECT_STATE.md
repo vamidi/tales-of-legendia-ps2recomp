@@ -8,6 +8,8 @@
 
 ## CURRENT STATUS — updated 2026-11-17 (session 152; read this first; the rest is history)
 
+> **Session 153 (2026-11-18) - read this section at the bottom before acting.** It corrects the handoff task: the mcman save-directory RPC (sid 0x80000400) **is** already served by the MCSERV HLE, so "0 saves" is the honest answer for the empty folder card in data/CD/mc0 (no card image exists anywhere in the tree). It also pins the real end state: the main EE thread dies with pc = ra = 0x38, produced by FUN_001B43E0's tail-jump epilogue at 0x001B4458, which is dispatched as a *resume* after intervening frames recycled its $ra stack slot (0x01FFFF38).
+
 **Session 152 (latest) — `0x3059B0`, the AppCell child step.** `entry_003059a0` (0x3059A0..0x3059D0) is
 emitted with **no `switch (ctx->pc)` at all** (it starts `ctx->pc = 0x3059a0` and runs
 `lw t9,(a0); lw t9,0x28(t9); jr t9`), so the phase machine's every-step call to `child->vtable[0x10]`
@@ -8436,6 +8438,157 @@ classes (a **different** subsystem — their unreachability is correct, not the 
 3. **Pre-existing second defect**: `jalr` to null at `0x301EB8` with `a0=0xFFFFFF81` (-127); the trace ring
    shows `0x301d20 -> 0x35c650 -> 0x2ea0c0 -> 0x238650 -> 0x238b50 -> 0x164be0 -> 0x301e30 -> 0x301f60`.
    It predates this fix and is unrelated to it.
+
+---
+
+## Session 153 (2026-11-18) - the handoff task corrected (the mcman RPC is already served); the real end state is the main thread dying at 0x1B4458
+
+### S153.1 The handoff premise is wrong: the save-directory RPC is *not* unhandled
+
+Measured with `TOL_TRACE_RPC=1` (the bind/call log carries the sid, which the unhandled trace does not):
+
+```
+[rpc] bind client=0x003E5D40 sid=0x80000400 mode=0x0
+[rpc] call client=0x003E5D40 sid=0x80000400 fn=0xFE mode=0x0 send=0x003E5DC0/48  recv=0x003E7300/12
+[rpc] call client=0x003E5D40 sid=0x80000400 fn=0x1  mode=0x1 send=0x003E5DC0/48  recv=0x003E7300/4  t3=0x00126310
+[rpc] call client=0x003E5D40 sid=0x80000400 fn=0xD  mode=0x1 send=0x003E5DF0/1044 recv=0x003E7300/4  t3=0x00125A78
+```
+
+`sid 0x80000400` is the **standard mcman RPC server** (fn `0xFE` init, `0x1` getInfo, `0xD` getDir) and it is
+handled by the **MCSERV HLE** (`thirdparty/PS2Recomp/ps2xIOP/src/modules/mcserv.cpp`, registered unconditionally by
+`createCoreServices` in `builtin_profiles.cpp`). It drives the real folder-card implementation
+(`ps2_stubs::sceMc*` via `PS2IopHostAdapter::memoryCard`). Session 70 already fixed its version gate
+(`kMcservVersion = 0x20A`, `kMcmanVersion = 0x20E`), so `libmc` accepts it.
+
+The `[IOP/RPC trace:unhandled]` lines in the handoff are `0x80000592`/`0x80000593` (the cdvd servers, before the native IOP has them - they succeed on a later attempt), **not** the save query. Routed services never print an `[iop-rpc]` line at all, so their absence from the trace means "served", not "unhandled".
+
+`0` entries is therefore the **honest answer for an empty card**:
+
+- `mcRoot` derives from the ELF's directory (`PS2Runtime::configureIoPathsFromElf`) -> `data/CD/mc0`, which exists and
+  is empty; `MemoryCard.cpp` defaults `bool formatted = true`, so the card reads as formatted, 0 saves.
+- There is **no card image or save data anywhere in the tree** (`data/` has no `*.ps2`/`*.mcd`; the four `mc0`/`mc1`
+  folders are empty). The runtime's card model is **folder-backed, not a 8 MB image**, so "mount a real image" would
+  be new code, not a mount.
+- Nothing is fabricated and nothing needs to be: `GetInfo` already reports a formatted card with free space through
+  the real stubs.
+
+### 8.2 The app job does advance past the save check (measured)
+
+`TOL_TRACE_SCRIPT=1` (`jobObjProbe` on `0x00365630`) for 60 s and 240 s, both identical:
+
+```
+#1..#10  app=0x0063E3D0 state=1 phase=1 next=FFFF inner=1 -> 3   (fonts, scene params, save check)
+#11      app=0x0063E3D0 state=1 phase=4 next=FFFF inner=0
+#12      app=0x0063E3D0 state=1 phase=4 next=FFFF inner=1
+```
+
+`state` = busy byte `+8`, `phase` = outer `+0x70`, `inner` = sub-state `+0x74`. So the AppCell job walks
+sub-state `1 -> 3 -> 4` and **12 calls in total** are made to `FUN_00365630`, all within one ~0.75 s window around
+52 s of emulated time; after that the step is never called again. There is no 13th call even in a 240 s run.
+
+Decompiled confirmation of the save-check branch (`FUN_00365700`, Ghidra):
+
+```c
+if (iVar11 == 3) { ...; *(int*)(app+0x74) += 1; goto LAB_00365a70; }   // 3 -> 4
+LAB_00365a70:
+  FUN_00153120(0,-1,0);  status = app+0x80;
+  if (status in {0,-0xF8,-0xF3}) {
+      if (FUN_002e0880(0) < 1) {                 // no saves
+          if (iRam004e914c < FUN_002df2c0()) { app+0x80 = -0xEE; app+0x72 = 3; return 1; }
+          app+0x72 = 4; return 1;                // -> outer state 4
+      }
+```
+
+`FUN_00365630` commits `outer = next` **only when the step returns 1**, and then also sets `phase(+0x74) = 0`. The
+samples show `outer` still 1 and `phase` still 4 after the call, i.e. the step is being **checkpointed mid-way**
+(the recompiled function returns with `ctx->pc` inside itself and is resumed later) - which is why sampling the
+object after the call shows a partial state. This is normal for this port, not a stall in the save path.
+
+### 8.3 The actual end state: the guest goes fully idle and tid=1 is Dormant at pc = ra = `0x38`
+
+`TOL_TRACE_SCRIPT + TOL_SCENE + TOL_STAGE`, 240 s:
+
+```
+[turncost] ... | guest=70818.6ms(29.5%) paceWait=164593.5ms(68.6%) presenter=4602.5ms(1.9%)
+           | DELTA guest=0.3% pace=97.7% pres=2.0% | loader state=1 chan=4 alive=1 mainIters=177(+0)
+```
+
+- the current delta is **97.7 % pacing/idle sleep, 0.3 % guest**: the EE has nothing runnable, so the runtime idles
+  and keeps presenting;
+- `mainIters` (increment per `FUN_00152B70`, the frame loop) is frozen at 177 for the rest of the run;
+- `[eethreads]` (150 s run): `running=0`, `tid=1 Dormant pc=0x00000038 ra=0x00000038 sp=0x01FFFF40 entry=0x00100008`,
+  `tid=2 Waiting sema 3`, `tid=6 WaitSusp sleep`, `tid=7 Waiting sleep`. Nothing is runnable.
+
+So the main EE thread (entry `crt0`) is **dead**, and everything else is parked behind it.
+
+### 8.4 Where it dies, measured (probes `TOL_RETCHAIN`, `TOL_SLOT38`)
+
+```
+[badpc] thread=1 pc=0x00000038 from=0x001B4458 ra=0x00000038 sp=0x01FFFF40
+        recent=0x001B4458, 0x001AC518, 0x00166490, 0x001AC518, 0x001A152C, 0x001A36A0, 0x001A35E4, ...
+```
+
+- `0x001B4458` is `FUN_001B43E0`'s **tail-jump epilogue**:
+  `ld s0,0(sp); ld s1,8(sp); ld s2,0x10(sp); ld ra,0x18(sp); j 0x1B6AD0; addiu sp,+0x20`
+  (`0x1B6AD0` is itself a pass-through thunk to `0x1AD0B8`), entered at `sp=0x01FFFF20` i.e. the row's own frame
+  (`prologue: addiu sp,-0x20; sd s0,0; sd s1,8; sd s2,0x10; sd ra,0x18`).
+- The row is invoked from `FUN_001A1498` -> thunk `0x0019A9C0` (`jal` at `0x1A1540`/`0x1A155C`) -> `0x19A9C0` does
+  `j 0x1B43E0` as a **direct C++ call** (`FUN_001b43e0_0x1b43e0(rdram, ctx, runtime)`), which is why an
+  entry-point `replaceFunction` never fires for it (1 such direct call exists; the only other edge is the jal).
+- `TOL_RETCHAIN` (epilogue dispatch at `0x1B4458`):
+
+```
+#1 tid=4 sp=0x00396B10 slot=0x001A1548 frame=0039F780/FFFFFFFF/00000001/001A1548
+#2..#8 tid=1 sp=0x01FFFF20 slot=0x001A1548 frame=0039F780/FFFFFFFF/00000001/001A1548
+#9 tid=1 sp=0x01FFFF20 slot=0x00000038 frame=0039F780/FFFFFFFF/00000001/00000038
+```
+
+  Only the `$ra` slot differs in #9; `s0/s1/s2` are still this row's values, so the frame was **not** reused as a
+  whole - a single 4-byte store landed on `0x01FFFF38`.
+- `TOL_SLOT38` (samples `0x01FFFF38` at every dispatcher turn and reports the pc that was running when it changed)
+  shows that address is a **recycled scratch slot at the top of the main thread's stack**, written by many
+  different frames at the same depth:
+
+```
+0x0 -> 0x00000005   after pc=0x00139880 (sp=0x01FFFF30)
+0x0 -> 0x00166438   after pc=0x00165D50 (sp=0x01FFFE80)
+... 0x45494549 ("EIEI") after pc=0x001EC75C ...
+0x0 -> 0x001A152C   after pc=0x00165BA8 (sp=0x01FFFF20)     <- this row's own $ra, written by the normal call
+0x0 -> 0x00000032   after pc=0x001EBC6C (sp=0x01FFFB80)
+```
+
+**Conclusion:** the dispatch at `0x1B4458` is a **resume** of the return point left by the checkpoint inside the
+`jal 0x1AC4F0` callee, and it happens after other frames at the same stack depth have overwritten the `$ra` slot.
+The epilogue therefore restores a recycled value (`0x38` in the fatal case), tail-jumps into `0x1B6AD0`, and the
+thread returns to `pc = 0x38`. This is the same family as the `0x1B18F0` death (resume on a frame that is no longer
+valid), not a missing switch case: the `case` for `0x1b4458` exists and is taken.
+
+It is also **timing dependent** - in one 45 s run tid=1 was still `Running` at 45 s (`pc=0x00151F88`) - which is
+consistent with a race between the resume and the next frame's use of that stack slot.
+
+### 8.5 Next step (concrete)
+
+1. Find what leaves `pc = 0x1B4458` pending across the stack recycle: either the scheduler's resume path
+   (`EeScheduler::run` dispatching an interior pc) or `dispatchGuestBranch` returning with a pending pc after a
+   callee checkpoint. `TOL_SLOT38` already prints, for every change, both the pc that was running and the pc that
+   is dispatched next, so the fatal transition can be caught directly (`TOL_SLOT38` + `TOL_RETCHAIN` together).
+2. Two candidate fixes, in order of preference:
+   - **runtime**: do not dispatch a *resume* pc whose producing frame is no longer valid (e.g. treat a checkpoint
+     inside a callee as a full unwinding return so the caller re-runs its own epilogue inline), or
+   - **per-address** (`tol_overrides.cpp`): re-express `0x1B4458` so it restores `s0/s1/s2` from the frame and
+     tail-jumps `0x1B6AD0` with `$ra` taken from the call site (`0x1A1548` via `0x1A1540`, `0x1A1564` via
+     `0x1A155C`) instead of from the stale slot - the row has exactly one caller (`FUN_001A1498`) and two call
+     sites, so this is well-founded.
+3. Do **not** re-investigate: the mcman RPC (served), the save check (advances), the renderer, the pacer, the GS
+   backend, the CRI pump, and DVCI (all measured correct in earlier sessions).
+
+### 8.6 Instrumentation added this session (both env-gated, no effect when unset)
+
+| env | where | what |
+|---|---|---|
+| `TOL_RETCHAIN` | `src/runtime/tol_overrides.cpp` (`retChainEntryProbe`, `retChainEpilogueProbe`, `retChainThunkProbe`) | entry/epilogue/thunk of the `0x1B43E0` row with `$ra`, `sp`, the frame words and the guest thread id |
+| `TOL_SLOT38` | submodule `ps2xRuntime/src/lib/Kernel/EeScheduler.cpp` | samples `0x01FFFF38` at every dispatch turn, prints the pc that was running when it changed |
+
 
 
 
