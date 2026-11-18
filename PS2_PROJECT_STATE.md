@@ -8097,6 +8097,56 @@ callers in this chain. Two outcomes:
 - **either non-zero** -> then `FUN_00298570` *is* reached and the break is inside it, which makes `FUN_00298570` itself the
   fix site.
 
+### Session 152 - ANSWER: neither FUN_003367b0 nor FUN_00338800 runs; the world-construction path is unreachable
+
+Install-verified probes on both (this was the missing check on the earlier create/destroy experiment):
+
+```
+[scenetest] create/destroy sites INSTALL: 366090=ok 3367b0=ok 338800=ok 169850=ok
+[ctor] INSTALL scriptVM-ctor(0x27c3f0)=ok map-ctor(0x29ca90)=ok
+[chain] INSTALL 0x2988a0=ok 0x298570=ok
+
+site 366090 = 1        <- the only entry: t=0, a0=0x63D890 (loader), ra=0x165230
+site 3367b0 = 0
+site 338800 = 0
+chain FUN_00298570 = 0     chain FUN_002988a0 = 0
+```
+
+**Neither `FUN_003367b0` nor `FUN_00338800` is ever called, so neither reaches `FUN_00298570`** (which is itself 0,
+confirming the causal order). Both probes installed correctly, so these zeros are trustworthy.
+
+**Where each link stands (all measured, install-verified):**
+
+| function | calls | role |
+|---|---|---|
+| `FUN_00366090` | **1** | the only `0x33xxxx`-family function that runs; created the manager `0x63E290` |
+| `FUN_003367b0` | 0 | world-construction entry A |
+| `FUN_00338800` | 0 | world-construction entry B |
+| `FUN_00298570` | 0 | world container ctor (their callee) |
+| `FUN_002988a0` | 0 | constructs 4 map objects in place via `FUN_0012f2b0` |
+| `FUN_0029ca90` (map ctor) | 0 | - |
+| `FUN_0027c3f0` (script-VM ctor) | 0 | - |
+
+**The only member of that whole family that executes is `FUN_00366090`, once, and it merely builds the manager.** Every
+path that would construct the world (map/field class, script VM class) is unreachable.
+
+**Their call sites (next level):**
+
+```
+FUN_003367b0  <- FUN_00336650     (single caller)
+FUN_00338800  <- FUN_00338350     (single caller)
+```
+
+### Next probe (exact)
+
+Probe **`FUN_00336650`** and **`FUN_00338350`** install-verified, and for each log the caller's `a0` and `ra`. Two
+outcomes:
+
+- **both zero** -> the break is above them; continue with the same method one level up (they are the last two links before
+  the world containers).
+- **either non-zero** -> the break is a guard *inside* it that rejects before the `FUN_003367b0` / `FUN_00338800` call -
+  and that guard is the fix site, since everything below it is already proven unreachable rather than broken.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

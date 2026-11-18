@@ -4303,7 +4303,10 @@ namespace
                                             }
                                         });
             }
-            std::fprintf(stderr, "[scenetest] create/destroy site probes installed\n");
+            std::fprintf(stderr,
+                         "[scenetest] create/destroy sites INSTALL: 366090=%s 3367b0=%s 338800=%s 169850=%s\n",
+                         sAPrev != nullptr ? "ok" : "NULL", sBPrev != nullptr ? "ok" : "NULL",
+                         sCPrev != nullptr ? "ok" : "NULL", sDPrev != nullptr ? "ok" : "NULL");
         }
 
         // CORRECTED vt+0x0C trace. The earlier version computed target as *(*(obj+0x10)+0x0C) but logged `vt` as
