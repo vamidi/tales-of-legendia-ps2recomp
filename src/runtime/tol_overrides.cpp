@@ -4752,6 +4752,56 @@ namespace
             std::fprintf(stderr, "[scenetest] memset probe installed (0x109108)\n");
         }
 
+        // Constructors of the two classes whose step methods are never dispatched. Install-verified so a zero count
+        // is trustworthy (the earlier actorCtor measurement lacked that check).
+        //   0x3D5030  script-VM class   : ctor FUN_0027c3f0, step +0x0C = FUN_0027d0f0
+        //   0x3D51A0  map/field class   : ctor FUN_0029ca90, step +0x1C = FUN_0029cc60, stream +0x2C = FUN_0029ce60
+        {
+            static uint64_t sCtorVm = 0u;
+            static uint64_t sCtorMap = 0u;
+            static PS2Runtime::RecompiledFunction sCtorVmPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sCtorMapPrev = nullptr;
+            static bool sVmOk = false;
+            static bool sMapOk = false;
+            if (!sVmOk && runtime.lookupFunction(0x0027C3F0u) != nullptr)
+            {
+                sCtorVmPrev = runtime.lookupFunction(0x0027C3F0u);
+                runtime.replaceFunction(0x0027C3F0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sCtorVm;
+                                            static const bool env = std::getenv("TOL_CTOR") != nullptr;
+                                            if (env && sCtorVm <= 5u)
+                                                std::fprintf(stderr, "[ctor] scriptVM-class ctor #%llu this=0x%08X\n",
+                                                             static_cast<unsigned long long>(sCtorVm), GPR_U32(ctx, 4));
+                                            if (sCtorVmPrev != nullptr)
+                                            {
+                                                sCtorVmPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+                sVmOk = true;
+            }
+            if (!sMapOk && runtime.lookupFunction(0x0029CA90u) != nullptr)
+            {
+                sCtorMapPrev = runtime.lookupFunction(0x0029CA90u);
+                runtime.replaceFunction(0x0029CA90u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sCtorMap;
+                                            static const bool env = std::getenv("TOL_CTOR") != nullptr;
+                                            if (env && sCtorMap <= 5u)
+                                                std::fprintf(stderr, "[ctor] map-class ctor #%llu this=0x%08X\n",
+                                                             static_cast<unsigned long long>(sCtorMap), GPR_U32(ctx, 4));
+                                            if (sCtorMapPrev != nullptr)
+                                            {
+                                                sCtorMapPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+                sMapOk = true;
+            }
+            std::fprintf(stderr,
+                         "[ctor] INSTALL scriptVM-ctor(0x27c3f0)=%s map-ctor(0x29ca90)=%s\n",
+                         sVmOk ? "ok" : "NULL", sMapOk ? "ok" : "NULL");
+        }
+
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
                      runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",
                      runtime.lookupFunction(0x00285E80u) != nullptr ? "ok" : "NULL",

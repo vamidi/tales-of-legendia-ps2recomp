@@ -7991,6 +7991,66 @@ slot `+0x0C` of vtable `0x3D5030`. Identify both constructors, probe them (insta
 successfully, trace the first dispatch attempt and the guard that rejects it. That is the last gap between "valid idle
 scene" and "geometry requested".
 
+### Session 152 - both target classes are never constructed (install-verified), and both chains converge
+
+Applied the rigorous method (install-verified probes, so a zero is trustworthy).
+
+**Constructors identified:**
+
+| class | vtable | ctor | registered step | measured |
+|---|---|---|---|---|
+| script VM | `0x3D5030` | `FUN_0027c3f0` | `+0x0C` = `FUN_0027d0f0` | **0 calls** |
+| map / field | `0x3D51A0` | `FUN_0029ca90` | `+0x1C` = `FUN_0029cc60`, `+0x2C` = `FUN_0029ce60` | **0 calls** |
+
+`FUN_0029ca90` confirmed as the ctor (`*this = &DAT_003d51a0`, then `FUN_00292b10(this+0x10)`); `+0x08` (`0x29caf0`) is the
+dtor.
+
+```
+[ctor] INSTALL scriptVM-ctor(0x27c3f0)=ok map-ctor(0x29ca90)=ok
+scriptVM-class = 0        map-class = 0
+```
+
+**So there is no dispatch attempt to trace and no guard that rejects it** - the objects are never created. Per the method,
+walk one level up.
+
+**The map-class ctor is only ever *registered*, in a fixed object pool:**
+
+```c
+FUN_002988a0(obj) {
+    FUN_0012f2b0(obj + 0x70,  0x29ca90, 0x29caf0, 0x80, 4);   // pool: ctor 0x29CA90, dtor 0x29CAF0, 0x80 x 4
+    FUN_0012f2b0(obj + 0x270, 0x29d440, 0x29d4b0, 0x70, 0xc); // pool: 0x70 x 12
+    FUN_0012f3e0(alloc(0x1210), 0x29c690, 0x29c6f0, 0x24, 0x80);
+}
+```
+
+So `0x29ca90` runs only when something **allocates from that pool** - and nothing does.
+
+**The two chains converge on the same driver family:**
+
+```
+map class:    0x29ca90  <- pool reg in FUN_002988a0 <- FUN_00298570 <- FUN_003367b0 / FUN_00338800
+script VM:    0x27c3f0  <- FUN_0016cfe0 <- FUN_00166a10 <- FUN_00168460 <- FUN_00168810
+manager:      0x3db31c  created/destroyed by the SAME FUN_003367b0 / FUN_00338800 (and FUN_00366090)
+```
+
+`FUN_003367b0` / `FUN_00338800` are two of the functions in the manager's create **and** destroy caller lists, and the
+manager *was* created once (`0x63E290`). So the world-construction chain **is entered**, reaches the pool
+**registration**, and then stops: **nothing ever allocates from the pool**, so no map/field object exists and its
+`+0x1C`/`+0x2C` methods are never dispatched. The script-VM chain separately never runs at all (it bottoms out in
+`FUN_00168810`, the field-load loop, which has zero static references).
+
+### Next probe (exact)
+
+Find the **pool allocate function** - the sibling of `FUN_0012f2b0` that hands out a slot and invokes the registered ctor -
+and probe it install-verified. Two outcomes:
+
+- **never called** -> the *consumption* side is the gap: whatever should request a map/field object never runs.
+- **called but returns nothing** -> inspect the pool's free-list/slot state after `FUN_0012f2b0` initialises it (a pool
+  initialised with zero free slots would fail silently this way).
+
+That distinguishes "nothing asks" from "asking fails", and it is the last mechanical gap between the valid idle scene and
+geometry being requested.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
