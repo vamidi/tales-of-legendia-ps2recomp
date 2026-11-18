@@ -7426,6 +7426,54 @@ Attribute the unaccounted wall-clock. Reuse the existing IRQ instrumentation (`T
 The one whose share rises while `FUN_00165ad0`'s iteration time falls is the thief. Only after that is known can the
 loader's starvation be fixed at its actual cause - and it is still a port-side scheduler/IRQ question, not scene code.
 
+### Session 152 - RETRACTION: the "3.6x VBlank deficit" was my arithmetic error; pacer and IRQ path are correct
+
+Added a permanent diagnostic, `TOL_PACING_RATIO` in `EeScheduler.cpp`: it counts VBlank pacing events
+(`traceVBlankPacing`, called once per VBlank) against `dispatchIrq` calls (and per-cause start/end/timer) and prints
+the rates once per second.
+
+```
+[ratio] vblankTicks/s=1  raises/s=3   vblankStart/s=1  vblankEnd/s=1  timer/s=0    (boot, ~22 s)
+[ratio] vblankTicks/s=0  raises/s=24  ...                                        (boot)
+[ratio] vblankTicks/s=60 raises/s=130 vblankStart/s=60 vblankEnd/s=60 timer/s=8    (steady state)
+[ratio] vblankTicks/s=59 raises/s=127 vblankStart/s=59 vblankEnd/s=59 timer/s=7
+[ratio] vblankTicks/s=60 raises/s=128 vblankStart/s=60 vblankEnd/s=60 timer/s=8
+```
+
+**In steady state VBlank pacing and VBlank IRQ raises are both exactly 60/s.** There is no deficit.
+
+**Retraction:** the previous entry's "650 raises vs ~2340 expected = 3.6x deficit" was wrong. `c2` in the `[eeirq]`
+trace is a **cumulative** counter (`sByCause[]` is never reset), and it was accumulated across the ~22 s boot phase where
+VBlank legitimately runs at 1-5/s. Dividing that boot-contaminated total by the full run time produced a fictitious
+deficit. The frame-rate path in the port is correct and is **not** the cause of anything.
+
+**Also retired:** the "83-98% unaccounted time" from the per-call costing was a methodology artifact - `g_iterStartQpc`,
+`g_iterSumUs` and `g_maxUs` were single globals in a cooperative multi-threaded guest (another thread's entry overwrites
+the iteration start), and the figure compared **wall-clock latency** against **CPU cost inside `jal`s**, which need not
+be equal. The trustworthy instrument is the project's own `TOL_TURN_COST`.
+
+**What `TOL_TURN_COST` actually says** (steady state, same run):
+
+```
+presents=18400 guest=29177.4ms(66.4%) paceWait=14423.2ms(32.8%) presenter=318.1ms(0.7%)
+guest 29170.2 -> 29177.4 ms across 600 presents: FLAT
+```
+
+Guest CPU total is flat while `paceWait` grows, and `guestEntries` advance only ~58 per 600 presents at ~0.04 ms each.
+So the guest is **idle by its own logic** - sitting in a wait, not being starved and not running slowly.
+
+**Where that leaves the investigation:** the renderer, pacer, VBlank/IRQ path, scheduler fairness, GS backend and
+presenter are all measured correct. The game runs, receives 60 VBlank/s, and waits. The only established defect remains
+the one from earlier entries: the model/scene load is never requested (the loader thread is stepped once per activation,
+clears `alive(+0x1AC)`, and is never re-armed), so the scene streams no geometry and the GS receives clears only.
+
+### Next probe (exact)
+
+Follow the guest's wait: identify what the main loop actually blocks on during its ~24 ms idle per present - read the
+waiting thread's `+0x1F1` channel and `+0x200` payload at the moment `paceWait` is entered, and map that channel to its
+signaller. If it waits on VBlank (correct) then the guest is simply spending its frame budget doing nothing, and the
+defect is upstream in guest logic; if it waits on something that never arrives, that signaller is the fix site.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
