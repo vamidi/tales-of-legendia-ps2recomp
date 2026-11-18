@@ -6354,6 +6354,52 @@ check whether the boundary is being rebased/late every frame (the trace prints `
 `max_late_us=`, `next_host_us=`). A boundary that rebases every frame, or a `next_host_us` far in the past,
 would explain a fixed ~5x shortfall.
 
+### Session 152 - pacing measured: guest clock is right, host wall is 4.8x worse; the guest spins in a queue
+
+`TOL_VBLANK_PACING_TRACE`:
+
+```
+[VBlank pacing] tick=1  cycle=4915299   host_us=54440889440  starts=1 rebases=1 max_late_us=320340
+[VBlank pacing] tick=41 cycle=201527259 host_us=54468728117  starts=3 rebases=3 max_late_us=948612
+```
+
+- `Δcycle` = 4.9 M per tick -> at 294.9 MHz that is **16.67 ms of guest time: the guest's own frame clock is a
+  correct 60 Hz**;
+- `Δhost` = 27.8 s over 41 ticks = **~680 ms of wall time per guest frame** (~40x slower than real time);
+- `rebases == starts` on every line - **every boundary rebases instead of catching up**, with `max_late_us` ~0.95 s.
+  So the pacer has given up on catching up; it is a symptom of the host being 40x behind, not the cause.
+
+`TOL_GFX_STATS_EVERY=120` splits the wall time:
+
+| | loading phase | idle phase |
+|---|---|---|
+| presented fps | 2.5 | 60.0 |
+| **GS backend share of wall** | **4 %** | 26 % |
+| ee-dispatches / frame | 390 | 1 |
+| sched loop | 1010 /s | 337 /s |
+
+So the port is **not render-bound**: the whole GS path is 4 % of wall time. The scheduler loop turns ~1000
+guest entries per second, yet only ~12 VBlanks/s arrive.
+
+`TOL_TRACE_EE_PC` shows where those entries go - one guest cluster on tid 1:
+
+```
+0x349C9C x104  0x349DD8 x101  0x349D68 x99  0x349D48 x91  0x3499A8 x36
+0x27B45C x36   0x3499D0 x32   0x349A38 x32   0x27B488 x32  0x27B4E0 x31
+```
+
+`0x3498xx-0x349Dxx` is `FUN_00349C00` and its neighbours: a **queue walk that dispatches items matching a
+predicate** (`0x3341A0` init, `0x3343E0` next, `0x334400` item, `0x3344E0`, `thunk_FUN_00334530` process).
+
+So the guest burns its ~1000 entries/s walking that queue while the frame (and therefore VBlank progress) barely
+advances. The 12.4 Hz is a *consequence* of this spin, not a separate defect.
+
+### Next probe (exact)
+
+Identify the queue `FUN_00349C00` walks and why it never drains: log its `param_1` (type), the item count returned
+by `FUN_003343E0`, and how many items hit `thunk_FUN_00334530` per call. A queue that is always non-empty and
+never matches the predicate is a permanent spin - and that would be the thing to fix rather than the pacer.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
