@@ -42,6 +42,16 @@ extern uint64_t g_tolGuestTransfers;
 #include <windows.h>
 #endif
 
+// Cross-TU regime markers: defined here, printed by the runtime's TOL_TURN_COST line in ps2_runtime.cpp so the
+// turn-cost split is always shown together with the guest's regime (loader TCB state + main-loop iterations).
+namespace tol_state
+{
+    uint64_t g_mainLoopIters = 0u;
+    uint32_t g_loaderState = 0xFFFFFFFFu;
+    uint32_t g_loaderChan = 0xFFFFFFFFu;
+    uint32_t g_loaderAlive = 0xFFFFFFFFu;
+}
+
 namespace
 {
     // Shared timeline counters. Every probe stamps these, so submits, polls and frames sit on one axis.
@@ -3259,11 +3269,6 @@ namespace
     // step callback(+0x1B0), resume pc(+0x1B4). Logged only on change so the transition history stays readable.
     void logLoaderTcb(const char *tag, PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx)
     {
-        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
-        if (!sEnv)
-        {
-            return;
-        }
         const uint32_t tcb = 0x004079A0u;
         static uint32_t sState = 0xFFFFFFFFu;
         static uint32_t sChan = 0xFFFFFFFFu;
@@ -3279,6 +3284,15 @@ namespace
         const uint32_t ch = runtime->Load8(rdram, ctx, tcb + 0x1F1u) & 0xFFu;
         const uint32_t la = runtime->Load8(rdram, ctx, tcb + 0x1F3u) & 0xFFu;
         const uint32_t al = runtime->Load32(rdram, ctx, tcb + 0x1ACu);
+        // Regime snapshot is updated unconditionally so the runtime's turn-cost line is never blank.
+        tol_state::g_loaderState = st;
+        tol_state::g_loaderChan = ch;
+        tol_state::g_loaderAlive = al;
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        if (!sEnv)
+        {
+            return;
+        }
         if (st == sState && ch == sChan && la == sLatch && al == sAlive)
         {
             return;
@@ -4572,6 +4586,7 @@ namespace
                                         [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
                                             g_iterStartQpc = loopQpc();
                                             g_iterSumUs = 0u;
+                                            ++tol_state::g_mainLoopIters;
                                             logLoaderTcb("52b70.pre", runtime, rdram, ctx);
                                             if (p52b70 != nullptr)
                                             {

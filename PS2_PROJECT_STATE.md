@@ -7514,6 +7514,51 @@ Distinguish the two regimes in one run: log the turn-cost split **together with*
 (e.g. the loader TCB's `state(+0x1F0)` and the main loop's iteration counter at each sample). Then report only samples
 from one regime. That removes the run-to-run instability that has twice led this investigation to a wrong conclusion.
 
+### Session 152 - unified regime line built; single-regime result: the guest is CPU-bound spinning, loader is READY
+
+Built the requested instrument. `TOL_TURN_COST` now prints, on one line: the cumulative split, the **per-window DELTA**
+(so a phase change cannot hide inside cumulative numbers), and the **regime markers** - loader TCB `state/chan/alive`
+plus `mainIters` and its increment. The markers are cross-TU globals (`tol_state::` in tol_overrides.cpp, declared
+`extern` in ps2_runtime.cpp) and are updated unconditionally, so the line is never blank.
+
+**Single-regime result (4 consecutive samples, identical):**
+
+```
+[turncost] presents=19000 guest=37679.4ms(98.6%) paceWait=0.0ms(0.0%) presenter=525.7ms(1.4%)
+          | DELTA guest=99.8% pace=0.0% pres=0.2%
+          | loader state=1 chan=4 alive=1   mainIters=48(+7)
+```
+
+- **guest 99.6-99.8 % of every window** - the guest is CPU-bound, not idle (this is regime B).
+- **paceWaits = 0** - the scheduler never waits for VBlank, so no host wait exists to blame.
+- **`loader state=1 chan=4 alive=1` throughout** - the loader TCB is *ready and alive*. It is **not** being starved by
+  the scheduler, the ready list, the waiter count, or its own arming. All earlier hypotheses about the TCB are dead.
+- **`mainIters` +7 per 200 presents (~17.5 iterations/s)** - the frame loop barely advances.
+
+**Why: the guest spins.** Added `TOL_GUEST_HOT`, which samples the guest PC at every `enterGuest`:
+
+```
+[guesthot] distinct=41  top: 0x0015FC10=264  0x0015FD80=262  0x0015FB7C=231  0x0015FCF0=230  0x001A35E4=102  0x001A36A0=102
+```
+
+Per 2000-entry window those four `0x15FB7C..0x15FD80` PCs are **~49 % of all guest entries**, and `distinct=41` means
+the guest is confined to a tiny code region. They are interior labels of **`FUN_0015fb60`**, which installs its own
+interior code labels into `param_1+0x1240..0x124C` via `PTR_LAB_00389210/40/70/80` - i.e. a self-referential dispatch
+table, and the engine calls those labels repeatedly. Earlier windows showed the same shape in
+`0x349C9C/0x349D48/0x349D68/0x349DD8` (~55 %), inside `FUN_00349c00`, the queue walker/poller already recorded.
+
+**Conclusion (single regime, consistent across all samples):** the runtime is not the bottleneck and the loader is not
+being starved. A **guest spin consumes ~99 % of the CPU**, which throttles `dispatch(4)` to ~17.5/s, so a loader that is
+ready and alive gets stepped only a handful of times. This is guest logic - consistent with the session's earliest
+measurement that the work queues are empty (233 queues, 8 matches ever).
+
+### Next probe (exact)
+
+Identify what drives the `FUN_0015fb60` label table continuously and what those label bodies poll: decompile the
+`PTR_LAB_00389210/40/70/80` targets (they are interior labels of `FUN_0015fb60`), and instrument the caller that invokes
+them at ~2000/s. Then find the producer that should fill the queue they poll - that producer is the fix site, and it is
+guest logic, not runtime, not rendering.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
