@@ -6308,6 +6308,52 @@ Two candidates, both now sharply defined:
    invocation versus one ordinary turn - if the handler's `jal 0x19A068` path is expensive, the interrupt rate is
    what makes the whole guest crawl.
 
+### Session 152 - measured: VBlank runs at 12.4 Hz (not 60), interrupts are cheap, the guest is idle-waiting
+
+**Interrupt rate** (`TOL_TRACE_EE_IRQ`, 60 s) and the raise sites, which correct the cause mapping:
+
+```c
+case EeEventType::VBlankStart: dispatchIrq(false, 2u);      // cause 2 = VBLANK START
+case EeEventType::VBlankEnd:   dispatchIrq(false, 3u);      // cause 3 = VBLANK END
+                               dispatchIrq(false, 9u + timer);  // Timer N -> 11 = Timer 2
+```
+
+```
+[eeirq] total=1800  c1=188  c2=743  c3=737  c5=23  c11=109
+```
+
+| cause | meaning | rate |
+|---|---|---|
+| 2 | VBlank start | **12.4 /s** |
+| 3 | VBlank end | 12.3 /s |
+| 11 | Timer 2 | 1.8 /s |
+| 1, 5 | other | 3.1 /s, 0.4 /s |
+
+`constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);` - i.e. the runtime *asks* for 60 Hz and
+delivers **12.4 Hz**, a 4.8x shortfall. (Earlier notes calling cause 2 "GS" were wrong; it is VBlank start.)
+
+**Cost per interrupt** (`[gscost]`, wrapping the cause-2 handler `0x166490` and measuring `g_tolGuestTransfers`):
+
+```
+isr_calls=600  isr_transfers=1399  avg=2.33  total_transfers=6180721
+```
+
+**2.33 guest transfers per interrupt** versus **~26 per ordinary switch-in** - the handler is cheap and is *not*
+the cost. What matters is the throughput: between ISR 200 and ISR 600 (~33 s) the entire guest advanced
+**977 transfers ≈ 30/s**. So the guest is not computing - it is **waiting**, paced by VBlank at 12.4 Hz.
+
+So the fade (and the whole boot) is slow for one reason: **the guest only gets ~12 frames per second**, and each
+frame's guest work is trivial. The bottleneck is the VBlank/pacing rate, not interrupt cost, not scheduling
+fairness, not the renderer.
+
+### Next probe (exact)
+
+`EeScheduler`'s VBlank boundary emitter: why does it fire at 12.4 Hz when `kVBlankPeriod` is 16667 us? Dump
+`ee_host_pacing::VBlankBoundary` (there is already a `TOL_VBLANK_PACING_TRACE` around `traceVBlankPacing`) and
+check whether the boundary is being rebased/late every frame (the trace prints `starts=`, `rebases=`,
+`max_late_us=`, `next_host_us=`). A boundary that rebases every frame, or a `next_host_us` far in the past,
+would explain a fixed ~5x shortfall.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

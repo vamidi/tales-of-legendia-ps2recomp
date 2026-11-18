@@ -2805,6 +2805,41 @@ namespace
     PS2Runtime::RecompiledFunction gBusySetPrev = nullptr;
     PS2Runtime::RecompiledFunction gFadePrev = nullptr;
     PS2Runtime::RecompiledFunction gFadeWaitPrev = nullptr;
+    PS2Runtime::RecompiledFunction gGsIsrPrev = nullptr;
+
+    // Cost per turn, part 1: how much guest work happens inside one GS interrupt handler (0x166490, cause 2).
+    // g_tolGuestTransfers counts every inter-function transfer, so the delta across the handler is its cost in
+    // guest calls; comparing it with total transfers / switch-ins gives the interrupt's share of the turn budget.
+    void gsIsrProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint64_t before = g_tolGuestTransfers;
+        if (gGsIsrPrev != nullptr)
+        {
+            gGsIsrPrev(rdram, ctx, runtime);
+        }
+        const uint64_t after = g_tolGuestTransfers;
+        static const bool sEnv = std::getenv("TOL_TRACE_ORDER") != nullptr;
+        static uint64_t sCalls = 0u;
+        static uint64_t sTransfers = 0u;
+        ++sCalls;
+        sTransfers += (after - before);
+        if (sEnv && (sCalls % 200u) == 0u)
+        {
+            std::fprintf(stderr, "[gscost] isr_calls=%llu isr_transfers=%llu avg=%.2f total_transfers=%llu\n",
+                         static_cast<unsigned long long>(sCalls), static_cast<unsigned long long>(sTransfers),
+                         sCalls != 0u ? static_cast<double>(sTransfers) / static_cast<double>(sCalls) : 0.0,
+                         static_cast<unsigned long long>(g_tolGuestTransfers));
+        }
+    }
+
+    void installGsIsrProbe(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x00166490u) != nullptr)
+        {
+            gGsIsrPrev = runtime.lookupFunction(0x00166490u);
+            runtime.replaceFunction(0x00166490u, &gsIsrProbe);
+        }
+    }
 
     // The scene fade FUN_00204240 (vt[0x0C] of the loader object 0x63D890 after it is re-created):
     //     while (FUN_001f8480(state) != 0) yield();          <- wait before anything is drawn
@@ -7251,6 +7286,8 @@ namespace tol
         installBusyWriterProbes(runtime);
         // The scene fade: entry/exit, its wait condition, and the alpha (see fadeProbe).
         installFadeProbes(runtime);
+        // GS interrupt handler cost (see gsIsrProbe).
+        installGsIsrProbe(runtime);
         // The ADX detach handshake (see adxDetachProbe).
         installAdxDetachProbe(runtime);
         // Thread identity of the "stop all streams" chain (see streamStopProbe).
