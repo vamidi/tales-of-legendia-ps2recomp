@@ -3055,6 +3055,86 @@ namespace
     }
 
     PS2Runtime::RecompiledFunction gFadeLoopPrev = nullptr;
+    PS2Runtime::RecompiledFunction gSceneA = nullptr;
+    PS2Runtime::RecompiledFunction gSceneB = nullptr;
+    PS2Runtime::RecompiledFunction gSceneC = nullptr;
+
+    // The fade's mode==1 tail is the scene-start sequence:
+    //     FUN_00232190(...); FUN_00285E80(...); FUN_002321B0(x, 1);
+    // Everything above it is verified correct (app job one-shot, fade completes, scheduler fair, presenter 1 %), so
+    // this is where "nothing is drawn" must be decided: do these run at all, and what do they return?
+    void sceneStartLog(const char *tag, uint32_t n, uint32_t a0, uint32_t a1, uint32_t ret)
+    {
+        std::fprintf(stderr, "[scene] %s #%u a0=0x%08X a1=0x%08X ret=0x%08X\n", tag, n, a0, a1, ret);
+    }
+
+    void sceneAProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        const uint32_t a1 = GPR_U32(ctx, 5);
+        if (gSceneA != nullptr)
+        {
+            gSceneA(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 10u || (sCalls % 100u) == 0u))
+            sceneStartLog("232190", sCalls, a0, a1, GPR_U32(ctx, 2));
+    }
+
+    void sceneBProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        const uint32_t a1 = GPR_U32(ctx, 5);
+        if (gSceneB != nullptr)
+        {
+            gSceneB(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 10u || (sCalls % 100u) == 0u))
+            sceneStartLog("285e80", sCalls, a0, a1, GPR_U32(ctx, 2));
+    }
+
+    void sceneCProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        const uint32_t a1 = GPR_U32(ctx, 5);
+        if (gSceneC != nullptr)
+        {
+            gSceneC(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        static uint32_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 10u || (sCalls % 100u) == 0u))
+            sceneStartLog("2321b0", sCalls, a0, a1, GPR_U32(ctx, 2));
+    }
+
+    void installSceneStartProbes(PS2Runtime &runtime)
+    {
+        std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
+                     runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",
+                     runtime.lookupFunction(0x00285E80u) != nullptr ? "ok" : "NULL",
+                     runtime.lookupFunction(0x002321B0u) != nullptr ? "ok" : "NULL");
+        if (runtime.lookupFunction(0x00232190u) != nullptr)
+        {
+            gSceneA = runtime.lookupFunction(0x00232190u);
+            runtime.replaceFunction(0x00232190u, &sceneAProbe);
+        }
+        if (runtime.lookupFunction(0x00285E80u) != nullptr)
+        {
+            gSceneB = runtime.lookupFunction(0x00285E80u);
+            runtime.replaceFunction(0x00285E80u, &sceneBProbe);
+        }
+        if (runtime.lookupFunction(0x002321B0u) != nullptr)
+        {
+            gSceneC = runtime.lookupFunction(0x002321B0u);
+            runtime.replaceFunction(0x002321B0u, &sceneCProbe);
+        }
+    }
 
     // 0x204380 is the fade-in loop condition (`lui v0,0x3F80; mtc1; c.lt.s f20,f0; bc1t body`). The loader TCB
     // parks here forever on the second fade, so sample the live FPU accumulator f20 next to the overlay's stored
@@ -3104,6 +3184,8 @@ namespace
             gFadeLoopPrev = runtime.lookupFunction(0x00204380u);
             runtime.replaceFunction(0x00204380u, &fadeLoopProbe);
         }
+        // Post-fade scene start (see sceneStartLog): the three calls in FUN_00204240's mode==1 tail.
+        installSceneStartProbes(runtime);
     }
 
     // Only two writers touch an object's busy byte:

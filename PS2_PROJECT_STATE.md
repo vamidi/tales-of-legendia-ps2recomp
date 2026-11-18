@@ -6671,6 +6671,41 @@ Every consumer on the turn path is now measured, and the two biggest (guest 49 %
 as designed; the presenter at 1 % rules the renderer out for good. If more throughput is wanted it must come from
 the guest doing real work per frame (the loading pipeline), not from the scheduler, the pacer or the renderer.
 
+### Session 152 - the post-fade scene start DOES run (all three calls), and still nothing draws
+
+Instrumented the fade's mode==1 tail (`TOL_TRACE_SCENE`):
+
+```
+232190 count 11  first: a0=0x004E9D70 a1=0x3F3AE148(0.7297f) ret=0x005AA170   <- engine object
+285e80 count 1   first: a0=0x005AA170 a1=0x00000004           ret=0x00000000   <- scene/view object
+2321b0 count 2   first: a0=0x004E9D70 a1=0x00000001           ret=0x00000001   <- success
+```
+
+This matches the source exactly: `FUN_00285E80(FUN_00232190(engine, 0.7297f), 4)`, with the pointer returned by
+`232190` (`0x5AA170`) passed straight in, and `FUN_002321B0(engine, 1)` returning 1.
+
+An earlier run showed `285e80` missing; that was a run without the full flag set - with `TOL_TRACE_SCENE` +
+`TOL_TRACE_ORDER` it fires once, early. **Corrected**: the scene start is not skipped.
+
+So the chain is now verified *through* the scene start:
+
+```
+app job one-shot -> loader hands over -> fade (works) -> scene start: 232190 -> 285E80 -> 2321B0 (all run, success)
+                                                                          |
+                                                                          v
+                                                        ...and no content is ever drawn
+```
+
+**The remaining defect is after the scene start**: the scene object (`0x5AA170`, built from the engine at
+`0x4E9D70`) is created and reported ready, but nothing then draws it - the per-frame scene render/pump never
+produces a single textured primitive (5 textured draws of 42,716 for the whole run).
+
+### Next probe (exact)
+
+Follow the scene object: read its vtable at `0x5AA170`, identify its step/draw slot, and probe that slot's call
+count. Then either the pump is never called (a scheduling/registration gap) or it is called and draws nothing
+(inside the scene renderer) - and the same instrument decides it in one run.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
