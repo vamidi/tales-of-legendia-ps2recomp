@@ -4686,6 +4686,36 @@ namespace
         installLoopBracket<9>(runtime, 0x001516B0u, "1516b0.entry");
         std::fprintf(stderr, "[scenetest] main-loop brackets installed\n");
 
+        // FUN_00109108 is memset(a0=dst, a1=fill, a2=size). The event loop starves ~324ms at a time inside its
+        // 32-byte block loop (pc=0x109144), so log the real sizes: 32 bytes/iteration means ~100MB per stall at
+        // that duration, far more than the scheduler's own 0x7400+0x8400 init fills.
+        if (runtime.lookupFunction(0x00109108u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sMemPrev = runtime.lookupFunction(0x00109108u);
+            runtime.replaceFunction(0x00109108u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        const uint32_t dst = GPR_U32(ctx, 4);
+                                        const uint32_t size = GPR_U32(ctx, 6);
+                                        static const bool env = std::getenv("TOL_MEMSET") != nullptr;
+                                        static uint64_t big = 0u, total = 0u;
+                                        ++total;
+                                        if (size >= 0x1000u)
+                                        {
+                                            ++big;
+                                            if (env && big <= 20u)
+                                                std::fprintf(stderr,
+                                                             "[memset] #%llu dst=0x%08X size=0x%X (%u) ra=0x%08X\n",
+                                                             static_cast<unsigned long long>(big), dst, size, size,
+                                                             GPR_U32(ctx, 31));
+                                        }
+                                        if (sMemPrev != nullptr)
+                                        {
+                                            sMemPrev(rdram, ctx, runtime);
+                                        }
+                                    });
+            std::fprintf(stderr, "[scenetest] memset probe installed (0x109108)\n");
+        }
+
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
                      runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",
                      runtime.lookupFunction(0x00285E80u) != nullptr ? "ok" : "NULL",

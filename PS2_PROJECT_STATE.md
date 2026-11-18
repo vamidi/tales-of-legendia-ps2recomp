@@ -7713,6 +7713,61 @@ current guest PC (and its containing function) at the moment the event loop fina
 the previous event-loop pass. That names the long-running guest region directly, with the same absolute-time anchoring
 that made the lateness number trustworthy.
 
+### Session 152 - event-loop passes instrumented: PC lands in memset; the 27MB clear explains only 2 of 19 stalls
+
+Instrumented `EeScheduler::processPendingEvents()` (`TOL_EVENTLOOP`): per pass it logs the wall gap since the previous
+pass, the current thread id and the guest PC (from the current thread's context; `m_pendingContext` is null between guest
+calls, and the TCB `+0x1B4` read returns 0, so the thread context is the usable source).
+
+```
+[evloop] pass=28 gap=100ms tid=1 pc=0x00109144
+[evloop] pass=30 gap=326ms tid=1 pc=0x00109144
+[evloop] pass=32 gap=326ms tid=1 pc=0x00109144
+[evloop] pass=40 gap=79ms  tid=1 pc=0x00109144
+```
+
+All stalls are on **tid=1**. The PC is consistently **`0x00109144`**, which is the store inside the 32-byte block loop of
+**`FUN_00109108` = `memset(dst, fill, size)`**:
+
+```
+0x109140  pcpyld t0, v1, v1
+0x109144  sq     t0, 0x0(a3)      <- the sampled PC
+0x109148  addiu  a2, a2, -0x20
+0x109158  beq    v0, zero, 0x00109144
+```
+
+Added `TOL_MEMSET` to log `(dst, size, ra)` for fills >= 4 KB. Largest observed:
+
+```
+[memset] #2 dst=0x004E9B80 size=0x1A16480 (27,354,240) ra=0x00100270
+[memset] #3 dst=0x004E9B80 size=0x1A16480 (27,354,240) ra=0x00100270
+```
+
+`0x4E9B80` is the ELF's second LOAD vaddr (the start of .bss) and the caller `ra=0x00100270` is in the CRT start-up
+region, so this is a 27.3 MB .bss clear. 27,354,240 / 32 bytes per iteration = 854,820 iterations, which at the observed
+gap duration is ~84 MB/s - i.e. **one such clear plausibly takes ~324 ms**.
+
+**But the arithmetic does not close, so no conclusion is drawn:**
+
+```
+occurrences of the 27 MB memset : 2
+observed ~324 ms gaps           : 19      (2 x 324 ms = 0.65 s  vs  19 x 324 ms = 6.2 s)
+```
+
+Two competing explanations remain equally consistent with the data:
+
+- **(A)** the guest issues many more `memset` calls than the log shows (sizes < 4 KB are not logged, and the `big <= 20`
+  cap stops output), so the 27 MB clear is merely the largest of many; or
+- **(B)** ~324 ms is simply the boot loop's natural period between event checks, and `memset` is only where the PC
+  happened to be sampled.
+
+### Next probe (exact)
+
+Aggregate, per second: **number of `memset` calls, total bytes memset, and number of event-loop passes**. If bytes/s
+approaches 27 MB x (passes/s) then (A) holds and a repeated ~27 MB clear is the defect; if bytes/s is small while the
+~324 ms gaps persist then (B) holds and the period is intrinsic to the boot loop. No conclusion until that ratio is
+measured - the last four entries show how expensive it is to skip this step.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
