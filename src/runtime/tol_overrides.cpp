@@ -3437,6 +3437,35 @@ namespace
                      f14, f18, f1C, f158, f160, f28, f2A8);
     }
 
+    // The scene-entry record at 0x4E9140 (0x18 bytes, partition 0). Count = (word0 >> 2). A change-detector answers
+    // whether it is ever non-zero - i.e. whether anything ever registered scene entries.
+    void logSceneRecord(const char *tag, PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx)
+    {
+        static const bool sEnv = std::getenv("TOL_SCENE") != nullptr;
+        if (!sEnv)
+        {
+            return;
+        }
+        static uint64_t sSig = ~0ull;
+        const uint32_t base = 0x004E9140u;
+        uint32_t w[6] = {0, 0, 0, 0, 0, 0};
+        uint64_t sig = 0u;
+        for (int i = 0; i < 6; ++i)
+        {
+            w[i] = runtime->Load32(rdram, ctx, base + static_cast<uint32_t>(i) * 4u);
+            sig = sig * 131u + w[i];
+        }
+        if (sig == sSig)
+        {
+            return;
+        }
+        sSig = sig;
+        std::fprintf(stderr,
+                     "[srec] %s w=%08X %08X %08X %08X %08X %08X | count=%u p2=%u p4=%u p6=0x%04X thr=0x%08X\n", tag,
+                     w[0], w[1], w[2], w[3], w[4], w[5], (w[0] >> 2) & 0x3FFFu, w[0] & 0xFFFFu,
+                     (w[1] & 0xFFFFu), (w[1] >> 16) & 0xFFFFu, w[3]);
+    }
+
     void installSceneStartProbes(PS2Runtime &runtime)
     {
         // FUN_00232110 is the engine's per-frame step: it calls vtable[0x1C] on the engine's three children at
@@ -3520,6 +3549,7 @@ namespace
                                         prev = now;
                                         logLoaderTcb("tick", runtime, rdram, ctx);
                                         logEntityState("tick", runtime, rdram, ctx);
+                                        logSceneRecord("tick", runtime, rdram, ctx);
                                         if (sTickPrev != nullptr)
                                         {
                                             sTickPrev(rdram, ctx, runtime);
@@ -4941,6 +4971,227 @@ namespace
             }
             std::fprintf(stderr, "[depthN] INSTALL 0x335ec0=%s 0x338200=%s\n", sO9340 ? "ok" : "NULL",
                          sO9360 ? "ok" : "NULL");
+        }
+
+        // THE LIVE SCENE PATH: app job state 1 -> FUN_00365700 -> 99-slot entry array (FUN_002e0880/002e08d0)
+        // -> 0x27Axxx (FUN_0027a160 / FUN_0027ad40). All six targets have 0 direct-call sites (checked).
+        {
+            static uint64_t sSceneCalls = 0u, sCountCalls = 0u, sSlotCalls = 0u;
+            static uint64_t sA160 = 0u, sAd40 = 0u, sStatusCalls = 0u;
+            static uint64_t sOccupied = 0u, sFlagged = 0u, sLastCount = 0u;
+            static uint32_t sLastSub = 0xFFFFFFFFu, sLastStatus = 0xFFFFFFFFu;
+            static PS2Runtime::RecompiledFunction p1 = nullptr, p2 = nullptr, p3 = nullptr;
+            static PS2Runtime::RecompiledFunction p4 = nullptr, p5 = nullptr, p6 = nullptr;
+            static bool o1 = false, o2 = false, o3 = false, o4 = false, o5 = false, o6 = false;
+
+            if (!o1 && runtime.lookupFunction(0x00365700u) != nullptr)
+            {
+                p1 = runtime.lookupFunction(0x00365700u);
+                runtime.replaceFunction(0x00365700u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+                    ++sSceneCalls;
+                    const uint32_t app = GPR_U32(ctx, 4);
+                    const uint32_t sub = rt->Load32(rdram, ctx, app + 0x74u);
+                    const uint32_t st = rt->Load32(rdram, ctx, app + 0x80u);
+                    static const bool env = std::getenv("TOL_SCENE") != nullptr;
+                    if (env && (sub != sLastSub || st != sLastStatus || sSceneCalls <= 4u))
+                    {
+                        sLastSub = sub;
+                        sLastStatus = st;
+                        std::fprintf(stderr,
+                                     "[scene] FUN_00365700 #%llu app=0x%08X sub(+74)=%u status(+80)=0x%08X\n",
+                                     static_cast<unsigned long long>(sSceneCalls), app, sub, st);
+                    }
+                    if (p1 != nullptr)
+                    {
+                        p1(rdram, ctx, rt);
+                    }
+                });
+                o1 = true;
+            }
+            if (!o2 && runtime.lookupFunction(0x002E0880u) != nullptr)
+            {
+                p2 = runtime.lookupFunction(0x002E0880u);
+                runtime.replaceFunction(0x002E0880u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+                    ++sCountCalls;
+                    if (p2 != nullptr)
+                    {
+                        p2(rdram, ctx, rt);
+                    }
+                    const uint32_t n = GPR_U32(ctx, 2);
+                    static const bool env = std::getenv("TOL_SCENE") != nullptr;
+                    if (env && (n != sLastCount || sCountCalls <= 4u))
+                    {
+                        sLastCount = n;
+                        std::fprintf(stderr, "[scene] entryCount FUN_002e0880 -> %u (#%llu)\n", n,
+                                     static_cast<unsigned long long>(sCountCalls));
+                    }
+                });
+                o2 = true;
+            }
+            if (!o3 && runtime.lookupFunction(0x002E08D0u) != nullptr)
+            {
+                p3 = runtime.lookupFunction(0x002E08D0u);
+                runtime.replaceFunction(0x002E08D0u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+                    ++sSlotCalls;
+                    const uint32_t idx = GPR_U32(ctx, 5);
+                    if (p3 != nullptr)
+                    {
+                        p3(rdram, ctx, rt);
+                    }
+                    const uint32_t e = GPR_U32(ctx, 2);
+                    if (e >= 0x00100000u && e + 8u < PS2_RAM_SIZE)
+                    {
+                        const uint32_t v0 = rt->Load16(rdram, ctx, e);
+                        const uint32_t v1 = rt->Load16(rdram, ctx, e + 2u);
+                        if ((int16_t)v0 > 0)
+                        {
+                            ++sOccupied;
+                            if (v1 != 0u)
+                            {
+                                ++sFlagged;
+                            }
+                            static const bool env = std::getenv("TOL_SCENE") != nullptr;
+                            static uint64_t shown = 0u;
+                            if (env && shown < 12u)
+                            {
+                                ++shown;
+                                std::fprintf(stderr, "[scene] slot i=%u ptr=0x%08X v0=%d v1=%u\n", idx, e,
+                                             (int)(int16_t)v0, v1);
+                            }
+                        }
+                    }
+                });
+                o3 = true;
+            }
+            if (!o4 && runtime.lookupFunction(0x0027A160u) != nullptr)
+            {
+                p4 = runtime.lookupFunction(0x0027A160u);
+                runtime.replaceFunction(0x0027A160u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+                    ++sA160;
+                    static const bool env = std::getenv("TOL_SCENE") != nullptr;
+                    if (env && sA160 <= 8u)
+                        std::fprintf(stderr, "[scene] FUN_0027a160 #%llu a0=0x%08X\n",
+                                     static_cast<unsigned long long>(sA160), GPR_U32(ctx, 4));
+                    if (p4 != nullptr)
+                    {
+                        p4(rdram, ctx, rt);
+                    }
+                });
+                o4 = true;
+            }
+            if (!o5 && runtime.lookupFunction(0x0027AD40u) != nullptr)
+            {
+                p5 = runtime.lookupFunction(0x0027AD40u);
+                runtime.replaceFunction(0x0027AD40u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+                    ++sAd40;
+                    if (p5 != nullptr)
+                    {
+                        p5(rdram, ctx, rt);
+                    }
+                });
+                o5 = true;
+            }
+            if (!o6 && runtime.lookupFunction(0x00153120u) != nullptr)
+            {
+                p6 = runtime.lookupFunction(0x00153120u);
+                runtime.replaceFunction(0x00153120u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+                    ++sStatusCalls;
+                    if (p6 != nullptr)
+                    {
+                        p6(rdram, ctx, rt);
+                    }
+                    static const bool env = std::getenv("TOL_SCENE") != nullptr;
+                    static uint32_t lastRet = 0xDEADBEEFu;
+                    const uint32_t ret = GPR_U32(ctx, 2);
+                    if (env && (ret != lastRet))
+                    {
+                        lastRet = ret;
+                        std::fprintf(stderr, "[scene] status FUN_00153120 -> 0x%08X (#%llu)\n", ret,
+                                     static_cast<unsigned long long>(sStatusCalls));
+                    }
+                });
+                o6 = true;
+            }
+            std::fprintf(stderr,
+                         "[scene] INSTALL 365700=%s e0880=%s e08d0=%s 27a160=%s 27ad40=%s 153120=%s\n",
+                         o1 ? "ok" : "NULL", o2 ? "ok" : "NULL", o3 ? "ok" : "NULL", o4 ? "ok" : "NULL",
+                         o5 ? "ok" : "NULL", o6 ? "ok" : "NULL");
+        }
+
+        // The stage-load failure chain: FUN_002e0950 -> FUN_002df460 -> FUN_00233e50 -> FUN_00233fc0 ->
+        // FUN_00126248(1,0,&status). Decide between "no I/O completion at all" (ram0x00388d30 == 0 -> returns -1)
+        // and "I/O completed with error" (returns 1, *param_3 = uRam003e7300 == -1).
+        {
+            static uint64_t sIo = 0u;
+            static PS2Runtime::RecompiledFunction sIoPrev = nullptr;
+            static bool sIoOk = false;
+            if (!sIoOk && runtime.lookupFunction(0x00126248u) != nullptr)
+            {
+                sIoPrev = runtime.lookupFunction(0x00126248u);
+                runtime.replaceFunction(0x00126248u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+                    ++sIo;
+                    const uint32_t a0 = GPR_U32(ctx, 4);
+                    const uint32_t a2 = GPR_U32(ctx, 6);
+                    const uint32_t ctr = rt->Load32(rdram, ctx, 0x00388D30u);
+                    const uint32_t code = rt->Load32(rdram, ctx, 0x003E7300u);
+                    if (sIoPrev != nullptr)
+                    {
+                        sIoPrev(rdram, ctx, rt);
+                    }
+                    const uint32_t ret = GPR_U32(ctx, 2);
+                    static const bool env = std::getenv("TOL_IO") != nullptr;
+                    static uint64_t shown = 0u;
+                    if (env && shown < 14u)
+                    {
+                        ++shown;
+                        uint32_t st = 0xDEADBEEFu;
+                        if (a2 >= 0x00100000u)
+                        {
+                            st = rt->Load32(rdram, ctx, a2);
+                        }
+                        std::fprintf(stderr,
+                                     "[io] FUN_00126248 #%llu a0=%u ret=%u counter(0x388D30)=%u code(0x3E7300)=0x%08X "
+                                     "statusOut=0x%08X\n",
+                                     static_cast<unsigned long long>(sIo), a0, ret, ctr, code, st);
+                    }
+                });
+                sIoOk = true;
+            }
+            std::fprintf(stderr, "[io] INSTALL 0x126248=%s\n", sIoOk ? "ok" : "NULL");
+        }
+
+        // Does the stage definition actually arrive? FUN_00233bf0 -> FUN_00126558(part,0,info,0,99, part*0x18C0+0x4D41C0)
+        // reads up to 99 entries into the destination buffer, and its return value is used as the entry COUNT.
+        {
+            static uint64_t sRd = 0u;
+            static PS2Runtime::RecompiledFunction sRdPrev = nullptr;
+            static bool sRdOk = false;
+            if (!sRdOk && runtime.lookupFunction(0x00126558u) != nullptr)
+            {
+                sRdPrev = runtime.lookupFunction(0x00126558u);
+                runtime.replaceFunction(0x00126558u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+                    ++sRd;
+                    const uint32_t part = GPR_U32(ctx, 4);
+                    const uint32_t dest = GPR_U32(ctx, 9);
+                    const uint32_t n = GPR_U32(ctx, 8);
+                    if (sRdPrev != nullptr)
+                    {
+                        sRdPrev(rdram, ctx, rt);
+                    }
+                    const uint32_t ret = GPR_U32(ctx, 2);
+                    static const bool env = std::getenv("TOL_STAGE") != nullptr;
+                    if (env && sRd <= 8u)
+                    {
+                        std::fprintf(stderr, "[stage] read #%llu part=%u dest=0x%08X n=%u ret=%u data=",
+                                     static_cast<unsigned long long>(sRd), part, dest, n, ret);
+                        for (uint32_t i = 0u; i < 16u; ++i)
+                            std::fprintf(stderr, "%02X", rt->Load8(rdram, ctx, dest + i) & 0xFFu);
+                        std::fprintf(stderr, "\n");
+                    }
+                });
+                sRdOk = true;
+            }
+            std::fprintf(stderr, "[stage] INSTALL 0x126558=%s\n", sRdOk ? "ok" : "NULL");
         }
 
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
