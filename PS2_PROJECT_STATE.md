@@ -7874,6 +7874,47 @@ two candidates already identified are the script VM `FUN_0027d0f0` (never dispat
 `FUN_0029ce60` (never dispatched). Whichever is supposed to call the source setter is the fix site; both are guest logic,
 so the fix is restoring that call path, not emulating anything.
 
+### Session 152 - hunting the entity source setter: exclusions narrowed it to one caller
+
+Goal: find the function that stores to `entity+0x18` (entity = `engine[0x0C]` = `0x4E9DB0`, size `0x2BC`) and name
+the dead entry point that should reach it.
+
+**Exclusion 1 - the entity's own code never sets it.** `scalars_search(0x18, in_function="FUN_00230")` returns exactly
+four sites, and `in_function="FUN_00231"` eleven; in both clusters `+0x18` is only ever **zeroed** or **read**:
+
+| site | what |
+|---|---|
+| `0x2308C8` in `FUN_00230810` | `sw zero,0x18` - the init hook zeroes it |
+| `0x230100` in `FUN_002300D0` | `sw zero,0x18` |
+| `0x230AE8`, `0x230B70` in `FUN_00230AD0` | `lw a0,0x18` - reads it |
+| `0x231AE0`, `0x231AF4` in `FUN_00231AD0` | read, then `sw zero` + free |
+
+So the setter is **not in the entity's code**.
+
+**Exclusion 2 - it is a file handle, and `FUN_00196C98` is its closer.** `FUN_00231AD0` does
+`lw a0,0x18; FUN_00196c98; sw zero,0x18`, and `FUN_00196c98` is the close primitive. So `+0x18` holds an open handle.
+
+**Exclusion 3 - none of the open-primitive callers stores into `+0x18`.** `FUN_00196A10` (open) has only four callers:
+
+| caller | what it does with the handle |
+|---|---|
+| `FUN_00292990` | stores at `+0x2C` (scene entry, state 3) |
+| `FUN_00206140` | reads the whole file into a buffer at `+0x420`, then **closes** it - no store |
+| `FUN_0019fb10` | builds a path string and opens - no store |
+| **`FUN_001961a8`** | **not yet examined** |
+
+**Exclusion 4 - the co-write signature search was a false positive.** Searching for functions that write both `+0x18`
+and `+0x160` gave 8 candidates; the only one in the entity cluster, `FUN_00235280`, is a **sprite/particle setup**
+routine (writes `short +0x34`, pointers `+0x3C/+0x40/+0x70`, allocates via `FUN_00238640`/`FUN_0035ab70`) whose `+0x18`
+store is a **vtable assignment on a different, newly allocated object** (`= &DAT_003d4c20`). Not the entity.
+
+### Next probe (exact)
+
+Decompile **`FUN_001961a8`** - the one remaining caller of the open primitive - and check whether it stores the handle at
+`+0x18` of a `0x2BC`-sized object. If it does, that is the source setter and its caller chain names the owning dead entry
+point. If it does not, then the handle is opened through the *other* primitive (`FUN_00196B88`, used by the scene entry
+state-4 path as `FUN_00196b88(entry[0x38], entry[0x3c])`), and the next enumeration is that primitive's callers.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
