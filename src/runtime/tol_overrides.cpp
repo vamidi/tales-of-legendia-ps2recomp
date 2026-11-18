@@ -52,6 +52,9 @@ namespace tol_state
     uint32_t g_loaderAlive = 0xFFFFFFFFu;
 }
 
+// VBlank event counter owned by EeScheduler.cpp.
+extern std::atomic<uint64_t> g_tolVBlankTicks;
+
 namespace
 {
     // Shared timeline counters. Every probe stamps these, so submits, polls and frames sit on one axis.
@@ -3346,6 +3349,28 @@ namespace
     uint64_t g_maxUs = 0u;
     const char *g_maxTag = "-";
     uint64_t g_iterSumUs = 0u;
+    uint64_t g_iterVb0 = 0u;
+    uint64_t g_lastVbSeen = 0u;
+    const char *g_lastVbTag = "-";
+
+    // Logs how many VBlank events elapsed between this bracket and the previous one, naming the call whose window
+    // consumed them. This answers "which call inside an iteration waits on multiple VBlanks".
+    void logVBlankGap(const char *tag)
+    {
+        static const bool sEnv = std::getenv("TOL_VBLANK_GAP") != nullptr;
+        if (!sEnv)
+        {
+            return;
+        }
+        const uint64_t vb = g_tolVBlankTicks.load();
+        if (g_lastVbSeen != 0u && vb != g_lastVbSeen)
+        {
+            std::fprintf(stderr, "[vbgap] after %s: +%llu vblank(s)\n", g_lastVbTag,
+                         static_cast<unsigned long long>(vb - g_lastVbSeen));
+        }
+        g_lastVbSeen = vb;
+        g_lastVbTag = tag;
+    }
 
     // Bracket a main-loop call with the TCB change-detector (entry only): since consecutive brackets are adjacent
     // statements, a change first seen at bracket N's entry happened inside bracket N-1 - which names the writer.
@@ -3362,6 +3387,7 @@ namespace
         }
         sPrev = runtime.lookupFunction(addr);
         runtime.replaceFunction(addr, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+            logVBlankGap(sTag);
             logLoaderTcb(sTag, rt, rdram, ctx);
             const uint64_t t0 = loopQpc();
             if (sPrev != nullptr)
@@ -4547,18 +4573,20 @@ namespace
                                                                        ? (loopQpc() - g_iterStartQpc) *
                                                                              1000000ull / loopQpcFreq()
                                                                        : 0ull;
+                                            const uint64_t vbDelta = g_tolVBlankTicks.load() - g_iterVb0;
                                             if (env && (sPred <= 14u || (sPred % 10u) == 0u ||
                                                         iterUs >= 200000ull))
                                                 std::fprintf(stderr,
                                                              "[mainloop] exitPred #%llu ret=0x%08X (%s) "
-                                                             "iterUs=%llu sum=%llu max=%lluus@%s\n",
+                                                             "iterUs=%llu sum=%llu max=%lluus@%s vblank=%llu\n",
                                                              static_cast<unsigned long long>(sPred),
                                                              GPR_U32(ctx, 2),
                                                              GPR_U32(ctx, 2) == 0u ? "continue loop"
                                                                                    : "EXIT inner loop",
                                                              static_cast<unsigned long long>(iterUs),
                                                              static_cast<unsigned long long>(g_iterSumUs),
-                                                             static_cast<unsigned long long>(g_maxUs), g_maxTag);
+                                                             static_cast<unsigned long long>(g_maxUs), g_maxTag,
+                                                             static_cast<unsigned long long>(vbDelta));
                                             g_maxUs = 0u;
                                             g_maxTag = "-";
                                         });
@@ -4586,6 +4614,8 @@ namespace
                                         [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
                                             g_iterStartQpc = loopQpc();
                                             g_iterSumUs = 0u;
+                                            g_iterVb0 = g_tolVBlankTicks.load();
+                                            logVBlankGap("52b70");
                                             ++tol_state::g_mainLoopIters;
                                             logLoaderTcb("52b70.pre", runtime, rdram, ctx);
                                             if (p52b70 != nullptr)

@@ -7613,6 +7613,51 @@ the VBlank counter at each call. If instead iterations are spread evenly over si
 rarely and `mainIters` is under-counted. This distinguishes a real wait from a measurement artifact before any further
 conclusion is drawn.
 
+### Session 152 - VBlank deltas per iteration: the 3.43 hypothesis is refuted; VBlank is starved BY the loop
+
+Added a VBlank event counter (`g_tolVBlankTicks`, incremented in `traceVBlankPacing`) and `TOL_VBLANK_GAP`, which logs
+the VBlank delta between consecutive loop-call brackets, plus a per-iteration `vblank=N` field on the exitPred line.
+
+**Per-iteration VBlank consumption:**
+
+```
+[mainloop] exitPred #20 iterUs=35700 sum=1252 max=935us@139a20  vblank=0
+[mainloop] exitPred #50 iterUs=48952 sum=7646 max=7168us@139a20 vblank=0
+[mainloop] exitPred #90 iterUs=44465 sum=7389 max=7032us@139a20 vblank=1
+```
+
+**Each iteration consumes 0 or 1 VBlanks, never multiple.** So the predicted "~3.4 VBlanks per iteration" is
+**refuted**, and the "bracket calls because iterations consume multiple VBlanks" branch does not apply.
+
+**What the numbers do show**: an iteration takes **~38-49 ms with `vblank=0`**. At 60 Hz that window should contain 2-3
+VBlanks, so a delta of 0 means the counter does not advance *during* the iteration - the EE event loop is not serviced
+while the guest runs. **The loop is not waiting on VBlank; VBlank is being starved by the loop.** That also explains the
+two regimes seen earlier: when the guest yields often, VBlanks are processed at 60/s and the guest then sleeps on them
+(regime A, paceWait 32%); when the guest runs long stretches, VBlank processing stalls and no pacing wait ever happens
+(regime B, paceWaits=0).
+
+**Where the stalls accumulate** (VBlank delta between consecutive loop-call brackets):
+
+```
+[vbgap] after 139a20:            +1 vblank
+[vbgap] after 19a080:            +1 vblank
+[vbgap] after 164d40:            +1 vblank
+[vbgap] after 152200.switchin:   +8 vblank
+[vbgap] after 151ff0:            +22 vblank
+```
+
+The large gaps are inside **`FUN_00151ff0` (the channel-dispatch wrapper, +22 VBlanks ~ 370 ms)** and
+**`FUN_00152200` (switch-in, +8/+4/+2)** - the cooperative switch path - not in the loop's ordinary calls
+(`139a20`, `19a080`, `164d40` each show only +1).
+
+### Next probe (exact)
+
+Bracket the *inside* of `FUN_00151ff0` for the loader TCB step and the VBlank counter (it wraps `FUN_00151e90` ->
+switch save/restore), and measure how long one dispatch call can run before an event is serviced. The question is now
+precise: **why can a single `dispatch(4)` run for ~22 VBlank periods (~370 ms) without servicing the event loop?**
+That is a port-side scheduler question (the event loop must preempt long guest runs), and it is the mechanism behind the
+1-5/s VBlank rates measured during boot and the regime instability.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
