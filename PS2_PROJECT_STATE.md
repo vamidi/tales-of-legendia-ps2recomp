@@ -7474,6 +7474,46 @@ waiting thread's `+0x1F1` channel and `+0x200` payload at the moment `paceWait` 
 signaller. If it waits on VBlank (correct) then the guest is simply spending its frame budget doing nothing, and the
 defect is upstream in guest logic; if it waits on something that never arrives, that signaller is the fix site.
 
+### Session 152 - the wait mapped: the signaller is VBlankStart (correct), and the guest has TWO regimes
+
+Instrumented both scheduler wait points (`TOL_WAIT_MAP`):
+
+1. the event-processing loop's `pacingWaitUntil` (line ~3251), which names the earliest due deadline's event type;
+2. **`EeScheduler::waitForEvent()`** - the actual per-frame wait - which blocks on the earliest entry of
+   `m_deadlines`, or on an Alarm timer if that is sooner.
+
+**The signaller is `EeEventType::VBlankStart`**, rescheduled every `kVBlankPeriodCycles` (lines 304-306 / 3330-3332).
+VBlank arrives at **60/s** (measured with `TOL_PACING_RATIO`: `vblankStart/s=60`). So per the decision rule: **the guest
+waits on VBlank, which arrives correctly - the defect is upstream in guest logic, not a never-arriving signaller.**
+
+**But the run-to-run behaviour is not one steady state.** Two back-to-back runs of the same binary:
+
+| run | paceWaits | guest | paceWait | reading |
+|---|---|---|---|---|
+| A (`TOL_PACING_RATIO`+`TOL_TRACE_SCENE`) | 1871 | 29177 ms (66.4%) | 14423 ms (32.8%) | guest finishes early and **sleeps** on VBlank |
+| B (`TOL_WAIT_MAP`) | **0** | 37544 ms (**98.9%**) | **0 ms (0.0%)** | guest never waits - it **saturates CPU** |
+
+`waitForEvent()` returned immediately in run B (events always pending), so no wait existed to map and the `[waitmap]`
+line correctly printed nothing.
+
+**Consequence:** the "the guest is idle" conclusion from the previous entry is only true in regime A. The guest
+alternates between idling on VBlank and saturating CPU, so **a single run's turn-cost split does not describe a steady
+state** and must not be used as the basis for a fix. Any claim of the form "X% of time is spent in Y" needs the regime
+stated, or needs both regimes measured in one run.
+
+### Status
+
+Measured correct: renderer, GS backend, presenter, pacer cadence (60/s), VBlank raise path (60/s start+end), scheduler
+fairness, TCB arming/linking/waiter-count, fade, scene start, and the frame-loop's own per-call cost (~10 ms constant).
+Not correct: **no model/scene load is ever requested** (loader stepped once per activation, `alive` cleared, never
+re-armed; `FUN_002311b0` never called; no `TLPS` geometry chunk accepted).
+
+### Next probe (exact)
+
+Distinguish the two regimes in one run: log the turn-cost split **together with** a marker of which regime the guest is in
+(e.g. the loader TCB's `state(+0x1F0)` and the main loop's iteration counter at each sample). Then report only samples
+from one regime. That removes the run-to-run instability that has twice led this investigation to a wrong conclusion.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
