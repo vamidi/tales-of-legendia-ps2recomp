@@ -62,7 +62,7 @@ extern std::atomic<uint64_t> g_tolMemsetBytes;
 // The overlay draws the port's own "Checking memory card (8MB)" boot panel while this is true; the PS2 BIOS draws
 // that panel on hardware and a direct-ELF port never executes the BIOS. External linkage on purpose: the overlay
 // (src/ui/ui_overlay.cpp) reads it.
-bool g_tolShowMcBootPanel = true;
+bool g_tolShowMcBootPanel = (std::getenv("TOL_NOMCBOOT") == nullptr);
 
 namespace
 {
