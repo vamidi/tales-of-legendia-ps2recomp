@@ -6636,6 +6636,41 @@ other consumers on the turn path - (a) the interrupt/invocation dispatch (`dispa
 cumulative microseconds each. Whichever dominates is the thing to fix; the guest logic, the fade and the renderer
 are all behaving correctly.
 
+### Session 152 - turn cost accounted: 49 % guest / 49.9 % pacing sleep / 1.1 % presenter
+
+`TOL_TURN_COST` timers (cumulative microseconds) in `EeScheduler.cpp` (`enterGuest`, `ee_host_pacing::waitUntil`,
+`m_eventCv.wait`) and `ps2_runtime.cpp` (`m_framePump`), reported every 200 presents. After a full 60 s run:
+
+```
+[turncost] presents=28400 guestEntries=48964 paceWaits=3810 |
+           guest=29020.7ms(49.0%)  paceWait=29527.5ms(49.9%)  presenter=674.4ms(1.1%)
+           total=59222.6ms  per-present=2.09ms
+```
+
+| consumer | share of wall | per iteration |
+|---|---|---|
+| (a) guest execution (`enterGuest`) | **49.0 %** | 1.02 ms |
+| (b) VBlank pacing wait (`ee_host_pacing::waitUntil`) | **49.9 %** | 1.04 ms |
+| (c) presenter (`m_framePump`) | **1.1 %** | 0.024 ms |
+
+So:
+
+- the **presenter is 1 %** - the renderer, the GS backend and the fade are conclusively not the cost;
+- the loop runs **~473 iterations/s at 2.09 ms each**, so the "~0.7 s per turn" figure from the TCB sampling was
+  an artifact of sampling every 20th switch-in (each sample spans many iterations) - not a real per-turn cost;
+- wall time is split **evenly between executing guest code and deliberately sleeping in the VBlank pacer**. The
+  port is doing exactly what pacing asks: run ~1 ms, sleep ~1 ms.
+
+Therefore there is no "slow turn" left to fix. What remains true is that the guest does almost no *useful* work
+per frame (draws: clears only), so game progress is slow in game terms even though the emulator is
+running at its intended rate. That is the loader pipeline, not a performance defect.
+
+### Conclusion of this line of work
+
+Every consumer on the turn path is now measured, and the two biggest (guest 49 %, pacer 49.9 %) are both behaving
+as designed; the presenter at 1 % rules the renderer out for good. If more throughput is wanted it must come from
+the guest doing real work per frame (the loading pipeline), not from the scheduler, the pacer or the renderer.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
