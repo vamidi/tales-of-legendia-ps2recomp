@@ -4850,6 +4850,53 @@ namespace
                          sO985 ? "ok" : "NULL");
         }
 
+        // The last two links before the world containers. Install-verified, logging a0/ra. Note: these are only
+        // interceptable via the dispatch table - a direct C++ call site would bypass a replaceFunction probe, so
+        // each target's direct-call count was checked in the corpus (all zero for every function in this chain).
+        {
+            static uint64_t sC6650 = 0u, sC8350 = 0u;
+            static PS2Runtime::RecompiledFunction sP6650 = nullptr, sP8350 = nullptr;
+            static bool sO6650 = false, sO8350 = false;
+            if (!sO6650 && runtime.lookupFunction(0x00336650u) != nullptr)
+            {
+                sP6650 = runtime.lookupFunction(0x00336650u);
+                runtime.replaceFunction(0x00336650u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sC6650;
+                                            static const bool env = std::getenv("TOL_CTOR") != nullptr;
+                                            if (env && sC6650 <= 6u)
+                                                std::fprintf(stderr, "[link] FUN_00336650 #%llu a0=0x%08X ra=0x%08X\n",
+                                                             static_cast<unsigned long long>(sC6650), GPR_U32(ctx, 4),
+                                                             GPR_U32(ctx, 31));
+                                            if (sP6650 != nullptr)
+                                            {
+                                                sP6650(rdram, ctx, runtime);
+                                            }
+                                        });
+                sO6650 = true;
+            }
+            if (!sO8350 && runtime.lookupFunction(0x00338350u) != nullptr)
+            {
+                sP8350 = runtime.lookupFunction(0x00338350u);
+                runtime.replaceFunction(0x00338350u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sC8350;
+                                            static const bool env = std::getenv("TOL_CTOR") != nullptr;
+                                            if (env && sC8350 <= 6u)
+                                                std::fprintf(stderr, "[link] FUN_00338350 #%llu a0=0x%08X ra=0x%08X\n",
+                                                             static_cast<unsigned long long>(sC8350), GPR_U32(ctx, 4),
+                                                             GPR_U32(ctx, 31));
+                                            if (sP8350 != nullptr)
+                                            {
+                                                sP8350(rdram, ctx, runtime);
+                                            }
+                                        });
+                sO8350 = true;
+            }
+            std::fprintf(stderr, "[link] INSTALL 0x336650=%s 0x338350=%s\n", sO6650 ? "ok" : "NULL",
+                         sO8350 ? "ok" : "NULL");
+        }
+
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
                      runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",
                      runtime.lookupFunction(0x00285E80u) != nullptr ? "ok" : "NULL",

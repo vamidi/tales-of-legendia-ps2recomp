@@ -8147,6 +8147,55 @@ outcomes:
 - **either non-zero** -> the break is a guard *inside* it that rejects before the `FUN_003367b0` / `FUN_00338800` call -
   and that guard is the fix site, since everything below it is already proven unreachable rather than broken.
 
+### Session 152 - instrument validated; the chain terminates in vtable methods of objects that never exist
+
+**First, the instrument was checked before the result** (the user's challenge was correct to raise pooling/threading):
+
+- `replaceFunction` swaps a **global dispatch-table** entry, so it intercepts calls from *any* guest thread. The EE is a
+  single cooperative executor with fibers, not OS threads, so a 0 means "no guest thread entered it".
+- But the recompiler also emits **direct C++ calls** - 1732 of them in the corpus - which **bypass** dispatch and therefore
+  bypass a `replaceFunction` probe. Each probed target was therefore checked for direct-call sites in the corpus:
+  **all six chain functions have 0 direct-call sites**, so their zeros are trustworthy.
+- **Pooling correction (again):** `FUN_0012f2b0` constructs N objects **in place and eagerly**; there is no free list. So
+  "0 ctor calls" means the constructing container never ran, not "nothing was requested".
+
+**Result (install-verified):**
+
+```
+[link] INSTALL 0x336650=ok 0x338350=ok
+FUN_00336650 = 0    FUN_00338350 = 0
+site 3367b0 = 0     site 338800 = 0    chain FUN_00298570 = 0
+```
+
+**Both callers are themselves dead ��� and they are vtable slots**, resolved from the ELF:
+
+```
+0x00338350 -> stored at 0x3D9368   (vtable 0x3D9360 + 0x08)
+0x00335FC0 -> stored at 0x3D9348   (vtable 0x3D9340 + 0x08)   [sole caller of FUN_00336650]
+0x00336650 -> no data store: direct call only
+```
+
+Two adjacent vtables on the established `0x20` stride, both methods at slot `+0x08`. **So the whole world-construction
+path is reachable only as a method of an object that is never constructed** - the identical signature to every other dead
+entry found in this session (the script VM at `0x3D5030+0x0C`, the map class at `0x3D51A0+0x1C/+0x2C`, the field-load loop
+at `0x3D2580+0x0C`, the manager dispatcher `FUN_00366090`). Only `FUN_00366090` ever executes, and it merely builds the
+manager object.
+
+**Architectural statement (what the evidence actually supports):** this port reaches a *valid idle scene*. The manager
+exists; every class that would build or drive the world, script, map or field and render it is a vtable method of an
+object that is never instantiated. There is no broken writer, no missing field, no guard to unblock inside reachable code -
+the **objects are absent**, and that is why the GS only ever receives clears.
+
+### Next probe (exact)
+
+Continue the method exactly one more level: find the **constructors of the classes owning vtables `0x3D9340` and
+`0x3D9360`** (search the ELF/Ghidra for scalar `0x9340` and `0x9360`, the same technique that found every earlier
+constructor), then probe those constructors install-verified, and check each for direct-call sites first.
+
+Walk upward until a constructor **is** called. That object is the last live point in the chain; whatever it does next - and
+whatever guard stops it - is the fix site. The method is now reliable: install-verified probe, direct-call check, receiver
+identity, and no conclusion stated before the measurement.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
