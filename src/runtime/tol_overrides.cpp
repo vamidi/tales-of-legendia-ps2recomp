@@ -3068,6 +3068,71 @@ namespace
         std::fprintf(stderr, "[scene] %s #%u a0=0x%08X a1=0x%08X ret=0x%08X\n", tag, n, a0, a1, ret);
     }
 
+    // The scene object handed to FUN_00285E80 (0x5AA170) is built by the now-verified scene start. Reading its
+    // vtable names its step/draw entry; counting that entry decides between "never pumped" (port-side
+    // registration) and "pumped but draws nothing" (inside the scene renderer).
+    uint32_t gSceneObj = 0u;
+    uint32_t gSceneVtable = 0u;
+    PS2Runtime::RecompiledFunction gSceneStep10Prev = nullptr;
+    PS2Runtime::RecompiledFunction gSceneStep38Prev = nullptr;
+    uint64_t gSceneStep10Calls = 0u;
+    uint64_t gSceneStep38Calls = 0u;
+
+    void sceneStep10Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gSceneStep10Calls;
+        if (gSceneStep10Prev != nullptr)
+        {
+            gSceneStep10Prev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        if (sEnv && (gSceneStep10Calls <= 10u || (gSceneStep10Calls % 100u) == 0u))
+            std::fprintf(stderr, "[scenestep] vt+10 #%llu a0=0x%08X\n",
+                         static_cast<unsigned long long>(gSceneStep10Calls), GPR_U32(ctx, 4));
+    }
+
+    void sceneStep38Probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gSceneStep38Calls;
+        if (gSceneStep38Prev != nullptr)
+        {
+            gSceneStep38Prev(rdram, ctx, runtime);
+        }
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        if (sEnv && (gSceneStep38Calls <= 10u || (gSceneStep38Calls % 100u) == 0u))
+            std::fprintf(stderr, "[scenestep] vt+38 #%llu a0=0x%08X\n",
+                         static_cast<unsigned long long>(gSceneStep38Calls), GPR_U32(ctx, 4));
+    }
+
+    // Called from sceneBProbe (FUN_00285E80) with the scene object in a0.
+    void sceneObjectDiscovery(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t obj)
+    {
+        if (gSceneVtable != 0u || obj < 0x00100000u || obj + 0x40u >= PS2_RAM_SIZE)
+            return;
+        gSceneObj = obj;
+        gSceneVtable = runtime->Load32(rdram, ctx, obj);
+        std::fprintf(stderr, "[scenestep] scene obj=0x%08X vtable=0x%08X slots:", obj, gSceneVtable);
+        for (uint32_t off = 0u; off <= 0x3Cu; off += 4u)
+            std::fprintf(stderr, " +%X=%08X", off, runtime->Load32(rdram, ctx, gSceneVtable + off));
+        std::fprintf(stderr, "\n");
+        if (gSceneVtable < 0x00100000u || gSceneVtable + 0x40u >= PS2_RAM_SIZE)
+            return;
+        const uint32_t step10 = runtime->Load32(rdram, ctx, gSceneVtable + 0x10u);
+        const uint32_t step38 = runtime->Load32(rdram, ctx, gSceneVtable + 0x38u);
+        if (step10 >= 0x00100000u && runtime->lookupFunction(step10) != nullptr)
+        {
+            gSceneStep10Prev = runtime->lookupFunction(step10);
+            runtime->replaceFunction(step10, &sceneStep10Probe);
+            std::fprintf(stderr, "[scenestep] installed vt+10 = 0x%08X\n", step10);
+        }
+        if (step38 >= 0x00100000u && step38 != step10 && runtime->lookupFunction(step38) != nullptr)
+        {
+            gSceneStep38Prev = runtime->lookupFunction(step38);
+            runtime->replaceFunction(step38, &sceneStep38Probe);
+            std::fprintf(stderr, "[scenestep] installed vt+38 = 0x%08X\n", step38);
+        }
+    }
+
     void sceneAProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t a0 = GPR_U32(ctx, 4);
@@ -3096,6 +3161,8 @@ namespace
         ++sCalls;
         if (sEnv && (sCalls <= 10u || (sCalls % 100u) == 0u))
             sceneStartLog("285e80", sCalls, a0, a1, GPR_U32(ctx, 2));
+        // FUN_00285E80 receives the scene object in a0: discover its vtable and instrument its step slots.
+        sceneObjectDiscovery(runtime, rdram, ctx, a0);
     }
 
     void sceneCProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

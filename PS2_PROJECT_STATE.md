@@ -6706,6 +6706,41 @@ Follow the scene object: read its vtable at `0x5AA170`, identify its step/draw s
 count. Then either the pump is never called (a scheduling/registration gap) or it is called and draws nothing
 (inside the scene renderer) - and the same instrument decides it in one run.
 
+### Session 152 - ANSWER: the scene object is never pumped (vt+0x38 never called)
+
+Read the scene object handed to `FUN_00285E80`:
+
+```
+[scenestep] scene obj=0x005AA170 vtable=0x003D50D0
+  +8=0x285150 +C=0x231DF0 +10=0x1ED5E0 +14=0x285280 +18=0x285330
+  +1C=0x2853D0 +28=0x2895F0 +38=0x292520          (the rest null)
+[scenestep] installed vt+10 = 0x001ED5E0
+[scenestep] installed vt+38 = 0x00292520
+```
+
+Call counts over 45 s:
+
+| slot | function | calls |
+|---|---|---|
+| `vt+0x10` | `0x1ED5E0` | **10** (a0 alternates `0x4E9DB0` engine / `0x5AA170` scene) |
+| `vt+0x38` | `0x292520` | **0** |
+
+**So the scene object exists, is reachable, and is queried through `+0x10`, but its step/render entry at `+0x38`
+is never called.** Per the decision rule this is the first branch: **the pump/registration is the fix, on the port
+side** - not inside the scene renderer, which is never given a chance to run.
+
+That is consistent with everything measured above it: the loader, the app job, the fade and the scene start all
+complete correctly, and then the scene sits idle because nothing drives it each frame. It also explains the final
+rendering fact directly - 5 textured draws of 42,716 - since a scene that is never stepped cannot submit
+geometry.
+
+### Next probe (exact)
+
+Find what should call the scene's `+0x38`: locate every site that walks scene objects and invokes that vtable slot
+(xref the slot value `0x3D50D0 + 0x38 = 0x3D5108`, and trace the engine's per-frame update - the same object that
+`FUN_00232190` returns is presumably registered somewhere). Either the registration never happens (guest state) or
+the pump loop runs but skips this object - and the same instrument decides it in one run.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
