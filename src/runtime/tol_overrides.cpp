@@ -3308,8 +3308,34 @@ namespace
                      (lPrev != 0u && predNext != tcb) ? "BROKEN-LINK(prev.next!=tcb)" : "link-ok");
     }
 
+    // Microsecond clock for per-call costing of FUN_00165ad0's inner loop.
+    inline uint64_t loopQpc()
+    {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        return static_cast<uint64_t>(t.QuadPart);
+    }
+
+    inline uint64_t loopQpcFreq()
+    {
+        static uint64_t sFreq = 0u;
+        if (sFreq == 0u)
+        {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            sFreq = static_cast<uint64_t>(f.QuadPart);
+        }
+        return sFreq;
+    }
+
+    uint64_t g_iterStartQpc = 0u;
+    uint64_t g_maxUs = 0u;
+    const char *g_maxTag = "-";
+    uint64_t g_iterSumUs = 0u;
+
     // Bracket a main-loop call with the TCB change-detector (entry only): since consecutive brackets are adjacent
     // statements, a change first seen at bracket N's entry happened inside bracket N-1 - which names the writer.
+    // Also costs the call, logging any single call slower than 5 ms so the growing one names itself.
     template <int I>
     void installLoopBracket(PS2Runtime &runtime, uint32_t addr, const char *tag)
     {
@@ -3323,9 +3349,17 @@ namespace
         sPrev = runtime.lookupFunction(addr);
         runtime.replaceFunction(addr, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
             logLoaderTcb(sTag, rt, rdram, ctx);
+            const uint64_t t0 = loopQpc();
             if (sPrev != nullptr)
             {
                 sPrev(rdram, ctx, rt);
+            }
+            const uint64_t us = (loopQpc() - t0) * 1000000ull / loopQpcFreq();
+            g_iterSumUs += us;
+            if (us > g_maxUs)
+            {
+                g_maxUs = us;
+                g_maxTag = sTag;
             }
         });
     }
@@ -4483,18 +4517,36 @@ namespace
                 runtime.replaceFunction(0x00153180u,
                                         [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
                                             ++sPred;
+                                            const uint64_t p0 = loopQpc();
                                             if (sPredPrev != nullptr)
                                             {
                                                 sPredPrev(rdram, ctx, runtime);
                                             }
+                                            const uint64_t predUs = (loopQpc() - p0) * 1000000ull / loopQpcFreq();
+                                            if (predUs > g_maxUs)
+                                            {
+                                                g_maxUs = predUs;
+                                                g_maxTag = "153180.pred";
+                                            }
                                             static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
-                                            if (env && (sPred <= 14u || (sPred % 200u) == 0u))
+                                            const uint64_t iterUs = g_iterStartQpc != 0u
+                                                                       ? (loopQpc() - g_iterStartQpc) *
+                                                                             1000000ull / loopQpcFreq()
+                                                                       : 0ull;
+                                            if (env && (sPred <= 14u || (sPred % 10u) == 0u ||
+                                                        iterUs >= 200000ull))
                                                 std::fprintf(stderr,
-                                                             "[mainloop] exitPred #%llu ret=0x%08X (%s)\n",
+                                                             "[mainloop] exitPred #%llu ret=0x%08X (%s) "
+                                                             "iterUs=%llu sum=%llu max=%lluus@%s\n",
                                                              static_cast<unsigned long long>(sPred),
                                                              GPR_U32(ctx, 2),
                                                              GPR_U32(ctx, 2) == 0u ? "continue loop"
-                                                                                   : "EXIT inner loop");
+                                                                                   : "EXIT inner loop",
+                                                             static_cast<unsigned long long>(iterUs),
+                                                             static_cast<unsigned long long>(g_iterSumUs),
+                                                             static_cast<unsigned long long>(g_maxUs), g_maxTag);
+                                            g_maxUs = 0u;
+                                            g_maxTag = "-";
                                         });
             }
             std::fprintf(stderr, "[scenetest] main-loop probes installed (0x152b70 / 0x153180)\n");
@@ -4518,6 +4570,8 @@ namespace
                 p52b70 = runtime.lookupFunction(0x00152B70u);
                 runtime.replaceFunction(0x00152B70u,
                                         [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            g_iterStartQpc = loopQpc();
+                                            g_iterSumUs = 0u;
                                             logLoaderTcb("52b70.pre", runtime, rdram, ctx);
                                             if (p52b70 != nullptr)
                                             {
@@ -4532,9 +4586,17 @@ namespace
                 runtime.replaceFunction(0x001516B0u,
                                         [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
                                             logLoaderTcb("516b0.pre", runtime, rdram, ctx);
+                                            const uint64_t t0 = loopQpc();
                                             if (p516b0 != nullptr)
                                             {
                                                 p516b0(rdram, ctx, runtime);
+                                            }
+                                            const uint64_t us = (loopQpc() - t0) * 1000000ull / loopQpcFreq();
+                                            g_iterSumUs += us;
+                                            if (us > g_maxUs)
+                                            {
+                                                g_maxUs = us;
+                                                g_maxTag = "516b0";
                                             }
                                             logLoaderTcb("516b0.post", runtime, rdram, ctx);
                                         });

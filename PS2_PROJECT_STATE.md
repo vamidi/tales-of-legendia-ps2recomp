@@ -7386,6 +7386,46 @@ dispatches, `FUN_001516b0`, `FUN_001f96c0`, `FUN_0019a080`, `FUN_00153780`, `FUN
 whose cost grows is the fix site. This is a *specific measured regression*, not general slowness - and it is what
 starves the loader, not any scene, scheduler or TCB logic.
 
+### Session 152 - per-call costing of FUN_00165ad0: NO call slows; the time is outside the loop body
+
+Every call in the inner loop was bracketed with `QueryPerformanceCounter`, accumulating per iteration
+(`iterUs` = 52b70 entry -> 153180 entry; `sum` = total across all brackets; `max` = slowest single call):
+
+```
+[mainloop] exitPred #70  iterUs=56099  sum=9516  max=8948us@139a20
+[mainloop] exitPred #110 iterUs=55931  sum=10923 max=10335us@139a20
+[mainloop] exitPred #160 iterUs=51089  sum=8475  max=7952us@139a20
+[mainloop] exitPred #164 iterUs=755890 sum=11093 max=10286us@139a20
+[mainloop] exitPred #170 iterUs=85873  sum=10071 max=9511us@139a20
+```
+
+Bracketed sites (all verified present in the function table, so all installed): `0x152b70`, `0x151ff0`
+(all three channel dispatches), `0x1516b0`, `0x1f96c0`, `0x19a080`, `0x153780`, `0x164d40`, `0x139a20`, and the
+predicate `0x153180` cost.
+
+**Findings:**
+
+- The whole loop body costs **~9.5-11 ms per iteration and does not grow** across 60 s.
+- `FUN_00139a20` is the single largest call at **~9-10 ms, constant** - it is not the regression.
+- A normal iteration measures **~56 ms**, so **~46 ms (83%) is outside every bracketed call**.
+- The 756 ms spike accounts only 11 ms in brackets, so **~745 ms (98%) is outside the loop body**.
+
+Because the loop's calls are adjacent `jal`s with no guest code between them, that unaccounted wall-clock is time when
+this thread is not executing its own body: **interrupt handlers (VBlank etc.) and other guest threads**.
+
+**So the earlier framing is corrected again:** the loader is starved because the *wall-clock* iteration rate of
+`FUN_00165ad0` degrades ~90x, but the degradation is **not** in any call the loop makes. The loop's own work is
+constant and cheap (~10 ms); what grows is the time stolen from it.
+
+### Next probe (exact)
+
+Attribute the unaccounted wall-clock. Reuse the existing IRQ instrumentation (`TOL_TRACE_EE_IRQ`) and add:
+(1) per-IRQ-handler entry/exit timing with the cause (2 = VBlank start, 3 = VBlank end, 9+T = timer),
+(2) a per-thread CPU-time total keyed by current TCB, printed every ~2 s, and
+(3) the count and total cost of VBlank handler runs per second.
+The one whose share rises while `FUN_00165ad0`'s iteration time falls is the thief. Only after that is known can the
+loader's starvation be fixed at its actual cause - and it is still a port-side scheduler/IRQ question, not scene code.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
