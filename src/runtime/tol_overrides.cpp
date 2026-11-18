@@ -5172,6 +5172,7 @@ namespace
                 runtime.replaceFunction(0x00126558u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
                     ++sRd;
                     const uint32_t part = GPR_U32(ctx, 4);
+                    const uint32_t pathPtr = GPR_U32(ctx, 6);
                     const uint32_t dest = GPR_U32(ctx, 9);
                     const uint32_t n = GPR_U32(ctx, 8);
                     if (sRdPrev != nullptr)
@@ -5182,11 +5183,18 @@ namespace
                     static const bool env = std::getenv("TOL_STAGE") != nullptr;
                     if (env && sRd <= 8u)
                     {
-                        std::fprintf(stderr, "[stage] read #%llu part=%u dest=0x%08X n=%u ret=%u data=",
-                                     static_cast<unsigned long long>(sRd), part, dest, n, ret);
-                        for (uint32_t i = 0u; i < 16u; ++i)
-                            std::fprintf(stderr, "%02X", rt->Load8(rdram, ctx, dest + i) & 0xFFu);
-                        std::fprintf(stderr, "\n");
+                        char path[80] = {0};
+                        for (uint32_t i = 0u; i < 79u; ++i)
+                        {
+                            const uint8_t c = rt->Load8(rdram, ctx, pathPtr + i) & 0xFFu;
+                            path[i] = static_cast<char>(c);
+                            if (c == 0u)
+                            {
+                                break;
+                            }
+                        }
+                        std::fprintf(stderr, "[stage] read #%llu part=%u path=\"%s\" dest=0x%08X n=%u ret=%u\n",
+                                     static_cast<unsigned long long>(sRd), part, path, dest, n, ret);
                     }
                 });
                 sRdOk = true;

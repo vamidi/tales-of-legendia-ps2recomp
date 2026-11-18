@@ -8253,6 +8253,92 @@ That yields the app's actual trajectory (which sub-state, which status code, how
 the scene is empty because the entry array is empty, because a status code aborts first, or because the 0x27Axxx
 functions run and produce nothing.
 
+### Session 152 - TRUE ROOT CAUSE: the CRI file RPC is unhandled (no IOP service), so the read returns 0
+
+Investigating the fix revealed the real defect, which supersedes the previous "fix at FUN_00126558" conclusion:
+
+```
+[IOP/RPC trace:unhandled] sid=0x80000592 rpc=0x0  send=0x3dbb00/4 recv=0x386400/16 loadedModules=[]
+[IOP/RPC trace:unhandled] sid=0x80000593 rpc=0x22 send=0x386840/4 recv=0x386400/4  loadedModules=[]
+[ps2xIOP] [iop] no kernel service for loadcore #12 / #27
+[ps2xIOP] [iop] no kernel service for sysclib #25
+[ps2xIOP] [iop] no kernel service for sysmem #3 / #6 / #9
+[ps2xIOP] [iop] started IO/File_Manager at 65536
+```
+
+**`loadedModules=[]` and every SIF RPC is unhandled.** Dispatch path: `SifCallRpc` -> `PS2IopTransport::handleRpc`
+(RPC.cpp:566) -> `IopSubsystem::handleRpc` (ps2_runtime.cpp:668). The result is `handled=false`, so the completion
+status `uRam003e7300` stays 0, and since `FUN_00233bf0` returns that status **as the entry count**, the scene gets 0
+entries.
+
+**What `FUN_00126558` actually is** (read in full):
+
+```c
+FUN_00126558(param_1, param_2, path /*param_3, <=1023 chars*/, param_4, count /*99*/, dest /*param_6*/) {
+    if (PollSema fails) return error;
+    if (path == 0 || *path == 0) return -0xD2;
+    uRam003e5e00 = dest;  ... uRam003e5dfc = count;
+    FUN_0010bda0(0x3E5E04, path, 0x3FF);            // copy the PATH STRING
+    if (count >= 0) FUN_00117bf0(dest, count << 6);  // clear count*0x40 = 6336 bytes -> 64-byte entries
+    FUN_00118628(0x3E5D40, 0xD /*RPC fn 13*/, 1, 0x3E5DF0, 0x414, 0x3E7300, 4, 0x125A78);
+}
+```
+
+and the consumer treats each 64-byte entry as a **filename**:
+`FUN_002df6d0` -> `FUN_00233cf0(part,i)` -> `FUN_002df420(name)` -> `FUN_0010b7e8(slot + 0x200, name)`, per entry, then reads
+a 0x400-byte header via `FUN_00233940`.
+
+**Therefore "make FUN_00126558 return the count and fill the buffer" cannot be done honestly as a constant return** - the
+buffer must contain the game's real directory listing (up to 99 names of 0x40 bytes). Writing a fabricated count and
+fabricated names would invent asset data, which violates the standing rule for this port.
+
+**The correct fix** is to implement the missing **CRI/SIF RPC function 13** in the port's HLE dispatcher
+(`ps2x::iop::IopSubsystem::handleRpc`): resolve the path from `0x3E5E04`, read the directory/entries from the disc image
+(or the AFS archive DVCI already locates), copy up to `count` 64-byte entries into `uRam003e5e00`, and write the real
+entry count to the completion word `0x3E7300`. That is real I/O implemented in the runtime - the same class of work as
+the earlier CRI op-channel fixes - not an override that fakes data.
+
+### Next probe (exact)
+
+`[IOP/RPC trace:unhandled]` prints `sid`, `rpcNum`, `send`/`recv` buffers and sizes. Capture the event for the
+stage-directory call specifically (`sid=0x80000593`, the fn issued by `FUN_00118628` from `FUN_00126558`, where `pc` is
+inside `FUN_00118628` and `send` is `0x3E5DF0`), then read `0x3E5E04` (the path) and `uRam003e5dfc` (the count) at that
+moment. That yields the exact path string the game asks for, which is the input the new `handleRpc` branch must serve.
+
+### Session 152 - RETRACTION of the "solution": the read is the MEMORY-CARD save list, not stage data
+
+Captured the actual path handed to the CRI read:
+
+```
+[stage] read #1 part=0 path="/BASLUS-21201TOL-S??" dest=0x004D41C0 n=99 ret=0
+```
+
+`/BASLUS-21201TOL-S??` is the **memory-card save-file listing** (`BASLUS-21201` = game id, `TOL-S` = its save prefix,
+`??` = wildcard). So:
+
+- `FUN_002df6d0` is the **save-file enumerator**, not a stage/entry builder;
+- the "entry count" (`FUN_00233bf0` -> count) is **the number of save files**;
+- **0 entries is correct behaviour** for a port with no memory-card image.
+
+**Therefore the previous entry's "SOLUTION" (and the plan to make `FUN_00126558` return a count and fill the buffer) is
+withdrawn.** Doing so would have fabricated a save list from a misread path - and the path was measured before any code was
+written, which is the only reason it was caught.
+
+**What this re-establishes:** `[IOP/RPC trace:unhandled]` with `loadedModules=[]` is real and worth fixing on its own
+merit, but it is **not** why the screen is black: the unhandled RPCs in this flow are the save-directory query, whose
+"0 results" answer is the correct outcome.
+
+**Where the live path actually goes next:** app job `0x63E3D0` state 1 (`FUN_00365700`) finishes by setting
+`app[0x72] = 4`, and `FUN_00365630` then dispatches **state 4 -> `FUN_00365fd0`**. That - and not the save list - is where
+the scene must start, and it is the next unread link.
+
+### Next probe (exact)
+
+Install-verified probe on **`FUN_00365fd0`** (app state 4) plus `FUN_00365cd0` (state 3), logging `app+0x74`, `app+0x80`
+and `app+0x72` on entry, and direct-call check first. Then follow whichever of them the app actually reaches to its end,
+and identify the first link that should create/draw the scene. No fix is proposed until that link is measured - the last
+three retractions all came from acting on an unverified premise.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
