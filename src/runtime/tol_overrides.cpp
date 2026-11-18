@@ -62,7 +62,7 @@ extern std::atomic<uint64_t> g_tolMemsetBytes;
 // The overlay draws the port's own "Checking memory card (8MB)" boot panel while this is true; the PS2 BIOS draws
 // that panel on hardware and a direct-ELF port never executes the BIOS. External linkage on purpose: the overlay
 // (src/ui/ui_overlay.cpp) reads it.
-bool g_tolShowMcBootPanel = false;
+bool g_tolShowMcBootPanel = true;
 
 namespace
 {
@@ -975,8 +975,8 @@ namespace
         ps2_syscalls::SifCallRpc(rdram, ctx, runtime);
     }
 
-    // The PS2 ABI passes the eighth argument of sceSifCallRpc — the SIF RPC end
-    // function — in $t3, with the end parameter as the first stack word. This
+    // The PS2 ABI passes the eighth argument of sceSifCallRpc â€” the SIF RPC end
+    // function â€” in $t3, with the end parameter as the first stack word. This
     // replacement answers the RPC inline (gameFileRead, loadfile, IxAudio, ...),
     // so the normal libsif reply path never runs and that end function would be
     // dropped. Completion-driven callers depend on it: libcdvd's async read
@@ -1836,7 +1836,7 @@ namespace
     // ---------------------------------------------------------------------------------------------------------
     // CRI I/O LATENCY (TOL_CRI_IO_LATENCY=1) - diagnostic.
     //
-    // FUN_00197940 pumps as `FUN_0019f468(); … FUN_0019f468(); FUN_001973a8();` and the tick FUN_001973a8 (which
+    // FUN_00197940 pumps as `FUN_0019f468(); â€¦ FUN_0019f468(); FUN_001973a8();` and the tick FUN_001973a8 (which
     // credits the DVCI handle) therefore samples the ADXF stream AFTER two stream pumps. Our file RPCs complete
     // synchronously, so a read goes 2 (reading) -> 3 (done) -> 2 (next read armed) inside one cycle and the tick
     // almost never observes 3: measured 1 observation in 148k polls, which is why the 430-entry AFS table freezes at
@@ -2205,7 +2205,7 @@ namespace
     // This wrapper reports the REAL status and, while the descriptor is still pending, runs the guest
     // scheduler (FUN_00151FF0) so worker 2 and the transfer handler make progress. Guest code stays in charge;
     // if the scheduler is preempted we keep its resume PC and return without fabricating a status.
-    constexpr uint32_t kStatusThunkPc = 0x001F7310u; // thunk_FUN_001f8480 — what FUN_001660A0 calls
+    constexpr uint32_t kStatusThunkPc = 0x001F7310u; // thunk_FUN_001f8480 â€” what FUN_001660A0 calls
     constexpr uint32_t kStatusRealPc = 0x001F8480u;  // the status function itself
     constexpr uint32_t kSchedEntryPc = 0x00151FF0u;  // guest scheduler entry
     PS2Runtime::RecompiledFunction gStatusThunkPrev = nullptr;
@@ -9609,7 +9609,7 @@ namespace tol
         installChildStepEntryFix(runtime);
         installXferProbes(runtime);
         // installXferStartFix is deliberately NOT called: wrapping 0x00196DB0 perturbs the submit path
-        // (41 submits -> 2) even when the wrapper only observes. See HANDOFF §0o.
+        // (41 submits -> 2) even when the wrapper only observes. See HANDOFF Â§0o.
         installDrainProbe(runtime);
         installFrameStartFix(runtime);
         installSpinRelease(runtime);
@@ -10420,6 +10420,5 @@ namespace tol
         std::fprintf(stderr, "[tol] no native overrides installed (the Timer-2 override was withdrawn)\n");
     }
 }
-
 
 
