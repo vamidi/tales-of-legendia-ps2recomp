@@ -7278,6 +7278,66 @@ actual gate. Instrument `FUN_00151710` and the list insert/remove helpers (`FUN_
 `FUN_0015243c`) for the loader TCB specifically, and log every write with `ra`. The port fix belongs there (a missing
 or wrong wake-up for that thread), not in scene code and not in an override that fabricates rendering.
 
+### Session 152 - TCB state machine traced: the gate is `alive(+0x1AC)`, not readiness starvation
+
+Every write site for the state byte `+0x1F0` in the whole guest (offset 496, from the recompiled corpus):
+
+| writer | role |
+|---|---|
+| `FUN_001517e0` | scheduler init - zeroes all TCBs and the channel counter table |
+| `FUN_00151cf0` | **thread exit**: state=3, park chan=10, decrement `0x48F570[chan]`, call `+0x1B8` |
+| `FUN_00151e90` | reap: state 3 -> remove from list -> state 0 |
+| `FUN_0035ddc0` | unrelated object (vtable `0x3D9FA0`), different struct |
+
+**Correction:** `0x48F570` is a **waiter reference count**, not an enable table (`FUN_00151cf0` decrements it on exit). So
+channels 6/7/8/9 reading 0 simply means nobody waits on them - normal, not a bug. That retires the previous entry's
+"disabled channels" framing.
+
+**Measured state machine (tags are the bracket that observed each change):**
+
+```
+t=0      tick             state=0 chan=0  alive=0
+t=17047  516b0.pre        state=1 chan=4  alive=1 resume=0x3661DC   ready - driver stage (FUN_00366090)
+t=17891  51cf0.pre        state=1 chan=4  alive=0                   stage finished: alive cleared
+t=17891  516b0.pre        state=3 chan=10                           terminated by FUN_00151cf0
+t=17922  151e90[4]        state=0 chan=10                           reaped inside dispatch(4)
+t=17937  516b0.pre        state=1 chan=4  alive=1 resume=0x204284   RE-ARMED - fade continuation
+t=24109  51cf0.pre        state=1 chan=4  alive=0                   second stage finished
+t=24125  151e90[4]        state=0 chan=10                           reaped
+t=24141  516b0.pre        state=1 chan=4  alive=1 resume=0x204284   RE-ARMED again
+```
+
+`ra=0x00151FA4` for every `FUN_00151cf0` call is the dispatcher's own line:
+
+```c
+if (*(int *)(iVar3 + 0x1AC) == 0) { FUN_00151cf0(*(undefined4 *)(iVar3 + 0x200)); }
+```
+
+**So the answer to "why is it not made ready":** it *is* made ready - 4 times - and each time it runs a stage until the
+**`alive` byte at `+0x1AC` is cleared**, at which point the dispatcher terminates it (state 3, channel 10, waiter count
+decremented) and the next pass reaps it to state 0. Re-arming sets `state=1, chan=4, alive=1` **and a new resume PC**,
+so each arm resumes guest code at a yield point (`0x3661DC` driver -> `0x204284` fade -> `0x204284` fade).
+
+It stops after the 4th because **`alive` is left at 0 and nothing arms it a fifth time**. Dispatch is not the
+constraint: the main loop `FUN_00165ad0` calls `dispatch(4)` every iteration (~540x per 60 s in the measured 110 ms
+loop).
+
+**Open point (proven, not guessed):** the arming writes (`state=1, chan=4, alive=1` plus the waiter-count increment)
+exist in neither the guest writers found above nor the runtime (`EeScheduler.cpp` only *reads* `+0x1AC/+0x1F0/+0x1F1/
++0x1F3`). Greps for `+0x1F0`/`+0x1F1`/`0x48F570` find no arming site, and the arming lands in a 15 ms window during
+which **another EE thread is running** (the dispatching thread's post-bracket shows no change), so the write comes from
+a *different thread* through an address form the greps did not match.
+
+### Next probe (exact)
+
+Identify the arming thread and site empirically, not statically: bracket the remaining main-loop calls in order
+(`FUN_00152b70`, `dispatch(0)`, `dispatch(1)`, `dispatch(4)`, `FUN_001516b0`, `FUN_001f96c0`, `FUN_0019a080`,
+`FUN_00153780`, `FUN_00164d40`, `FUN_00139a20`) with `logLoaderTcb`, and record the **current thread id** in each tag
+(from the scheduler's current-TCB global). The first tag whose name is not the dispatching thread names the arming
+thread; bracketing that thread's own calls then lands the exact write. Fix site: whatever should arm the loader a 5th
+time (the guest's continuation after the fade) - port-side, in the scheduler/guest-continuation path, with no emulation
+and no fabricated rendering.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

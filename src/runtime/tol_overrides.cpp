@@ -4259,6 +4259,13 @@ namespace
                                         }
                                         const uint32_t ch = GPR_U32(ctx, 4) & 0xFFu;
                                         ++total;
+                                        {
+                                            static const char *kT[10] = {"151e90[0]", "151e90[1]", "151e90[2]",
+                                                                        "151e90[3]", "151e90[4]", "151e90[5]",
+                                                                        "151e90[6]", "151e90[7]", "151e90[8]",
+                                                                        "151e90[9]"};
+                                            logLoaderTcb(ch < 10u ? kT[ch] : "151e90[?].pre", runtime, rdram, ctx);
+                                        }
                                         if (env && seen[ch] == 0u)
                                         {
                                             seen[ch] = 1u;
@@ -4288,6 +4295,14 @@ namespace
                                         if (sDispPrev3 != nullptr)
                                         {
                                             sDispPrev3(rdram, ctx, runtime);
+                                        }
+                                        {
+                                            static const char *kT2[10] = {"151e90[0].post", "151e90[1].post",
+                                                                          "151e90[2].post", "151e90[3].post",
+                                                                          "151e90[4].post", "151e90[5].post",
+                                                                          "151e90[6].post", "151e90[7].post",
+                                                                          "151e90[8].post", "151e90[9].post"};
+                                            logLoaderTcb(ch < 10u ? kT2[ch] : "151e90[?].post", runtime, rdram, ctx);
                                         }
                                     });
             std::fprintf(stderr, "[scenetest] dispatcher probe installed (0x151e90)\n");
@@ -4447,6 +4462,69 @@ namespace
                                         });
             }
             std::fprintf(stderr, "[scenetest] main-loop probes installed (0x152b70 / 0x153180)\n");
+        }
+
+        // Bracket each scheduler helper with the TCB change-detector. logLoaderTcb only prints on change, so the tag
+        // of each [tcb] line names the exact window in which the loader TCB's state byte changed.
+        {
+            struct HelperProbe
+            {
+                uint32_t addr;
+                const char *tag;
+                PS2Runtime::RecompiledFunction *prev;
+            };
+            static PS2Runtime::RecompiledFunction p52b70 = nullptr;
+            static PS2Runtime::RecompiledFunction p516b0 = nullptr;
+            static PS2Runtime::RecompiledFunction p51cf0 = nullptr;
+            static PS2Runtime::RecompiledFunction p51e90 = nullptr;
+            if (p52b70 == nullptr && runtime.lookupFunction(0x00152B70u) != nullptr)
+            {
+                p52b70 = runtime.lookupFunction(0x00152B70u);
+                runtime.replaceFunction(0x00152B70u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            logLoaderTcb("52b70.pre", runtime, rdram, ctx);
+                                            if (p52b70 != nullptr)
+                                            {
+                                                p52b70(rdram, ctx, runtime);
+                                            }
+                                            logLoaderTcb("52b70.post", runtime, rdram, ctx);
+                                        });
+            }
+            if (p516b0 == nullptr && runtime.lookupFunction(0x001516B0u) != nullptr)
+            {
+                p516b0 = runtime.lookupFunction(0x001516B0u);
+                runtime.replaceFunction(0x001516B0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            logLoaderTcb("516b0.pre", runtime, rdram, ctx);
+                                            if (p516b0 != nullptr)
+                                            {
+                                                p516b0(rdram, ctx, runtime);
+                                            }
+                                            logLoaderTcb("516b0.post", runtime, rdram, ctx);
+                                        });
+            }
+            if (p51cf0 == nullptr && runtime.lookupFunction(0x00151CF0u) != nullptr)
+            {
+                p51cf0 = runtime.lookupFunction(0x00151CF0u);
+                runtime.replaceFunction(0x00151CF0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            const uint32_t ra = GPR_U32(ctx, 31);
+                                            logLoaderTcb("51cf0.pre [exit-thread]", runtime, rdram, ctx);
+                                            if (p51cf0 != nullptr)
+                                            {
+                                                p51cf0(rdram, ctx, runtime);
+                                            }
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            static uint32_t n = 0u;
+                                            ++n;
+                                            if (env && n <= 12u)
+                                                std::fprintf(stderr,
+                                                             "[tcb] FUN_00151cf0 (thread exit) call #%u ra=0x%08X\n", n,
+                                                             ra);
+                                            logLoaderTcb("51cf0.post [exit-thread]", runtime, rdram, ctx);
+                                        });
+            }
+            std::fprintf(stderr, "[scenetest] scheduler-helper brackets installed\n");
         }
 
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
