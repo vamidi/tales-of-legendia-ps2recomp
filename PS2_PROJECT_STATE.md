@@ -7022,6 +7022,68 @@ stores of `0x003D2580`, identify the constructor, and instrument it plus its cal
 created, walk one more level; if it *is* created, then the field-load loop is being skipped by a guard inside the
 dispatcher and that guard is the fix site.
 
+### Session 152 - ROOT CAUSE: the scene dispatcher (manager 0x3DB31C) is created once, then destroyed, and never recreated
+
+The whole "nothing renders" symptom reduces to **one global that ends up null**: the object pointer at
+**`0x3DB31C`** (gp-relative, `gp - 0x78D4`; the corpus shows it as `READ32(ADD32(GPR_U32(ctx,28), 4294936364))`).
+It is the dispatcher that every subsystem beats through `(*mgr->vt[0x08])()` and `(*mgr->vt[0x0C])()`.
+
+**Measured at runtime:**
+
+```
+[scenetest] clearManager by FUN_001ea800 at t=0ms      (global 0 -> 0, harmless)
+[scenetest] mgrFactory #1 a0=0x00000000 a1=0x00000000
+[scenetest] mgrCtor #1 this=0x0063E290
+[scenetest] mgrFactory #1 -> global 0x3DB31C = 0x0063E290      <- created
+[scenetest] clearManager by FUN_001ea8b0 at t=17657ms (global now 0x0063E290)   <- DESTROYED
+[tick] #150 ... mgr=0x00000000                                  <- null for the rest of the run
+```
+
+**Why:** `FUN_002055b0` is the game's scene-execution driver, and its own body brackets the two events:
+
+```c
+FUN_002055b0(scene) {
+    FUN_001ea850(0, uStack_c);          // create the manager (the single mgrFactory call)
+    ... main loop: (*mgr->vt[8])(); FUN_00204ed0(...); FUN_00169f90(); (*mgr->vt[0xC])(); yield ...
+    FUN_001ea8b0();                     // destroy the manager at completion (t = 17.657 s)
+}
+```
+
+`FUN_002055b0` has zero static references; its pointer is stored at **`0x3D479C` = `0x3D4750 + 0x4C`**, i.e. slot
+`+0x4C` of the **loader object's vtable** (`0x63D890`, the same object whose `vt[0x0C]` is the fade `0x204240`).
+
+So the loader drives the scene once (0 - 17.6 s), tears the manager down, and **is never invoked again**. From that
+moment `0x3DB31C` is null, so:
+
+- the app loop's `(*mgr->vt[8])()` / `(*mgr->vt[0xC])()` have nothing to beat,
+- every `vt+0x0C` method goes silent - the script VM (`0x27d0f0`), the field-load loop (`0x168810`), the field init
+  (`0x169370`), measured 0 calls each (this is the "+0x1C dispatched, +0x0C never dispatched" pattern),
+- no model-load request is ever issued, entries stay at state 0, and the GS receives clears only.
+
+That also explains the earlier **24 s window with no engine ticks**: it brackets this teardown at 17.66 s.
+
+**Walked chain, for the record (each level vtable-only, each measured 0):**
+
+```
+FUN_00168810 (field-load loop)        <- vtable 0x3D2580 +0x0C   (derived)
+FUN_00169370 (field init/registration)<- vtable 0x3D25E0 +0x0C   (base)
+FUN_0027C3F0 (script-actor ctor)      <- vtable 0x3D5030, ctor called from FUN_0016cfe0 <- {FUN_00166a10, FUN_0020c610}
+FUN_0029CE60 (map/field streamer)     <- vtable 0x3D51A0 +0x2C   (NOT the scene's +0xFC; the scene vtable ends ~+0x3C)
+all of them depend on mgr = 0x3DB31C
+```
+
+**Port framing (not emulation).** This is guest behaviour, not a missing emulator feature: the guest object that owns
+`vt+0x4C` (`0x3D4750`, the loader at `0x63D890`) still exists after the fade and the scene start; the port simply never
+re-enters its scene driver. The fix is to restore the guest call sequence - re-invoke the loader's `+0x4C` scene driver
+after the scene start, exactly as the guest would - not to emulate anything new and not to fake a renderer.
+
+### Next probe (exact)
+
+Probe `0x002055b0` (call count and return time) plus every dispatch of the loader's `+0x4C`, and identify the guest state
+machine step that should re-enter it after `FUN_00285E80`'s scene start: the loader object `0x63D890` keeps vtable
+`0x3D4750`, so read its state fields after the scene start and find the guard/branch that ends the sequence instead of
+looping back to `+0x4C`. That branch is the fix site.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

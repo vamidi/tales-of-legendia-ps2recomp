@@ -3230,6 +3230,23 @@ namespace
             sceneStartLog("2321b0", sCalls, a0, a1, GPR_U32(ctx, 2));
     }
 
+    // Timestamps manager teardowns so the create -> clear order for global 0x3DB31C is visible.
+    void logManagerClear(const char *tag, PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx)
+    {
+        static uint64_t sT0 = 0u;
+        static uint64_t sN = 0u;
+        const uint64_t now = GetTickCount64();
+        if (sT0 == 0u)
+        {
+            sT0 = now;
+        }
+        ++sN;
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        if (sEnv && sN <= 24u)
+            std::fprintf(stderr, "[scenetest] clearManager by %s at t=%llums (global now 0x%08X)\n", tag,
+                         static_cast<unsigned long long>(now - sT0), runtime->Load32(rdram, ctx, 0x003DB31Cu));
+    }
+
     void installSceneStartProbes(PS2Runtime &runtime)
     {
         // FUN_00232110 is the engine's per-frame step: it calls vtable[0x1C] on the engine's three children at
@@ -3300,10 +3317,16 @@ namespace
                                         ++calls;
                                         if (env && (calls <= 25u || (calls % 50u) == 0u))
                                             std::fprintf(stderr,
-                                                         "[tick] #%u t=%llums dt=%llums task=0x%08X\n", calls,
+                                                         "[tick] #%u t=%llums dt=%llums task=0x%08X "
+                                                         "mgr=0x%08X mgrVt=0x%08X\n",
+                                                         calls,
                                                          static_cast<unsigned long long>(now - first),
                                                          static_cast<unsigned long long>(now - prev),
-                                                         runtime->Load32(rdram, ctx, 0x003DB1F8u));
+                                                         runtime->Load32(rdram, ctx, 0x003DB1F8u),
+                                                         runtime->Load32(rdram, ctx, 0x003DB31Cu),
+                                                         runtime->Load32(
+                                                             rdram, ctx,
+                                                             runtime->Load32(rdram, ctx, 0x003DB31Cu)));
                                         prev = now;
                                         if (sTickPrev != nullptr)
                                         {
@@ -3790,6 +3813,192 @@ namespace
                                             }
                                         });
             }
+        }
+
+        // FUN_00169370 is the field/scene init: gated on the global byte at 0x3DB22C (cGpffff863c) it registers the
+        // field-manager factory 0x168B40 via FUN_00165150. The factory FUN_00168B40 allocates 0x24 and calls the
+        // ctor FUN_001681D0 (vtable 0x3D2580, loop at +0x0C). Instrument all three plus the gate byte.
+        {
+            static uint64_t sFieldInit = 0u;
+            static uint64_t sRegister = 0u;
+            static uint64_t sFactory = 0u;
+            static PS2Runtime::RecompiledFunction sFieldInitPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sRegisterPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sFactoryPrev = nullptr;
+            if (sFieldInitPrev == nullptr && runtime.lookupFunction(0x00169370u) != nullptr)
+            {
+                sFieldInitPrev = runtime.lookupFunction(0x00169370u);
+                runtime.replaceFunction(0x00169370u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sFieldInit;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sFieldInit <= 5u || (sFieldInit % 100u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] fieldInit #%llu gate[0x3DB22C]=%u "
+                                                             "registers=%llu factory=%llu\n",
+                                                             static_cast<unsigned long long>(sFieldInit),
+                                                             runtime->Load8(rdram, ctx, 0x003DB22Cu) & 0xFFu,
+                                                             static_cast<unsigned long long>(sRegister),
+                                                             static_cast<unsigned long long>(sFactory));
+                                            if (sFieldInitPrev != nullptr)
+                                            {
+                                                sFieldInitPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sRegisterPrev == nullptr && runtime.lookupFunction(0x00165150u) != nullptr)
+            {
+                sRegisterPrev = runtime.lookupFunction(0x00165150u);
+                runtime.replaceFunction(0x00165150u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sRegister;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sRegister <= 12u || (sRegister % 100u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] register #%llu fn=0x%08X a1=0x%08X\n",
+                                                             static_cast<unsigned long long>(sRegister),
+                                                             GPR_U32(ctx, 4), GPR_U32(ctx, 5));
+                                            if (sRegisterPrev != nullptr)
+                                            {
+                                                sRegisterPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sFactoryPrev == nullptr && runtime.lookupFunction(0x00168B40u) != nullptr)
+            {
+                sFactoryPrev = runtime.lookupFunction(0x00168B40u);
+                runtime.replaceFunction(0x00168B40u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sFactory;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sFactory <= 5u || (sFactory % 100u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] fieldFactory #%llu (will construct "
+                                                             "vtable 0x3D2580)\n",
+                                                             static_cast<unsigned long long>(sFactory));
+                                            if (sFactoryPrev != nullptr)
+                                            {
+                                                sFactoryPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            std::fprintf(stderr, "[scenetest] fieldInit/register/factory probes installed (gate 0x3DB22C logged on call)\n");
+        }
+
+        // FUN_001ea850 is the manager factory: alloc 0x2c, FUN_001ea8f0(obj,a0,a1), store into uGpffff872c =
+        // 0x3DB31C. That global is null for the entire run, which is why no vt+0x0C method is ever dispatched.
+        // Its natural caller sits in the same 0x169xxx cluster as the field init: FUN_001696c0.
+        {
+            static uint64_t sMgrFactory = 0u;
+            static uint64_t sMgrCaller = 0u;
+            static uint64_t sMgrCtor = 0u;
+            static PS2Runtime::RecompiledFunction sMgrFactoryPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sMgrCallerPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sMgrCtorPrev = nullptr;
+            if (sMgrFactoryPrev == nullptr && runtime.lookupFunction(0x001EA850u) != nullptr)
+            {
+                sMgrFactoryPrev = runtime.lookupFunction(0x001EA850u);
+                runtime.replaceFunction(0x001EA850u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sMgrFactory;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sMgrFactory <= 8u || (sMgrFactory % 100u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] mgrFactory #%llu a0=0x%08X a1=0x%08X\n",
+                                                             static_cast<unsigned long long>(sMgrFactory),
+                                                             GPR_U32(ctx, 4), GPR_U32(ctx, 5));
+                                            if (sMgrFactoryPrev != nullptr)
+                                            {
+                                                sMgrFactoryPrev(rdram, ctx, runtime);
+                                            }
+                                            if (env && (sMgrFactory <= 8u || (sMgrFactory % 100u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[scenetest] mgrFactory #%llu -> global 0x3DB31C = "
+                                                             "0x%08X\n",
+                                                             static_cast<unsigned long long>(sMgrFactory),
+                                                             runtime->Load32(rdram, ctx, 0x003DB31Cu));
+                                        });
+            }
+            if (sMgrCallerPrev == nullptr && runtime.lookupFunction(0x001696C0u) != nullptr)
+            {
+                sMgrCallerPrev = runtime.lookupFunction(0x001696C0u);
+                runtime.replaceFunction(0x001696C0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sMgrCaller;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sMgrCaller <= 8u || (sMgrCaller % 100u) == 0u))
+                                                std::fprintf(stderr, "[scenetest] mgrCaller1696C0 #%llu a0=0x%08X\n",
+                                                             static_cast<unsigned long long>(sMgrCaller),
+                                                             GPR_U32(ctx, 4));
+                                            if (sMgrCallerPrev != nullptr)
+                                            {
+                                                sMgrCallerPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sMgrCtorPrev == nullptr && runtime.lookupFunction(0x001EA8F0u) != nullptr)
+            {
+                sMgrCtorPrev = runtime.lookupFunction(0x001EA8F0u);
+                runtime.replaceFunction(0x001EA8F0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sMgrCtor;
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sMgrCtor <= 8u || (sMgrCtor % 100u) == 0u))
+                                                std::fprintf(stderr, "[scenetest] mgrCtor #%llu this=0x%08X\n",
+                                                             static_cast<unsigned long long>(sMgrCtor),
+                                                             GPR_U32(ctx, 4));
+                                            if (sMgrCtorPrev != nullptr)
+                                            {
+                                                sMgrCtorPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            std::fprintf(stderr, "[scenetest] manager probes installed\n");
+        }
+
+        // The manager is created at 0x63E290 and later the global 0x3DB31C is null again. Three writers clear it:
+        // FUN_001ea800, FUN_001ea810, FUN_001ea8b0. Timestamp each so the create -> clear order is visible.
+        {
+            static PS2Runtime::RecompiledFunction sClearA = nullptr;
+            static PS2Runtime::RecompiledFunction sClearB = nullptr;
+            static PS2Runtime::RecompiledFunction sClearC = nullptr;
+            if (sClearA == nullptr && runtime.lookupFunction(0x001EA800u) != nullptr)
+            {
+                sClearA = runtime.lookupFunction(0x001EA800u);
+                runtime.replaceFunction(0x001EA800u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            logManagerClear("FUN_001ea800", runtime, rdram, ctx);
+                                            if (sClearA != nullptr)
+                                            {
+                                                sClearA(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sClearB == nullptr && runtime.lookupFunction(0x001EA810u) != nullptr)
+            {
+                sClearB = runtime.lookupFunction(0x001EA810u);
+                runtime.replaceFunction(0x001EA810u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            logManagerClear("FUN_001ea810", runtime, rdram, ctx);
+                                            if (sClearB != nullptr)
+                                            {
+                                                sClearB(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sClearC == nullptr && runtime.lookupFunction(0x001EA8B0u) != nullptr)
+            {
+                sClearC = runtime.lookupFunction(0x001EA8B0u);
+                runtime.replaceFunction(0x001EA8B0u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            logManagerClear("FUN_001ea8b0", runtime, rdram, ctx);
+                                            if (sClearC != nullptr)
+                                            {
+                                                sClearC(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            std::fprintf(stderr, "[scenetest] manager-clear probes installed\n");
         }
 
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
