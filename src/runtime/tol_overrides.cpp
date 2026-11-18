@@ -3255,6 +3255,45 @@ namespace
             std::fprintf(stderr, "[scenetest] site %s #%u ra=0x%08X a0=0x%08X mgr=0x%08X\n", tag, n, ra, a0, mgr);
     }
 
+    // Loader TCB 0x4079A0: state(+0x1F0), wait channel(+0x1F1), activate latch(+499 = +0x1F3), alive(+0x1AC),
+    // step callback(+0x1B0), resume pc(+0x1B4). Logged only on change so the transition history stays readable.
+    void logLoaderTcb(const char *tag, PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        if (!sEnv)
+        {
+            return;
+        }
+        const uint32_t tcb = 0x004079A0u;
+        static uint32_t sState = 0xFFFFFFFFu;
+        static uint32_t sChan = 0xFFFFFFFFu;
+        static uint32_t sLatch = 0xFFFFFFFFu;
+        static uint32_t sAlive = 0xFFFFFFFFu;
+        static uint64_t sT0 = 0u;
+        const uint64_t now = GetTickCount64();
+        if (sT0 == 0u)
+        {
+            sT0 = now;
+        }
+        const uint32_t st = runtime->Load8(rdram, ctx, tcb + 0x1F0u) & 0xFFu;
+        const uint32_t ch = runtime->Load8(rdram, ctx, tcb + 0x1F1u) & 0xFFu;
+        const uint32_t la = runtime->Load8(rdram, ctx, tcb + 0x1F3u) & 0xFFu;
+        const uint32_t al = runtime->Load32(rdram, ctx, tcb + 0x1ACu);
+        if (st == sState && ch == sChan && la == sLatch && al == sAlive)
+        {
+            return;
+        }
+        sState = st;
+        sChan = ch;
+        sLatch = la;
+        sAlive = al;
+        std::fprintf(stderr,
+                     "[tcb] %s t=%llums state(+1F0)=%u chan(+1F1)=%u latch(+1F3)=%u alive(+1AC)=%u "
+                     "cb(+1B0)=0x%08X resume(+1B4)=0x%08X\n",
+                     tag, static_cast<unsigned long long>(now - sT0), st, ch, la, al,
+                     runtime->Load32(rdram, ctx, tcb + 0x1B0u), runtime->Load32(rdram, ctx, tcb + 0x1B4u));
+    }
+
     void installSceneStartProbes(PS2Runtime &runtime)
     {
         // FUN_00232110 is the engine's per-frame step: it calls vtable[0x1C] on the engine's three children at
@@ -3336,6 +3375,7 @@ namespace
                                                              rdram, ctx,
                                                              runtime->Load32(rdram, ctx, 0x003DB31Cu)));
                                         prev = now;
+                                        logLoaderTcb("tick", runtime, rdram, ctx);
                                         if (sTickPrev != nullptr)
                                         {
                                             sTickPrev(rdram, ctx, runtime);
@@ -4198,6 +4238,215 @@ namespace
         else
         {
             std::fprintf(stderr, "[scenetest] STEPWRAP probe NOT INSTALLED (0x165210 missing)\n");
+        }
+
+        // FUN_00151e90 is the channel dispatcher that activates threads. Record which channels it is actually asked
+        // to serve (first sighting of each) and a periodic census - if the loader's wait channel is absent from that
+        // set, its thread can never be activated no matter what else is correct.
+        if (runtime.lookupFunction(0x00151E90u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sDispPrev3 = runtime.lookupFunction(0x00151E90u);
+            runtime.replaceFunction(0x00151E90u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t seen[256] = {0};
+                                        static uint32_t total = 0u;
+                                        static uint64_t t0 = 0u;
+                                        const uint64_t now = GetTickCount64();
+                                        if (t0 == 0u)
+                                        {
+                                            t0 = now;
+                                        }
+                                        const uint32_t ch = GPR_U32(ctx, 4) & 0xFFu;
+                                        ++total;
+                                        if (env && seen[ch] == 0u)
+                                        {
+                                            seen[ch] = 1u;
+                                            std::fprintf(stderr,
+                                                         "[disp] FIRST channel=%u t=%llums | loaderTcb "
+                                                         "state=%u chan=%u latch=%u\n",
+                                                         ch, static_cast<unsigned long long>(now - t0),
+                                                         runtime->Load8(rdram, ctx, 0x004079A0u + 0x1F0u) & 0xFFu,
+                                                         runtime->Load8(rdram, ctx, 0x004079A0u + 0x1F1u) & 0xFFu,
+                                                         runtime->Load8(rdram, ctx, 0x004079A0u + 0x1F3u) & 0xFFu);
+                                        }
+                                        if (env && (total % 3000u) == 0u)
+                                        {
+                                            std::fprintf(stderr, "[disp] total=%u channels:", total);
+                                            for (int i = 0; i < 256; ++i)
+                                            {
+                                                if (seen[i] != 0u)
+                                                {
+                                                    std::fprintf(stderr, " %d", i);
+                                                }
+                                            }
+                                            std::fprintf(stderr, " | loaderTcb state=%u chan=%u latch=%u\n",
+                                                         runtime->Load8(rdram, ctx, 0x004079A0u + 0x1F0u) & 0xFFu,
+                                                         runtime->Load8(rdram, ctx, 0x004079A0u + 0x1F1u) & 0xFFu,
+                                                         runtime->Load8(rdram, ctx, 0x004079A0u + 0x1F3u) & 0xFFu);
+                                        }
+                                        if (sDispPrev3 != nullptr)
+                                        {
+                                            sDispPrev3(rdram, ctx, runtime);
+                                        }
+                                    });
+            std::fprintf(stderr, "[scenetest] dispatcher probe installed (0x151e90)\n");
+        }
+        else
+        {
+            std::fprintf(stderr, "[scenetest] dispatcher probe NOT INSTALLED (0x151e90 missing)\n");
+        }
+
+        // FUN_001520a0(id) returns *(u16*)(0x48F570 + id*2): the per-channel ENABLE flag. FUN_00151ff0(id) only
+        // forwards to the dispatcher when this is non-zero, so a disabled channel makes the frame loop's
+        // dispatch(7/9/8/6) a silent no-op and starves any thread waiting on it.
+        if (runtime.lookupFunction(0x001520A0u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sEnablePrev = runtime.lookupFunction(0x001520A0u);
+            runtime.replaceFunction(0x001520A0u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t asked[256] = {0};
+                                        static uint32_t total = 0u;
+                                        const uint32_t id = GPR_U32(ctx, 4);
+                                        ++total;
+                                        if (sEnablePrev != nullptr)
+                                        {
+                                            sEnablePrev(rdram, ctx, runtime);
+                                        }
+                                        const uint32_t en = GPR_U32(ctx, 2) & 0xFFFFu;
+                                        const uint32_t key = id & 0xFFu;
+                                        if (env && asked[key] == 0u)
+                                        {
+                                            asked[key] = 1u;
+                                            std::fprintf(stderr, "[enable] FIRST ask id=%u -> enabled=%u (total %u)\n",
+                                                         id, en, total);
+                                        }
+                                        if (env && (total % 4000u) == 0u)
+                                        {
+                                            std::fprintf(stderr, "[enable] table 0x48F570:");
+                                            for (uint32_t i = 0u; i < 16u; ++i)
+                                                std::fprintf(stderr, " %u=%u", i,
+                                                             runtime->Load16(rdram, ctx, 0x0048F570u + i * 2u) &
+                                                                 0xFFFFu);
+                                            std::fprintf(stderr, "\n");
+                                        }
+                                    });
+            std::fprintf(stderr, "[scenetest] channel-enable probe installed (0x1520a0)\n");
+        }
+        else
+        {
+            std::fprintf(stderr, "[scenetest] channel-enable probe NOT INSTALLED (0x1520a0 missing)\n");
+        }
+
+        // FUN_00151ff0(id) is the request wrapper: it only dispatches when the enable table permits. Logging each id
+        // with the caller's ra shows exactly which code asks for which channel, and how often the loader's channel (4)
+        // is actually requested.
+        if (runtime.lookupFunction(0x00151FF0u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sReqPrev = runtime.lookupFunction(0x00151FF0u);
+            runtime.replaceFunction(0x00151FF0u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t count[256] = {0};
+                                        static uint32_t firstRa[256] = {0};
+                                        static uint32_t firstT[256] = {0};
+                                        static uint64_t t0 = 0u;
+                                        const uint64_t now = GetTickCount64();
+                                        if (t0 == 0u)
+                                        {
+                                            t0 = now;
+                                        }
+                                        const uint32_t id = GPR_U32(ctx, 4) & 0xFFu;
+                                        const uint32_t en =
+                                            runtime->Load16(rdram, ctx, 0x0048F570u + id * 2u) & 0xFFFFu;
+                                        ++count[id];
+                                        if (env && firstRa[id] == 0u)
+                                        {
+                                            firstRa[id] = GPR_U32(ctx, 31);
+                                            firstT[id] = static_cast<uint32_t>(now - t0);
+                                            std::fprintf(stderr,
+                                                         "[req] FIRST id=%u enabled=%u ra=0x%08X t=%llums\n", id, en,
+                                                         GPR_U32(ctx, 31),
+                                                         static_cast<unsigned long long>(now - t0));
+                                        }
+                                        if (env && (count[id] % 500u) == 0u)
+                                            std::fprintf(stderr,
+                                                         "[req] id=%u count=%u enabled=%u firstRa=0x%08X "
+                                                         "firstT=%ums\n",
+                                                         id, count[id], en, firstRa[id], firstT[id]);
+                                        if (sReqPrev != nullptr)
+                                        {
+                                            sReqPrev(rdram, ctx, runtime);
+                                        }
+                                    });
+            std::fprintf(stderr, "[scenetest] channel-request probe installed (0x151ff0)\n");
+        }
+        else
+        {
+            std::fprintf(stderr, "[scenetest] channel-request probe NOT INSTALLED (0x151ff0 missing)\n");
+        }
+
+        // FUN_00165ad0's inner loop is the real main loop: each iteration dispatches channels 0/1/4 and ends with
+        // lVar2 = FUN_00153180(); while (lVar2 == 0). Timing iterations and logging that predicate says whether the
+        // loop exits after one pass (outer work is the pacer) or is genuinely slow (something inside blocks).
+        {
+            static PS2Runtime::RecompiledFunction sIterPrev = nullptr;
+            static PS2Runtime::RecompiledFunction sPredPrev = nullptr;
+            static uint64_t sIter = 0u;
+            static uint64_t sPred = 0u;
+            static uint64_t sT0 = 0u;
+            static uint64_t sLastIter = 0u;
+            if (sIterPrev == nullptr && runtime.lookupFunction(0x00152B70u) != nullptr)
+            {
+                sIterPrev = runtime.lookupFunction(0x00152B70u);
+                runtime.replaceFunction(0x00152B70u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            const uint64_t now = GetTickCount64();
+                                            if (sT0 == 0u)
+                                            {
+                                                sT0 = now;
+                                            }
+                                            const uint64_t dt = sLastIter == 0u ? 0u : now - sLastIter;
+                                            sLastIter = now;
+                                            ++sIter;
+                                            if (env && (sIter <= 14u || (sIter % 200u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[mainloop] iter #%llu t=%llums dt=%llums "
+                                                             "pred=%llu mgr=0x%08X\n",
+                                                             static_cast<unsigned long long>(sIter),
+                                                             static_cast<unsigned long long>(now - sT0),
+                                                             static_cast<unsigned long long>(dt),
+                                                             static_cast<unsigned long long>(sPred),
+                                                             runtime->Load32(rdram, ctx, 0x003DB31Cu));
+                                            if (sIterPrev != nullptr)
+                                            {
+                                                sIterPrev(rdram, ctx, runtime);
+                                            }
+                                        });
+            }
+            if (sPredPrev == nullptr && runtime.lookupFunction(0x00153180u) != nullptr)
+            {
+                sPredPrev = runtime.lookupFunction(0x00153180u);
+                runtime.replaceFunction(0x00153180u,
+                                        [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                            ++sPred;
+                                            if (sPredPrev != nullptr)
+                                            {
+                                                sPredPrev(rdram, ctx, runtime);
+                                            }
+                                            static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                            if (env && (sPred <= 14u || (sPred % 200u) == 0u))
+                                                std::fprintf(stderr,
+                                                             "[mainloop] exitPred #%llu ret=0x%08X (%s)\n",
+                                                             static_cast<unsigned long long>(sPred),
+                                                             GPR_U32(ctx, 2),
+                                                             GPR_U32(ctx, 2) == 0u ? "continue loop"
+                                                                                   : "EXIT inner loop");
+                                        });
+            }
+            std::fprintf(stderr, "[scenetest] main-loop probes installed (0x152b70 / 0x153180)\n");
         }
 
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",

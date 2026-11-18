@@ -7201,6 +7201,83 @@ answers "why only 4 activations" directly: either the thread sits in a wait stat
 and it is a scheduler question, so the resolution belongs in the runtime's scheduler, not in an override that fakes
 scene behaviour.**
 
+### Session 152 - ANSWER: the loader activates 4x because its thread is only *ready* 4x, not because dispatch is rare
+
+Probed the scheduler path in the runtime (PCSX2 reads are unusable - `0x63D890` returned all-zero, same debug-server
+failure as the GS registers, so all measurement is done in the port).
+
+**(a) Which channels are actually served.** `FUN_00151ff0(id)` forwards to the dispatcher only when the enable table at
+`0x48F570` allows it:
+
+```
+[enable] FIRST ask id=0 -> enabled=3
+[enable] FIRST ask id=1 -> enabled=0
+[enable] FIRST ask id=4 -> enabled=1     <- the loader's channel: ENABLED
+[enable] FIRST ask id=7 -> enabled=0     <- frame loop asks 7: DISABLED
+[enable] FIRST ask id=9 -> enabled=0     <- DISABLED
+[enable] FIRST ask id=8 -> enabled=0     <- DISABLED
+[enable] FIRST ask id=6 -> enabled=0     <- DISABLED
+```
+
+**(b) Who requests what, and from where.**
+
+```
+[req] FIRST id=0 enabled=3  ra=0x166070  t=0ms
+[req] FIRST id=1 enabled=0  ra=0x166078  t=32ms
+[req] FIRST id=4 enabled=1  ra=0x165BA8  t=27578ms
+[req] FIRST id=7 enabled=0  ra=0x164FF0  t=27766ms   } the 4 dispatches inside
+[req] FIRST id=9 enabled=0  ra=0x164FF8  t=27766ms   } FUN_00164f80 are all
+[req] FIRST id=8 enabled=0  ra=0x165000  t=27766ms   } no-ops forever
+[req] FIRST id=6 enabled=0  ra=0x16500C  t=27766ms   }
+```
+
+**(c) The real main loop** is `FUN_00165ad0`, and its inner loop dispatches exactly the enabled channels:
+
+```c
+do {
+    FUN_00152b70(); FUN_00151ff0(0); FUN_00151ff0(1); FUN_00151ff0(4);
+    FUN_001516b0(); FUN_001f96c0(); FUN_0019a080(); FUN_00153780();
+    FUN_00164d40(); FUN_00139a20();
+    lVar2 = FUN_00153180();
+} while (lVar2 == 0);
+```
+
+```
+[mainloop] iter #2 t=62ms dt=62ms  mgr=0x0063E290
+[mainloop] iter #3 t=187ms dt=125ms
+[mainloop] iter #4..#12  dt≈47-125 ms   pred increments 1:1
+[mainloop] exitPred #1..#12  ret=0 -> "continue loop"  (never exits)
+```
+
+So the main loop iterates at **~110 ms (~9 Hz)** and calls `dispatch(4)` **every iteration** - about 540 times in 60 s.
+
+**Therefore the activation count is NOT a dispatch-rate problem.** The loader activates 4 times because on the other
+~536 dispatches its TCB is not in the ready state (`+0x1F0 != 1`) and `FUN_00151e90` skips it:
+
+```
+[tcb] t=27593ms state=1 chan=4   -> activated
+[tcb] t=28750ms state=0 chan=10  -> skipped
+[tcb] t=28797ms state=1 chan=4   -> activated
+[tcb] t=37468ms state=0 chan=10  -> skipped
+[tcb] t=37531ms state=1 chan=4   -> activated
+```
+
+`cb(+0x1B0) = 0x165210` and `alive(+0x1AC) = 1` throughout, so the TCB is correctly wired; only its **state** gates it.
+
+### Open discrepancy (not explained - do not build on it)
+
+`mgr` at `0x3DB31C` reads `0x63E290` from mainloop iteration #2 (t = 62 ms), but reads `0` at `VT0C #3` (t = 1359 ms) and
+`VT0C #4` (t = 10218 ms). The only three functions that write that global (`FUN_001ea800`, `FUN_001ea810`,
+`FUN_001ea8b0`) were all probed and fired only at t=0 and t≈17-28 s. Something zeroes it in between, or one of the
+reads is not measuring what it appears to. This must be resolved before using the manager's lifetime as evidence.
+
+### Next probe (exact)
+
+Find who sets the loader TCB's state byte `0x4079A0+0x1F0` to `1` (ready) and to `0` - that is the wake-up path and the
+actual gate. Instrument `FUN_00151710` and the list insert/remove helpers (`FUN_001517c0`, `FUN_00151cf0`,
+`FUN_0015243c`) for the loader TCB specifically, and log every write with `ra`. The port fix belongs there (a missing
+or wrong wake-up for that thread), not in scene code and not in an override that fabricates rendering.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
