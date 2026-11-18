@@ -4122,38 +4122,82 @@ namespace
             std::fprintf(stderr, "[scenetest] create/destroy site probes installed\n");
         }
 
-        // FUN_00165400(obj) is the generic dispatcher (*(obj+0x10))->vt[0x0C](). Tracing it shows every vt+0x0C
-        // dispatch (including the loader's scene driver FUN_00366090) and exactly when it stops happening.
+        // CORRECTED vt+0x0C trace. The earlier version computed target as *(*(obj+0x10)+0x0C) but logged `vt` as
+        // *(vptr) - the vtable's first slot, not its address - so every target read as 0. Compute the target from
+        // vptr directly, and also log the task-list head (piGpffff8608 = 0x3DB1F8) that FUN_00165150 appends to.
         if (runtime.lookupFunction(0x00165400u) != nullptr)
         {
-            static PS2Runtime::RecompiledFunction sDispPrev = runtime.lookupFunction(0x00165400u);
+            static PS2Runtime::RecompiledFunction sDispPrev2 = runtime.lookupFunction(0x00165400u);
             runtime.replaceFunction(0x00165400u,
                                     [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
                                         static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
                                         static uint32_t calls = 0u;
-                                        static uint64_t t0 = 0u;
+                                        static uint64_t firstT = 0u;
                                         const uint64_t now = GetTickCount64();
-                                        if (t0 == 0u)
+                                        if (firstT == 0u)
                                         {
-                                            t0 = now;
+                                            firstT = now;
                                         }
                                         ++calls;
                                         const uint32_t obj = GPR_U32(ctx, 4);
-                                        const uint32_t vp = runtime->Load32(rdram, ctx, obj + 0x10u);
-                                        const uint32_t vt = runtime->Load32(rdram, ctx, vp);
-                                        if (env && (calls <= 16u || (calls % 200u) == 0u))
+                                        const uint32_t vptr = runtime->Load32(rdram, ctx, obj + 0x10u);
+                                        const uint32_t target = runtime->Load32(rdram, ctx, vptr + 0xCu);
+                                        if (env && calls <= 20u)
                                             std::fprintf(stderr,
-                                                         "[scenetest] vt0C #%u t=%llums obj=0x%08X vptr(+10)=0x%08X "
-                                                         "vt=0x%08X target=0x%08X ra=0x%08X mgr=0x%08X\n",
-                                                         calls, static_cast<unsigned long long>(now - t0), obj, vp,
-                                                         vt, runtime->Load32(rdram, ctx, vt + 0xCu),
-                                                         GPR_U32(ctx, 31),
+                                                         "[scenetest] VT0C #%u t=%llums obj=0x%08X vptr(+10)=0x%08X "
+                                                         "target(+0C)=0x%08X ra=0x%08X tasks=0x%08X mgr=0x%08X\n",
+                                                         calls, static_cast<unsigned long long>(now - firstT), obj,
+                                                         vptr, target, GPR_U32(ctx, 31),
+                                                         runtime->Load32(rdram, ctx, 0x003DB1F8u),
                                                          runtime->Load32(rdram, ctx, 0x003DB31Cu));
-                                        if (sDispPrev != nullptr)
+                                        if (sDispPrev2 != nullptr)
                                         {
-                                            sDispPrev(rdram, ctx, runtime);
+                                            sDispPrev2(rdram, ctx, runtime);
                                         }
                                     });
+            std::fprintf(stderr, "[scenetest] VT0C probe installed (dispatcher 0x165400)\n");
+        }
+        else
+        {
+            std::fprintf(stderr, "[scenetest] VT0C probe NOT INSTALLED (0x165400 missing from table)\n");
+        }
+
+        // entry_00165210_0x165210 is the step-wrapper whose body calls FUN_00165400 at 0x165228 (ra=0x165230).
+        // Probing its ENTRY (0x165210) captures the loop that dispatches it - the thing that runs only 4 times.
+        if (runtime.lookupFunction(0x00165210u) != nullptr)
+        {
+            static PS2Runtime::RecompiledFunction sWrapPrev = runtime.lookupFunction(0x00165210u);
+            runtime.replaceFunction(0x00165210u,
+                                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+                                        static const bool env = std::getenv("TOL_TRACE_SCENE") != nullptr;
+                                        static uint32_t calls = 0u;
+                                        static uint64_t firstT = 0u;
+                                        const uint64_t now = GetTickCount64();
+                                        if (firstT == 0u)
+                                        {
+                                            firstT = now;
+                                        }
+                                        ++calls;
+                                        const uint32_t a0 = GPR_U32(ctx, 4);
+                                        const uint32_t inner = runtime->Load32(rdram, ctx, a0);
+                                        if (env && calls <= 16u)
+                                            std::fprintf(stderr,
+                                                         "[scenetest] STEPWRAP #%u t=%llums a0=0x%08X *a0=0x%08X "
+                                                         "ra=0x%08X tasks=0x%08X mgr=0x%08X\n",
+                                                         calls, static_cast<unsigned long long>(now - firstT), a0,
+                                                         inner, GPR_U32(ctx, 31),
+                                                         runtime->Load32(rdram, ctx, 0x003DB1F8u),
+                                                         runtime->Load32(rdram, ctx, 0x003DB31Cu));
+                                        if (sWrapPrev != nullptr)
+                                        {
+                                            sWrapPrev(rdram, ctx, runtime);
+                                        }
+                                    });
+            std::fprintf(stderr, "[scenetest] STEPWRAP probe installed (0x165210)\n");
+        }
+        else
+        {
+            std::fprintf(stderr, "[scenetest] STEPWRAP probe NOT INSTALLED (0x165210 missing)\n");
         }
 
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",

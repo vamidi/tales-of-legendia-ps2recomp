@@ -7137,6 +7137,70 @@ and instrument the list head `piGpffff8608` (`gp - 0x79F8` = `0x3DB1F8`... verif
 the loader object still exists with vtable `0x3D4750`, so it must be kept in that step list after the scene start -
 exactly what the guest does, with no emulation involved.
 
+### Session 152 - VERIFIED MODEL: the loader is stepped once per thread activation, 4 activations in 60 s
+
+Method correction first (three earlier claims were wrong: "never pumped", "27 TLPS chunks", "FUN_002055b0 is the
+driver"). The fix applied here: every probe logs install status, call site (`ra`), receiver identity, and the live
+globals; and no candidate is described as the driver until it has actually been probed.
+
+**Verified dispatch trace (target now computed from `vptr`, not `*(vptr)`):**
+
+```
+VT0C #1 t=0ms      obj=0x63D850 vptr(+10)=0x3D4770 target(+0C)=0x204690
+VT0C #2 t=0ms      obj=0x63D890 vptr(+10)=0x3DA380 target(+0C)=0x366090   <- scene driver (pre-fade table)
+VT0C #3 t=1359ms   obj=0x63D890 vptr(+10)=0x3D4750 target(+0C)=0x204240   <- the fade   (post-fade table)
+VT0C #4 t=10218ms  obj=0x63D890 vptr(+10)=0x3D4750 target(+0C)=0x204240   <- the fade
+tasks=0x497050 (constant)   mgr=0x00000000 at all four
+```
+
+This settles the contradiction from the previous entry: `0x366090` really is `vt+0x0C` of `0x3DA380`, and the fade
+really is `vt+0x0C` of `0x3D4750`. It also corrects an inference: `mgr = 0` at **all four** dispatches including
+t = 10.2 s, so the manager is created *later* than the driver's entry.
+
+**And the dispatcher's caller is the scheduler, not an object loop:**
+
+```
+STEPWRAP #1 t=0ms      a0=0x00407740 *a0=0x63D850  ra=0x00151FC8
+STEPWRAP #2 t=0ms      a0=0x00407B60 *a0=0x63D890  ra=0x00151FC8
+STEPWRAP #3 t=1391ms   a0=0x00407B60 *a0=0x63D890  ra=0x00151FC8
+STEPWRAP #4 t=10204ms  a0=0x00407B60 *a0=0x63D890  ra=0x00151FC8
+```
+
+`ra=0x151FC8` is inside **`FUN_00151e90`** (the thread dispatcher), which invokes
+`(*callback)(TCB + 0x1C0)` **once per activation**, latched by the byte at `TCB+499`:
+
+```c
+if (*(char *)(iVar3 + 0x1F0) == 1 && *(byte *)(iVar3 + 0x1F1) == channel) {
+    if (*(char *)(iVar3 + 499) == 0) { *(char*)(iVar3 + 499) = 1; (*cb)(iVar3 + 0x1C0); }
+    FUN_0015243c(); FUN_00152200(); FUN_0015253c();
+}
+```
+
+`a0 = 0x407B60 = TCB + 0x1C0` → **TCB = 0x4079A0, the loader TCB** already recorded. `*(TCB+0x1C0) = 0x63D890`.
+
+**So the loader object is stepped exactly once per activation of its thread, and that thread was activated 4 times in
+60 seconds.** That is the guard - a *scheduling* fact, not a branch inside any scene, fade or driver code. Everything
+downstream (script VM, field load, field init, map stream, model load) is silent because the object that would drive it
+is stepped 4 times and then not at all.
+
+**What is certain vs still inferred:**
+
+| certain | still inferred |
+|---|---|
+| loader stepped 4x via `FUN_00151e90` -> `(*cb)(TCB+0x1C0)` -> `vt+0x0C` | *why* the loader thread is activated only 4x |
+| `vt+0x0C` = `0x366090` (pre-fade) then `0x204240` (post-fade) | whether the guest expects more activations or the port drops wake-ups |
+| manager created once, destroyed once, null thereafter | which subsystem should recreate it |
+| task list head `0x3DB1F8` constant at `0x497050` | whether that is the correct task for this phase |
+
+### Next probe (exact)
+
+Instrument the loader TCB `0x4079A0`: log `+0x1F0` (state), `+0x1F1` (wait channel), `+499` (activate latch),
+`+0x1AC` (alive), `+0x200` and `+0x1B0` on every `FUN_00151e90` iteration that touches it, plus a timestamp. That
+answers "why only 4 activations" directly: either the thread sits in a wait state whose channel is never signalled
+(port-side wake-up gap), or it is descheduled by the priority/selector globals `0x3DB1A0/B0/C0`. **That is the fix site
+and it is a scheduler question, so the resolution belongs in the runtime's scheduler, not in an override that fakes
+scene behaviour.**
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
