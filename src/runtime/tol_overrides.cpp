@@ -3287,11 +3287,47 @@ namespace
         sChan = ch;
         sLatch = la;
         sAlive = al;
+        const uint32_t depth = runtime->Load32(rdram, ctx, 0x003DB1A0u);
+        const uint32_t curTcb =
+            depth < 0x40u ? runtime->Load32(rdram, ctx, 0x0048F750u + depth * 0x1D0u) : 0u;
+        const uint32_t lPrev = runtime->Load32(rdram, ctx, tcb + 0x1F8u);
+        const uint32_t lNext = runtime->Load32(rdram, ctx, tcb + 0x1FCu);
+        const uint32_t lHead = runtime->Load32(rdram, ctx, 0x003DB194u);
+        const uint32_t lTail = runtime->Load32(rdram, ctx, 0x003DB198u);
+        const uint32_t w4 = runtime->Load16(rdram, ctx, 0x0048F578u) & 0xFFFFu;
+        const uint32_t predNext = lPrev != 0u ? runtime->Load32(rdram, ctx, lPrev + 0x1FCu) : 0u;
+        const uint32_t succPrev = lNext != 0u ? runtime->Load32(rdram, ctx, lNext + 0x1F8u) : 0u;
         std::fprintf(stderr,
                      "[tcb] %s t=%llums state(+1F0)=%u chan(+1F1)=%u latch(+1F3)=%u alive(+1AC)=%u "
-                     "cb(+1B0)=0x%08X resume(+1B4)=0x%08X\n",
+                     "cb(+1B0)=0x%08X resume(+1B4)=0x%08X | depth=%u cur=0x%08X "
+                     "link prev(+1F8)=0x%08X next(+1FC)=0x%08X head=0x%08X tail=0x%08X wait4=%u "
+                     "predNext=0x%08X succPrev=0x%08X %s\n",
                      tag, static_cast<unsigned long long>(now - sT0), st, ch, la, al,
-                     runtime->Load32(rdram, ctx, tcb + 0x1B0u), runtime->Load32(rdram, ctx, tcb + 0x1B4u));
+                     runtime->Load32(rdram, ctx, tcb + 0x1B0u), runtime->Load32(rdram, ctx, tcb + 0x1B4u),
+                     depth, curTcb, lPrev, lNext, lHead, lTail, w4, predNext, succPrev,
+                     (lPrev != 0u && predNext != tcb) ? "BROKEN-LINK(prev.next!=tcb)" : "link-ok");
+    }
+
+    // Bracket a main-loop call with the TCB change-detector (entry only): since consecutive brackets are adjacent
+    // statements, a change first seen at bracket N's entry happened inside bracket N-1 - which names the writer.
+    template <int I>
+    void installLoopBracket(PS2Runtime &runtime, uint32_t addr, const char *tag)
+    {
+        static PS2Runtime::RecompiledFunction sPrev = nullptr;
+        static const char *sTag = tag;
+        (void)I;
+        if (sPrev != nullptr || runtime.lookupFunction(addr) == nullptr)
+        {
+            return;
+        }
+        sPrev = runtime.lookupFunction(addr);
+        runtime.replaceFunction(addr, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+            logLoaderTcb(sTag, rt, rdram, ctx);
+            if (sPrev != nullptr)
+            {
+                sPrev(rdram, ctx, rt);
+            }
+        });
     }
 
     void installSceneStartProbes(PS2Runtime &runtime)
@@ -4426,7 +4462,7 @@ namespace
                                             const uint64_t dt = sLastIter == 0u ? 0u : now - sLastIter;
                                             sLastIter = now;
                                             ++sIter;
-                                            if (env && (sIter <= 14u || (sIter % 200u) == 0u))
+                                            if (env && (sIter <= 14u || (sIter % 20u) == 0u))
                                                 std::fprintf(stderr,
                                                              "[mainloop] iter #%llu t=%llums dt=%llums "
                                                              "pred=%llu mgr=0x%08X\n",
@@ -4526,6 +4562,22 @@ namespace
             }
             std::fprintf(stderr, "[scenetest] scheduler-helper brackets installed\n");
         }
+
+        // Bracket the rest of FUN_00165ad0's inner loop in execution order. Together with the existing 52b70 and
+        // 151e90[ch] brackets this covers every consecutive pair, so the tag under which the arming change first
+        // appears identifies the call that performed it - and 'cur' shows which thread was running.
+        installLoopBracket<0>(runtime, 0x001F96C0u, "1f96c0");
+        installLoopBracket<1>(runtime, 0x0019A080u, "19a080");
+        installLoopBracket<2>(runtime, 0x00153780u, "153780");
+        installLoopBracket<3>(runtime, 0x00164D40u, "164d40");
+        installLoopBracket<4>(runtime, 0x00139A20u, "139a20");
+        // Close the 151e90.post -> 516b0 window: the wrapper and the three switch primitives it calls.
+        installLoopBracket<5>(runtime, 0x00151FF0u, "151ff0");
+        installLoopBracket<6>(runtime, 0x0015243Cu, "15243c.save");
+        installLoopBracket<7>(runtime, 0x00152200u, "152200.switchin");
+        installLoopBracket<8>(runtime, 0x0015253Cu, "15253c.post");
+        installLoopBracket<9>(runtime, 0x001516B0u, "1516b0.entry");
+        std::fprintf(stderr, "[scenetest] main-loop brackets installed\n");
 
         std::fprintf(stderr, "[scene] install: 232190=%s 285E80=%s 2321B0=%s\n",
                      runtime.lookupFunction(0x00232190u) != nullptr ? "ok" : "NULL",

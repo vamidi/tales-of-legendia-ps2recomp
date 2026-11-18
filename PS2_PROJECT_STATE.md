@@ -7338,6 +7338,54 @@ thread; bracketing that thread's own calls then lands the exact write. Fix site:
 time (the guest's continuation after the fade) - port-side, in the scheduler/guest-continuation path, with no emulation
 and no fabricated rendering.
 
+### Session 152 - arming found empirically; three hypotheses refuted by measurement
+
+**Correction to the plan:** the arming thread is not a separate thread. `cur` (the scheduler's current-TCB, read from
+`0x48F750 + depth*0x1D0` with `depth` at `0x3DB1A0`) shows `cur=0x004079A0` (the loader) only inside its own exit path;
+every arming happens at `depth=0, cur=0`, i.e. **on the dispatching side**, before `FUN_001516b0` is entered.
+
+**The arming writes are in the context save/restore primitives**, bracketed directly:
+
+```
+15253c.post t=29672  latch=0 alive=0 resume=0x165220 | cur=0x00407580
+15243c.save t=29672  latch=1 alive=0 resume=0x165220 | cur=0x004079A0   <- FUN_0015243c sets latch(+0x1F3)=1
+15253c.post t=29687  latch=1 alive=1 resume=0x3661DC | cur=0x004079A0   <- FUN_0015253c sets alive(+0x1AC)=1 + resume(+0x1B4)
+```
+
+So: **arm = context restore; step = the callback in `FUN_00151e90`, fired while `latch == 0`** (one step per restore).
+
+**Three hypotheses were tested and REFUTED by measurement:**
+
+| hypothesis | measurement | verdict |
+|---|---|---|
+| waiter count at `0x48F578` (channel 4) fell to 0, so `FUN_00151ff0(4)` short-circuits | `wait4 = 3` throughout (dips to 2 on exit, returns to 3) | **refuted** |
+| the reap (`FUN_00151710`) unlinked the TCB so the walk never reaches it | final state `prev=0x407580 next=0 head=0x407160 tail=0x4079A0` | **refuted** |
+| half-link: predecessor's `next` doesn't point back | `predNext=0x004079A0`, `pred=0x407580`, `link-ok` | **refuted** |
+
+**The state at the end is fully eligible:** `state=1, chan=4, alive=1, latch=1, resume=0x204284`, linked as the tail, with
+the predecessor pointing back and the channel count non-zero.
+
+**What actually gates it - the dispatch loop collapses.** `FUN_00165ad0` (the loop that dispatches channels 0/1/4):
+
+```
+iter #40  t=2265ms  dt=31ms   ~32 Hz
+iter #80  t=3843ms  dt=31ms
+iter #120 t=5437ms  dt=31ms
+iter #160 t=7015ms  dt=47ms
+(<20 further iterations in the remaining 53 s -> ~0.36 Hz)
+```
+
+So after ~7 s the loader is offered a few dozen dispatch opportunities in a minute instead of ~1900, and it is stepped
+3-4 times. `FUN_00153180` (the loop predicate) always returns 0, so the loop never exits - it just slows by ~90x.
+
+### Next probe (exact)
+
+Instrument the per-call cost inside `FUN_00165ad0`'s inner loop (timestamps around `FUN_00152b70`, the three
+dispatches, `FUN_001516b0`, `FUN_001f96c0`, `FUN_0019a080`, `FUN_00153780`, `FUN_00164d40`, `FUN_00139a20`,
+`FUN_00153180`) and print the slowest call per iteration. The loop cost grows ~90x in the first 7 s; the single call
+whose cost grows is the fix site. This is a *specific measured regression*, not general slowness - and it is what
+starves the loader, not any scene, scheduler or TCB logic.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
