@@ -3043,10 +3043,13 @@ namespace
             gFadePrev = runtime.lookupFunction(0x00204240u);
             runtime.replaceFunction(0x00204240u, &fadeProbe);
         }
-        if (runtime.lookupFunction(0x001F8480u) != nullptr)
+        // The fade's pre-wait calls the trampoline at 0x1F7310 (`j 0x1F8480`), not the target directly - probing
+        // the target never fires. 0x1F8480 returns 0xFF when the object handed to it is null, and the loop waits
+        // for 0, so a null object is an infinite wait.
+        if (runtime.lookupFunction(0x001F7310u) != nullptr)
         {
-            gFadeWaitPrev = runtime.lookupFunction(0x001F8480u);
-            runtime.replaceFunction(0x001F8480u, &fadeWaitProbe);
+            gFadeWaitPrev = runtime.lookupFunction(0x001F7310u);
+            runtime.replaceFunction(0x001F7310u, &fadeWaitProbe);
         }
     }
 

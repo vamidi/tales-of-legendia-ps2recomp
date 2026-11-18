@@ -6516,6 +6516,45 @@ its step. My probe on `0x1F8480` never fired, which means that address is not th
 the next concrete step: if it never returns 0, the fade never draws, the thread never returns, and the pipeline
 never re-arms - which would tie every observation together without touching the renderer or the guest's fade.
 
+### Session 152 - the fade's wait DOES fire and DOES terminate (hypothesis refuted)
+
+My probe had been installed on the *target* `0x1F8480`; the fade calls the trampoline **`0x1F7310`** (`j 0x1F8480`),
+so it never fired. Retargeted:
+
+```
+[fadewait] #1  a0=0x00000080 ret=0x00000002
+[fadewait] #2  a0=0x00000080 ret=0x00000001
+[fadewait] #3  a0=0x00000080 ret=0x00000000     <- the wait ends
+[fadewait] #4  a0=0x00000101 ret=0x00000001
+[fadewait] #5  a0=0x00000101 ret=0x00000000
+...                                            (12 waits in 40 s)
+[fadewait] #12 a0=0x00000305 ret=0x00000001
+```
+
+So `FUN_001f8480` (-> `*(u8*)(obj+2)`, or 0xFF when null) counts down **2 -> 1 -> 0** and the loop exits every
+time, and successive objects (`0x80`, `0x101`, `0x182`, `0x284`, `0x305`) are awaited in turn. **The fade's wait is
+healthy and is not the blocker** - another hypothesis refuted by measurement rather than by argument.
+
+### Where that leaves the chain (all measured, each link verified)
+
+- 233-slot resource table populated (230/233), polled at a normal 60 Hz;
+- the walk's `a2` gate is closed on hardware too (mode byte `0x4A86D9 = 0x14` in both port and PCSX2);
+- the fade runs, its wait terminates, its alpha ramps 0.6 -> 1.0 -> 0.2;
+- the app job is one-shot (`busy` written once each way, ra 0x366168 / 0x36600C);
+- the loader step `0x165400` is invoked only **4** times in the whole run;
+- the guest draws no content (5 textured draws of 42,716).
+
+So the one thing still unexplained is precisely the **5th** loader-step invocation that never happens after the
+second fade returns. The fade returns normally, so the next question is what happens to the loader thread at that
+moment: whether it exits (and nothing re-creates it) or stays parked in a state nobody re-arms.
+
+### Next probe (exact)
+
+Watch the loader TCB (`0x4079A0`) across the moment the last fade returns: `+0x1AC` (alive), `+0x1F0` (state),
+`+0x1B4` (resume pc), plus `+0x1A8`, sampled once per second; and log whether `0x165400` is ever entered after it.
+If the thread's alive flag drops to 0, the loader thread ends after the fade and the missing piece is whatever
+should re-create it; if it stays alive with a pc outside the step, the re-arm is a guest state nobody sets.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that
