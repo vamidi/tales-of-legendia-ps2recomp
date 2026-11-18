@@ -7813,6 +7813,67 @@ earlier chain established `FUN_002311b0` (the entry kick) is never called and th
 entity[0x160] == 1`, measured as `0/0/0` on the only entity stepped. Find who is supposed to write `entity[0x18]`
 (source handle) - that writer is the fix site, and it is guest logic.
 
+### Session 152 - entity source handle: deliberately zeroed at construction, and NO writer ever runs
+
+Traced the entity (engine child `+0x0C` = `0x4E9DB0`, class vtable `0x3D4AC0`) from creation to steady state.
+
+**Creation chain (all reached - this part works):**
+
+```
+FUN_00231f30(engine)                       engine constructor
+  alloc(700) -> FUN_002306e0(entity)       entity ctor: sets vtable 0x3D4AC0, inits +0x38/+0x168, zeroes +0x08/+0x34
+  engine[0x0C] = entity                    <- 0x4E9DB0, the entity we have been measuring
+  (*(*entity + 0x14))()  = FUN_00230810    entity init hook
+  alloc(8)    -> FUN_00231e00              engine[0x10] = 0x5AA140
+  alloc(0x20) -> FUN_00285120, FUN_00285290(engine[0x18], 4)   engine[0x18] = the scene, 4 entries
+  FUN_002321b0(engine, 1)
+```
+
+**`FUN_00230810` (the init hook) explains the measured state exactly:**
+
+```c
+entity[+0x30] = alloc(0, 0x18000, 0x40);   // 96 KB data buffer
+entity[+0x14] = 1;                          // mode = 1        (measured mode(+14)=1)
+entity[+0x18] = 0;                          // SOURCE HANDLE explicitly zeroed
+entity[+0x1C] = 0;                          // second source explicitly zeroed
+entity[+0x24] = 0; entity[+0x2C] = 0;
+entity[+0x2A8] = 0;                         // gate used by FUN_002311b0
+entity[+0x2AC] = 0;
+```
+
+So this is **not** a failed allocation or a corrupt structure: the entity is *deliberately* built in the empty state.
+A setter must therefore run afterwards. Enumerated the vtable to find it:
+
+```
++08 = 0x230780 (dtor)   +0C = 0x231DF0   +10 = 0x1ED5E0   +14 = 0x230810 (init, above)
++18 = 0x230950          +1C = 0x230A50 (step)   +28 = 0x230730
+```
+
+`+0x18` = `FUN_00230950` is a **destructor** (frees `+0x30`, the four `+0x298` slots and the two `+0xC` entries), not a
+setter. So the setter is a plain API function, not reachable through this vtable.
+
+**Runtime proof that no writer ever runs** (`logEntityState`, change-detector sampled at the ~9 Hz engine tick, 45 s):
+
+```
+[entity] tick mode(+14)=1 src18=0x00000000 src1C=0x00000000 f158=0 f160=0 pending(+28)=0 f2A8=0
+```
+
+That is the **only** line emitted - the signature never changes. So `src18`, `src1C`, `f158`, `f160`, `pending` and
+`f2A8` are never written after construction.
+
+**Conclusion: this is a missing initialisation.**
+`FUN_00230ad0`'s gate `(entity[0x18] || entity[0x1C]) && entity[0x160] == 1` fails on its first term because the setter
+that should populate the source handle is **never called**. Everything downstream follows: no `FUN_00231be0` load, no
+`FUN_002311b0` kick, entries stay at state 0, GS receives clears only.
+
+### Next probe (exact)
+
+Locate the setter statically and then find which never-called entry point owns it: search for functions that store to
+`entity+0x18` (the entity is `engine[0x0C]`, size 0x2BC), then check which of the dead entry points should reach it - the
+two candidates already identified are the script VM `FUN_0027d0f0` (never dispatched) and the map streamer
+`FUN_0029ce60` (never dispatched). Whichever is supposed to call the source setter is the fix site; both are guest logic,
+so the fix is restoring that call path, not emulating anything.
+
 ## 7. Next
 
 1. **Durable fix**: regenerate with a `case` per instruction (Option A). This session is direct evidence that

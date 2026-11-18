@@ -3407,6 +3407,36 @@ namespace
         });
     }
 
+    // Entity 0x4E9DB0 (engine child +0x0C, class vtable 0x3D4AC0). Its init FUN_00230810 deliberately sets
+    // mode(+0x14)=1 and source(+0x18)=source2(+0x1C)=0, so a setter must run later. This sampler proves whether any
+    // writer ever runs: it logs only on change.
+    void logEntityState(const char *tag, PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_SCENE") != nullptr;
+        if (!sEnv)
+        {
+            return;
+        }
+        const uint32_t e = 0x004E9DB0u;
+        static uint32_t sSig = 0xFFFFFFFFu;
+        const uint32_t f14 = runtime->Load8(rdram, ctx, e + 0x14u) & 0xFFu;
+        const uint32_t f18 = runtime->Load32(rdram, ctx, e + 0x18u);
+        const uint32_t f1C = runtime->Load32(rdram, ctx, e + 0x1Cu);
+        const uint32_t f158 = runtime->Load32(rdram, ctx, e + 0x158u);
+        const uint32_t f160 = runtime->Load32(rdram, ctx, e + 0x160u);
+        const uint32_t f28 = runtime->Load8(rdram, ctx, e + 0x28u) & 0xFFu;
+        const uint32_t f2A8 = runtime->Load8(rdram, ctx, e + 0x2A8u) & 0xFFu;
+        const uint32_t sig = f14 ^ (f18 * 3u) ^ (f1C * 5u) ^ (f158 * 7u) ^ (f160 * 11u) ^ (f28 * 13u) ^ (f2A8 * 17u);
+        if (sig == sSig)
+        {
+            return;
+        }
+        sSig = sig;
+        std::fprintf(stderr,
+                     "[entity] %s mode(+14)=%u src18=0x%08X src1C=0x%08X f158=%u f160=%u pending(+28)=%u f2A8=%u\n", tag,
+                     f14, f18, f1C, f158, f160, f28, f2A8);
+    }
+
     void installSceneStartProbes(PS2Runtime &runtime)
     {
         // FUN_00232110 is the engine's per-frame step: it calls vtable[0x1C] on the engine's three children at
@@ -3489,6 +3519,7 @@ namespace
                                                              runtime->Load32(rdram, ctx, 0x003DB31Cu)));
                                         prev = now;
                                         logLoaderTcb("tick", runtime, rdram, ctx);
+                                        logEntityState("tick", runtime, rdram, ctx);
                                         if (sTickPrev != nullptr)
                                         {
                                             sTickPrev(rdram, ctx, runtime);
