@@ -8886,8 +8886,11 @@ tiles into 224, faithfully copied into 0 and scanned out. Presentation is no lon
 
 ### 156.R4 Next (guest-side, not the presenter)
 
-1. Those fills are untextured black: `fillTex` is only 5. Find why the tile/background draws carry
-   `tme=0` + `rgba=0` (the memory-card screen and the logos are textured draws), i.e. whether the app's scene
-   renderer (state 4 `FUN_00365fd0`) is actually reached or a fade overlay is drawn forever.
+1. Those fills are untextured black: `fillTex` is only 5. Measured with the extended probe (which now prints
+   **both** vertices, because a flat sprite takes its colour from the second): `iip=1 rgba0=0,0,0,0
+   rgba1=0,0,0,0` - so the guest itself emits black geometry, it is not a colour-decode bug on one vertex.
+   The question is therefore why the tile/background draws carry `tme=0` + black (the memory-card screen and the
+   logos are textured draws), i.e. whether the app's scene renderer (state 4 `FUN_00365fd0`) is actually reached
+   or a placeholder/fade draw loop is running.
 2. Do **not** re-investigate: PMODE/EN2 selection, DISPFB2 parsing (incl. FBP 0), DISPLAY2 geometry, the
    strip copy, its direction, or the presenter read path - all measured correct here.

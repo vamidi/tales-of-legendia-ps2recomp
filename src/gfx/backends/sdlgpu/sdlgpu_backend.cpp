@@ -1135,11 +1135,17 @@ struct SdlGpuBackend::Impl {
                 if (sSeq <= 24u || (sSeq % 200u) == 0u)
                 {
                     const GSVertex &v0 = batch.vertices[0];
+                    const GSVertex &v1 = batch.vertices[batch.vertexCount > 1u ? 1u : 0u];
+                    // A flat-shaded sprite takes its colour from the second vertex, so print both: a
+                    // black v0 with a white v1 still draws white, and misreading that looks like "the
+                    // guest draws black".
                     std::fprintf(stderr,
-                                 "[gsorder] #%u %s target=%u tbp0=%u tme=%d tcc=%d tfx=%d rgba=%u,%u,%u,%u "
+                                 "[gsorder] #%u %s target=%u tbp0=%u tme=%d iip=%d tcc=%d tfx=%d "
+                                 "rgba0=%u,%u,%u,%u rgba1=%u,%u,%u,%u "
                                  "adj=(%.0f,%.0f) written=[%u,%u..%u,%u] fills=%u comps=%u fillTex=%u fillRGB=%u\n",
                                  sSeq, fill ? "FILL224" : "COMPOSITE", context.frame.fbp, context.tex0.tbp0,
-                                 state.prim.tme ? 1 : 0, context.tex0.tcc, context.tex0.tfx, v0.r, v0.g, v0.b, v0.a,
+                                 state.prim.tme ? 1 : 0, state.prim.iip ? 1 : 0, context.tex0.tcc, context.tex0.tfx,
+                                 v0.r, v0.g, v0.b, v0.a, v1.r, v1.g, v1.b, v1.a,
                                  v0.x - context.xyoffset.ofx / 16.0f, v0.y - context.xyoffset.ofy / 16.0f, written.x0,
                                  written.y0, written.x1, written.y1, sFills, sComps, sFillTextured, sFillColored);
                 }
