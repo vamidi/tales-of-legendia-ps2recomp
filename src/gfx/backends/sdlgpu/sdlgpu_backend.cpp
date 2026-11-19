@@ -2736,8 +2736,80 @@ struct SdlGpuBackend::Impl {
 
         GsDisplaySetup circuit1 =
             gsDecodeDisplay(request.dispfb1, request.display1, pmode.enableCircuit1);
-        const GsDisplaySetup circuit2 =
+        GsDisplaySetup circuit2 =
             gsDecodeDisplay(request.dispfb2, request.display2, pmode.enableCircuit2);
+        // PCRTC read source, measured on SLUS_212.01: PMODE = 0x66, so only Circuit 2 is enabled and
+        // DISPFB1/DISPLAY1 must be ignored (DISPFB1 stays at the runtime default). DISPFB2 is the real
+        // scanout: the guest programs it (measured: DISPFB2 = 0x1000, i.e. FBP 0 / FBW 8 / PSM CT32),
+        // and FBP 0 is a genuine VRAM page - this guest double-buffers onto it - so it must never be
+        // treated as "unset". Only when DISPFB names a page that has never been drawn and is not one of
+        // the draw frames either is a drawn context frame substituted, which keeps a display register
+        // that lags a frame from presenting stale memory.
+        {
+            const GSFrameReg &drawnA = request.contextFrames[0];
+            const GSFrameReg &drawnB = request.contextFrames[1];
+            auto pageDrawn = [&](uint32_t fbp, uint32_t psm) {
+                GsSurface *surface = targets->findColorSurface(fbp << 5u, psm);
+                return surface != nullptr && !surface->undefined && surface->ownsAnything();
+            };
+            auto retarget = [&](GsDisplaySetup &c) {
+                if (!c.valid)
+                    return;
+                const bool shownDrawn = pageDrawn(c.fbp, c.psm);
+                const bool shownIsDrawFrame = c.fbp == drawnA.fbp || c.fbp == drawnB.fbp;
+                if (shownDrawn || shownIsDrawFrame) {
+                    // Honour the guest. The CRTC cannot read a line wider than the page's pitch; clamp
+                    // when the display register disagrees with FBW (measured: DISPLAY2 asks for 640 from
+                    // a 512-wide page while the mode is still the runtime default).
+                    if (c.fbw >= 1u && c.fbw * 64u < c.width)
+                        c.width = c.fbw * 64u;
+                    return;
+                }
+                // Pick the drawn page that actually holds GPU-drawn pixels, preferring one whose line
+                // length matches the CRTC read width (measured: 224/FBW 8 early, 280/FBW 10 later).
+                const GSFrameReg *pick = nullptr;
+                bool pickDrawn = false;
+                int pickScore = -1;
+                for (const GSFrameReg &candidate : request.contextFrames) {
+                    GsSurface *surface = targets->findColorSurface(candidate.fbp << 5u, candidate.psm);
+                    const bool drawn = surface != nullptr && !surface->undefined && surface->ownsAnything();
+                    const bool widthMatch = candidate.fbw != 0u && candidate.fbw * 64u == c.width;
+                    const int score = (drawn ? 2 : 0) + (widthMatch ? 1 : 0);
+                    if (score >= pickScore) { // ties go to the later frame, the last one written
+                        pick = &candidate;
+                        pickDrawn = drawn;
+                        pickScore = score;
+                    }
+                }
+                if (pick == nullptr)
+                    return;
+                if (std::getenv("TOL_TRACE_GSPRESENT") != nullptr) {
+                    static uint32_t sRetargetLogs = 0u;
+                    static uint32_t sLastPick = 0xFFFFFFFFu;
+                    const bool changed = sLastPick != pick->fbp;
+                    ++sRetargetLogs;
+                    if (changed || (sRetargetLogs % 300u) == 0u) {
+                        sLastPick = pick->fbp;
+                        std::fprintf(stderr,
+                                     "[gspresent] retarget#%u display fbp=%u fbw=%u (drawn=%d) -> fbp%u fbw%u "
+                                     "drawn=%d width=%u ctx=[%u/%u, %u/%u]\n",
+                                     sRetargetLogs, c.fbp, c.fbw, shownDrawn ? 1 : 0, pick->fbp, pick->fbw,
+                                     pickDrawn ? 1 : 0, c.width, drawnA.fbp, drawnA.fbw, drawnB.fbp, drawnB.fbw);
+                    }
+                }
+                c.fbp = pick->fbp;
+                if (pick->fbw != 0u)
+                    c.fbw = pick->fbw;
+                if (gsIsColorFramePsm(pick->psm))
+                    c.psm = pick->psm;
+                c.originX = 0u;
+                c.originY = 0u;
+                if (c.fbw >= 1u && c.fbw * 64u < c.width)
+                    c.width = c.fbw * 64u;
+            };
+            retarget(circuit1);
+            retarget(circuit2);
+        }
         // TOL shows the same buffer on both circuits a line apart and blends
         // them 50/50, which hid interlace flicker on a TV. On a progressive
         // display it only blurs, by a native line at every internal scale.
