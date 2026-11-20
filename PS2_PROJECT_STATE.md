@@ -10232,3 +10232,34 @@ Disassemble the caller around `0x2DF62C` and read the branch that selects `0x2DF
 in the emulator that branch must select the other path (the one that leads to `FUN_00233FC0`'s poll on `0x126248`).
 The condition register/flag that differs between the two runs is the last gate in this chain, and the fix belongs
 at that branch - an override in the `childStepEntryFix` shape, or a data correction if it is a flag.
+
+---
+
+## Session 185 (2026-11-20) - the gate is an OPCODE: the port dispatches `-0xF3` into FUN_002DF6D0
+
+Caller disassembly around the call site `0x2DF62C`:
+
+```
+0x2DF5E4  beq $s2, -0xF4  -> 0x2DF640
+0x2DF5F0  beq $s2, -0xF2  -> 0x2DF640
+0x2DF5FC  beq $s2, -0xF3  -> 0x2DF624      <-- the path the port takes
+0x2DF604  beql $s2, 0     -> 0x2DF614   (lbu $v1,($s0))
+0x2DF60C  b   -> 0x2DF640
+0x2DF614  v0=1 ; v1 &= 1 ; beq -> 0x2DF6B0
+0x2DF624  jal 0x2DF6D0      ; a0 = s3
+0x2DF62C  s2 = v0 ; bltz -> 0x2DF6B0
+```
+
+So `$s2` is a command opcode and `-0xF3` (0xFFFFFF0D) is the only value that routes into `FUN_002DF6D0`. The port
+called it at t=22.927 s, therefore **the port's `$s2` was `-0xF3`** at that dispatch. The emulator never calls
+`FUN_002DF6D0`, so at the same point its `$s2` is a different opcode (or the dispatcher is not reached with -0xF3).
+
+This is the last gate in the chain, and it is a value, not a control-flow defect: a command word differs.
+
+### 185.1 Next
+
+1. Find where `$s2` is loaded in function `FUN_002DF5xx` (the switch head) - it comes from the request/message the
+   function is processing.
+2. Compare that request's opcode in the port and the emulator at the same guest milestone: the port delivers
+   `-0xF3`, the emulator something else. The producer of that field is the fix site (a data write or the code that
+   fills the request).
