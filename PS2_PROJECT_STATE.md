@@ -9784,3 +9784,36 @@ Instrument the **inside** of the step: `0x165210 -> 0x165220 -> 0x165400 -> ...`
 emulator's sequence up to the `0x2062A0` call. The port's copy exits/restarts at `0x165220`, and session 152
 already fixed the sibling case (`childStepEntryFix` at `0x3059B0`) with a per-address step override - the same
 treatment belongs here.
+
+---
+
+## Session 172 (2026-11-20) - the step does run in the port; the missing call is inside 0x165400
+
+`TOL_POKE_ALIVE=1 TOL_TRACE_PC=0x165210,0x165220,0x165400 TOL_WATCH_TARGET=0x2062A0`, 40 s:
+
+```
+0x00165210  entries=2  first t=39.344s  a0=0x00407740  ra=0x00151FC8
+0x00165400  entries=2  first t=39.344s  a0=0x0063D850  ra=0x00165230
+0x2062A0    target hits = 0
+```
+
+So the loader step is **not** dead: the microkernel dispatches `0x165210`, the wrapper enters `0x165400` with the
+job object `0x63D850`, all at 39.3 s - and the step still never calls the loader object's slot +2
+(`0x2062A0`, object `0x63D890`). The missing dispatch is therefore **inside `FUN_00165400`** (one function), not
+in the scheduler, not in the TCB, not in the microkernel.
+
+### 172.1 No fix was applied, deliberately
+
+`+0x1AC` is written by the guest's own task-start code; the port leaves it 0, so the guest never sets it - which
+is what the poke proved by substituting for it. A host poke is a diagnostic, not a fix, and a blind override inside
+`0x165400` risks the loader path that currently works (three load units, scene start, 110 MB of transfers). The
+next step needs one decompile of `FUN_00165400` to see which vtable slot it fires for the job's loader object, and
+that has to come before touching it.
+
+### 172.2 Order for the next session
+
+1. Decompile `FUN_00165400` (job `0x63D850` -> loader object `0x63D890`) and list the slots it calls; the emulator
+   calls slot +2 with `(a0=0x63D890, a1=1)`.
+2. Compare that with what the port actually calls at 39.3 s (same probe, add the slot addresses).
+3. Only then write the per-address override, in the shape of session 152's `childStepEntryFix`.
+4. Fix `+0x1AC` at its real writer instead of poking it from the main loop.
