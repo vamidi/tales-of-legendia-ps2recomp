@@ -10655,5 +10655,45 @@ for tid 6 should be followed by a `0x114610` ENTER with `a0=6`, then tid 6 `Runn
 Do not repeat: sleeping tid 6 (faithful), the suspend/resume chain (proved), the fade (exonerated), and any
 `Store*`-based watch of `0x394304`.
 
+---
+
+## Session 192 (2026-11-20) - FIX: wakeupThread no longer swallows a wake while suspended; regression clean and the whole boot is 1.6x faster
+
+### 192.1 The defect and the change
+
+`rawThreadStatus` was already correct (`Waiting = THS_WAIT 4`, `WaitingSuspended = THS_WAITSUSPEND 0xC`), so the
+guest's `beq v1,4` at `0x1991c0` did reach `WakeupThread`. The wake was lost one layer deeper: `wakeupThread()`
+sent a `WaitingSuspended` sleeper to `makeReady()`, which cannot promote a suspended thread, and `resumeThread()`
+then mapped `WaitingSuspended -> Waiting`. Since `0x198B20` wakes (`0x198b8c`) *before* it resumes (`0x198b94`),
+the wake was always discarded.
+
+`EeScheduler::wakeupThread`: when the target is `Waiting`/`WaitingSuspended` on `Sleep` **and still suspended**,
+clear the sleep wait and move it to `Suspended`, so the following `ResumeThread` takes the existing
+`Suspended -> enqueueReady` path. Unsuspended sleepers keep `makeReady`.
+
+### 192.2 Verified
+
+```
+[62.751] [call] ENTER 0x00114610 from=0x001991D0 a0=6 a1=0x0C ra=0x001991D8   <- WakeupThread(6), same site as hardware
+[107.030] tid=6 Waiting wait=sleep susp=0 pc=0x00198FD0                     <- suspend stays 0, pc inside the loop
+```
+
+### 192.3 Regression (same probes as the pre-fix baseline `logs/perf/base150`)
+
+| milestone | before | after |
+|---|---|---|
+| first creates | 8.9 s | **7.1 s** |
+| 4th create | 44.9 s | **28.6 s** |
+| unit1 / unit2 / unit3 fade | 46.5 / 57.6 / 68.2 s | **29.5 / 36.1 / 43.0 s** |
+| `guest-branch:missing-target` / `[badpc]` | 1 / 0 | **1 / 0** |
+| `g/s` (guest-seconds per wall-second) | 0.01-0.08 | **0.56-0.58** |
+| `mainIters` rate | 8/s | **12/s** |
+
+So the kernel change does not regress the boot or the three load units - it reaches every milestone earlier and the
+emulated clock runs ~10x faster, because the worker no longer sits in the spin. Still `tex builds = 0`: the worker
+now wakes and runs, then sleeps again because no work is posted. The remaining item is the producer
+(`0x3943B8` run flag / the queue `0x1B7888` fetches), not the scheduler.
+
+
 
 
