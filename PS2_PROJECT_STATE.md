@@ -9376,3 +9376,59 @@ The emulator shows the title at **~21 s** and only resumes thread 6 at **22.88 s
 2. Diff that set against the port's steady-state set above - the first emulator address the port never reaches
    is the gate (the port's loop is already known).
 3. Keep `TOL_AUTO_RESUME` as a probe only; it is not a fix.
+
+---
+
+## Session 163 (2026-11-20) - the worker loop runs once in the port and 4047 times in the emulator
+
+### 163.1 The worker thread's loop, and the counter that proves it is not running
+
+`FUN_00198f38` (tid 6's body) is a work loop:
+
+```
+0x198FA0  ld  v0,(0x394340); v0++; sd v0,(0x394340)     <- iteration counter
+0x198FAC  jal 0x1B7888                                   <- work fetch
+0x198FB0  sw  $s1=1,(0x394314)  /  0x198FB4 sw $zero     <- busy heartbeat
+0x198FBC  lw  v0,(0x394304); beq 1 -> SleepThread        <- optional frame sleep
+0x198FD0  bnez s0 -> 0x19902C
+0x198FD8  v0 = 0x3942C8; if ==1 -> ResumeIfSuspended(*(0x394370))
+0x19902C  ld v0,(0x3943B8); beqz -> 0x198FA0             <- loop while the flag is 0
+```
+
+Measured, same globals both sides:
+
+| address | port (`pf_1`, 49.9 s) | emulator (title) |
+|---|---|---|
+| `0x394340` iteration counter | **1** | **0xFCF (4047)** |
+| `0x394314` heartbeat | 0 | 1 |
+| `0x3943E8` | 0 | 1 |
+| `0x3943B8` run flag | 0 | 0 |
+| `0x394304` | 0 | 0 |
+
+`FUN_001B7888` (the work fetch) is entered **once** in 60 s (`t=5.895 s`) and returns `v0=0` immediately. So the
+thread starts its loop, comes round once, then sleeps and is never dispatched again.
+
+### 163.2 Why sleeping is fatal here
+
+`SleepThread` (0x32) blocks with `EeWaitState{EeWaitReason::Sleep, std::monostate{}}` - **no deadline**. Such a
+thread only runs again on an explicit `WakeupThread`. The port's guest never issues one for tid 6 (the
+`TOL_TRACE_SUSP` log shows only suspend/resume, and tid 4/5 similarly sit in `Waiting(sleep)` from 7 s to 80 s
+with no state change at all).
+
+The two writers of the run flag `0x3943B8` are `FUN_00199938` (0x19997C) and `FUN_00199AF0` (0x199B40, 0x199BAC).
+`TOL_TRACE_PC=0x199AF0,0x199938` over 60 s: **0 entries**. So the port never calls the code that would tell the
+worker "there is work" and wake it - which is consistent with unit 4 never starting (session 161.2).
+
+### 163.3 Status of the logo goal
+
+Not yet on screen. The chain is now: unit 3 finishes -> the app never starts the next unit / never calls
+`FUN_00199AF0` -> the worker thread (which draws) stays in `SleepThread` -> nothing is submitted, the screen
+keeps the leftover fade. `TOL_AUTO_RESUME` wakes it for one iteration only (it re-sleeps), so it is a probe, not
+a fix.
+
+### 163.4 Next
+
+1. Find the caller of `FUN_00199AF0` / `FUN_00199938` (xrefs in Ghidra) and check which of their ancestors the
+   port stops at - that is the same place unit 4 fails to start. With the flag set, the worker loop runs and the
+   title content follows.
+2. Keep using `pf_*` (0x390000..0x3A0000) dumps: that range holds this whole subsystem and now diffs cleanly.
