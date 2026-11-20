@@ -10737,6 +10737,20 @@ the guest is 99 % busy, so it reported no transition while the authoritative on-
 (`[call] ... t304=1` at the second `0x1B7888` fetch) shows the flag was 1. Use the call-site reading, not the
 sampler.
 
+### 192.7 Disproved: 0x394304 is not the pacing mechanism, and the fetch returns 0 on both sides
+
+- **Paced clear tested** (`TOL_CLEAR_SLEEPFLAG=50`): only **one** clear happened in 80 s (the flag is set once and
+  never re-set), the worker then spun at ~2,100 fetch/s and the frame loop starved (`mainIters +0`, `g/s 0.017`).
+  So "clear the flag" is neither correct nor paced - it is a one-shot hold flag.
+- **Fetch return value measured on both sides**: port `[call] EXIT 0x001B7888 ... v0=0x00000000`; hardware at the
+  return point (`bp 0x198FB4`, `eval v0`) also `0x0`. So the fetch return is **not** the difference either.
+- What remains: hardware calls `WakeupThread(6)` ~20x/s from `0x1991D8` (session 191.2), i.e. the whole release
+  chain `0x2062A0 -> ... -> 0x198B20 -> 0x199198` runs **per frame** there, and only **once** in the port. The
+  pacing is the release cadence, not any flag or return value.
+- Frame-independent upload counters now exist (`[turncost] ... gsw=N(+d) gif=N(+d)`) so texture activity can be
+  read even when the frame loop stalls. Steady state so far: `gif=4(+0)`, `gsw=0(+0)` - no uploads.
+
+
 
 
 
