@@ -10281,3 +10281,35 @@ State at the end of this thread (all measured, none guessed):
 - the 4th task differs in *where it waits*: emulator polls `0x126248` in `FUN_00233FC0`; the port enters
   `FUN_002DF6D0` because its dispatcher receives opcode `-0xF3` and exits through `pc=0x116A6C`;
 - remaining unknown: the producer of that opcode (this section's probe).
+
+---
+
+## Session 187 (2026-11-20) - FOUND IT: the job-table request code differs (0x0D vs 0x0E)
+
+`FUN_002DF590` loads `0x4E9140` in its first two instructions (`lui 0x4F; addiu -0x6EC0`) - it is the **job table**
+dispatcher. And `s2` (the opcode that routed into `FUN_002DF6D0`) is `-0xF3` = `0xFFFFFF0D`, i.e. `0x0D - 0x100`.
+
+Job table `0x4E9140`, entry 0, from `pd_2.bin` (port) vs `emu_title.bin`:
+
+| word | port | emulator |
+|---|---|---|
+| `+0x0` | `0x00000001` | `0x00000000` |
+| `+0x4` | `0xFF0D0001` | `0xFF0E0000` |
+| `+0x8` | `0x00000002` | `0x00000002` |
+| `+0xC` | `0x00002000` | `0x00000000` |
+| `+0x10` | `0x00000001` | `0x00000000` |
+| `+0x14` | `0x00623100` | `0x00623100` |
+
+The request code byte is **`0x0D` in the port and `0x0E` in the emulator** (the `-0xF3` the dispatcher received is
+`0x0D - 0x100`). Entry state differs too (`1` vs `0`), and `+0xC`/`+0x10` differ - the port's entry 0 is one step
+further along, with the wrong request id.
+
+So the whole chain resolves to this: the port queues job request **0x0D**, the emulator queues **0x0E**. Every layer
+above is correct; the wrong id sends the 4th task into `FUN_002DF6D0` instead of the poll path, and the screen stays
+black.
+
+### 187.1 The fix
+
+Find the writer of the request byte at `0x4E9140 + 4` (byte 1) and the state at `+0` - i.e. the job submit call that
+enqueues entry 0 - and compare its argument with the emulator's. Correcting the id (0x0D -> 0x0E) is a one-value
+fix, and it is the only place left where the two runs disagree.
