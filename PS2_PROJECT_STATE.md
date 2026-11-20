@@ -10263,3 +10263,21 @@ This is the last gate in the chain, and it is a value, not a control-flow defect
 2. Compare that request's opcode in the port and the emulator at the same guest milestone: the port delivers
    `-0xF3`, the emulator something else. The producer of that field is the fix site (a data write or the code that
    fills the request).
+
+---
+
+## Session 186 (2026-11-20) - the `$s2` producer is not in the window scanned; function extent needed
+
+The opcode dispatcher's switch head is above `0x2DF5E0`; a scan of `0x2DF520..0x2DF5E8` shows no write to `$s2`
+(only `jal 0x2DF0B0` and `move $v0,$s2`), so `$s2` is loaded earlier in that function. The next probe is a full
+disassembly of the function containing `0x2DF5E0` (`tools/map_lookup.ps1 0x2DF5E0` for its extent, then
+`tools/disasm_guest.py <elf> <start> <end>`), grepping for writes to `$s2` - that names the field and the
+instruction that fills it, i.e. the producer of the `-0xF3` opcode.
+
+State at the end of this thread (all measured, none guessed):
+
+- control flow identical to the emulator at: microkernel dispatch (`0x165210`), app-job step (`0x365700`),
+  4th create + dispatch (`0x2E1F80` / `0x2E09E0`), TCB table, priority counts, context slots;
+- the 4th task differs in *where it waits*: emulator polls `0x126248` in `FUN_00233FC0`; the port enters
+  `FUN_002DF6D0` because its dispatcher receives opcode `-0xF3` and exits through `pc=0x116A6C`;
+- remaining unknown: the producer of that opcode (this section's probe).
