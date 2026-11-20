@@ -9817,3 +9817,39 @@ that has to come before touching it.
 2. Compare that with what the port actually calls at 39.3 s (same probe, add the slot addresses).
 3. Only then write the per-address override, in the shape of session 152's `childStepEntryFix`.
 4. Fix `+0x1AC` at its real writer instead of poking it from the main loop.
+
+---
+
+## Session 173 (2026-11-20) - correction: 0x165400 fires slot +0xC, not +2
+
+Decompiled `FUN_00165400`:
+
+```c
+void FUN_00165400(int param_1)
+{
+  (**(code **)(*(int *)(param_1 + 0x10) + 0xc))();   /* vtable slot +0x0C of the object at job+0x10 */
+}
+```
+
+So the loader step's `0x165400` is the **slot +0x0C** dispatcher (that is the unit callback `0x204240`, whose
+three runs the port already performs). It is **not** the slot +2 dispatcher, so session 172's "the missing call is
+inside FUN_00165400" is wrong for slot +2.
+
+Which leaves the emulator's own evidence as the only guide to slot +2: at the `0x2062A0` hit
+`ra=0x00151FC8, v0=0x00165210, s0=0x004079A0, a0=0x0063D890, a1=1` - i.e. the microkernel called `0x165210`, and
+`0x2062A0` is reached *deeper in that same call* with `$ra` still `0x151FC8`, so it is reached by a **tail
+transfer** (`j`/`jr`) from the step chain, not by a `jal` from `0x165400`.
+
+Combined with the resume backtrace (`0x2062A0 -> 0x3353C0 -> 0x2542D0 -> 0x254030 -> 0x2540B0 -> 0x259B20 ->
+0x1B75D8 -> 0x198B20`), slot +2 is entered **from inside `FUN_002062a0` itself**, not into it: `0x2062A0` is the
+slot+2 *entry*, and everything after it is what the emulator does once the unit starts.
+
+### 173.1 What that means for the fix
+
+The port reaches `0x165210` and `0x165400` (slot +0xC) but never `0x2062A0`. Since `0x2062A0` is the slot+2
+entry and it is reached with `ra` preserved from the microkernel `jalr`, the tail transfer that reaches it comes
+from a path the port's step does not take - the next measurement is the tail transfers **out of** the step:
+`TOL_TRACE_SOURCE` on the step's tail instructions, or `TOL_WATCH_TARGET=0x2062A0` in the *emulator* (which the
+port probe already shows as 0 hits, so the emulator side will name the source instruction that performs it).
+
+Do not patch `0x165400`; it is the unit callback and it works.
