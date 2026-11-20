@@ -8894,3 +8894,60 @@ tiles into 224, faithfully copied into 0 and scanned out. Presentation is no lon
    or a placeholder/fade draw loop is running.
 2. Do **not** re-investigate: PMODE/EN2 selection, DISPFB2 parsing (incl. FBP 0), DISPLAY2 geometry, the
    strip copy, its direction, or the presenter read path - all measured correct here.
+
+---
+
+## Session 157 (2026-11-20) - port-drawn memory-card panel removed; guest side traced to the scene's entity streams
+
+### 157.1 The "custom panel" was ours, and it is gone
+
+The screen the user described ("NOW LOADING, then a custom panel, then black") contained a **port-drawn** panel:
+`src/ui/ui_overlay.cpp` painted a "Checking memory card (8MB)" lane (black background, peach box, five lines of
+prose, a progress bar) whenever `g_tolShowMcBootPanel` was set, and `tol_overrides.cpp` armed it on the first
+`FUN_00126558` save-directory read. It reproduced the **PS2 BIOS** panel, which a direct-ELF port never draws.
+
+Removed: the whole draw block and both cross-TU flags (`g_tolShowMcBootPanel`, `g_tolMcBootPanelQueryDone`), and
+the `TOL_NOMCBOOT` opt-out with them. Commit `46a0066`.
+
+Verified by window capture (client area, per-monitor DPI aware): 5 s = the game's own `NOW LOADING` with content
+around it (3.1 % non-black), 9-18 s = `NOW LOADING` only (0.72 %), 26 s = black (0 %). `[badpc]` 0. The port now
+shows **only guest output**.
+
+### 157.2 The display IS filled and presented every frame (measured)
+
+- Composite strips (20 x 64x448, `tme/abe/fst=1`, `tbp0=7168`, rgba 128/128/128/128, FIX 64/96) sample page 224
+  through the **live render target**: `[gscopy] sampled=yes cand=yes inOrder=1 direct=1` on every strip.
+- They land in page 0 (`[gsdraw] surf base=0 ... written=[63,0..129,448]`), and the presenter scans page 0 out:
+  `[prep-out] displayFbp=0 sourceFbp=0 512x448 mode=1` (BackendNative) for the whole run.
+- So the pipeline is faithful; what it carries is black because **page 224 itself is black**.
+
+### 157.3 Guest side: the scene has entities but they never start their streams
+
+Measured with the new `[sceneobj]` probe (`TOL_TRACE_SCENE`), scene `0x5AA170`:
+
+```
+count(+8)=4   e0..e3 = 0x5AA1B0 / 0x5C7E80 / 0x5E5B50 / 0x603820
+each: renderer r30(+0x30) != 0, reader(+0x34) != 0, stream(+0x2C) == 0, state(+0x14C) == 0
+```
+Unchanged from step 1 to step 200 (~7 s of stepping). The per-entity state machine is:
+`FUN_002928B0 -> state 1`, `FUN_00292930 -> 2`, `FUN_00292A40 -> 4`, `FUN_00292610 -> 0 (teardown)`.
+`FUN_00285E80` (the scene "start" called from the loader's fade tail) only **resets** every entity
+(`FUN_00292680 -> FUN_00292610`, state 0). The state setters have exactly three call sites -
+`FUN_002311B0` (0x2311B0), `FUN_00285BC0`, `FUN_00285C90` - the **actor/effect** layer, which this boot never
+reaches. `FUN_002857C0` draws entity by entity, so 4 idle entities = 4 no-ops.
+
+What the guest does draw is the loader's fade: black untextured 66x34 tiles (`tme=0 iip=1 rgba0/1=0,0,0,0`,
+~1000/s into page 224) while the overlay `0x63D970` alpha cycles `1.0 -> 0.2 -> 1.0` (`FUN_00204240` fades
+0->1, waits 90, 1->0 per load unit).
+
+Also confirmed against ps2tek: FRAME_1/2 is `FBP 0-8, FBW 16-21, PSM 24-29`, so `GSDrawState::frame` decoding in
+`gs_frontend.cpp` is correct (the earlier "FBW looks misplaced" suspicion is closed).
+
+### 157.4 Next (guest side)
+
+1. Find why the actor/effect layer never runs `FUN_002311B0` for these entities - i.e. what spawns the actors that
+   own them (the entity at `+0xC` is handed to `FUN_002928B0` by an actor object with its own `+0x158` kind and
+   `+0x160` mode). That is the missing content, not the presenter.
+2. `[fade]`/`[fadef20]`/`[fadewait]` show the loader fade completing and cycling, so the fade is not the gate.
+3. PCSX2 cannot be used as a reference right now: this DebugServer returns empty for `read_memory`/`disassemble`
+   (`buffer` undefined), same class as the known-empty GSPRIV read.
