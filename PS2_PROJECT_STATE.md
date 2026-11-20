@@ -10176,3 +10176,37 @@ difference; if it is the same shape, the task is simply waiting for work that th
 producer - not the waiter - is the thing to fix.
 
 Everything above (dispatch, create, TCB fields, job step) is measured and identical.
+
+---
+
+## Session 183 (2026-11-20) - the two loops identified: emulator's 4th task polls 0x126248; the port's never gets there
+
+`FUN_00233FC0` (72 B), the emulator's steady state for TCB5:
+
+```
+0x233FC8  sw zero,0x1C(sp)
+0x233FCC  a0=1 ; a1=0 ; a2=sp+0x1C
+0x233FD4  jal 0x126248          <- channel read (1, 0, &out)
+0x233FDC  bnez v0 -> 0x233FF8   <- got data: return it
+0x233FE4  jal 0x15231C          <- yield
+0x233FEC  b 0x233FD0            <- loop  (this is the pinned pc)
+```
+
+So in the emulator the 4th task is a **worker poller** on the CRI/stream channel `0x126248` - a normal idle loop,
+exactly the function session 152 documented and already fixed once (`criEndFunctionFix`).
+
+The port's pinned pc `0x2DF7F4` is `+0x124` inside `FUN_002DF6D0` (1732 B, branch-heavy code around
+`0x2DF7D0`: `b 0x2DFD64`, `lw v0,0xD0(sp)`, `sh v1,(v0)`) - **not** a poll loop. The port's 4th task therefore
+never reaches its poll function; it is stuck earlier, inside `FUN_002DF6D0`.
+
+### 183.1 Decision
+
+This is the "same shape or not" question answered: **not the same**. The task is not waiting for work in the port;
+it never arrives at the wait. So the fix target is the path that should lead into `FUN_00233FC0`, i.e. whatever
+`FUN_002DF6D0` is doing when it stalls at `+0x124`.
+
+### 183.2 Next probe (one)
+
+Trace `FUN_002DF6D0` entry and its calls in the port (`TOL_TRACE_PC=0x2DF6D0` plus its callees as they appear),
+and compare with the emulator's sequence for TCB5 before it settles in `FUN_00233FC0`. The first callee the
+emulator runs and the port does not is the gate.
