@@ -4970,6 +4970,20 @@ namespace
                                             {
                                                 runtime->Store32(rdram, ctx, 0x00407B4Cu, 1u);
                                             }
+                                            // TOL_JOBFIX=1: the job table's entry 0 carries request id 0x0D in the
+                                            // port and 0x0E in the emulator (session 187). The id is the routing key for
+                                            // FUN_002DF590, and 0x0D sends the drawing task into FUN_002DF6D0 instead of
+                                            // its poll path. Correct it as soon as it appears (one-shot, opt-in).
+                                            if (std::getenv("TOL_JOBFIX") != nullptr)
+                                            {
+                                                static bool sJobFixed = false;
+                                                if (!sJobFixed && runtime->Load8(rdram, ctx, 0x004E9146u) == 0x0Du)
+                                                {
+                                                    runtime->Store8(rdram, ctx, 0x004E9146u, 0x0Eu);
+                                                    sJobFixed = true;
+                                                    std::fprintf(stderr, "[jobfix] job[0] request id 0x0D -> 0x0E\n");
+                                                }
+                                            }
                                             logLoaderTcb("52b70.pre", runtime, rdram, ctx);
                                             if (p52b70 != nullptr)
                                             {

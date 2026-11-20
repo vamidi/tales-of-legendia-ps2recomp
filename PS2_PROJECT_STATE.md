@@ -10313,3 +10313,37 @@ black.
 Find the writer of the request byte at `0x4E9140 + 4` (byte 1) and the state at `+0` - i.e. the job submit call that
 enqueues entry 0 - and compare its argument with the emulator's. Correcting the id (0x0D -> 0x0E) is a one-value
 fix, and it is the only place left where the two runs disagree.
+
+---
+
+## Session 188 (2026-11-20) - the job-id fix is applied and fires; the screen is still black (single-value fix insufficient)
+
+`TOL_JOBFIX=1` (new, opt-in, in the main-loop probe) rewrites the job-table request id as soon as it appears:
+
+```
+[jobfix] job[0] request id 0x0D -> 0x0E
+```
+
+Run with `TOL_POKE_ALIVE=1 TOL_JOBFIX=1`, captures at 72 / 87 / 102 s: **still black**. Guest 99.3 % busy,
+`loader state=1 chan=4 alive=1`, `mainIters` climbing, one known `0x301EB8` jalr-to-null.
+
+So the request id alone is not the whole difference. Comparing `job[0]` again after the fix, three other words are
+still one step ahead of the emulator:
+
+| word | port | emulator |
+|---|---|---|
+| `+0x0` state | `0x00000001` | `0x00000000` |
+| `+0xC` | `0x00002000` | `0x00000000` |
+| `+0x10` | `0x00000001` | `0x00000000` |
+
+i.e. the port's job 0 is *already running/finished* where the emulator's is idle - the entry's lifecycle is offset,
+not just its id.
+
+### 188.1 Where this leaves the work (next session, in this order)
+
+1. **Speed first**, because it is what makes every measurement ambiguous (and it is why two of my readings were
+   invalid): the port reaches the 4th create at 37 s vs the emulator's 9.25 s. Measure per-phase wall time
+   (`TOL_TURN_COST` + the `[turncost]` line) across boot -> unit1 -> unit4 and attack the largest block.
+2. Then re-compare the full `job[0]` lifecycle (`+0x0`, `+0x4` id, `+0xC`, `+0x10`) at matched milestones; the
+   port is one state ahead, so something submits/consumes that entry early.
+3. Keep `TOL_JOBFIX` as a probe until (2) shows the entry matches end to end.
