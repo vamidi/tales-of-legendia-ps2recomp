@@ -9730,3 +9730,57 @@ of that word is the one to fix.
 `+0x1B4 = 0x204380` in the port sits in the same `0x20xxxx` code region as the emulator's `0x2057C8`, so the
 task's own resume state is plausible - the gap is that the dispatcher keeps entering it at the wrapper entry
 instead of that resume point.
+
+---
+
+## Session 171 (2026-11-20) - the dispatcher is identical after all; the gap is INSIDE the step (0x165210 -> 0x2062A0)
+
+### 171.1 TCB 4 block, full compare (port `pd_2` vs emulator `emu_title`)
+
+```
+** +1AC 0x00000000  0x00000001     (alive)
+   +1B0 0x00165210  0x00165210     (entry, identical)
+** +1B4 0x00165220  0x002057C8     (resume pc)
+   +1B8 0x00165250  0x00165250
+   +1BC 0x00000000  0x00000000
+   +1C0 0x0063D890  0x0063D890     (object arg)
+   +1C4 0x00000000  0x00000000
+   +1F0 0x01000401  0x01000401
+   +1F4 0x00000000  0x00000000
+   +1F8 0x00407580  0x00407580
+   +1FC 0x00000000  0x00000000
+```
+
+Only `+0x1AC` and `+0x1B4` differ - no other field of the TCB is involved.
+
+### 171.2 Correction: the run loop dispatches the SAME pc on both sides
+
+At the emulator's `0x2062A0` entry: `ra=0x00151FC8  v0=0x00165210  a0=0x0063D890  a1=0x00000001  s0=0x004079A0`.
+
+`v0` is `0x165210`, not `0x2062A0` - so the microkernel calls **the same wrapper `0x165210` the port calls**,
+and `0x2062A0` is reached *inside* that call with `(a0 = object 0x63D890, a1 = 1)`. Session 167's reading of
+`+0x1B4 = 0x2062A0` as "the dispatched pc" was wrong; `+0x1B4 = 0x2057C8` is simply where the step was when the
+dump was taken.
+
+So: the microkernel, the TCB and the dispatch are all correct in the port. **The divergence is inside the loader
+step**: the wrapper starts, the emulator's copy walks into the object's step and calls slot +2 (`0x2062A0`), the
+port's copy stays at the wrapper body (`0x165220`) and restarts.
+
+### 171.3 Out-of-band call with the right arguments still fails
+
+`TOL_CALL_PC` now takes `addr,a0,a1`; calling `0x2062A0` with `(0x63D890, 1)` after the units:
+
+```
+[callpc] -> 0x002062A0 a0=0x0063D890 a1=0x00000001
+[callpc] returned pc=0x0010EE5C v0=0x0000002C
+```
+
+It leaves through the syscall path again, so invoking the callback from the main loop is not a valid fix - it
+must run inside its own task/stack. Graphics unchanged: `draws=480/120 frames, transfers=0, tex builds=0`.
+
+### 171.4 Next (the last known gap)
+
+Instrument the **inside** of the step: `0x165210 -> 0x165220 -> 0x165400 -> ...` in the port and compare with the
+emulator's sequence up to the `0x2062A0` call. The port's copy exits/restarts at `0x165220`, and session 152
+already fixed the sibling case (`childStepEntryFix` at `0x3059B0`) with a per-address step override - the same
+treatment belongs here.

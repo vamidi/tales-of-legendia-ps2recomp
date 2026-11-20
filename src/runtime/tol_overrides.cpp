@@ -4913,18 +4913,27 @@ namespace
                                                                ? static_cast<uint32_t>(std::strtoul(comma + 1, nullptr, 0))
                                                                : 0u;
                                                 }();
+                                                static const uint32_t sCallA1 = [] {
+                                                    const char *const spec = std::getenv("TOL_CALL_PC");
+                                                    const char *const c1 = spec != nullptr ? std::strchr(spec, ',') : nullptr;
+                                                    const char *const c2 = c1 != nullptr ? std::strchr(c1 + 1, ',') : nullptr;
+                                                    return c2 != nullptr
+                                                               ? static_cast<uint32_t>(std::strtoul(c2 + 1, nullptr, 0))
+                                                               : 0u;
+                                                }();
                                                 if (!sCalled && gFadeCalls >= 3u && sCallPc >= 0x00100000u)
                                                 {
                                                     sCalled = true;
                                                     PS2Runtime::RecompiledFunction fn = runtime->lookupFunction(sCallPc);
                                                     std::fprintf(stderr,
-                                                                 "[callpc] fades=%u -> 0x%08X a0=0x%08X fn=%p\n",
+                                                                 "[callpc] fades=%u -> 0x%08X a0=0x%08X a1=0x%08X fn=%p\n",
                                                                  static_cast<unsigned>(gFadeCalls), sCallPc, sCallA0,
-                                                                 reinterpret_cast<void *>(fn));
+                                                                 sCallA1, reinterpret_cast<void *>(fn));
                                                     if (fn != nullptr)
                                                     {
                                                         const uint32_t savedRa = GPR_U32(ctx, 31);
                                                         SET_GPR_U32(ctx, 4, sCallA0);
+                                                        SET_GPR_U32(ctx, 5, sCallA1);
                                                         SET_GPR_U32(ctx, 31, 0u);
                                                         ctx->pc = sCallPc;
                                                         fn(rdram, ctx, runtime);
