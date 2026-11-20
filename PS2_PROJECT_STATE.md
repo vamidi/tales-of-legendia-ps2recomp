@@ -10521,3 +10521,78 @@ a non-header hook (a `.cpp` function the macro calls, or the print itself) - do 
 3. Do not repeat: `TOL_XFER_WALLPUMP`, `TOL_JOBFIX=2`, `TOL_EE_CYCLE_SCALE` as anything but a diagnostic, and the
    `Store*`-based write watches.
 
+---
+
+## Session 190 (2026-11-20) - the whole resume chain IS called (proved at the call level); the fade is not covering anything; the remaining gap is thread state, not a missing function
+
+### 190.1 New instrument: `TOL_TRACE_CALL=<addr>` - sees tail-called callees
+
+`replaceFunction()` and `TOL_TRACE_PC` wrap the *function table*. Generated code reaches many functions by a
+**direct C++ call** (`FUN_xxx(rdram, ctx, runtime)`) for `j`/tail transfers, which never touches the table. That is
+why so many "0 entries" readings were wrong. `TOL_TRACE_CALL` hooks the actual invocation site in
+`PS2Runtime::dispatchGuestBranch` (around `targetFn(rdram, ctx, this)`), so it fires for every call kind and prints
+entry **and exit** registers.
+
+RETRACTED as instrument artefacts (table probes cannot see direct calls): "`0x1B75D8` / `0x198B20` / `0x1B75D8`
+never run" (this session, earlier attempt), and session 161's "all eight chain addresses entered 0 times" for the
+tail-called members.
+
+### 190.2 The resume chain runs end to end, with the emulator's arguments
+
+Port, `TOL_TRACE_CALL=0x198BF8` (75 s run):
+
+```
+[57.107] [call] ENTER 0x00198BF8 from=0x001B7600 kind=3 a0=0 a1=1 a2=0x1E ra=0x1B7608 t304=0 id36C=6
+[57.123] [call] EXIT  0x00198BF8 pc=0x001B7608 v0=0 a0=0x00000006 t304=0 id36C=6
+```
+
+Emulator, breakpoints at boot (fresh `-fastboot` run):
+
+```
+t=26.12s 0x1B75D8 a0=6 a1=1 a2=0x1E ra=0x259B48
+t=26.17s 0x198B20 a0=6 a1=0x19 a2=0x1E ra=0x1B7608
+```
+
+Measured chain, both sides, same arguments:
+
+| step | port | emulator |
+|---|---|---|
+| `0x2062A0` (loader slot+8) | 44.6 s, `a0=0x63D890 a1=1 s0=0x4079A0` | 25.8 s, same |
+| `0x3353C0` / `0x2542D0` / `0x259B20` | yes (jal) | yes |
+| `0x258E88` (`addiu a0,zero,6`) | yes (jal) | yes |
+| `0x1B75D8` (direct tail call) | yes (via `TOL_TRACE_CALL` of its callee) | yes |
+| `0x198BF8` -> `a0 = *(0x39436C)` | `id36C=6` | `6` |
+| `0x198B20(6, 0x19)` | enters, returns in 16 ms | enters |
+| `0x199200(6)` -> ResumeThread(6) | **only ever logged with a0=3** | yes |
+
+The function table the `jalr` reads is also correct: `0x49C850` (index 6) = `0x198BF8` on both sides; the guest
+computes it itself at `0x199900` (`lui 0x1A; addiu -0x7408`).
+
+### 190.3 The fade is NOT covering the title (measured, twice)
+
+`TOL_TRACE_ORDER`, 120 s: alpha ramps `0.04 -> 1.00` in 25 steps, holds, then descends (`0.2`, `0.6`); afterwards
+`[gfx] ... draws=480/120 frames (4/frame) transfers=0 tex builds=0` forever. A native fade override would reveal a
+black clear, not a logo. The emulator's own title frame was captured (`snaps/`): it is a **starfield of sprite
+stars**, i.e. textured quads - and the port uploads no textures after the load.
+
+### 190.4 Where the gap actually is
+
+`0x198B20` sets `*(0x394304)=1`, raises the priority, then loops
+`{ SuspendIfActive(id); ResumeIfSuspended(id); } while (*(0x394304) != 0)`, then re-suspends. In the port it
+returns with `t304=0`, so one iteration ran. But at 94 s tid 6 is still `WaitSusp wait=sleep susp=1 pc=0x00198FD0`,
+and `resume id=6` never appears, while `0x199200` is only ever called with `a0=3`.
+
+So the defect is no longer a missing call: it is the **thread-state machine** - either `ResumeIfSuspended` does not
+turn `Waiting(sleep)+suspended` into a runnable thread (session 162 measured the same: the suspend bit clears, the
+sleep does not), or tid 4's loop re-suspends it (measured 33x/s from `ra=0x198DCC`). Note the emulator performs the
+*same* `SuspendIfActive(6)` and `(3)` calls at the title, so "wrong thread" is not the answer.
+
+### 190.5 Next (single item)
+
+Compare the kernel's thread record for tid 6 immediately after `0x198B20` returns, port vs emulator: `status`,
+`suspendCount`, `waitReason`. If the port is `Waiting/Sleep` where the emulator is `Ready`, the fix belongs in
+`EeScheduler::resumeThread` (a resume must also make a sleeping-on-suspend thread runnable, as the EE kernel
+does), not in any guest function. `TOL_TRACE_CALL=0x198BF8` + `TOL_TRACE_SUSP=6` in one run gives both sides of
+that instant.
+
+
