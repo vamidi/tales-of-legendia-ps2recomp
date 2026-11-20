@@ -10043,3 +10043,49 @@ So nothing is skipped in the create path. The open question narrows to what happ
    is then dispatched at its entry.
 2. If created but never dispatched, compare its TCB (`entry`, `+0x1AC`, `+0x1F0` state/prio) with the emulator's
    fourth task - that is the last mechanical difference in this chain.
+
+---
+
+## Session 179 (2026-11-20) - CONFIRMED: the fourth task IS created and dispatched in the port (identical args); 176/177 retracted
+
+95 s run, `TOL_TRACE_PC=0x151CD0,0x2E09E0`:
+
+```
+7.280s  0x151CD0 #1 a0=0x001F8150
+7.280s  0x151CD0 #2 a0=0x001F84B0
+7.328s  0x151CD0 #3 a0=0x001660A0
+37.337s 0x151CD0 #4 a0=0x002E09E0 a1=1 a2=0 ra=0x002E1FC4 sp=0x00423450   <- 4th create
+37.371s 0x002E09E0 #1 a0=0x00407D70 ra=0x00151F88 sp=0x00417550           <- dispatched by the microkernel
+```
+
+Emulator, same two events: create at 9.25 s (`a0=0x2E09E0 a1=1 a2=0 ra=0x2E1FC4`), dispatch at 9.34 s
+(`a0=0x407D70 ra=0x151F88`). **Identical arguments, identical caller, identical dispatcher** - the port is just
+~4x later (37.3 s vs 9.3 s).
+
+Fourth task's TCB = index 5 = `0x407BB0` (`a0` at dispatch is `TCB+0x1C0`):
+
+| field | port (`f4_1`, 87 s) | emulator (`emu_title`) |
+|---|---|---|
+| `+0x1AC` | 0 | 0 |
+| `+0x1B0` entry | 0 | 0 |
+| `+0x1B4` resume pc | `0x002DF7F4` | `0x00233FEC` |
+| `+0x1F0` state/prio | `0x01000A00` | `0x01000A00` |
+
+Both alive, same state/priority; only the resume pc differs, which is expected from different progress points.
+
+### 179.1 Retraction and what is actually left
+
+Sessions 176 and 177 concluded "the port never creates the 4th task / never enters the 0x2E08xx family". Both used
+windows shorter than the port needs (30-40 s of a 4x-slower boot). At 95 s the port does exactly what the emulator
+does. The line is retracted.
+
+Every control-flow link measured today is now identical on both sides: microkernel dispatch (`0x165210`), app job
+step (`0x365700`, `a0=0x63E3D0`), create site (`0x2E1F80`, `a0=0,a1=1,a2=1`), 4th create and dispatch, TCB table,
+priority counts, context slots. The only measured difference left is **speed** (~4x) plus the resume-pc values that
+follow from it.
+
+### 179.2 Next
+
+Measure with the 4x factor in mind: run the port 200 s and capture the window at 150 / 180 / 200 s (guest ~40 s,
+past the emulator's title point). If it is still black then, the divergence is downstream of the 4th task's own
+progress and must be found by comparing that task's `+0x1B4` chain, not by any of the links retired above.
