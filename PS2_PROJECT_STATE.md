@@ -9518,3 +9518,56 @@ right one.
   emulator and is missing in the port.
 - Alternative: instrument `FUN_00151E90` (dispatcher) in the port to print every dequeued item - the emulator runs
   `0x2062A0` from there at ~2/s, so the port's dispatcher log will show which item it runs instead.
+
+---
+
+## Session 166 (2026-11-20) - the microkernel table matches; the missing dispatch is a one-shot `vtable+8` call
+
+New probe: `TOL_TRACE_SOURCE=0xADDR` (in `dispatchGuestBranch`) logs every transfer whose *source instruction*
+is that address, with target and registers.
+
+### 166.1 What the port's run loop actually dispatches
+
+`TOL_TRACE_SOURCE=0x151FC0` (the microkernel's `jalr $v0`, 45 s):
+
+```
+#1 -> 0x00164F40 a0=0x00407950
+#2 -> 0x00165210 a0=0x00407740
+#3 -> 0x00165210 a0=0x00407B60
+#4..#6 -> 0x00165210 a0=0x00407B60
+```
+
+Six dispatches in 45 s, all of them the TCB-index tasks 2/3/4 (`a0` is `TCB+0x1C0`). `0x2062A0` never.
+
+### 166.2 The microkernel structures are identical
+
+`sidestep` of the TCB table (`0x407160`, stride `0x210`) between `pd_2.bin` (port, 95 s) and
+`emu_title.bin` (emulator, title):
+
+| idx | entry | state/prio | next | port vs emu |
+|---|---|---|---|---|
+| 2 | `0x00165210` | 1/4 | `0x00407790` | identical |
+| 3 | `0x00164F40` | 1/4 | `0x00407370` | identical |
+| 4 | `0x00165210` | 1/4 | `0x00407580` | identical |
+
+Priority counts `0x48F570` = `[2,0,0,0,3,0,0,0]` on **both** sides; context slots `0x48F590..` all zero on both.
+So the port's microkernel is not missing a task entry - the difference is not a queue slot.
+
+### 166.3 Refinement: `0x2062A0` is called *once*, not per frame
+
+A breakpoint on `0x2062A0` gets **0 hits** at the title (two 20 s windows), while the earlier backtrace shows
+it as the frame that calls `0x3353C0` (return address `0x2062D0` = inside `FUN_002062a0`). So it fires **once**,
+at ~22 s, and that single call is what starts the chain that resumes the worker.
+
+It has 0 static xrefs, the word appears in no RAM dump, and its only occurrence in the image is the vtable slot
+`0x3D47D8` - so it is reached through a generic `lw t9,(a0); lw t9,8(t9); jalr t9` on an object of type
+`0x3D47D0`. The port **has** such an object (`0x63D890`, vtable `0x3D47D0`) but never performs that dispatch,
+which is exactly session 164's conclusion narrowed to a single call.
+
+### 166.4 Next
+
+1. Find the code that performs `vtable+8` on the `0x3D47D0` object: search the image for the constructor storing
+   `0x3D47D0` into an object (that names the type), then for the caller that reads `+8`. In the port, that caller
+   is the loader/app step that never runs for this object.
+2. Because the emulator's call is one-shot at ~22 s, a breakpoint on `0x3353C0` with a condition on its caller
+   gives the same information cheaply: `get_backtrace` there shows frame [9] only.
