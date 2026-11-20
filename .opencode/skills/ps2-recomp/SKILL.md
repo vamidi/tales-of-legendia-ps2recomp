@@ -222,6 +222,28 @@ mcp_pcsx2_pcsx2_find_pattern(pattern)  # search PS2 RAM for hex pattern (use ?? 
 
 **NEVER ask the user to look at PCSX2 for you.** You have MCP tools — use them.
 
+**⚠ The MCP wrapper is unreliable for memory/disassembly** (measured 2026-11-20): `read_memory` with
+`hexdump` always fails and with `hex` returns *lagged* bytes (a 32-byte read comes back as 16, from the previous
+request), `disassemble`/`evaluate` error out, and parallel calls abort each other. PCSX2 also **auto-pauses when
+its window is minimized**, which makes `resume` look broken (`paused: true`, cycles frozen) — restore and focus
+the window first.
+
+Bypass the wrapper with the repo's direct DebugServer clients (newline JSON over TCP 21512):
+
+```
+python tools/ps2dbg.py status|pause|resume|step
+python tools/ps2dbg.py read <addr> <len>        # hex + u32 words
+python tools/ps2dbg.py dump <addr> <len> <file> # byte-exact, chunked
+python tools/ps2dbg.py regs [cat] | dis <addr> [n] | eval "<expr>"
+python tools/ps2dbg.py bp <addr> [cond] | watch <addr> <end> [type] [cond] | threads
+python tools/pcsx2_trace.py <seconds> <addr[:cond]> [...]   # BP hits with a0..a3/ra/sp + game fields
+```
+
+Compare **heap** objects (runtime-allocated), never `.bss` inside the ELF image — those match by construction.
+Align on a guest milestone (a breakpoint) and dump the same range from both sides; wall-clock alignment means
+nothing when the port runs slower. And when a probe says "function never called", verify with a second,
+independent probe: two `replaceFunction` installs on one address leave only the last active.
+
 For full tool catalog, A/B comparison workflow, and recipes → load `12-pcsx2-mcp-playbook.md`.
 
 ---
@@ -241,7 +263,7 @@ For full tool catalog, A/B comparison workflow, and recipes → load `12-pcsx2-m
 | `09-ps2tek.md` | 230KB PS2 hardware holy grail |
 | `10-agent-guardrails.md` | Problem resolution + mistake taxonomy + adversarial split |
 | `11-operational-phases.md` | Phase 0-5 deep workflow + test protocols |
-| `12-pcsx2-mcp-playbook.md` | PCSX2 DebugServer tools, A/B comparison, recipes |
+| `12-pcsx2-mcp-playbook.md` | PCSX2 DebugServer tools, **known MCP read/disasm defects**, the direct clients `tools/ps2dbg.py` / `tools/pcsx2_trace.py`, A/B comparison, recipes |
 | `13-decisional-brain.md` | Reasoning loop, diagnosis escalation, anti-patterns |
 | `14-ps2-elf-files.md` | ELF sections, disc extraction, naming, magic bytes |
 | `15-ps2x-analyzer.md` | `ps2_analyzer` discovery paths, generated TOML shape |

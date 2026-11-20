@@ -6,7 +6,18 @@
 
 ---
 
-## CURRENT STATUS — updated 2026-11-20 (session 156 result; read this first; the rest is history)
+## CURRENT STATUS — updated 2026-11-20 (session 158; read this first; the rest is history)
+
+> **Session 158 (latest) - PCSX2 is finally a usable reference, and the port matches it at the scene start.**
+> The MCP wrapper is broken for memory/disassembly (lagged reads, `hexdump` dead) - use `tools/ps2dbg.py` and
+> `tools/pcsx2_trace.py`, which talk to the DebugServer's real protocol (newline JSON over TCP 21512). Reference
+> boot: unit1 @6 s -> **scene start @11 s** (`FUN_00285E80(a0=0x5AA170, a1=4, a2=0xE0)`) -> unit2 -> unit3 ->
+> title @~21 s. The port issues the **same calls with the same arguments**, and the scene heap object matches the
+> emulator field for field (four idle entities - which are *not* the title). Two real port defects remain:
+> the loader units take ~50 s each instead of ~5 s (the fade yield costs ~0.66 s), and the scene page (280)
+> receives **only untextured black** draws - zero textured draws target it, so the copy to page 0 carries black.
+> Next: dump `0x5AA000..0x5AD000` in PCSX2 at the `0x285E80` breakpoint and diff it against the port's
+> `logs/ramdump/port_scene.bin`. Full detail in *Session 158* at the bottom.
 
 > **Session 156 (2026-11-20) - the presenter now scans out what the GS draws.** `src/gfx/backends/sdlgpu/sdlgpu_backend.cpp`
 > retargets the read circuits from DISPFB2 onto a drawn page before any `readCircuit`, and honours DISPFB2's own page
@@ -8950,4 +8961,82 @@ Also confirmed against ps2tek: FRAME_1/2 is `FBP 0-8, FBW 16-21, PSM 24-29`, so 
    `+0x160` mode). That is the missing content, not the presenter.
 2. `[fade]`/`[fadef20]`/`[fadewait]` show the loader fade completing and cycling, so the fade is not the gate.
 3. PCSX2 cannot be used as a reference right now: this DebugServer returns empty for `read_memory`/`disassemble`
-   (`buffer` undefined), same class as the known-empty GSPRIV read.
+   (`buffer` undefined), same class as the known-empty GSPRIV read. **Superseded by session 158 — see 158.1.**
+
+---
+
+## Session 158 (2026-11-20) - the emulator is now a usable reference; the port matches it up to the scene start
+
+### 158.1 The PCSX2 MCP wrapper is broken; the DebugServer is not
+
+Measured on PCSX2-MCP v1.0.0 (2026-11-20):
+
+- `read_memory format=hexdump` → always errors ("buffer … undefined").
+- `read_memory format=hex` → returns **lagged** data: a 32-byte read comes back as 16 bytes and the next 16-byte
+  read as 32, so a given address appears to hold the *previous* read's contents. This is what made `0x005AA170`
+  look wrong earlier; the memory was fine.
+- `disassemble` → "Cannot read properties of undefined (reading 'map')". `evaluate` → fails/aborts.
+- Two MCP calls in one turn abort each other; issue one at a time.
+- **PCSX2 auto-pauses when its window loses focus.** The window sits at `-18286,-18286` when minimized, so
+  `resume` looked broken (`paused: true`, cycles frozen). Restore + `SetForegroundWindow` first.
+
+The server itself is newline-delimited JSON over **TCP 21512** (not HTTP). Two direct clients are now in `tools/`
+and documented in the skill (`12-pcsx2-mcp-playbook.md` §1b):
+
+```
+tools/ps2dbg.py       status|pause|resume|step|read|dump|dis|eval|regs|bp|watch|threads|str
+tools/pcsx2_trace.py  <seconds> <addr[:cond]> [...]   BP hits with a0..a3/ra/sp + game fields
+```
+
+### 158.2 Reference boot sequence (breakpoints on 0x204240 and 0x285E80)
+
+```
+t= 6.02s  0x204240 mode=1                    -> returns 11.0s
+t=11.04s  0x285E80 a0=0x5AA170 a1=4 a2=0xE0   <- scene start, count(+8)=4
+t=11.24s  0x204240 mode=2                    -> returns 16.2s
+t=16.26s  0x204240 mode=3                    -> title on screen by ~21s
+```
+
+Only **three** load units exist; the scene is started after unit 1, not after the last one. Each unit costs
+~5 s in the emulator.
+
+### 158.3 The port matches the reference at the scene start (verified, not assumed)
+
+- `0x204240` runs 3 times, modes 1/2/3, same order.
+- `0x285E80` is called with **identical arguments** to the emulator: `a0=0x5AA170 a1=0x00000004 a2=0x000000E0`,
+  `ra=0x20444C`; `0x2321B0` follows with `ra=0x204460`. (An earlier "0x285E80 never runs" reading was an
+  instrumentation artifact: a `TOL_TRACE_PC` probe had replaced the `[scene]` probe on the same slot.)
+- Scene heap object matches the emulator field for field: vtable `0x003D50D0`, `+4 = 0x3F400000`, `+8 count = 4`,
+  entities `0x5AA1B0 / 0x5C7E80 / 0x5E5B50 / 0x603820`, entity0 renderer `0x003933C8`, reader `0x003B1C18`,
+  stream `+0x2C = 0`, state `+0x14C = 0` - and the emulator's entity slots are idle too, so these four entities
+  are **not** the title's content.
+- Note: an earlier "the scene matches" dump was taken against a *previous* PCSX2 session (its heap had since been
+  reset to zero). Always confirm the emulator's heap is live before trusting a match.
+
+### 158.4 Two real port defects found on the way
+
+1. **~10x slowdown in the loader units.** Each unit takes ~50 s wall in the port vs ~5 s in the emulator
+   (three units plus fades ≈ 150 s before the title can appear). The fade loop steps 0.04 per
+   `FUN_0015231c()` yield, and each yield is ~0.66 s instead of a frame (~16 ms). Not a logic error, but it is
+   why the screen stays black/loading for minutes.
+2. **The scene page receives no textured geometry.** After the switch from page 224 to page 280, the port draws
+   only untextured black primitives (`type=4`, `tme=0`, `rgba=0`) into 280, and `[gsorder]` records **zero**
+   textured draws targeting 280 (only the 280 -> 0 display copy is textured). Page 280 is therefore black, the
+   copy is faithful, and the window shows the stale loading image. `entity+0x30` renderers exist and the scene
+   step runs at ~30/s, so the renderers' own submissions are the place to look.
+
+### 158.5 Next (start here tomorrow)
+
+1. **Finish the RAM diff at the scene start.** The port dump is already captured
+   (`logs/ramdump/port_scene.bin`, 0x5AA000..0x5AD000, via `TOL_DUMP_RAM_SCENE`). With PCSX2 running, break on
+   `0x285E80`, dump the same range with `tools/ps2dbg.py dump 0x5AA000 0x3000 <file>`, and diff - that separates
+   "renderers never submit" from "guests diverge right after the scene start".
+2. **Find the renderers' submit path.** Entity `+0x30` (e.g. `0x3933C8`) is set up by `FUN_00292740` and updated
+   each scene step by `FUN_00292810` -> `FUN_001a0da0` / `FUN_00292330` / `FUN_001a0f20`; the draw must come from
+   the renderer object itself. If it never submits, that is the missing title/service content.
+3. **Profile the fade yield.** `FUN_00204240`'s `FUN_0015231c()` costs ~0.66 s per iteration in the port; find
+   what it waits on (vblank/`EeScheduler`) - fixing that alone makes the boot 10x faster and the black phase
+   seconds instead of minutes.
+4. Do **not** re-investigate: PMODE/EN2, DISPFB2/FBP 0, DISPLAY2 geometry, the 224/280->0 copy, the presenter, the
+   port-drawn memory-card panel (removed), the fetch of `0x285E80` (it runs), or the scene object's identity
+   (it matches the emulator).

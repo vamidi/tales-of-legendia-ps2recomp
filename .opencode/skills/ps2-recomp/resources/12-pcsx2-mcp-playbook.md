@@ -23,6 +23,57 @@ Step 3: mcp_pcsx2_pcsx2_status()
 
 **Always connect at session start if PCSX2 is available.** Update `PS2_PROJECT_STATE.md → PCSX2 MCP Status`.
 
+### §1b Known defects in the MCP wrapper — and the direct client
+
+The MCP layer in front of the DebugServer is **not trustworthy for memory or disassembly** (measured 2026-11-20,
+PCSX2-MCP v1.0.0):
+
+| Call | Symptom |
+|---|---|
+| `read_memory format=hexdump` | always errors ("buffer … undefined") |
+| `read_memory format=hex` | returns **lagged** data: a 32-byte read comes back as 16 bytes and vice versa, so an address can appear to hold another address's contents |
+| `disassemble` | "Cannot read properties of undefined (reading 'map')" |
+| `evaluate` | fails or aborts |
+| parallel MCP calls | the first is aborted, the second errors — issue **one call at a time** |
+
+Two more traps that look like game bugs:
+
+- **PCSX2 auto-pauses when its window loses focus.** A minimized/hidden window (`-18286,-18286`) makes
+  `resume` appear to do nothing: `status` keeps `paused: true` and `cycles` never changes. Restore + focus the
+  window first (`ShowWindow(h, 9)`, `SetForegroundWindow(h)`).
+- **The DebugServer is newline-delimited JSON over TCP 21512**, not HTTP. A raw `Invoke-WebRequest` fails with
+  "protocol violation"; use a socket.
+
+**Use the repo's direct clients instead (they bypass the MCP wrapper):**
+
+```
+python tools/ps2dbg.py status                      # alive/paused/pc/cycles
+python tools/ps2dbg.py pause | resume | step
+python tools/ps2dbg.py read  0x005AA170 0x40       # hex + little-endian u32 words
+python tools/ps2dbg.py dump  0x5AA000 0x3000 out.bin   # chunked, byte-exact
+python tools/ps2dbg.py dis   0x00100008 20
+python tools/ps2dbg.py eval  "pc"                  # also: regs [cat], bp <addr> [cond],
+                                                   # watch <addr> <end> [type] [cond], threads, str
+python tools/pcsx2_trace.py 150 0x00204240 0x00285E80
+                                                   # sets BPs, logs hit#/pc/a0..a3/ra/sp + game fields, resumes
+```
+
+`pcsx2_trace.py` understands two Tales-of-Legendia objects so its output is directly comparable with the port's
+`[fade]` / `[scene]` probes: the loader at `a0` (`+0x14` mode, `+0x18` arg, `+0x20` overlay) and the scene at
+`a0` (`+0x08` entity count).
+
+### §1c Comparing recomp vs emulator — what is real evidence
+
+- **Compare heap objects, not `.bss` constants.** Anything inside the ELF's loaded image (`vaddr` inside
+  `PT_LOAD.filesz`) is identical by construction; only runtime-allocated objects prove the port's guest state.
+  Check with the ELF program headers before celebrating a match.
+- **Align on a guest milestone, not wall time.** Break on a specific function (`tools/pcsx2_trace.py`) in the
+  emulator and dump at the same call in the port (`TOL_DUMP_RAM_SCENE` / `TOL_DUMP_RAM`), then diff the two
+  dumps byte-for-byte. Wall-clock alignment is meaningless when the port is several times slower.
+- **A probe can shadow another probe.** Two `replaceFunction` installs on one address leave only the last one
+  active, so "function never called" must be re-checked with an independent probe (e.g. `TOL_TRACE_PC`) before
+  it is believed.
+
 ---
 
 ## §2 Tool Catalog
