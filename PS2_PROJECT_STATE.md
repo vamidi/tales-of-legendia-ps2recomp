@@ -10694,6 +10694,22 @@ emulated clock runs ~10x faster, because the worker no longer sits in the spin. 
 now wakes and runs, then sleeps again because no work is posted. The remaining item is the producer
 (`0x3943B8` run flag / the queue `0x1B7888` fetches), not the scheduler.
 
+### 192.4 Re-check: job[0] is NOT a timing artifact (retracts the 189/190 hypothesis)
+
+After the wake fix (4th create 44.9 -> 28.6 s, unit1 at 23.4-29.5 s across runs) the six unit-boundary dumps were
+taken again (`TOL_DUMP_UNITS=0x480000,0x200000,logs\ramdump3`) and compared with `ref_unit*`:
+
+```
+unit1/1_ret/2/2_ret/3/3_ret   port  00000001 FF0D0001 00000002 00002000 00000001 00623100
+                              ref   00000000 FF0E0000 00000002 00000000 00000000 00623100
+```
+
+Identical to the pre-fix measurement, at **every** boundary. So "job[0] is one lifecycle step ahead because the
+port is 4x slow" is wrong; the entry is consumed before unit 1 in every run regardless of timing. Treat job[0] as
+a symptom of the same early app-job step, not as something to patch (`TOL_JOBFIX=2` already idled the guest).
+The remaining producer probe stays as in 192.3.
+
+
 
 
 
