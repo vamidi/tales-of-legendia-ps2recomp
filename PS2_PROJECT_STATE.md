@@ -9663,3 +9663,32 @@ verification dump used range `0x390000..0x3A0000`, which does **not** contain `0
    `0x165220` (then draws/appearance).
 2. If it does not, trace the 8-byte store at `0x407B50` (add `+0x1B4` to `TOL_WATCH_WRITE` as a 64-bit watch) to
    see which continuation the wrapper writes, and compare with the emulator's `0x2057C8`.
+
+---
+
+## Session 169 (2026-11-20) - VERIFIED: the alive flag gates the continuation (0x165220 -> 0x204380)
+
+`TOL_POKE_ALIVE=1` with a dump covering TCB 4 (`TOL_DUMP_RAM=0x3E0000,0x2A0000,...`):
+
+| field | before (session 168) | **after the poke** | emulator |
+|---|---|---|---|
+| `+0x1AC` alive flag | 0 | **1** | 1 |
+| `+0x1B4` resume pc | `0x00165220` | **`0x00204380`** | `0x002057C8` |
+
+So `TCB+0x1AC` is exactly the gate: while it is 0 the microkernel does not carry the loader task across its
+yield and the step restarts at the wrapper (`0x165220`); with it asserted the continuation advances into the
+loader object's step code (`0x20xxxx`). The regime line now reads `loader state=1 chan=4 **alive=1**`,
+`mainIters` keeps climbing, and the only error in the run is the known `0x301EB8` jalr-to-null (1 per run).
+
+### 169.1 Still no picture at 72/87/102 s
+
+Window capture with the poke asserted: still black (client area only). The task now progresses, but whatever it
+does next (the loader object's step at `0x20xxxx`, which is where `0x2062A0` lives) has not produced a frame in
+~100 s. Nothing has regressed: no new `[badpc]`, no missing target beyond the known one.
+
+### 169.2 Next
+
+1. Run with `TOL_POKE_ALIVE=1` **and** `TOL_TRACE_SOURCE=0x151FC0` to see whether the dispatcher now reaches
+   `0x002062A0` (and at what rate); if yes, the remaining gap is time/one more load unit, not logic.
+2. If it reaches `0x2062A0`, check `[gfx]` draws/textures in the same run; the fix then becomes "assert
+   `+0x1AC` at task start in the step wrapper" rather than a host poke.
