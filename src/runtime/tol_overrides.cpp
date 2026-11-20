@@ -4883,10 +4883,18 @@ namespace
                                                 if (!sAutoResumed && sAutoResumeId > 0 && gFadeCalls >= 3u)
                                                 {
                                                     sAutoResumed = true;
-                                                    const int rc = runtime->eeScheduler().resumeThread(sAutoResumeId, false);
+                                                    EeScheduler &sched = runtime->eeScheduler();
+                                                    const int rcResume = sched.resumeThread(sAutoResumeId, false);
+                                                    // The thread is Waiting(sleep) as well as suspended, so clearing
+                                                    // the suspend bit alone leaves it parked. Deliver the wake too: the
+                                                    // guest's own resume chain (FUN_002062a0 -> ... -> FUN_00198b20) does
+                                                    // both within one frame in the emulator.
+                                                    const int rcWake = sched.wakeupThread(sAutoResumeId, false);
                                                     std::fprintf(stderr,
-                                                                 "[autoresume] units done (fades=%u) -> resumeThread(%d) rc=%d\n",
-                                                                 static_cast<unsigned>(gFadeCalls), sAutoResumeId, rc);
+                                                                 "[autoresume] units done (fades=%u) -> resumeThread(%d) rc=%d, "
+                                                                 "wakeupThread(%d) rc=%d\n",
+                                                                 static_cast<unsigned>(gFadeCalls), sAutoResumeId,
+                                                                 rcResume, sAutoResumeId, rcWake);
                                                 }
                                             }
                                             logLoaderTcb("52b70.pre", runtime, rdram, ctx);

@@ -9330,3 +9330,49 @@ one of them that runs).
    that owns it. The port's object is of a different type, which suggests a re-created/reused block, not the
    unit-4 loader.
 3. Do not re-investigate: `0x1B76F8` "fabricated entry" (closed above), the scene object, the presenter.
+
+---
+
+## Session 162 (2026-11-20) - ran the forced resume: the thread wakes and idles, and it is the wrong gate
+
+`TOL_AUTO_RESUME=6` now also delivers `wakeupThread(6)` after `resumeThread(6)` (the thread was
+`Waiting(sleep)` + suspended, so clearing the suspend bit alone left it parked):
+
+```
+[autoresume] units done (fades=3) -> resumeThread(6) rc=0, wakeupThread(6) rc=0
+```
+
+Thread 6 then really runs:
+
+```
+t= 7.04s tid6 WaitSusp wait=sleep susp=1 pc=0x0019902C
+t=66.23s tid6 Ready    wait=-      susp=0 pc=0x0019902C     <- resume+wake took
+t=67.24s tid6 Suspended wait=-     susp=1 pc=0x0019902C     <- something re-suspends it
+t=77.40s tid6 Waiting  wait=sleep  susp=0 pc=0x00198FD0     <- it advanced, and looped
+t=79.41s tid6 WaitSusp  wait=sleep susp=1 pc=0x00198FD0
+```
+
+`0x19902C -> 0x198FD0` is *backwards*: it ran the loop head at `0x198FD0` again, i.e. the thread executes
+its own idle/wait loop and sleeps again. Window capture at 72 / 87 / 102 s: **still black** (only the ImGui
+strip), no new draws.
+
+### 162.1 Why this is the wrong gate (emulator evidence)
+
+The emulator shows the title at **~21 s** and only resumes thread 6 at **22.88 s**. The resume is a
+*consequence* of the title flow, not its cause - so forcing it cannot produce the logos, and it does not.
+
+### 162.2 Where that leaves the divergence
+
+- The port's `0x259500` (title chain link) is entered **once per run** (43.99 s) and returns immediately;
+  the emulator enters it ~2/s because its caller `FUN_001b7688` runs from the **frame loop**.
+- The port's frame loop is a different loop: steady-state pcs `0x1A35E4/0x1A36A0` (`FUN_001a35f0`),
+  `0x1A152C` (`FUN_001a1498`), `0x198270`, `0x1B76F8`.
+- `FUN_002062a0` (the loader vtable slot that starts the next unit and resets the fade) is entered 0 times.
+
+### 162.3 Next (the actual gate)
+
+1. Take the emulator's pc set in the window **16.3 s -> 21 s** (unit 3 returned -> title), by breaking on
+   `0x20444C` for mode 3 and sampling `pc` every ~30 ms for 5 s. That window is the title's construction.
+2. Diff that set against the port's steady-state set above - the first emulator address the port never reaches
+   is the gate (the port's loop is already known).
+3. Keep `TOL_AUTO_RESUME` as a probe only; it is not a fix.
