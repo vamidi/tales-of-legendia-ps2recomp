@@ -10732,6 +10732,12 @@ and the worker is expected to clear it while draining; with the flag left set, t
 The delay slot at `0x198FB0` is `sw $s1,(s3)` - it does not set `a0`/`a1`, so the `a1=1` on hardware comes from
 the loop's own state, not from a missing argument setup.
 
+**Probe (a) is not trustworthy**: `TOL_WATCH_SLEEPFLAG` samples from the host main loop, which is starved while
+the guest is 99 % busy, so it reported no transition while the authoritative on-thread reading at the call site
+(`[call] ... t304=1` at the second `0x1B7888` fetch) shows the flag was 1. Use the call-site reading, not the
+sampler.
+
+
 
 
 
