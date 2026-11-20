@@ -4953,6 +4953,14 @@ namespace
                                                     runtime->eeScheduler().wakeupThread(sWakeId, false);
                                                 }
                                             }
+                                            // TOL_POKE_ALIVE=1: keep TCB 4's +0x1AC (the microkernel's "keep the task
+                                            // alive across a yield" flag) asserted. The port leaves it 0 and the
+                                            // emulator has 1; with 0 the run loop does not carry the task over, so the
+                                            // loader step restarts at 0x165220 instead of resuming at 0x2057C8.
+                                            if (std::getenv("TOL_POKE_ALIVE") != nullptr)
+                                            {
+                                                runtime->Store32(rdram, ctx, 0x00407B4Cu, 1u);
+                                            }
                                             logLoaderTcb("52b70.pre", runtime, rdram, ctx);
                                             if (p52b70 != nullptr)
                                             {

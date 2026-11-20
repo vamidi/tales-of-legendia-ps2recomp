@@ -9618,3 +9618,48 @@ table difference: it is the loader step not advancing.
    Compare `TCB+0x1B4` writes: the emulator's reaches `0x2062A0`, the port's stays `0x165210`.
 2. The step wrapper is already known from session 152 (`childStepEntryFix`, `0x3059B0`, step fragments at
    `0x165220`/`0x165400`); check whether this call site needs the same per-address treatment.
+
+---
+
+## Session 168 (2026-11-20) - TCB 4's continuation: port `0x165220` vs emulator `0x2057C8`, and the alive flag differs
+
+New probe: `TOL_WATCH_WRITE=0xADDR` (32-bit stores, in `PS2Runtime::Store32`) prints every store into one guest
+word with the writing pc and `$ra`.
+
+### 168.1 The two differing words (same dumps, same decode)
+
+TCB 4 = `0x4079A0`:
+
+| field | port (`pd_1`/`pd_2`, 50 s and 95 s) | emulator (`emu_title`) |
+|---|---|---|
+| `+0x1AC` alive/yield flag | **0** | **1** |
+| `+0x1B0` entry | `0x00165210` | `0x00165210` |
+| `+0x1B4` resume pc | **`0x00165220`** | **`0x002057C8`** |
+| `+0x1B8` | `0x00165250` | `0x00165250` |
+| `+0x1C0` arg | `0x0063D890` | `0x0063D890` |
+| `+0x1F0` state/prio | `0x01000401` | `0x01000401` |
+
+So the loader task is the same task with the same entry and the same object argument; only the **carried
+continuation** and the **alive flag** differ. The port's resume pc sits at the step wrapper's first body
+instruction (`0x165220`) for the whole run, i.e. the wrapper restarts instead of resuming into the loader
+object's step, which is where `0x2062A0` (vtable+8) lives.
+
+### 168.2 The `+0x1C4` word is never written by a 32-bit store
+
+`TOL_WATCH_WRITE=0x407B54` (= `0x4079A0 + 0x1B4`): **0 hits in 50 s**. The field is therefore written either as
+part of an 8-byte store at `0x407B50` or only at task creation - which is consistent with "the port never
+advances it".
+
+### 168.3 Experiment: assert the alive flag (`TOL_POKE_ALIVE=1`)
+
+`Store32(0x00407B4C, 1)` on every main-loop iteration (the microkernel keeps the task across a yield only when
+`TCB+0x1AC != 0`). The run completed without new errors (only the known `0x301EB8` jalr-to-null), but the
+verification dump used range `0x390000..0x3A0000`, which does **not** contain `0x4079A0` - so the effect is
+**not yet measured**. Re-run with `TOL_DUMP_RAM=0x3E0000,0x2A0000,...` to read `+0x1AC`/`+0x1B4` after the poke.
+
+### 168.4 Next
+
+1. Re-measure the poke with a dump that covers `0x4079A0`, and check whether `+0x1B4` starts advancing past
+   `0x165220` (then draws/appearance).
+2. If it does not, trace the 8-byte store at `0x407B50` (add `+0x1B4` to `TOL_WATCH_WRITE` as a 64-bit watch) to
+   see which continuation the wrapper writes, and compare with the emulator's `0x2057C8`.
