@@ -9232,3 +9232,101 @@ produces this pc — a green-thread resume field (`TCB+0x1B4`) or an indirect tran
    should receive `(a1=1, a2=<work buffer>)`, which starts the title chain.
 3. Dumps for the next comparison are already in `logs/ramdump/`: `pd_*` (port periodic), `port_unit*`/`ref_unit*`
    (unit boundaries), `emu_title.bin` (reference title).
+
+---
+
+## Session 161 (2026-11-20) - the producer named: the graphics thread is created suspended and the guest never resumes it
+
+### 161.1 Correction: `0x1B76F8` is not a fabricated entry
+
+`TOL_WATCH_PC=0x1B76F8` (new, in `EeScheduler::enterGuest`) prints the invocation stack and the owned context
+of every turn that starts there:
+
+```
+[watchpc] #1 tid=1 pc=0x001B76F8 ra=0x001B76F8 sp=0x01FFFE10 inv=0 inCall=1 ownPc=0x001B76F8 prev=0x00198248
+```
+
+`inv=0`, `inCall=1`, `ownPc == pc` - these are **in-place suspensions of tid 1 inside the row**, ~60/s while
+that phase lasts, not fabricated entries. `ra == pc` is normal there: `0x1B76F0` is `jalr $v0`, so `$ra` is
+the continuation `0x1B76F8`. Session 160.4's "fabricated entry" reading was wrong.
+
+`TOL_WATCH_TARGET=0x1B7688,0x259500,0x259780,0x1B76F8` (new, in `dispatchGuestBranch`) records every
+*table-mediated* transfer into those addresses with source pc and a0..a3: **zero hits in 25 s**, so nothing
+jumps to them either - the row is simply already inside.
+
+### 161.2 The real gate: the graphics/stream thread never gets resumed
+
+`TOL_TRACE_EE_THREADS` at 69 s (steady state):
+
+```
+tid=1 Running  pc=0x0019BD20 entry=0x00100008
+tid=6 WaitSusp wait=sleep susp=1 pc=0x0019902C entry=0x00198F38
+```
+
+`entry=0x198F38` is the bottom frame of the emulator's title backtrace (session 160.4) - this is the thread
+that draws the title. `TOL_TRACE_SUSP` (new, in `suspendThread`/`resumeThread`) names the producer:
+
+```
+[susp] suspend id=6 count=1 status=2 callerTid=1 callerRa=0x001992AC      (t=5.49 s, once)
+```
+
+`FUN_00199538` = `CreateThread(entry=0x198F38, stack=0x397BF0, 0x2000)` -> `StartThread` -> `ChangePriority`
+-> `FUN_00199268(t)` = **SuspendIfActive**, i.e. the thread is created *suspended* on purpose. Ding
+`TOL_TRACE_PC=0x199268,0x199200` shows the caller sites: id 3 is suspended/resumed 63 times from
+`0x198AB0`/`0x198A28`, id 6 is suspended twice from `0x1995BC` (`FUN_00199538`) and **never resumed**.
+
+The emulator resumes it at **t = 22.9 s**, `ResumeThread(a0=6)`, backtrace:
+
+```
+0x114670 (0x39 ResumeThread) <- 0x199200 (ResumeIfSuspended) <- 0x198B20
+   <- 0x1B75D8 <- 0x259B20 <- 0x2540B0 <- 0x254030 <- 0x2542D0 <- 0x3353C0 <- 0x2062A0
+```
+
+`FUN_002062a0` resets `+0x428 = 1.0f` (fade alpha) and `+0x42c/+0x42e/+0x430 = 0`, then calls
+`FUN_003353c0` / `FUN_003357a0` - a loader-object vtable slot (it has **0 static xrefs**, so it is only
+reached through a function pointer). It is the "start the next unit / show the screen" callback.
+
+Measured in the port (`TOL_TRACE_PC`, 60 s): **every one of those eight addresses is entered 0 times**
+(`0x2062A0 0x3353C0 0x2542D0 0x254030 0x2540B0 0x259B20 0x1B75D8 0x198B20`). That is why the title content
+never appears: the resume chain is never started, the drawing thread stays suspended, and the 4 untextured
+draws/frame are just the leftover fade.
+
+Supporting evidence from the steady-state diff: at the title the emulator has *another* loader object at
+`0x63D890` (`vtable 0x003D4750`, `mode(+0x14) = 1`, `arg(+0x18) = 0x014E29E0`) - a fourth load unit. The port's
+object there has `vtable 0x003D47D0`, `+0x14 = 0x0063DCF0`, `+0x18 = 0` - a different object entirely, because
+the unit-4 start never happened.
+
+### 161.3 Experiment: force the resume (`TOL_AUTO_RESUME=<id>`)
+
+`TOL_AUTO_RESUME=6` calls `eeScheduler().resumeThread(6)` once, after the third fade:
+
+```
+[autoresume] units done (fades=3) -> resumeThread(6) rc=0     (KE_OK)
+```
+
+but the thread stays `WaitSusp wait=sleep susp=1 pc=0x19902C` afterwards. Its status is *Waiting(sleep)* +
+suspended, not *WaitingSuspended*, so the resume only clears the suspend bit; the thread then still needs the
+sleep to be woken - and it never is. So the resume is necessary but not sufficient: the immediate next
+question is what wakes a sleeping thread in this port (tid 4/5 sleep too, and in the emulator tid 6 is the only
+one of them that runs).
+
+### 161.4 New probes (all env-gated, hoisted out of hot paths)
+
+| env | where | what it shows |
+|---|---|---|
+| `TOL_WATCH_PC=0xADDR` | `EeScheduler::enterGuest` | every turn starting at that pc: tid, ra, sp, invocation depth, `inGuestCall`, owned pc, previous dispatch pc |
+| `TOL_WATCH_TARGET=0xADDR[,..]` | `dispatchGuestBranch` | every table-mediated transfer into that address with source pc, kind and a0..a3 |
+| `TOL_TRACE_SUSP=1` | `suspendThread` / `resumeThread` | id, suspend count, status, caller tid and caller ra |
+| `TOL_AUTO_RESUME=<id>` | main-loop probe | resumes that thread once after the third load unit |
+
+### 161.5 Next
+
+1. **Why does tid 6 stay asleep?** After the forced resume it is `Waiting(sleep)` at `pc=0x19902C`; the guest
+   never wakes it. Check the sleep/wakeup path for that thread (`SleepThread` 0x32 wrapper `0x114600`) against
+   the emulator, and whether the port's alarm/timer for it ever fires. If tid 6 runs and submits, the title
+   content should follow even without the rest of the chain.
+2. **Or find why `FUN_002062a0` is never called.** It is a vtable slot (0 static xrefs); compare the loader
+   object's vtable slot table at `0x63D890+0x10` (port `0x003D47D0` vs emulator `0x003D4750`) and the object
+   that owns it. The port's object is of a different type, which suggests a re-created/reused block, not the
+   unit-4 loader.
+3. Do not re-investigate: `0x1B76F8` "fabricated entry" (closed above), the scene object, the presenter.

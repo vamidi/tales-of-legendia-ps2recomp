@@ -4871,6 +4871,24 @@ namespace
                                             // steady state; the microkernel switch-in probe that used to own it is
                                             // displaced by the resume probe.
                                             dumpRamIfDue(rdram, ctx, runtime);
+                                            // TOL_AUTO_RESUME=<id>: the guest creates its graphics thread suspended
+                                            // (FUN_00199538: CreateThread -> StartThread -> SetPriority -> Suspend) and
+                                            // resumes it later from FUN_002062a0 -> ... -> FUN_00198b20, a chain this
+                                            // port never reaches. Resuming it once after the third load unit tests
+                                            // whether that resume is the only thing missing before the title content.
+                                            if (const char *const resumeSpec = std::getenv("TOL_AUTO_RESUME"))
+                                            {
+                                                static bool sAutoResumed = false;
+                                                static const int sAutoResumeId = std::atoi(resumeSpec);
+                                                if (!sAutoResumed && sAutoResumeId > 0 && gFadeCalls >= 3u)
+                                                {
+                                                    sAutoResumed = true;
+                                                    const int rc = runtime->eeScheduler().resumeThread(sAutoResumeId, false);
+                                                    std::fprintf(stderr,
+                                                                 "[autoresume] units done (fades=%u) -> resumeThread(%d) rc=%d\n",
+                                                                 static_cast<unsigned>(gFadeCalls), sAutoResumeId, rc);
+                                                }
+                                            }
                                             logLoaderTcb("52b70.pre", runtime, rdram, ctx);
                                             if (p52b70 != nullptr)
                                             {
