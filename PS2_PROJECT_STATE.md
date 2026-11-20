@@ -10089,3 +10089,26 @@ follow from it.
 Measure with the 4x factor in mind: run the port 200 s and capture the window at 150 / 180 / 200 s (guest ~40 s,
 past the emulator's title point). If it is still black then, the divergence is downstream of the 4th task's own
 progress and must be found by comparing that task's `+0x1B4` chain, not by any of the links retired above.
+
+---
+
+## Session 180 (2026-11-20) - 200 s run: still black with the task carried; divergence is downstream of the 4th task
+
+`TOL_POKE_ALIVE=1`, captures at 150 / 180 / 200 s: **all black** (client area only, no draw content).
+
+So with the loader task carried (session 169: `+0x1B4` advances to `0x204380`, `alive=1`), and with every
+control-flow link verified identical to the emulator (sessions 178/179), the port still produces no frame at
+guest ~40 s - past the emulator's title point (~21 s guest).
+
+### 180.1 Where the next measurement goes
+
+The 4th task's resume chain: at comparable progress the port's `TCB 5 (0x407BB0) +0x1B4 = 0x002DF7F4` and the
+emulator's = `0x00233FEC`. Neither is the title loop, so both are mid-flight; the useful comparison is the
+**sequence** of `+0x1B4` values (not one sample), aligned on the same guest milestone:
+
+1. `TOL_WATCH_WRITE` on `TCB5+0x1B4` (`0x407D74`) in the port, 200 s window - the writer is the microkernel save
+   path (`0x15231C`), so this gives the full resume-pc history.
+2. In the emulator, break on the same save path for that TCB and log `+0x1B4` per yield for the same span.
+3. The first guest function the emulator's sequence reaches and the port's does not is the remaining divergence.
+
+Everything above that point has been retired with measurements, so this is the only layer left.
