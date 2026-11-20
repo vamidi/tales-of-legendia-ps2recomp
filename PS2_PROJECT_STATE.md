@@ -9571,3 +9571,50 @@ which is exactly session 164's conclusion narrowed to a single call.
    is the loader/app step that never runs for this object.
 2. Because the emulator's call is one-shot at ~22 s, a breakpoint on `0x3353C0` with a condition on its caller
    gives the same information cheaply: `get_backtrace` there shows frame [9] only.
+
+---
+
+## Session 167 (2026-11-20) - PRECISE: TCB 4 (0x4079A0) is dispatched at 0x2062A0 in the emulator, never in the port
+
+Breakpoint armed at boot on `0x2062A0` itself, hit at `t=25.79 s`:
+
+```
+0x2062A0  ra=0x00151FC8  a0=0x0063D890  a1=0x00000001  sp=0x01FFECE0  s0=0x004079A0
+  [0] 0x2062A0
+  [1] 0x151E90 (pc 0x151FC8)     <- microkernel `jalr` at 0x151FC0
+  [2] 0x165AD0 (pc 0x165BA8)     <- game startup
+  [3] crt0
+```
+
+**The item is TCB 4 = `0x4079A0`** (the "loader TCB" the port has been probing since session 63):
+
+| field | value |
+|---|---|
+| TCB base | `0x4079A0` (index 4, `0x407160 + 4*0x210`) |
+| dispatched pc (`TCB+0x1B4`) | `0x002062A0` |
+| dispatch arg (`a0`, from `TCB+0x1C0`) | `0x0063D890` — the loader object, vtable `0x3D47D0` |
+| `a1` | 1 |
+
+So `0x2062A0` is **slot +2 (`vtable+8`) of the loader object, run as the loader task's own step**, and the
+microkernel dispatches it as the resume pc of TCB 4. Sessions 165/166's "the microkernel never dispatches it" was
+a sampling artifact: the previous windows armed the dispatcher breakpoint but filtered a run whose TCB 4 had not
+advanced yet.
+
+Port side, same TCB, measured:
+
+- TCB 4 exists with `entry(+0x1B0) = 0x00165210`, state 1, prio 4, `alive(+0x1AC) = 0`, `chan(+0x1F1) = 4`;
+- `TOL_TRACE_SOURCE=0x151FC0` dispatches it at `0x00165210` (the step wrapper) 5x in 45 s - **never** at
+  `0x002062A0`, so its resume pc never advances past the wrapper;
+- the object at `0x63D890` is present with vtable `0x3D47D0` but `+0x14/+0x18/+0x1C..+0x24` never initialised
+  (session 164), i.e. the object's own state was never set up before the step was due.
+
+`pd_2` vs `emu_title` TCB tables, priority counts and context slots are **identical**, so this is not a queue or
+table difference: it is the loader step not advancing.
+
+### 167.1 Next
+
+1. Trace the loader task's step `0x165210` in the port against the emulator: it is dispatched at its entry each
+   time in the port (resume pc never moves), which means each dispatch restarts the wrapper instead of resuming.
+   Compare `TCB+0x1B4` writes: the emulator's reaches `0x2062A0`, the port's stays `0x165210`.
+2. The step wrapper is already known from session 152 (`childStepEntryFix`, `0x3059B0`, step fragments at
+   `0x165220`/`0x165400`); check whether this call site needs the same per-address treatment.
