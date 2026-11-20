@@ -10709,6 +10709,30 @@ port is 4x slow" is wrong; the entry is consumed before unit 1 in every run rega
 a symptom of the same early app-job step, not as something to patch (`TOL_JOBFIX=2` already idled the guest).
 The remaining producer probe stays as in 192.3.
 
+### 192.5 Producer probe: all three producers are retired; the difference is the worker loop's cadence and the sleep-flag handshake
+
+Port (`TOL_TRACE_CALL=0x1B7888,0x199938,0x199AF0,0x199988` + `TOL_TRACE_SLEEP`, 55 s) vs fresh-boot PCSX2 on the
+same four addresses:
+
+| address | port | emulator |
+|---|---|---|
+| `0x1B7888` (work fetch) | **2 calls** (3.6 s, 45.9 s) | **~20/s from 26.15 s** |
+| `0x199938` (run-flag writer) | 0 | **0** |
+| `0x199AF0` (run-flag writer) | 0 | **0** |
+| `0x199988` (release/refcount) | 0 | **0** |
+
+So session 163's three "producer" candidates do not run on hardware either - they are retired, not the gate.
+
+What differs is the worker's own loop: after the release, hardware calls `0x1B7888` every ~50 ms with
+`a0=0x3B7348`, `a1=1`; the port calls it a second time at 45.9 s with `a1=0x390000` (the stale first-call set) and
+**`0x394304 = 1`**, so the loop takes the `beq 1 -> SleepThread` at `0x198FBC` instead of iterating.
+
+Next fix site: the `0x394304` set/clear handshake. `0x198B20` sets it (`0x198b60`) and clears it in its epilogue,
+and the worker is expected to clear it while draining; with the flag left set, the worker sleeps on its next pass.
+The delay slot at `0x198FB0` is `sw $s1,(s3)` - it does not set `a0`/`a1`, so the `a1=1` on hardware comes from
+the loop's own state, not from a missing argument setup.
+
+
 
 
 
