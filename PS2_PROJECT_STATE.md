@@ -10210,3 +10210,25 @@ it never arrives at the wait. So the fix target is the path that should lead int
 Trace `FUN_002DF6D0` entry and its calls in the port (`TOL_TRACE_PC=0x2DF6D0` plus its callees as they appear),
 and compare with the emulator's sequence for TCB5 before it settles in `FUN_00233FC0`. The first callee the
 emulator runs and the port does not is the gate.
+
+---
+
+## Session 184 (2026-11-20) - the port calls FUN_002DF6D0; the emulator never does
+
+| side | `0x2DF6D0` |
+|---|---|
+| emulator (armed from boot) | **0 calls** |
+| port (200 s) | 1 call, t=22.927 s, from `ra=0x002DF62C`, `a0=0 a1=0 a2=0x41745C a3=0x3E5DC0`, and it exits with `pc=0x00116A6C` (a kernel wrapper), not back to its caller |
+
+So the port's fourth task runs a function the reference never runs, and that call does not return normally - it
+hands control to a syscall path (`pc=0x116A6C`). The caller is `ra=0x2DF62C` (inside `FUN_002DF5xx`).
+
+That also explains the "pinned `+0x1B4 = 0x2DF7F4`": the task is suspended inside that call, so the value never
+moves - it is a fibre suspension, not a spin.
+
+### 184.1 Next (one disassembly, then the fix)
+
+Disassemble the caller around `0x2DF62C` and read the branch that selects `0x2DF6D0`:
+in the emulator that branch must select the other path (the one that leads to `FUN_00233FC0`'s poll on `0x126248`).
+The condition register/flag that differs between the two runs is the last gate in this chain, and the fix belongs
+at that branch - an override in the `childStepEntryFix` shape, or a data correction if it is a flag.
