@@ -9853,3 +9853,60 @@ from a path the port's step does not take - the next measurement is the tail tra
 port probe already shows as 0 hits, so the emulator side will name the source instruction that performs it).
 
 Do not patch `0x165400`; it is the unit callback and it works.
+
+---
+
+## Session 174 (2026-11-20) - SOURCE IDENTIFIED: `j 0x1653F0` at 0x165210; the port starts at the *other* entry (0x165220)
+
+Static scan for the `lw t9,8(t9); jr t9` pattern in the image found five sites; the relevant one is `0x1653F4`,
+and its context is decisive:
+
+```
+0x1653F0  lw t9, 0x10($a0)      ; object = *(a0 + 0x10)
+0x1653F4  lw t9, 8($t9)         ; vtable slot +8   <-- the slot we were hunting
+0x1653F8  jr $t9                ; -> 0x2062A0
+0x165400  lw t9, 0x10($a0)
+0x165404  lw t9, 0xC($t9)       ; slot +0x0C       (the unit callback 0x204240)
+0x165408  jr $t9
+```
+
+Ghidra xrefs of `0x1653F0`: exactly **one** - an unconditional jump from **`0x165210`**.
+
+And `0x165210` is:
+
+```
+0x165210  j    0x1653F0         ; tail-jump to the slot+8 thunk
+0x165214  lw   $a0, ($a0)       ; delay slot: a0 = the object
+```
+
+while the *next* entry is a different function body:
+
+```
+0x165220  addiu sp,-0x10 ; sd ra,(sp)
+          jal  0x165400         ; slot +0x0C  (unit callback)
+          jal  0x15231C         ; yield
+          ... jr ra
+```
+
+So the loader task has two entry points, and they are **not** interchangeable:
+
+| entry | what it does |
+|---|---|
+| `0x165210` | slot **+8** -> `0x2062A0` ("start the next unit / show the screen") |
+| `0x165220` | slot **+0x0C** -> `0x204240` (unit fade) + yield |
+
+Measured: the port's `TCB4+0x1B4 = 0x00165220`, the emulator's is `0x002057C8` (deep in the object step), and the
+port's step trace shows `0x165210` entered with `a0=0x00407740` but `0x165400` called from `ra=0x00165230` - i.e.
+the port runs the **0x165220** body. That is the whole defect: the loader task is started/resumed at `0x165220`,
+so the slot+8 entry `0x165210` never runs, `0x2062A0` is never called, and no frame is produced.
+
+### 174.1 The fix (now a one-line target)
+
+The task's start/resume pc must be **`0x165210`**, not `0x165220`. That is what the guest's own task-start code
+sets in the emulator (and why `+0x1AC` is 1 there). Concretely:
+
+1. find the writer of `TCB4+0x1B4` that stores `0x165220` (the guest's step-start code, `0x1518C0`/`0x151CD0`
+   family) and compare it with the emulator, or
+2. as a verified-later probe, override the entry so the task starts at `0x165210`.
+
+Do not patch `0x165400` (slot +0x0C - it works) and do not poke `+0x1AC` in production (diagnostic only).
