@@ -9977,3 +9977,33 @@ the create/start block copy inside `0x1518C0`/`0x151CD0`, not by generated store
    the first ancestor that is skipped is the gate - the same bisect that worked for the dispatcher.
 2. `0x2E09E0` sits in the `0x2E08xx` family already documented in session 121 (job table / `FUN_002E0820`), so the
    gate is likely the same job chain that was being investigated then.
+
+---
+
+## Session 177 (2026-11-20) - the whole 0x2E08xx job family is dormant in the port
+
+Same four addresses probed on both sides.
+
+Emulator (t = 9.25 ... 9.7 s, main thread stack `0x423450`):
+
+```
+0x002E1FC4  a0=0x00407BB0 a1=0x00407D68 a2=0x00407D64   (interior pc: the call site of the 4th create)
+0x002E09E0  a0=0x00407D70 ra=0x00151F88                  <- the 4th task starts, dispatched by the microkernel
+0x002E0820  a0=0 a1=0x0063E450 a2=1 ra=0x003659BC        <- job-table poll, 4 calls in 0.5 s
+```
+
+Port: **0 entries for all four** (`0x2E1FC4`, `0x2E0820`, `0x2E0880`, `0x2E09E0`) over 40 s.
+
+So it is not one missing call: the port never enters the job family at all in this phase, while the emulator both
+starts the 4th task *and* polls the job table (`0x2E0820`) from `ra=0x3659BC` four times in half a second.
+
+Note `0x2E1FC4` is an **interior** pc (the create's return address), so probing it as an entry cannot fire on
+either side; the 0-entry result for it is not evidence. `0x2E0820` / `0x2E09E0` are real entries and are the two
+that matter - both dead in the port.
+
+### 177.1 Next (one probe, then the fix site is known)
+
+1. Probe the **function entry containing `0x2E1FC4`** in the emulator with `get_backtrace` at its hit: that names
+   the app-side caller of the 4th create (the port's missing ancestor).
+2. Probe `0x003659BC`'s containing function (the job-table poll caller) in the port - if it is dead too, the gate
+   is the loop that drives both, i.e. the AppCell/loader job pump, and that is where the override belongs.
