@@ -10143,3 +10143,36 @@ so that measurement is invalid. The only valid emulator datum remains the title-
    should be doing instead.
 
 Everything else in this chain has been measured and retired; this is the last known difference.
+
+---
+
+## Session 182 (2026-11-20) - TCB5 has no per-yield sequence; each side sits in a different wait loop
+
+Emulator, poll of `0x407D64` (correct address, fresh boot):
+
+```
+t=0.02s  +0x1B4 = 0x00000000
+t=9.21s  +0x1B4 = 0x00233FEC
+distinct values: 2        (unchanged for the remaining ~60 s)
+```
+
+Port (session 181): `0` until ~50 s, then `0x002DF7F4` unchanged for 120 s.
+
+So `+0x1B4` is **not** a per-yield history on either side - it is a steady-state value that only changes when the
+task is switched out. Both sides pin; they pin in **different functions**:
+
+| side | resume pc | containing function |
+|---|---|---|
+| emulator | `0x00233FEC` | `FUN_00233fc0` (72 bytes) - the op-channel poll loop documented in session 152 |
+| port | `0x002DF7F4` | `FUN_002df6d0` (1732 bytes) at `+0x124` |
+
+So the fourth task exists, is dispatched, and idles - but in a different loop than the emulator's.
+
+### 182.1 Next
+
+Disassemble `FUN_002DF6D0 +0x124` (what the port's 4th task waits on) and compare with `FUN_00233FC0` (already
+known: poll `0x126248` then yield). If the port's loop is a wait that never completes, that is the last mechanical
+difference; if it is the same shape, the task is simply waiting for work that the loader never posts, and the
+producer - not the waiter - is the thing to fix.
+
+Everything above (dispatch, create, TCB fields, job step) is measured and identical.
