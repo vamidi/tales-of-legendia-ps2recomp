@@ -10595,4 +10595,65 @@ Compare the kernel's thread record for tid 6 immediately after `0x198B20` return
 does), not in any guest function. `TOL_TRACE_CALL=0x198BF8` + `TOL_TRACE_SUSP=6` in one run gives both sides of
 that instant.
 
+---
+
+## Session 191 (2026-11-20) - fresh-boot reference trace: hardware sleeps tid 6 too (3.11 s) and WAKES it (25.87 s, WakeupThread from 0x1991D8); the gap is the kernel's status word, not a missing call
+
+### 191.1 Probe (a) and (b) from 190.5: both negative, and both were the wrong layer
+
+| probe | result |
+|---|---|
+| `TOL_WATCH_SLEEPFLAG=1` (samples `0x394304`, invisible to `Store*`) | stays **0** for 45 s - the sleep is not armed by that flag |
+| `TOL_TRACE_CALL=0x114600` (`li v1,0x32; syscall`, the only SleepThread site in the ELF) | **0 calls** - but blind: `0x114600` can be reached by a direct C++ call |
+| `TOL_TRACE_SLEEP=1` (kernel `sleepCurrent`, sees every caller) | `[3.471] [sleep] #3 tid=6 pc=0x0019902C wake=0` - the worker sleeps itself |
+
+`createThread` is clean (`GuestThread thread{}`) and `suspendThread` never touches `wait`, so the Sleep state is genuinely the guest's own call.
+
+### 191.2 Fresh-boot PCSX2 trace (the reference answer)
+
+`tools/pcsx2_trace.py 30 0x114600`, fresh `-fastboot`:
+
+```
+#3 t=3.11s pc=0x00114600 a1=0x00390000 a2=0x003943B8 ra=0x0019902C sp=0x00399B80
+```
+
+`ra=0x19902C`, `sp=0x399B80` = **tid 6**. So hardware puts the worker to sleep at 3.11 s as well - the port's
+sleep (3.471 s) is **faithful**, and "make sure we are leaving the thread" is answered: hardware leaves it asleep
+too. What hardware then does is **wake it**:
+
+```
+#1 t=25.87s pc=0x00114610 a0=0x00000006 a1=0x0000000C ra=0x001991D8 sp=0x01FFEBB0
+#2 t=26.22s ... ra=0x001991D8
+... ~20x/s afterwards ...
+```
+
+`0x114610` is `li v1,0x33; syscall` = **WakeupThread**, called with `a0=6` from inside `FUN_00199198` (the
+`0x199198(6)` the port also calls).
+
+### 191.3 The exact gate (generated code of `FUN_00199198`)
+
+```
+0x1991b8  v1 = *(sp+0)            ; the status word the kernel returned
+0x1991bc  v0 = 4
+0x1991c0  beq v1, 4 -> 0x1991D0   ; status == 4  ->  jal 0x114610 (WakeupThread)
+0x1991c4  a1 = 0xC
+0x1991c8  bne v1, 0xC -> ...      ; 0xC path
+0x1991d0  jal 0x114610            ; WakeupThread(id)
+```
+
+So the fix layer is the **runtime kernel's thread-status word**, not a guest function and not a missing call. The
+port's `0x199198(6)` runs, reads a status that is neither `4` nor `0xC` (its thread is `Waiting(sleep)` with
+`susp` just cleared), skips the wake, and the worker stays asleep forever.
+
+### 191.4 The fix (next session, one edit + one run)
+
+Make the status the kernel returns for a thread that is `Waiting(Sleep)` with a suspend count match the EE
+kernel's encoding - `4` is the value the guest tests for the waiting-suspended case - so `0x199198`'s own
+`beq v1,4` takes the wake branch. Verify with `TOL_TRACE_SLEEP=1 TOL_TRACE_CALL=0x114610` in the port: `[sleep]`
+for tid 6 should be followed by a `0x114610` ENTER with `a0=6`, then tid 6 `Running` and `[gfx] tex builds > 0`.
+
+Do not repeat: sleeping tid 6 (faithful), the suspend/resume chain (proved), the fade (exonerated), and any
+`Store*`-based watch of `0x394304`.
+
+
 
