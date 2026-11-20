@@ -1377,6 +1377,24 @@ struct SdlGpuBackend::Impl {
             const bool directSample = sampled && sampled != color && samplesFitSurface(batch, *sampled);
             const bool copyFeedback = sampled && !directSample &&
                 canSnapshotFeedback(batch, *sampled, feedbackPadding);
+            // TOL_TRACE_GSFRAME: the display-copy strips sample page 224 (tbp0 7168) into page 0. Record whether
+            // that sample resolves to the LIVE render target (which holds the panel) or to VRAM (which reads zero,
+            // measured: texel(0,0)=0x00000000) - that decides whether the copy can ever carry the picture.
+            if (context.tex0.tbp0 == 7168u && std::getenv("TOL_TRACE_GSFRAME") != nullptr) {
+                static uint32_t sCopyPathLogs = 0u;
+                if ((sCopyPathLogs++ % 120u) == 0u) {
+                    std::fprintf(stderr,
+                                 "[gscopy] target=%u sampled=%s cand=%s%s%s%s inOrder=%d direct=%d feedback=%d "
+                                 "candScale=%u candUndef=%d candPending=%d\n",
+                                 context.frame.fbp, sampled ? "yes" : "no", candidate ? "yes" : "no",
+                                 candidate == color ? "=target" : "", 
+                                 (candidate && candidate->undefined) ? " undefined" : "",
+                                 (candidate && !candidate->needsUpload.empty()) ? " pending" : "",
+                                 inOrder ? 1 : 0, directSample ? 1 : 0, copyFeedback ? 1 : 0,
+                                 candidate ? candidate->scale : 0u, (candidate && candidate->undefined) ? 1 : 0,
+                                 (candidate && !candidate->needsUpload.empty()) ? 1 : 0);
+                }
+            }
             // Live targets have not passed through texture-cache TEXA expansion.
             const auto liveTargetTexa = [&] {
                 if (context.tex0.psm == GS_PSM_CT24 || context.tex0.psm == GS_PSM_CT16 ||

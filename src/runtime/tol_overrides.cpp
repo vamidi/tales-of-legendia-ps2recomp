@@ -58,14 +58,6 @@ extern std::atomic<uint64_t> g_tolVBlankTicks;
 extern std::atomic<uint64_t> g_tolMemsetCalls;
 extern std::atomic<uint64_t> g_tolMemsetBytes;
 
-// Set once the game's memory-card save-directory query has been served (see the FUN_00126558 probe below).
-// The overlay draws the port's own "Checking memory card (8MB)" boot panel while this is true; the PS2 BIOS draws
-// that panel on hardware and a direct-ELF port never executes the BIOS. External linkage on purpose: the overlay
-// (src/ui/ui_overlay.cpp) reads it.
-bool g_tolShowMcBootPanel = false;
-// Set once the save-directory read has returned: the panel finishes its sweep and hands the screen to the guest.
-bool g_tolMcBootPanelQueryDone = false;
-
 namespace
 {
     // Shared timeline counters. Every probe stamps these, so submits, polls and frames sit on one axis.
@@ -3150,6 +3142,36 @@ namespace
         if (sEnv)
         {
             const bool isScene = (a0 == gSceneObj);
+            // Scene CONTENT: FUN_002857C0 iterates `count(+8)` entities at `+0xC + i*4` and draws each one, so an
+            // empty list draws nothing no matter how often the scene is stepped. Each entity carries its stream
+            // state at +0x14C (5/6 = streaming) and its reader at +0x34; printing them separates "the scene has no
+            // entities" from "entities exist but their streams never complete".
+            if (isScene && a0 >= 0x00100000u && a0 + 0x40u < PS2_RAM_SIZE &&
+                (gSceneStep1CSceneCalls <= 5u || (gSceneStep1CSceneCalls % 100u) == 0u))
+            {
+                const uint32_t count = runtime->Load32(rdram, ctx, a0 + 8u);
+                std::fprintf(stderr, "[sceneobj] step=%llu scene=0x%08X count(+8)=%u +4=0x%08X +1C=%d",
+                             static_cast<unsigned long long>(gSceneStep1CSceneCalls), a0, count,
+                             runtime->Load32(rdram, ctx, a0 + 4u), static_cast<int>(runtime->Load32(rdram, ctx, a0 + 0x1Cu)));
+                for (uint32_t i = 0u; i < count && i < 4u; ++i)
+                {
+                    const uint32_t e = runtime->Load32(rdram, ctx, a0 + 0xCu + i * 4u);
+                    if (e < 0x00100000u || e + 0x150u >= PS2_RAM_SIZE)
+                    {
+                        std::fprintf(stderr, " e%u=0x%08X(bad)", i, e);
+                        continue;
+                    }
+                    // +0x30 is the entity's renderer: FUN_00285E80 and FUN_00292810 (draw) are no-ops when it is 0.
+                    std::fprintf(stderr,
+                                 " e%u=0x%08X[st14C=%d c148=%u r30=0x%08X rd34=0x%08X s2C=0x%08X t14=%d]",
+                                 i, e, static_cast<int>(runtime->Load32(rdram, ctx, e + 0x14Cu)),
+                                 static_cast<unsigned>(runtime->Load8(rdram, ctx, e + 0x148u)),
+                                 runtime->Load32(rdram, ctx, e + 0x30u), runtime->Load32(rdram, ctx, e + 0x34u),
+                                 runtime->Load32(rdram, ctx, e + 0x2Cu),
+                                 static_cast<int>(runtime->Load32(rdram, ctx, e + 0x14u)));
+                }
+                std::fprintf(stderr, "\n");
+            }
             if (isScene && gSceneStep1CSceneCalls <= 5u)
                 std::fprintf(stderr, "[scenestep] vt+1C SCENE #%llu (total %llu) a0=0x%08X\n",
                              static_cast<unsigned long long>(gSceneStep1CSceneCalls),
@@ -5179,13 +5201,6 @@ namespace
                 sRdPrev = runtime.lookupFunction(0x00126558u);
                 runtime.replaceFunction(0x00126558u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
                     ++sRd;
-                    // The game has issued its memory-card save-directory read. Arm the port's BIOS-style
-                    // "Checking memory card (8MB)" panel here, exactly where the BIOS would show it, and let it
-                    // run its sweep once; it disarms itself after the read returns (g_tolMcBootPanelQueryDone).
-                    if (sRd == 1u && std::getenv("TOL_NOMCBOOT") == nullptr) {
-                        g_tolShowMcBootPanel = true;
-                        g_tolMcBootPanelQueryDone = false;
-                    }
                     const uint32_t part = GPR_U32(ctx, 4);
                     const uint32_t pathPtr = GPR_U32(ctx, 6);
                     const uint32_t dest = GPR_U32(ctx, 9);
@@ -5194,8 +5209,6 @@ namespace
                     {
                         sRdPrev(rdram, ctx, rt);
                     }
-                    // The check is finished: the panel completes and gets out of the way.
-                    g_tolMcBootPanelQueryDone = true;
                     const uint32_t ret = GPR_U32(ctx, 2);
                     static const bool env = std::getenv("TOL_STAGE") != nullptr;
                     if (env && sRd <= 8u)
