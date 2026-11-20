@@ -4897,7 +4897,43 @@ namespace
                                                                  rcResume, sAutoResumeId, rcWake);
                                                 }
                                             }
-                                            // TOL_AUTO_WAKE=<id>[,<everyN>]: the worker loop (FUN_00198f38) calls
+                                            // TOL_CALL_PC=0xADDR[,a0]: invoke one guest function as a call from the
+                                            // main loop, once, after the units. The emulator reaches FUN_002062a0 (slot
+                                            // +2 of the 0x3D47D0 vtable) through the microkernel run loop; the port never
+                                            // does. This tests whether that callback alone is the missing step.
+                                            if (const char *const callSpec = std::getenv("TOL_CALL_PC"))
+                                            {
+                                                static bool sCalled = false;
+                                                static const uint32_t sCallPc =
+                                                    static_cast<uint32_t>(std::strtoul(callSpec, nullptr, 0));
+                                                static const uint32_t sCallA0 = [] {
+                                                    const char *const spec = std::getenv("TOL_CALL_PC");
+                                                    const char *const comma = spec != nullptr ? std::strchr(spec, ',') : nullptr;
+                                                    return comma != nullptr
+                                                               ? static_cast<uint32_t>(std::strtoul(comma + 1, nullptr, 0))
+                                                               : 0u;
+                                                }();
+                                                if (!sCalled && gFadeCalls >= 3u && sCallPc >= 0x00100000u)
+                                                {
+                                                    sCalled = true;
+                                                    PS2Runtime::RecompiledFunction fn = runtime->lookupFunction(sCallPc);
+                                                    std::fprintf(stderr,
+                                                                 "[callpc] fades=%u -> 0x%08X a0=0x%08X fn=%p\n",
+                                                                 static_cast<unsigned>(gFadeCalls), sCallPc, sCallA0,
+                                                                 reinterpret_cast<void *>(fn));
+                                                    if (fn != nullptr)
+                                                    {
+                                                        const uint32_t savedRa = GPR_U32(ctx, 31);
+                                                        SET_GPR_U32(ctx, 4, sCallA0);
+                                                        SET_GPR_U32(ctx, 31, 0u);
+                                                        ctx->pc = sCallPc;
+                                                        fn(rdram, ctx, runtime);
+                                                        SET_GPR_U32(ctx, 31, savedRa);
+                                                        std::fprintf(stderr, "[callpc] returned pc=0x%08X v0=0x%08X\n",
+                                                                     ctx->pc, GPR_U32(ctx, 2));
+                                                    }
+                                                }
+                                            }
                                             // SleepThread on EVERY iteration, so it depends on an external wake per
                                             // iteration; the port's guest never delivers one (0x394340 stays at 1 while
                                             // the emulator reaches 0x7864). Re-deliver the wake from here to test whether

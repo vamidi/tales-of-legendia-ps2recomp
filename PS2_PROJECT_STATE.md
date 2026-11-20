@@ -9477,3 +9477,44 @@ is entered 0 times, the worker is never resumed, and nothing is drawn. Two candi
 2. Compare `+0x14`/`+0x18`/`+0x1C..+0x24` of the object at `0x63D890` between the port's `pd_2.bin` and
    `emu_title.bin` at *the same* point: the port's are 0 where the emulator's hold a mode and three pointers, so
    the missing write is the "unit started" initialisation.
+
+---
+
+## Session 165 (2026-11-20) - the slot+2 dispatcher is the microkernel run loop; direct invocation is not enough
+
+Deep backtrace at `ResumeThread(6)` in the emulator (40 frames) completes the chain that session 164 lacked:
+
+```
+0x114670 ResumeThread <- 0x199200 <- 0x198B20 <- 0x1B75D8 <- 0x259B20 <- 0x2540B0 <- 0x254030
+   <- 0x2542D0 <- 0x3353C0 <- 0x2062A0 <- [0x151E90 run loop, pc=0x151FC8] <- 0x151FF0 <- 0x165AD0 <- crt0
+```
+
+So the object's **slot +2 (`vtable+8`) is fired by the guest microkernel run loop**, not by a C++ caller: the
+callback is read live from the vtable at dispatch time. Confirmed by scanning RAM: the word `0x002062A0` occurs
+**zero** times in `pd_2.bin`, `emu_title.bin` and `pf_1.bin` - the queue holds the *object*, not the function
+pointer.
+
+### 165.1 Direct invocation experiment (`TOL_CALL_PC=0x2062A0,0x63D890`)
+
+Calling the callback once from the main loop after the units, with `a0 = 0x63D890`:
+
+```
+[callpc] fades=3 -> 0x002062A0 a0=0x0063D890 fn=...
+[callpc] returned pc=0x0010EE5C v0=0x0000002C
+```
+
+`0x394340` (worker loop counter) went 1 -> 2, so the callback did reach the worker, but it left through a
+syscall path (`pc=0x10EE5C`) instead of completing, and the run flag `0x3943B8` stayed 0 - no draws, no title.
+Calling it out of the microkernel's own context is not a valid fix; it is only evidence that the callback is the
+right one.
+
+### 165.2 Status and next step
+
+- The object at `0x63D890` (vtable `0x3D47D0`) is created and never advanced: `+0x14` holds a pointer, `+0x18`
+  and `+0x1C..+0x24` are zero, where the emulator's carries a mode and three child pointers.
+- Nothing in RAM holds `0x2062A0`, so the run-queue entry must be the object itself. Next: dump the microkernel
+  run queue / ready lists (`0x407160` TCBs, `0x48F570` priority counts, `0x48F590` context slots) in the port's
+  `pd_*` and `pf_*` and in `emu_title.bin`, and find which list entry carries the object at `0x63D890` in the
+  emulator and is missing in the port.
+- Alternative: instrument `FUN_00151E90` (dispatcher) in the port to print every dequeued item - the emulator runs
+  `0x2062A0` from there at ~2/s, so the port's dispatcher log will show which item it runs instead.
