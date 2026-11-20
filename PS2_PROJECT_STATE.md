@@ -9910,3 +9910,29 @@ sets in the emulator (and why `+0x1AC` is 1 there). Concretely:
 2. as a verified-later probe, override the entry so the task starts at `0x165210`.
 
 Do not patch `0x165400` (slot +0x0C - it works) and do not poke `+0x1AC` in production (diagnostic only).
+
+---
+
+## Session 175 (2026-11-20) - TCB4+0x1B4 has NO Store32/Store64 writer in 45 s (block copy)
+
+`TOL_WATCH_WRITE=0x407B54` now watches both 32-bit stores (`Store32`) and 64-bit stores (`Store64`, matching when
+the watched word falls inside `[vaddr, vaddr+8)`). 45 s run: **0 hits from either**, while `+0x1B4` reads
+`0x00165220` in every dump.
+
+So the field is not written by generated `WRITE32/WRITE64` at all: it is initialised by the task-creation path as
+part of a **block copy** (`memcpy`/128-bit stores) or by a store that happens before the first watched call. That is
+why the earlier 32-bit-only watch was also empty - it was not a lost write, it is a different writer class.
+
+### 175.1 What that means for the fix
+
+The value `0x165220` in `TCB4+0x1B4` comes from the microkernel's create/start path (`0x1518C0` / `0x151CD0`
+family), not from the step. To fix the task entry at its actual writer:
+
+1. break in the **emulator** on the create call with `0x4079A0` (or on `0x151CD0` with `a0 = 0x4079A0`), and read
+   which pc/arg it stores into `+0x1B4`; the emulator's task starts at the `0x165210` entry.
+2. in the port, watch `Store128`/the `memcpy` path for `0x407B54` (the block copy), or hook the create function
+   (`0x151CD0`) and print its arguments - that names the writer directly.
+3. only then change the entry (`0x165210` instead of `0x165220`) and the `+0x1AC` alive byte at that same site.
+
+No production code was changed this session: the two candidate writers are both unproven, and the loader path that
+works (three units, scene start, 110 MB of transfers) must not be disturbed by a guess.
