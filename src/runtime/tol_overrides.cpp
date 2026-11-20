@@ -4897,6 +4897,26 @@ namespace
                                                                  rcResume, sAutoResumeId, rcWake);
                                                 }
                                             }
+                                            // TOL_AUTO_WAKE=<id>[,<everyN>]: the worker loop (FUN_00198f38) calls
+                                            // SleepThread on EVERY iteration, so it depends on an external wake per
+                                            // iteration; the port's guest never delivers one (0x394340 stays at 1 while
+                                            // the emulator reaches 0x7864). Re-deliver the wake from here to test whether
+                                            // that alone restarts the loop.
+                                            if (const char *const wakeSpec = std::getenv("TOL_AUTO_WAKE"))
+                                            {
+                                                static const int sWakeId = std::atoi(wakeSpec);
+                                                static const int sWakeEvery = [] {
+                                                    const char *const spec = std::getenv("TOL_AUTO_WAKE");
+                                                    const char *const comma = spec != nullptr ? std::strchr(spec, ',') : nullptr;
+                                                    const int n = comma != nullptr ? std::atoi(comma + 1) : 1;
+                                                    return n > 0 ? n : 1;
+                                                }();
+                                                static uint64_t sWakeTick = 0u;
+                                                if (sWakeId > 0 && (sWakeTick++ % static_cast<uint64_t>(sWakeEvery)) == 0u)
+                                                {
+                                                    runtime->eeScheduler().wakeupThread(sWakeId, false);
+                                                }
+                                            }
                                             logLoaderTcb("52b70.pre", runtime, rdram, ctx);
                                             if (p52b70 != nullptr)
                                             {

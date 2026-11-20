@@ -9432,3 +9432,48 @@ a fix.
    port stops at - that is the same place unit 4 fails to start. With the flag set, the worker loop runs and the
    title content follows.
 2. Keep using `pf_*` (0x390000..0x3A0000) dumps: that range holds this whole subsystem and now diffs cleanly.
+
+---
+
+## Session 164 (2026-11-20) - the gate is vtable slot +2 of the object at 0x63D890, and the port never calls it
+
+Caller chain of the run-flag setters (Ghidra xrefs):
+
+```
+FUN_00199938 / FUN_00199AF0   (set 0x3943B8, resume the worker)
+  <- FUN_00199988              ("release": 0x3942C4--; when 0 -> the above + ChangeThreadPriority(0x394368)
+  |                             + FUN_001b7658/0x1b7670/0x1b79a0)
+  |   <- FUN_0019a2b0          (a pure thunk, 0 static xrefs -> called through a pointer)
+  <- FUN_0019a550              (second release variant, 0 static xrefs)
+```
+
+`FUN_00199538` (create worker) is the matching "hold": it creates tid 6 suspended and the count `0x3942C4`
+stays 1 in **both** the port and the emulator at the sampled points, so the count is not the gate.
+
+`TOL_TRACE_SUSP=6` (now filterable by id) over 40 s: exactly **one** suspend of tid 6 (t=5.435 s, from
+`FUN_00199538`) and **no** resume. `TOL_AUTO_WAKE=6` cannot help - `wakeupThread` does not clear a *suspend*.
+
+### 164.1 The vtable slot that is never called
+
+`0x2062A0` (the top of the emulator's resume backtrace) occurs **once** in the image, as data at VA
+**`0x003D47D8`** = `0x3D47D0 + 8`, i.e. **slot +2 of the vtable at 0x3D47D0**. So the emulator drives an object
+whose vtable is `0x3D47D0`, and its slot +2 is the "start the next unit / reset the fade" callback.
+
+And the port's object at `0x63D890` at steady state carries **exactly vtable `0x003D47D0`** with
+`+0x14 = 0x0063DCF0`, `+0x18 = 0`, `+0x1C..+0x24 = 0` - i.e. it was created but never advanced (the emulator's
+object there is the *other* type, vtable `0x003D4750`, `mode(+0x14) = 1`, `arg(+0x18) = 0x014E29E0`).
+
+So the port builds the next-unit object and then never calls its slot +2, which is why `FUN_002062a0` (0x2062A0)
+is entered 0 times, the worker is never resumed, and nothing is drawn. Two candidate causes remain:
+
+1. the driver that dispatches slot +2 (the loader/app step) is itself not reached, or
+2. the object's state field that gates the dispatch (likely `+0x14`, still a pointer instead of a mode) is never
+   advanced because the preceding step failed.
+
+### 164.2 Next
+
+1. Find which function reads/fires `*(vtable+8)` for that object (Ghidra: xrefs of `0x3D47D0` as a value in
+   memory, and the loader-step function that calls slot +2) and compare its entry in the port.
+2. Compare `+0x14`/`+0x18`/`+0x1C..+0x24` of the object at `0x63D890` between the port's `pd_2.bin` and
+   `emu_title.bin` at *the same* point: the port's are 0 where the emulator's hold a mode and three pointers, so
+   the missing write is the "unit started" initialisation.
