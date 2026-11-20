@@ -10007,3 +10007,39 @@ that matter - both dead in the port.
    the app-side caller of the 4th create (the port's missing ancestor).
 2. Probe `0x003659BC`'s containing function (the job-table poll caller) in the port - if it is dead too, the gate
    is the loop that drives both, i.e. the AppCell/loader job pump, and that is where the override belongs.
+
+---
+
+## Session 178 (2026-11-20) - CORRECTION: the port runs the same app-job step and the same create call; 177 was a window artifact
+
+Both probed at their function entries.
+
+Emulator, `FUN_002e1f80` (contains `0x2E1FC4`), backtrace at the hit:
+
+```
+0x002E1F80  ra=0x00365840  a0=0 a1=1 a2=1
+  <- 0x00365700 (FUN_00365700, pc 0x365840)      <- app job / AppCell step
+  stack: 0x63E3D0, 0x63DA00, 0x63D8D0, 0x3661C0, 0x165230, 0x151F88
+```
+
+Port, same two entries (`TOL_TRACE_PC=0x2E1F80,0x365700`, 40 s):
+
+```
+0x00365700  x10   a0=0x0063E3D0 a1=0x0063E3E8 a2=1 a3=0x0063DA00 ra=0x0036567C   (t=38.62s)
+0x002E1F80  x1    a0=0x00000000 a1=0x00000001 a2=0x00000001 ra=0x00365840        (t=38.64s)
+```
+
+Identical call, identical arguments, same caller `0x365840` - the port's app job step **does** run and **does**
+reach the create site. Session 177's "the port creates 3 tasks, the emulator 4" was a **sampling artifact**: that
+probe ran only 30 s, while the port's 4th create happens at **38.6 s** (its boot is ~4x slower than the emulator's
+9.25 s).
+
+So nothing is skipped in the create path. The open question narrows to what happens **after** the create: whether
+`0x2E09E0` is started and dispatched as a microkernel task in the port.
+
+### 178.1 Next (90 s windows, not 40)
+
+1. `TOL_TRACE_PC=0x151CD0,0x2E09E0` for 90 s: confirm the 4th create (`a0=0x2E09E0`) happens and whether the task
+   is then dispatched at its entry.
+2. If created but never dispatched, compare its TCB (`entry`, `+0x1AC`, `+0x1F0` state/prio) with the emulator's
+   fourth task - that is the last mechanical difference in this chain.
