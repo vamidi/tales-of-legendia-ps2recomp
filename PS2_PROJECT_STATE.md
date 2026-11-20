@@ -10112,3 +10112,34 @@ emulator's = `0x00233FEC`. Neither is the title loop, so both are mid-flight; th
 3. The first guest function the emulator's sequence reaches and the port's does not is the remaining divergence.
 
 Everything above that point has been retired with measurements, so this is the only layer left.
+
+---
+
+## Session 181 (2026-11-20) - TCB5's resume pc is PINNED at 0x2DF7F4 in the port (50 s -> 175 s)
+
+Port, `TOL_POKE_ALIVE=1`, 200 s, dumps every 25 s, TCB5 struct `0x407BB0`, `+0x1B4` = `0x407D64`:
+
+```
+sq_0 (t=  5s)  +0x1B4=0x00000000
+sq_1 (t= 30s)  +0x1B4=0x00000000
+sq_2 (t= 55s)  +0x1B4=0x002DF7F4
+sq_3 (t= 80s)  +0x1B4=0x002DF7F4
+sq_4 (t=105s)  +0x1B4=0x002DF7F4
+sq_5 (t=130s)  +0x1B4=0x002DF7F4
+sq_6 (t=155s)  +0x1B4=0x002DF7F4
+```
+
+So the 4th task starts (`0x2DF7F4` first appears between 30 s and 55 s) and then **never advances its resume pc
+again for the next 120 s**. That is the stall, and it is one function: `0x2DF7F4`.
+
+Emulator side: the poll in this session used `0x407D74` - off by `0x10` from the correct `0x407D64` - and returned 0,
+so that measurement is invalid. The only valid emulator datum remains the title-time dump: `TCB5+0x1B4 = 0x00233FEC`.
+
+### 181.1 Next (single item)
+
+1. Re-poll the emulator at **`0x407D64`** (correct address) and collect its `+0x1B4` history.
+2. Disassemble `0x2DF7F4` in the port's sense: it is where the 4th task idles; the emulator's value (`0x233FEC`) is
+   in a different function, so the first emulator-side value after the same guest milestone names what the port
+   should be doing instead.
+
+Everything else in this chain has been measured and retired; this is the last known difference.
