@@ -9143,3 +9143,92 @@ Verified with the **plain** command (no env vars other than the stats switch), 6
    stop agreeing *after* the scene start (the range `0x5AA000..0x5AD000` is proven identical).
 3. Do not re-investigate: preemption mode, the scene object/entities, PMODE/DISPFB2, the presenter, the
    224/280->0 copy.
+
+---
+
+## Session 160 (2026-11-20) - milestone-aligned RAM diffs: the units agree, the steady state is frozen, and the divergence is a fabricated entry at 0x1B76F8
+
+### 160.1 Tooling added (both sides, guest-milestone aligned)
+
+| piece | what it does |
+|---|---|
+| `TOL_DUMP_UNITS="addr,len,dir"` (`src/runtime/tol_overrides.cpp`) | 6 snapshots at the loader units: `port_unit{1,2,3}.bin` at `FUN_00204240` entry and `port_unit{1,2,3}_ret.bin` at its return; mode comes from `obj+0x14` |
+| `tools/ref_units.py` | the reference side: breakpoints on `0x204240` and on the caller's continuation, writes `ref_unit<N>[_ret].bin`. Usage: `python tools/ref_units.py logs/ramdump 0x480000 0x200000 120` |
+| `TOL_DUMP_RAM` moved into the main-loop probe (`0x152B70`) | it used to be driven from the microkernel switch-in probe, which the resume probe displaces, so it fired once and never again. Now `pd_0/pd_1/pd_2` at 45 s intervals work |
+
+Capture commands used:
+
+```
+python tools/ref_units.py logs/ramdump 0x480000 0x200000 120
+TOL_DUMP_UNITS=0x480000,0x200000,logs\ramdump
+TOL_DUMP_RAM=0x3E0000,0x2A0000,logs\ramdump\pd_%u.bin,45000
+```
+
+### 160.2 Result 1: at all six unit boundaries the two sides agree
+
+Diffing `port_unit<N>` vs `ref_unit<N>` (2 MB each, 524 288 words):
+
+- `[engine] 0x4E9D70`, `[loader] 0x63D890`, `[scene] 0x5AA170`, `[unit1ent] 0x5AA1B0`: **identical at every
+  boundary**, including both `_ret` snapshots.
+- The remaining word-level differences are transient buffers and hash/counter slots (`0x48F8xx`, `0x4969xx`,
+  `0x49AC40`), not structures.
+
+So the guest state is in lockstep through the whole loader, and the divergence is strictly *after* unit 3.
+
+### 160.3 Result 2: after unit 3 the port's heap is frozen, not slow
+
+`pd_1` (49.9 s) vs `pd_2` (94.9 s), same range: **20 of 688 128 words differ**, all in one 0x60-stride list at
+`0x3EF684..0x3EF9E7`. TCBs, run queue, task table `0x4E9140`, engine `0x4E9D70`, scene `0x5AA140`, loader
+`0x63D890`, job table `0x63EA40`: 0 changed words in 45 s. The guest runs (99.6 % busy, `mainIters` moves) and
+redraws 4 untextured primitives per frame, but allocates and writes nothing new.
+
+### 160.4 Result 3: the emulator's title path, and where the port leaves it
+
+Backtrace taken in PCSX2 at the title-loop pc `0x1278D0` (`get_backtrace`, 20 frames):
+
+```
+0x198F38 -> 0x1B768C -> 0x259500 -> 0x259780 -> 0x2598E8 -> 0x2684C0 -> 0x268570 -> 0x268688
+         -> 0x26DD48 -> 0x261C28 -> 0x262060 -> 0x262870 -> 0x264AE8 -> 0x267CA0 -> 0x12CB78
+         -> 0x12C2D8 -> 0x12CE60 -> 0x12C748 -> 0x128408 -> 0x1278D0
+```
+
+Measured in the emulator (breakpoints, 1 s): `0x1B7688` is entered **7x/s** from `0x198E0C`, `0x198EE0`,
+`0x206454`, `0x198FB4`, `0x19A024` with `a0 = 0,2,4,5,6` (a service dispatcher); for `a0 = 0` it calls
+`0x259500` with **a1 = 1, a2 = 0x0158xxxx** (a loaded work buffer) and that call continues into `0x259780`.
+
+Measured in the port (`TOL_TRACE_PC`, 70 s):
+
+- `0x1B7688`: **0 entries** — the function's real entry is never dispatched.
+- `0x1B76F8`: **44 entries**, every one with `ra == pc == 0x1B76F8`, `sp = 0x01FFFE10` (guest stack top),
+  `a0 = 0, a1 = 0x18, a2 = 1, a3 = 0x003B1998` — i.e. a *top-level* dispatch of an interior address.
+- `0x259500`: entered **once per run** (43.99 s), with `a1 = 0x00390000, a2 = 0x003943B8` instead of the
+  emulator's `(1, 0x0158xxxx)`, and it returns immediately (`v0 = 1`) without reaching `0x259780`.
+
+`0x1B76F8` is `FUN_001b7688 + 0x70`, and the disassembly shows why that matters:
+
+```
+001B76F0  jalr $v0          <- calls a function pointer taken from a table
+001B76F4  lw  $a0, 4($s0)   <- delay slot
+001B76F8  sw  $zero, ($s1)  <- the continuation 0x1B76F8
+```
+
+It is a **return point of a `jalr`**, not an entry: no prologue, it uses `$s0/$s1/$s2` established at
+`0x1B768C`. Dispatching there as a top-level turn runs that tail with unrelated registers, which is exactly
+why `0x259500` receives the wrong arguments and returns immediately. The ELF contains **zero** occurrences of
+the word `0x001B76F8` (nor of `0x1B7688`/`0x259500`) in any data or pointer table, so the guest never takes
+its address either — the dispatch is fabricated by the port.
+
+So session 154's class is still present, one level up: a pending interior pc (`0x1B76F8`) is resumed as a
+top-level call. In-place preemption (session 159) removed the *checkpoint* producer, but something else still
+produces this pc — a green-thread resume field (`TCB+0x1B4`) or an indirect transfer.
+
+### 160.5 Next
+
+1. **Name the producer of pc = 0x1B76F8.** It is not a `jalr` target (no pointer in the image) and not a
+   checkpoint (in-place now). Log every write of `0x001B76F8` into a TCB resume slot / dispatch pc:
+   `TOL_TRACE_PC=0x152200`-style probe that prints `a0/a1` plus the restored pc, or a `ps2TraceGuestWrite`
+   watch on `TCB+0x1B4` for the thread that runs it. The dispatch appears ~0.6x/s from 4.06 s on.
+2. Once the fabricated entry is gone, `0x1B7688` should be entered 7x/s like the emulator and `0x259500`
+   should receive `(a1=1, a2=<work buffer>)`, which starts the title chain.
+3. Dumps for the next comparison are already in `logs/ramdump/`: `pd_*` (port periodic), `port_unit*`/`ref_unit*`
+   (unit boundaries), `emu_title.bin` (reference title).

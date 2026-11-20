@@ -2549,6 +2549,58 @@ namespace
         return true;
     }
 
+    // TOL_DUMP_UNITS="addr,len,dir": heap snapshots at the three loader-unit boundaries (FUN_00204240 entry and
+    // return, keyed by the unit's mode at +0x14). Those are guest milestones the reference emulator reaches at
+    // exactly the same points, so the two sides are directly comparable; wall-clock alignment is meaningless
+    // (session 158). Reference side: tools/ref_units.py.
+    void dumpUnitBoundary(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, int mode, bool exiting)
+    {
+        static const char *const spec = std::getenv("TOL_DUMP_UNITS");
+        if (spec == nullptr || mode < 1 || mode > 9)
+        {
+            return;
+        }
+        static bool parsed = false;
+        static uint32_t addr = 0u, len = 0u;
+        static char dir[480] = {};
+        if (!parsed)
+        {
+            parsed = true;
+            const char *c1 = std::strchr(spec, ',');
+            const char *c2 = c1 != nullptr ? std::strchr(c1 + 1, ',') : nullptr;
+            if (c1 == nullptr || c2 == nullptr)
+            {
+                return;
+            }
+            addr = static_cast<uint32_t>(std::strtoul(spec, nullptr, 0));
+            len = static_cast<uint32_t>(std::strtoul(c1 + 1, nullptr, 0));
+            std::snprintf(dir, sizeof(dir), "%s", c2 + 1);
+            if (len == 0u || addr >= PS2_RAM_SIZE || len > PS2_RAM_SIZE - addr)
+            {
+                len = 0u;
+            }
+        }
+        if (len == 0u)
+        {
+            return;
+        }
+        char path[640];
+        std::snprintf(path, sizeof(path), "%s\\port_unit%d%s.bin", dir, mode, exiting ? "_ret" : "");
+        std::FILE *fp = std::fopen(path, "wb");
+        if (fp == nullptr)
+        {
+            std::fprintf(stderr, "[ramdump] cannot open %s\n", path);
+            return;
+        }
+        std::vector<uint8_t> bytes(len);
+        for (uint32_t i = 0u; i < len; ++i)
+            bytes[i] = runtime->Load8(rdram, ctx, (addr + i) & 0x01FFFFFFu);
+        std::fwrite(bytes.data(), 1u, bytes.size(), fp);
+        std::fclose(fp);
+        std::fprintf(stderr, "[ramdump] unit%d%s 0x%08X..0x%08X -> %s\n", mode, exiting ? " ret" : "", addr,
+                     addr + len, path);
+    }
+
     // TOL_DUMP_RAM="addr,len,C:\path\dump_%u.bin[,intervalMs]": periodic guest-RAM snapshots, so the port's heap
     // can be diffed against the reference emulator's at the same milestone instead of compared field by field.
     void dumpRamIfDue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -3120,14 +3172,16 @@ namespace
         ++gFadeCalls;
         const bool ok = (obj + 0x28u < PS2_RAM_SIZE);
         const uint32_t overlayBefore = ok ? runtime->Load32(rdram, ctx, obj + 0x20u) : 0u;
+        const int unitMode = ok ? static_cast<int>(runtime->Load32(rdram, ctx, obj + 0x14u)) : -1;
+        dumpUnitBoundary(rdram, ctx, runtime, unitMode, false);
         if (sEnv && sCalls <= 8u)
             std::fprintf(stderr, "[fade] #%u ENTER obj=0x%08X mode(+14)=%d a(+18)=0x%08X overlay=0x%08X\n", sCalls, obj,
-                         ok ? static_cast<int>(runtime->Load32(rdram, ctx, obj + 0x14u)) : -1,
-                         ok ? runtime->Load32(rdram, ctx, obj + 0x18u) : 0u, overlayBefore);
+                         unitMode, ok ? runtime->Load32(rdram, ctx, obj + 0x18u) : 0u, overlayBefore);
         if (gFadePrev != nullptr)
         {
             gFadePrev(rdram, ctx, runtime);
         }
+        dumpUnitBoundary(rdram, ctx, runtime, unitMode, true);
         const uint32_t overlayAfter = ok ? runtime->Load32(rdram, ctx, obj + 0x20u) : 0u;
         if (sEnv && sCalls <= 8u)
         {
@@ -4813,6 +4867,10 @@ namespace
                                             g_iterVb0 = g_tolVBlankTicks.load();
                                             logVBlankGap("52b70");
                                             ++tol_state::g_mainLoopIters;
+                                            // TOL_DUMP_RAM is driven from the main loop so it keeps firing in the
+                                            // steady state; the microkernel switch-in probe that used to own it is
+                                            // displaced by the resume probe.
+                                            dumpRamIfDue(rdram, ctx, runtime);
                                             logLoaderTcb("52b70.pre", runtime, rdram, ctx);
                                             if (p52b70 != nullptr)
                                             {
