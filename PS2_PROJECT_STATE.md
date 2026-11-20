@@ -9049,7 +9049,7 @@ Only **three** load units exist; the scene is started after unit 1, not after th
 
 Setup: PCSX2 restarted from `data\Tales of Legendia (USA).iso` (`-fastboot`), breakpoints on the scene
 start `0x285E80` and on `0x20444C` (the first instruction after the caller's `jal 0x285e80`, so it fires
-exactly when the call has returned — the same point the port's `TOL_DUMP_RAM_SCENE` samples, because
+exactly when the call has returned ï¿½ the same point the port's `TOL_DUMP_RAM_SCENE` samples, because
 `sceneBProbe` dumps *after* it has run `gSceneB`).
 
 | file | what it is |
@@ -9060,7 +9060,7 @@ exactly when the call has returned — the same point the port's `TOL_DUMP_RAM_SCE
 
 Result: **ref_entry vs ref_ret differ in 0 words** (`0x285E80` only resets the entities, as session 157
 said), and **port vs ref_ret differ in 0 of 3072 words**. The scene object, its vtable `0x003D50D0`,
-`+4 = 0x3F400000`, `+8 = 4`, the four entities, the `RNDM` engine magic at `0x5AA190` — all byte-identical.
+`+4 = 0x3F400000`, `+8 = 4`, the four entities, the `RNDM` engine magic at `0x5AA190` ï¿½ all byte-identical.
 So there is **no guest divergence at the scene start**; 158.5.1 is closed in favour of "the renderers never
 submit", and the heap layout matches too (same addresses on both sides).
 
@@ -9078,7 +9078,7 @@ setter hits: 0x2928B0=0  0x292930=1  0x292A40=0  0x292610=4
 entity stream/state: 0/0 for all four, never changed
 ```
 
-So the scene's four entities are idle in the reference emulator too — the title's content is not them.
+So the scene's four entities are idle in the reference emulator too ï¿½ the title's content is not them.
 This confirms 157.3/158.3 with a second, independent probe.
 
 ### 159.3 ROOT CAUSE of the flakiness: unwinding preemption is what kills the main thread
@@ -9093,7 +9093,7 @@ A plain run of the session-158 binary (no env vars) died at **3.70 s**:
 
 `0x114570/0x1145d0` are the kernel's exit-thread wrappers (`li v1,0x2f / syscall`); right after one, the
 scheduler dispatched a *turn* at `0x0049C790`, a heap pointer. After that the guest was 8-9 % busy with
-`paceWait` 90 %, `mainIters=0` forever, no loader, no GS traffic — the session-154 class (a pending
+`paceWait` 90 %, `mainIters=0` forever, no loader, no GS traffic ï¿½ the session-154 class (a pending
 interior pc outliving the frame it returns into), and it is the *default* behaviour, so most plain runs
 never reach the loader. The "50 s per unit" figure came from the lucky runs that survived.
 
@@ -9108,7 +9108,7 @@ A/B with in-place preemption on the same binary:
 
 The old reason for keeping in-place off (stall in libc init at `0x109144`, "main Ready but never
 re-selected") was the shared `m_dispatchedThreadId` bookkeeping fixed in session 155 (`enterGuest`), not
-this path — with the fix in place the stall does not reproduce.
+this path ï¿½ with the fix in place the stall does not reproduce.
 
 ### 159.4 FIX: in-place preemption is now the default
 
@@ -9127,7 +9127,7 @@ Verified with the **plain** command (no env vars other than the stats switch), 6
 - 99.4 % guest busy, `mainIters` 986 and climbing ~32/s, `loader state=1 chan=4`;
 - the three load units now run at the emulator's cadence: fade modes 1/2/3 enter at **23.7 / 30.3 / 39.2 s**
   (emulator: 6.0 / 11.2 / 16.3 s, i.e. 5.2 s apart; the port spends 6.6 s and 8.9 s apart, and starts later
-  because it boots slower) — the "~50 s per unit, 0.66 s per yield" symptom is gone;
+  because it boots slower) ï¿½ the "~50 s per unit, 0.66 s per yield" symptom is gone;
 - the guest uploads real data: one interval reports `transfers=858 (110808 KiB) draws=11408 resolves=447
   tex builds=4 (1568 Ktexels)`, then settles at 4 untextured draws/frame with `transfers=0`.
 
@@ -9138,7 +9138,7 @@ Verified with the **plain** command (no env vars other than the stats switch), 6
    prints only textured ones, so they are the untextured fade/clear path) and then the title's own submit
    path. Steady-state pcs for comparison: port `tid=1` cycles `0x1A35E4/0x1A36A0` (`FUN_001a35f0`),
    `0x1A152C` (`FUN_001a1498`), `0x1B76F8` (`FUN_001b7688`), `0x198270`; emulator at the title samples
-   `0x1279B4/0x127A14` (`FUN_001278d0`) — different loops, so the divergence is after the load units.
+   `0x1279B4/0x127A14` (`FUN_001278d0`) ï¿½ different loops, so the divergence is after the load units.
 2. `TOL_DUMP_RAM` exists for periodic dumps; use it with a common milestone to bisect where the two sides
    stop agreeing *after* the scene start (the range `0x5AA000..0x5AD000` is proven identical).
 3. Do not re-investigate: preemption mode, the scene object/entities, PMODE/DISPFB2, the presenter, the
@@ -9198,9 +9198,9 @@ Measured in the emulator (breakpoints, 1 s): `0x1B7688` is entered **7x/s** from
 
 Measured in the port (`TOL_TRACE_PC`, 70 s):
 
-- `0x1B7688`: **0 entries** — the function's real entry is never dispatched.
+- `0x1B7688`: **0 entries** ï¿½ the function's real entry is never dispatched.
 - `0x1B76F8`: **44 entries**, every one with `ra == pc == 0x1B76F8`, `sp = 0x01FFFE10` (guest stack top),
-  `a0 = 0, a1 = 0x18, a2 = 1, a3 = 0x003B1998` — i.e. a *top-level* dispatch of an interior address.
+  `a0 = 0, a1 = 0x18, a2 = 1, a3 = 0x003B1998` ï¿½ i.e. a *top-level* dispatch of an interior address.
 - `0x259500`: entered **once per run** (43.99 s), with `a1 = 0x00390000, a2 = 0x003943B8` instead of the
   emulator's `(1, 0x0158xxxx)`, and it returns immediately (`v0 = 1`) without reaching `0x259780`.
 
@@ -9216,11 +9216,11 @@ It is a **return point of a `jalr`**, not an entry: no prologue, it uses `$s0/$s
 `0x1B768C`. Dispatching there as a top-level turn runs that tail with unrelated registers, which is exactly
 why `0x259500` receives the wrong arguments and returns immediately. The ELF contains **zero** occurrences of
 the word `0x001B76F8` (nor of `0x1B7688`/`0x259500`) in any data or pointer table, so the guest never takes
-its address either — the dispatch is fabricated by the port.
+its address either ï¿½ the dispatch is fabricated by the port.
 
 So session 154's class is still present, one level up: a pending interior pc (`0x1B76F8`) is resumed as a
 top-level call. In-place preemption (session 159) removed the *checkpoint* producer, but something else still
-produces this pc — a green-thread resume field (`TCB+0x1B4`) or an indirect transfer.
+produces this pc ï¿½ a green-thread resume field (`TCB+0x1B4`) or an indirect transfer.
 
 ### 160.5 Next
 
@@ -9592,7 +9592,7 @@ Breakpoint armed at boot on `0x2062A0` itself, hit at `t=25.79 s`:
 |---|---|
 | TCB base | `0x4079A0` (index 4, `0x407160 + 4*0x210`) |
 | dispatched pc (`TCB+0x1B4`) | `0x002062A0` |
-| dispatch arg (`a0`, from `TCB+0x1C0`) | `0x0063D890` — the loader object, vtable `0x3D47D0` |
+| dispatch arg (`a0`, from `TCB+0x1C0`) | `0x0063D890` ï¿½ the loader object, vtable `0x3D47D0` |
 | `a1` | 1 |
 
 So `0x2062A0` is **slot +2 (`vtable+8`) of the loader object, run as the loader task's own step**, and the
@@ -10347,3 +10347,177 @@ not just its id.
 2. Then re-compare the full `job[0]` lifecycle (`+0x0`, `+0x4` id, `+0xC`, `+0x10`) at matched milestones; the
    port is one state ahead, so something submits/consumes that entry early.
 3. Keep `TOL_JOBFIX` as a probe until (2) shows the entry matches end to end.
+
+---
+
+## Session 189 (2026-11-20) - SPEED MEASURED per phase: wall time is guest execution, and the 36 s pre-create block is a guest spin whose waits are metered by host throughput; job[0] is one lifecycle step ahead at unit 1 ENTRY and is load-bearing
+
+### 189.1 Instrument: two additions, both free when unused
+
+| tool | where | what it adds |
+|---|---|---|
+| `[turncost] ... cyc=%llu dcyc=%llu g/s=%.3f` | `ps2_runtime.cpp` (presenter stats, 5x/s) | the emulated EE cycle counter and guest-seconds per wall-second. Zero guest cost: reads `eeScheduler().eeCycle()`, no per-branch work. |
+| `TOL_XFER_WALLPUMP=<us>` | `ps2_runtime.cpp` (host loop) + `checkpointDue` (EE thread) | sets a flag on a wall-clock cadence, turned into a guest invocation of the pump entry `0x0019A080` at a safe point. Opt-in, false by default. |
+
+Also new: `TOL_JOBFIX=2` (see 189.6). `tools`-side: a timestamped launcher (`%TEMP%\opencode\tolrun.ps1`) plus a foreground-forcing window capture, so every number below is tied to the wall time it happened at and every capture shows the `TOLRecomp` window (verified: black client area, no ImGui strip).
+
+### 189.2 Measured wall split: guest execution, every phase (default build)
+
+150 s run, `[turncost]` every 200 presents, present + `[pc]` milestones:
+
+```
+[   8.785] [pc] enter 0x00151CD0 #1 a0=0x001F8150      (GS worker 1)
+[   8.785] [pc] enter 0x00151CD0 #2 a0=0x001F84B0      (GS worker 2)
+[   8.879] [pc] enter 0x00151CD0 #3 a0=0x001660A0
+[  44.881] [pc] enter 0x00151CD0 #4 a0=0x002E09E0      (4th create)
+[  44.926] [pc] enter 0x002E09E0 #1 a0=0x00407D70      (4th dispatch)
+[  46.535] [fade] #1 ENTER mode(+14)=1
+[  57.580] [fade] #2 ENTER mode(+14)=2
+[  68.218] [fade] #3 ENTER mode(+14)=3
+```
+
+| phase | port | emulator | ratio |
+|---|---|---|---|
+| boot -> first creates | 8.8 s | 5.15 s | 1.7x |
+| creates -> 4th create | **36.1 s** | 3.8 s | **9.5x** |
+| unit1 -> unit2 | 11.1 s | 5.1 s | 2.1x |
+| unit2 -> unit3 | 10.6 s | 5.1 s | 2.1x |
+| fades vs 4th create | after | before (fade1 6.0, create 9.25) | order flips (189.5) |
+
+Split of the counted time is the same in every window: `guest=97-99.5%`, `presenter=0.3-1.0%`, `paceWait=0.0%`
+(`[turncost]`). So the largest single block is **the 36.1 s between the first three task creates and the 4th
+create**, and inside it the cost is guest code, not the presenter, the pacer or the GS (session 152 measured the
+GS backend at 4 % of wall during loading).
+
+**Run-to-run variance is large and must be respected**: the same build in a second run put the fades at
+26.06 / 32.99 / 40.21 s (`TOL_DUMP_UNITS` run), i.e. unit1 20 s earlier. Any window shorter than ~2 min, or any
+comparison between two different runs, is unsafe.
+
+### 189.3 Inside the block: a 4-PC guest loop, and emulated time at 1-8 % of real
+
+`TOL_GUEST_HOT`, t=14-39 s (2 000 entries per line):
+
+```
+[14.076] entries=6000  distinct=152 top: 0x349D68=3.1% 0x349C9C=2.6% 0x349DD8=2.6% 0x349D48=2.5%
+[19.405] entries=10000 distinct=21  top: 0x349D48=2.8% 0x349D68=2.8% 0x349C9C=2.8% 0x349DD8=2.8%
+[32.409] entries=20000 distinct=21  top: 0x349D48=1.4% 0x349D68=1.4% 0x349C9C=1.4% 0x349DD8=1.4%
+```
+
+`0x349C9C/0x349D48/0x349D68/0x349DD8` are ~56 % of all entries with only **21 distinct pcs** in the window;
+`FUN_00349C00` is the queue walk and `FUN_0027B390` the 60 Hz poller (session 152). `cyc/dcyc` in the same window:
+4-10 M emulated cycles per 0.36 s, i.e. **`g/s` = 0.01-0.08** (real time = 1.0).
+
+Consequence, measured in the transfer trace (`TOL_TRACE_XFER=1`):
+
+```
+[    4.864] [xfer] submit #69 blocks=266 ...  frames=36  iopump=68  pumps=162
+[   20.443] [xfer] submit #70 blocks=255 ...  frames=38  iopump=69  pumps=199
+[    8.940] [xfer] tick-pump #1 ... done=0   chunk=0   win=266
+[   40.939] [xfer] tick-pump #2 ... done=255 chunk=255 win=255
+```
+
+A 266-block read submitted at 4.86 s is next submitted at 20.44 s, and the frame tick that drains it
+(`0x001392D0`, the entry the existing frame-start fix hooks) runs **twice in 32 s**. One pump moves one 2048-byte
+block, so the read trickles. This is not a broken loop: it is the 60 Hz poller behaving normally while the
+emulated clock - which meters VBlanks, and therefore the pump - advances at host speed.
+
+### 189.4 Attacks tried (all measured, two rejected)
+
+| attack | result |
+|---|---|
+| `TOL_EE_CYCLE_SCALE=8` (more emulated cycles per branch) | 4th create 44.9 -> **23.6 s**, creates 8.8 -> 4.8 s. The block is time dilation, not raw throughput. Same ordering, no content. |
+| `TOL_EE_CYCLE_SCALE=32` | **worse**: creates at 8.5 s (not 4.8) and no 4th create in 90 s. The scale interacts with guest timing assumptions; diagnostic only. |
+| `TOL_EE_CYCLE_SCALE=4` | 4th create 37.4 s, fade1 38.7 s; only unit1 in 150 s. No content. |
+| `TOL_XFER_WALLPUMP=1500` (host-driven pump) | **rejected**: boot stalls at 3.59 s, right after the CRI main-thread pump install, never reaches the loader. Re-entering `0x0019A080` from an arbitrary preemption point deadlocks it. Kept opt-in only. |
+
+So: the port's *real work* is only ~2.1x the emulator (the unit phases), and the 9.5x block is waiting. The
+runtime already has a real-time path - with `TOL_JOBFIX=2` the guest went idle and `[turncost]` reported
+`g/s=0.96-1.05` with 88 % `paceWait` (189.6) - so the dilation exists only while a thread stays runnable. What is
+missing is a way to recognise "the only runnable thread is spinning" and advance emulated time instead of
+executing the spin (idle-loop detection, or scheduling VBlank on the host deadline as well as the cycle deadline;
+VBlank is a 59.94 Hz hardware signal, `updateNextDeadline()` currently compares cycles only).
+
+### 189.5 job[0] at matched guest milestones (the unit boundaries), port vs emulator
+
+`TOL_DUMP_UNITS=0x480000,0x200000,logs\ramdump2` (port, this build) and `tools/ref_units.py` (emulator,
+`ref_unit*` from session 160 - the guest code that writes this table has not changed). Entry `0x004E9140`,
+6 words:
+
+| word | port (all 6 boundaries) | emulator (all 6 boundaries) |
+|---|---|---|
+| `+0x0` state | **0x00000001** | **0x00000000** |
+| `+0x4` id/status | **0xFF0D0001** | **0xFF0E0000** |
+| `+0x8` | 0x00000002 | 0x00000002 |
+| `+0xC` | **0x00002000** | **0x00000000** |
+| `+0x10` | **0x00000001** | **0x00000000** |
+| `+0x14` | 0x00623100 | 0x00623100 |
+
+Both sides are **stable across unit1/2/3 entry and exit** - so this is not a race that resolves. The port is one
+lifecycle step ahead *already at unit 1 entry* (status 1, `+0xC`/`+0x10` populated, id 0x0D) where the emulator is
+still idle with request 0x0E queued. At 22.9 s the port's table was still empty
+(`[jobtable] dump ... 00000000 0000FFFF`), so the submit+claim happens between ~23 s and unit1.
+
+Probe timings (`TOL_TRACE_JOBTABLE=1`, 60 s run, claim at 24.400 s):
+
+```
+[ 5.194] [jobpoke]  #1 entry=0x004E9140 slot=0 status 0 -> 0 ra=0x002DEEE4      (FUN_002DEF60, submits nothing)
+[24.400] [jobref]   #1 index=0 entry=0x004E9140 status 00 -> 02 bit1=1 ret=1 ra=0x002E1F98   (claim, inside FUN_002E1F80)
+[24.431] [jobslot6] #1 s0=0x4E9140 ... 0000 -> 0000 ... ra=0x00117304
+```
+
+and the unit1 fade followed 1.4-1.6 s later in both runs that had both events. In the emulator the 4th create
+(9.25 s) follows unit1's fade entry (6.0 s) by 3.25 s. So the port runs the app-job step that claims entry 0
+*before* unit 1 where the emulator runs it after - consistent with the id being one unit behind (0x0D vs 0x0E).
+
+### 189.6 `TOL_JOBFIX=2`: resetting the whole entry idles the guest, it does not draw
+
+Mode 1 (id only, session 188) rewrote 0x0D->0x0E and produced no frame. Mode 2 also restores the emulator's
+idle values (`+0x0=0`, `+0x4=0xFF0E0000`, `+0xC=0`, `+0x10=0`), one shot, at the moment the id appears:
+
+```
+[  23.577] loader state=1 chan=4 alive=1 mainIters=2(+2)     g/s=0.012  paceWait=0.0%
+[  23.715] [jobfix] job[0] request id 0x0D -> 0x0E (mode 2, full entry reset)
+[  24.600] mainIters=11(+0)                                   g/s=1.045  paceWait=88.1%
+[  25.904] mainIters=11(+0)                                   g/s=1.034  paceWait=87.8%
+```
+
+The guest goes **idle** (all threads waiting, main loop frozen at iteration 11) and the emulated clock then runs at
+**real time**. No fade, no content, screenshots at 100/130/148 s black. So the entry's lifecycle is load-bearing -
+clearing it removes work the guest expects and nothing re-submits it. A fix cannot be a data rewrite of that word;
+it has to be at the guest code that claims it early, or in the ordering that lets unit 1's fade finish first.
+
+### 189.7 RETRACTION (instrument blind spot): `PS2Runtime::Store*` cannot see generated-code RAM writes
+
+`ps2_runtime_macros.h` (header, read-only) expands `WRITE8/16/32/64/128` to
+
+```c
+if (PS2Runtime::isSpecialAddress(_addr)) runtime->Store32(rdram, ctx, _addr, val);
+else { ps2TraceGuestWrite(rdram, _addr, 4u, val, 0u, "WRITE32", ctx); <direct rdram store> }
+```
+
+so **every RAM store from generated code bypasses `PS2Runtime::Store*`**, and therefore bypasses
+`TOL_WATCH_WRITE`, `TOL_WATCH_JOBTABLE` and the `[jobtable] #` writer trace. Confirmed this session:
+`TOL_WATCH_JOBTABLE=1` for 150 s printed only the dump line, zero `[jobtable] #<n> pc=...` lines, while the table
+was demonstrably populated.
+
+This retracts, as instrument artefacts rather than facts:
+
+- session 168 `TOL_WATCH_WRITE=0x407B54` "0 hits" and session 175 "TCB4+0x1B4 has NO Store32/Store64 writer" -
+  the field is written by generated RAM stores the probe cannot see;
+- session 180 `TOL_WATCH_WRITE` on `TCB5+0x1B4`;
+- this session's first attempt to trace the job-table writer.
+
+`ps2TraceGuestWrite` (the universal RAM-write hook) is `inline` in `ps2_runtime.h`, so tracing those writers needs
+a non-header hook (a `.cpp` function the macro calls, or the print itself) - do not repeat the blind-spot probe.
+
+### 189.8 Next (in order)
+
+1. **Speed, single target**: give the scheduler an idle-skip when the only runnable thread is spinning, or gate
+   VBlank on the host deadline (`updateNextDeadline()` uses cycles only). Proof that real-time emission works is
+   in 189.6: an idle guest already runs at `g/s` ~1.0. Expected effect: the 36 s block becomes the emulator's
+   3.8 s, and the pump/frame tick stop starving.
+2. **Then the ordering**: at matched milestones the port claims job[0] *before* unit 1's fade where the emulator
+   does it after. Fix the ordering or the claim site (`ra=0x002E1F98` inside `FUN_002E1F80`), not the entry data.
+3. Do not repeat: `TOL_XFER_WALLPUMP`, `TOL_JOBFIX=2`, `TOL_EE_CYCLE_SCALE` as anything but a diagnostic, and the
+   `Store*`-based write watches.
+

@@ -4979,9 +4979,26 @@ namespace
                                                 static bool sJobFixed = false;
                                                 if (!sJobFixed && runtime->Load8(rdram, ctx, 0x004E9146u) == 0x0Du)
                                                 {
+                                                    const char *const jobSpec = std::getenv("TOL_JOBFIX");
+                                                    const int jobMode = jobSpec != nullptr ? std::atoi(jobSpec) : 1;
                                                     runtime->Store8(rdram, ctx, 0x004E9146u, 0x0Eu);
+                                                    // Mode 2: also restore the rest of the entry to the emulator's
+                                                    // idle state (session 189 measured at all six unit boundaries:
+                                                    // port 1/FF0D0001/2/2000/1/623100 vs emulator
+                                                    // 0/FF0E0000/2/0/0/623100). The port's entry is already consumed,
+                                                    // so rewriting the id alone leaves the dispatcher looking at a
+                                                    // finished request - that is why mode 1 alone produced no frame.
+                                                    if (jobMode >= 2)
+                                                    {
+                                                        runtime->Store32(rdram, ctx, 0x004E9140u, 0u);
+                                                        runtime->Store32(rdram, ctx, 0x004E9144u, 0xFF0E0000u);
+                                                        runtime->Store32(rdram, ctx, 0x004E914Cu, 0u);
+                                                        runtime->Store32(rdram, ctx, 0x004E9150u, 0u);
+                                                    }
                                                     sJobFixed = true;
-                                                    std::fprintf(stderr, "[jobfix] job[0] request id 0x0D -> 0x0E\n");
+                                                    std::fprintf(stderr,
+                                                                 "[jobfix] job[0] request id 0x0D -> 0x0E (mode %d%s)\n",
+                                                                 jobMode, jobMode >= 2 ? ", full entry reset" : "");
                                                 }
                                             }
                                             logLoaderTcb("52b70.pre", runtime, rdram, ctx);
