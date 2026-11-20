@@ -89,7 +89,7 @@ def main():
             hits += 1
             line = (f"#{hits:4d} t={time.time()-t0:7.2f}s pc=0x{pc:08X} "
                     f"a0=0x{g.get('a0',0):08X} a1=0x{g.get('a1',0):08X} "
-                    f"a2=0x{g.get('a2',0):08X} ra=0x{g.get('ra',0):08X} sp=0x{g.get('sp',0):08X}")
+                    f"a2=0x{g.get('a2',0):08X} v0=0x{g.get('v0',0):08X} ra=0x{g.get('ra',0):08X} sp=0x{g.get('sp',0):08X}")
             a0 = g.get("a0", 0)
             if 0x00100000 <= a0 < 0x02000000:
                 if pc == 0x00204240:
