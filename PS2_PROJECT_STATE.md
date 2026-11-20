@@ -142,7 +142,7 @@ off and the submodule's `ps2xIOP` sources throw - session 120).
 `TOL_TRACE_DVCI`, `TOL_TRACE_GSHIST`, `TOL_TRACE_GSPRIV`, `TOL_TRACE_LOAD`, `TOL_TRACE_SCRIPT`,
 `TOL_TRACE_TASKSTEP`, `TOL_PUMP_PRIO4` (experimental I/O-wait pump; injecting pumps from anywhere else corrupts
 guest state â€” measured), `TOL_WATCH_TASK`, `TOL_WATCH_SLOT2`, `TOL_TRACE_PREEMPT` (in-place preemption counter),
-`TOL_FIBER_PREEMPT` (opt-in fiber preemption experiment â€” currently makes the boot stall, see session 120).
+`TOL_NO_FIBER_PREEMPT` (opt-out: restores the old unwinding preemption; in-place is the default since session 159).
 
 **Confirmed NOT the problem:** no skipped functions (`skip = []` in `data/config_fixed.toml`, 0 `TODO_NAMED` in
 the corpus); the 55 `stubs` are the libkernel import wrappers and all resolve to real handlers; no missing
@@ -9040,3 +9040,106 @@ Only **three** load units exist; the scene is started after unit 1, not after th
 4. Do **not** re-investigate: PMODE/EN2, DISPFB2/FBP 0, DISPLAY2 geometry, the 224/280->0 copy, the presenter, the
    port-drawn memory-card panel (removed), the fetch of `0x285E80` (it runs), or the scene object's identity
    (it matches the emulator).
+
+---
+
+## Session 159 (2026-11-20) - scene-start RAM is byte-identical to the emulator; the real gate was the preemption mode
+
+### 159.1 The RAM diff the previous session asked for: identical (3072/3072 words)
+
+Setup: PCSX2 restarted from `data\Tales of Legendia (USA).iso` (`-fastboot`), breakpoints on the scene
+start `0x285E80` and on `0x20444C` (the first instruction after the caller's `jal 0x285e80`, so it fires
+exactly when the call has returned — the same point the port's `TOL_DUMP_RAM_SCENE` samples, because
+`sceneBProbe` dumps *after* it has run `gSceneB`).
+
+| file | what it is |
+|---|---|
+| `logs/ramdump/ref_scene_entry.bin` | PCSX2, at `0x285E80` entry (t = 10.75 s) |
+| `logs/ramdump/ref_scene_ret.bin` | PCSX2, at `0x20444C` (t = 10.86 s) |
+| `logs/ramdump/port_scene.bin` | port, after `FUN_00285E80` returned (session 158) |
+
+Result: **ref_entry vs ref_ret differ in 0 words** (`0x285E80` only resets the entities, as session 157
+said), and **port vs ref_ret differ in 0 of 3072 words**. The scene object, its vtable `0x003D50D0`,
+`+4 = 0x3F400000`, `+8 = 4`, the four entities, the `RNDM` engine magic at `0x5AA190` — all byte-identical.
+So there is **no guest divergence at the scene start**; 158.5.1 is closed in favour of "the renderers never
+submit", and the heap layout matches too (same addresses on both sides).
+
+### 159.2 The emulator's own four entities stay idle as well (measured)
+
+`tools/` watch script over the emulator from boot to title, sampling entity `+0x2C` (stream) and `+0x14C`
+(state) every 0.5 s and counting the state setters:
+
+```
+t=0.20s  0x204240 mode=2
+t=0.45s  0x292930 a0=0x4EA090 (+0x14C=0)      <- a *different* scene object
+t=4.32s  0x292610 a0=0x53DE20
+t=5.42s  0x204240 mode=3
+setter hits: 0x2928B0=0  0x292930=1  0x292A40=0  0x292610=4
+entity stream/state: 0/0 for all four, never changed
+```
+
+So the scene's four entities are idle in the reference emulator too — the title's content is not them.
+This confirms 157.3/158.3 with a second, independent probe.
+
+### 159.3 ROOT CAUSE of the flakiness: unwinding preemption is what kills the main thread
+
+A plain run of the session-158 binary (no env vars) died at **3.70 s**:
+
+```
+[guest-branch:missing-target] kind=DirectJump op=EE scheduler source=0x49c790 target=0x49c790
+  pc=0x49c790 ra=0x49c790 sp=0x1fffdd0 ... codeRegion=no policy=1
+  trace=... -> 0x1145e0 -> 0x114650 -> 0x1145d0 -> 0x114570
+```
+
+`0x114570/0x1145d0` are the kernel's exit-thread wrappers (`li v1,0x2f / syscall`); right after one, the
+scheduler dispatched a *turn* at `0x0049C790`, a heap pointer. After that the guest was 8-9 % busy with
+`paceWait` 90 %, `mainIters=0` forever, no loader, no GS traffic — the session-154 class (a pending
+interior pc outliving the frame it returns into), and it is the *default* behaviour, so most plain runs
+never reach the loader. The "50 s per unit" figure came from the lucky runs that survived.
+
+A/B with in-place preemption on the same binary:
+
+| | default (unwind) | `TOL_FIBER_PREEMPT=1` |
+|---|---|---|
+| main-thread death | 3.70 s at `0x49C790` | none |
+| guest busy | 8-9 % | 99.2 % |
+| `mainIters` | 0 | 8 per 0.33 s, still climbing at 100 s |
+| loader | dead | `state=1 chan=4`, `FUN_00285E80` at 30.6 s |
+
+The old reason for keeping in-place off (stall in libc init at `0x109144`, "main Ready but never
+re-selected") was the shared `m_dispatchedThreadId` bookkeeping fixed in session 155 (`enterGuest`), not
+this path — with the fix in place the stall does not reproduce.
+
+### 159.4 FIX: in-place preemption is now the default
+
+`thirdparty/PS2Recomp/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp`, `checkpointDue()`:
+
+```cpp
+static const bool sFiberPreempt = std::getenv("TOL_NO_FIBER_PREEMPT") == nullptr;
+```
+
+`TOL_FIBER_PREEMPT` is still accepted (now redundant); `TOL_NO_FIBER_PREEMPT=1` restores the unwinding
+behaviour for A/B. Rebuilt incrementally (`ninja -C build/tol2 -j 12 tol`, 4 steps, no CMake re-run).
+
+Verified with the **plain** command (no env vars other than the stats switch), 60 s:
+
+- no `0x49C790`, no `[badpc]`; only the pre-existing `jalr`-to-null at `0x301EB8` (1 per run);
+- 99.4 % guest busy, `mainIters` 986 and climbing ~32/s, `loader state=1 chan=4`;
+- the three load units now run at the emulator's cadence: fade modes 1/2/3 enter at **23.7 / 30.3 / 39.2 s**
+  (emulator: 6.0 / 11.2 / 16.3 s, i.e. 5.2 s apart; the port spends 6.6 s and 8.9 s apart, and starts later
+  because it boots slower) — the "~50 s per unit, 0.66 s per yield" symptom is gone;
+- the guest uploads real data: one interval reports `transfers=858 (110808 KiB) draws=11408 resolves=447
+  tex builds=4 (1568 Ktexels)`, then settles at 4 untextured draws/frame with `transfers=0`.
+
+### 159.5 Next
+
+1. **The remaining black screen.** After the burst the port draws exactly 4 untextured primitives per frame
+   and uploads no more textures, while the emulator shows the title. Identify those 4 draws (`[gsorder]`
+   prints only textured ones, so they are the untextured fade/clear path) and then the title's own submit
+   path. Steady-state pcs for comparison: port `tid=1` cycles `0x1A35E4/0x1A36A0` (`FUN_001a35f0`),
+   `0x1A152C` (`FUN_001a1498`), `0x1B76F8` (`FUN_001b7688`), `0x198270`; emulator at the title samples
+   `0x1279B4/0x127A14` (`FUN_001278d0`) — different loops, so the divergence is after the load units.
+2. `TOL_DUMP_RAM` exists for periodic dumps; use it with a common milestone to bisect where the two sides
+   stop agreeing *after* the scene start (the range `0x5AA000..0x5AD000` is proven identical).
+3. Do not re-investigate: preemption mode, the scene object/entities, PMODE/DISPFB2, the presenter, the
+   224/280->0 copy.
