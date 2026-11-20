@@ -9692,3 +9692,41 @@ does next (the loader object's step at `0x20xxxx`, which is where `0x2062A0` liv
    `0x002062A0` (and at what rate); if yes, the remaining gap is time/one more load unit, not logic.
 2. If it reaches `0x2062A0`, check `[gfx]` draws/textures in the same run; the fix then becomes "assert
    `+0x1AC` at task start in the step wrapper" rather than a host poke.
+
+---
+
+## Session 170 (2026-11-20) - with the poke: continuation advances, dispatcher still never reaches 0x2062A0, no draws
+
+Run: `TOL_POKE_ALIVE=1 TOL_TRACE_SOURCE=0x151FC0 TOL_GFX_STATS_EVERY=120`, 110 s.
+
+Dispatcher (`0x151FC0`), all targets:
+
+```
+0x00165210  6x   (first t=24.86s, a0=0x00407740)
+0x00164F40  1x   (first t=24.86s, a0=0x00407950)
+```
+
+**`0x002062A0` is never dispatched**, even though `TCB4+0x1B4` was measured at `0x00204380` in the same
+configuration (session 169). Graphics, unchanged from the baseline:
+
+```
+[gfx] 22.8 fps | transfers=0 draws=480/120 frames (4/frame) passes=240 | tex builds=0 gif packets=720
+```
+
+### 170.1 What that means
+
+`+0x1AC` (alive) does gate the *carry* of the task - `+0x1B4` moves from `0x165220` to `0x204380`. But the
+microkernel still dispatches the wrapper `0x165210`, so **the pc the dispatcher uses is not `TCB+0x1B4`** (or
+not only it): it is whatever `$v0` was loaded from in the run loop, and in the emulator that read produced
+`0x2062A0` with `s0 = 0x4079A0`.
+
+So the next measurement must be the operand, not the guess: read the whole TCB 4 field block (`+0x1B0..+0x1C8`
+and `+0x1F0..+0x1FC`) **at the emulator's `0x2062A0` dispatch hit** and compare it with the port's same block at
+a dispatch of `0x165210`. Whichever word holds `0x2062A0` there is the field the run loop reads; the port's copy
+of that word is the one to fix.
+
+### 170.2 Also worth noting
+
+`+0x1B4 = 0x204380` in the port sits in the same `0x20xxxx` code region as the emulator's `0x2057C8`, so the
+task's own resume state is plausible - the gap is that the dispatcher keeps entering it at the wrapper entry
+instead of that resume point.
