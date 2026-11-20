@@ -9936,3 +9936,44 @@ family), not from the step. To fix the task entry at its actual writer:
 
 No production code was changed this session: the two candidate writers are both unproven, and the loader path that
 works (three units, scene start, 110 MB of transfers) must not be disturbed by a guess.
+
+---
+
+## Session 176 (2026-11-20) - the port creates 3 microkernel tasks; the emulator creates 4 (the 4th is 0x2E09E0)
+
+Traced the task-create path on both sides (`0x151CD0` = create, `0x1518C0` = start):
+
+Emulator:
+
+```
+t=5.15s  0x151CD0 a0=0x001F8150 a1=0 a2=1 ra=0x1F8294      (GS worker 1)
+t=5.28s  0x151CD0 a0=0x001F84B0 a1=0 a2=0 ra=0x1F82C0      (GS worker 2)
+t=5.42s  0x151CD0 a0=0x001660A0 a1=0 a2=1 ra=0x166050
+t=9.32s  0x151CD0 a0=0x002E09E0 a1=1 a2=0 ra=0x2E1FC4      <-- MISSING IN THE PORT
+  inner 0x151B4C slots: a0=8/0/1/3   records a2 = 0x407360/0x407570/0x407990/0x407DB0
+```
+
+Port:
+
+```
+7.548s  0x151CD0 a0=0x001F8150
+7.548s  0x151CD0 a0=0x001F84B0
+7.595s  0x151CD0 a0=0x001660A0
+counts: 0x151CD0 = 3   (emulator = 4)
+```
+
+So the port creates only **three** of the four tasks. The fourth, entry `0x002E09E0` created from `ra=0x002E1FC4`
+on the main thread, is exactly the piece that has been missing at every level above: without it nothing drives the
+later unit, so `0x2062A0` (slot +8) is never called.
+
+The TCB record base is `0x407990` for the third task (`0x4079A0` = record + 0x10), which is TCB 4 - matching the
+`+0x1B0 = 0x165210` we compared, so the *entry* field is already correct on both sides; it is the missing fourth
+task, not the entry value, that stops the chain. (That also explains session 175: `+0x1AC`/`+0x1B4` are written by
+the create/start block copy inside `0x1518C0`/`0x151CD0`, not by generated stores.)
+
+### 176.1 Next
+
+1. Probe `0x002E1FC4` (the caller of the 4th create) and its callers in both sides; the port never reaches it, so
+   the first ancestor that is skipped is the gate - the same bisect that worked for the dispatcher.
+2. `0x2E09E0` sits in the `0x2E08xx` family already documented in session 121 (job table / `FUN_002E0820`), so the
+   gate is likely the same job chain that was being investigated then.
