@@ -2522,9 +2522,93 @@ namespace
         }
     }
 
+    // One-shot dump of "addr,len,path" (no %u) into a file.
+    bool dumpRamOnce(const char *spec, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                     const char *path)
+    {
+        const char *c1 = std::strchr(spec, ',');
+        const char *c2 = c1 != nullptr ? std::strchr(c1 + 1, ',') : nullptr;
+        if (c1 == nullptr || c2 == nullptr)
+        {
+            return false;
+        }
+        const uint32_t addr = static_cast<uint32_t>(std::strtoul(spec, nullptr, 0));
+        const uint32_t len = static_cast<uint32_t>(std::strtoul(c1 + 1, nullptr, 0));
+        std::FILE *fp = std::fopen(path, "wb");
+        if (fp == nullptr)
+        {
+            std::fprintf(stderr, "[ramdump] cannot open %s\n", path);
+            return false;
+        }
+        std::vector<uint8_t> bytes(len);
+        for (uint32_t i = 0u; i < len; ++i)
+            bytes[i] = runtime->Load8(rdram, ctx, (addr + i) & 0x01FFFFFFu);
+        std::fwrite(bytes.data(), 1u, bytes.size(), fp);
+        std::fclose(fp);
+        std::fprintf(stderr, "[ramdump] scene-start 0x%08X..0x%08X -> %s\n", addr, addr + len, path);
+        return true;
+    }
+
+    // TOL_DUMP_RAM="addr,len,C:\path\dump_%u.bin[,intervalMs]": periodic guest-RAM snapshots, so the port's heap
+    // can be diffed against the reference emulator's at the same milestone instead of compared field by field.
+    void dumpRamIfDue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const char *const spec = std::getenv("TOL_DUMP_RAM");
+        if (spec == nullptr)
+        {
+            return;
+        }
+        static bool parsed = false;
+        static uint32_t addr = 0u, len = 0u, intervalMs = 30000u, index = 0u;
+        static char pathTemplate[512] = {};
+        static uint64_t last = 0u;
+        if (!parsed)
+        {
+            parsed = true;
+            const char *c1 = std::strchr(spec, ',');
+            const char *c2 = c1 != nullptr ? std::strchr(c1 + 1, ',') : nullptr;
+            if (c1 == nullptr || c2 == nullptr)
+            {
+                std::fprintf(stderr, "[ramdump] bad TOL_DUMP_RAM (want addr,len,path[,ms])\n");
+                return;
+            }
+            addr = static_cast<uint32_t>(std::strtoul(spec, nullptr, 0));
+            len = static_cast<uint32_t>(std::strtoul(c1 + 1, nullptr, 0));
+            const char *p = c2 + 1;
+            const char *c3 = std::strrchr(p, ',');
+            if (c3 != nullptr)
+            {
+                intervalMs = static_cast<uint32_t>(std::strtoul(c3 + 1, nullptr, 0));
+                std::snprintf(pathTemplate, sizeof(pathTemplate), "%.*s", static_cast<int>(c3 - p), p);
+            }
+            else
+            {
+                std::snprintf(pathTemplate, sizeof(pathTemplate), "%s", p);
+            }
+        }
+        const uint64_t now = GetTickCount64();
+        if (last != 0u && now - last < intervalMs)
+        {
+            return;
+        }
+        last = now;
+        char path[640];
+        std::snprintf(path, sizeof(path), pathTemplate, index++);
+        if (std::FILE *fp = std::fopen(path, "wb"))
+        {
+            std::vector<uint8_t> bytes(len);
+            for (uint32_t i = 0u; i < len; ++i)
+                bytes[i] = runtime->Load8(rdram, ctx, (addr + i) & 0x01FFFFFFu);
+            std::fwrite(bytes.data(), 1u, bytes.size(), fp);
+            std::fclose(fp);
+            std::fprintf(stderr, "[ramdump] 0x%08X..0x%08X -> %s\n", addr, addr + len, path);
+        }
+    }
+
     void orderDispAProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         orderEvent("dispA", ctx);
+        dumpRamIfDue(rdram, ctx, runtime);
         // 0x152200 is the switch-in: it reads the selector triple (0x3DB1A0 * 0x3DB1B0 + 0x3DB1C0) to pick the
         // context slot, then calls TCB+0x1B4. Logging the triple and the chosen TCB names the dispatch choice,
         // and shows whether the loader thread (TCB 0x4079A0, parked at 0x3661DC) is ever selected.
@@ -3257,6 +3341,21 @@ namespace
         ++sCalls;
         if (sEnv && (sCalls <= 10u || (sCalls % 100u) == 0u))
             sceneStartLog("285e80", sCalls, a0, a1, GPR_U32(ctx, 2));
+        // One-shot RAM snapshot at the scene start: the same call happens at the same point in the reference
+        // emulator, so the two dumps are directly comparable.
+        if (const char *const dumpSpec = std::getenv("TOL_DUMP_RAM_SCENE"))
+        {
+            static bool sDumped = false;
+            if (!sDumped)
+            {
+                sDumped = true;
+                char path[640];
+                std::snprintf(path, sizeof(path), "%s", std::strrchr(dumpSpec, ',') != nullptr
+                                                          ? std::strrchr(dumpSpec, ',') + 1
+                                                          : "scene_dump.bin");
+                dumpRamOnce(dumpSpec, rdram, ctx, runtime, path);
+            }
+        }
         // FUN_00285E80 receives the scene object in a0: discover its vtable and instrument its step slots.
         sceneObjectDiscovery(runtime, rdram, ctx, a0);
     }

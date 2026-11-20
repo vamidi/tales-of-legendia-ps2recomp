@@ -1120,7 +1120,9 @@ struct SdlGpuBackend::Impl {
         if (std::getenv("TOL_TRACE_GSORDER") != nullptr) {
             static uint32_t sSeq = 0u, sFills = 0u, sComps = 0u;
             const bool fill = (context.frame.fbp == 224u);
-            const bool composite = (state.prim.tme != 0) && (context.tex0.tbp0 == 7168u);
+            // Any textured draw: the display copy sources a different page per phase (224 early, 280 once the
+            // scene starts), and the title's own artwork is textured too, so logging only tbp0==7168 hid both.
+            const bool composite = (state.prim.tme != 0);
             if (fill) ++sFills;
             if (composite) ++sComps;
             if (fill || composite) {
