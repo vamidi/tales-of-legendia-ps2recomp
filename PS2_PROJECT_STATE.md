@@ -8,17 +8,17 @@
 
 ## CURRENT STATUS - updated 2026-11-25 (session 200; READ THIS FIRST, then jump to *Session 200* at the bottom)
 
-> **Session 200 (latest) - the IPU is implemented and wired; the unit-1 stall is a turn-rate problem, not a
-> deadlock.** A real MPEG-2 IPU (adapted from the Grandia port) now lives in the runtime
-> (`include/ps2_ipu.h`, `src/lib/hw/ps2_ipu.{cpp}` + `mpeg_tables.h` + `ipu_common.h`) and `ps2_memory.cpp`
-> forwards `0x10002000..0x10002030`, the `0x10007000` FIFO and DMA channels 3/4 to it, so the movie/title
-> video has a decoder waiting for it. It has not run on real data yet (the movie is behind the three logo
-> cards). Measured on the card phase: `FUN_00204240` mode 1 runs a **bounded 90-iteration yield loop** at
-> `0x20439C..0x2043F8` (same as PCSX2, same `TCB+0x1F2` status), but the port needs **~1.4 s per green-thread
-> turn** against the reference's ~16 ms, so unit 1 takes minutes instead of ~5 s (`[yield]`/`[unitwait]`
-> probes; the expensive turn is the prio-0 GS worker at `0x1F8168`, ~80 ms, backend-independent). Also
+> **Session 200 (latest) - the IPU is implemented and wired; the boot stalls in FUN_00204240's mode==1
+> tail, after the fade and after the yield wait.** A real MPEG-2 IPU (adapted from the Grandia port) now
+> lives in the runtime (`include/ps2_ipu.h`, `src/lib/hw/ps2_ipu.{cpp}` + `mpeg_tables.h` + `ipu_common.h`)
+> and `ps2_memory.cpp` forwards `0x10002000..0x10002030`, the `0x10007000` FIFO (32- and 128-bit) and DMA
+> channels 3/4 to it, so the movie/title video has a decoder waiting for it (not yet exercised: the movie is
+> behind the cards). Measured on the card phase: `FUN_00204240` mode 1 runs a bounded 90-iteration yield
+> loop at `0x20439C..0x2043F8`; the port exits it deterministically after **64** iterations (the TCB status
+> byte `+0x1F2` flips), then **stalls in the mode==1 tail** - `[fade] #2` never arrives, guest time freezes
+> at ~36.4 s with 80-91 % paceWait, while the green scheduler still rotates the other five TCBs. Also
 > retracted: `mainIters` freezing at 108 is normal (the `0x152B70` frame body is an early-boot loop that
-> exits at ~5.4 s). Full detail, file list and next measurements: *Session 200*.
+> exits at ~5.4 s). Details, probes and next steps: *Session 200* / *200.5*.
 
 
 > **Session 197 (latest) - the boot sequence is 3 logo CARDS (2D) then an MPEG-2 opening movie + video title.**
