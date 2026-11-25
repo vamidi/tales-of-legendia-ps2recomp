@@ -5838,7 +5838,9 @@ namespace
                 runtime.replaceFunction(0x0015231Cu, &yieldTraceProbe);
             }
         }
-        if (runtime.lookupFunction(0x002043F0u) != nullptr)
+        // The unit-wait probes sit on the yield loop (0x2043F0) and its exit, which run every game frame
+        // while a card waits; keep them opt-in so the shipping path pays nothing.
+        if (std::getenv("TOL_TRACE_YIELD") != nullptr && runtime.lookupFunction(0x002043F0u) != nullptr)
         {
             gUnitWaitPrev = runtime.lookupFunction(0x002043F0u);
             runtime.replaceFunction(0x002043F0u, &unitWaitResumeProbe);
@@ -5874,7 +5876,7 @@ namespace
             installTimed(0x001F7A30u, &gTimerDraw, &timedDrawProbe);
             installTimed(0x00281490u, &gTimerAsk, &timedAskProbe);
         }
-        if (runtime.lookupFunction(0x00204400u) != nullptr)
+        if (std::getenv("TOL_TRACE_YIELD") != nullptr && runtime.lookupFunction(0x00204400u) != nullptr)
         {
             gUnitExitPrev = runtime.lookupFunction(0x00204400u);
             runtime.replaceFunction(0x00204400u, &unitWaitExitProbe);
