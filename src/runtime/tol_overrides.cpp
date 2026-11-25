@@ -5674,6 +5674,32 @@ namespace
                          "[yield] #%llu ra=0x%08X sp=0x%08X wall=%.1fms guestCyc=%.1fms transfers=+%llu\n",
                          static_cast<unsigned long long>(sCalls), GPR_U32(ctx, 31), GPR_U32(ctx, 29), wallMs, cycMs,
                          static_cast<unsigned long long>(transfers - sLastTransfers));
+            // The fade thread's TCB (0x4079A0) and the green ready counts, sampled after its 64th yield:
+            // state 0 / links cleared means the run loop deleted it, a live TCB with no turns means starvation.
+            const uint32_t tcb = 0x004079A0u;
+            std::fprintf(stderr,
+                         "[gtcb] 0x4079A0 +1AC=%u +1F0=%u +1F1=%u +1F2=%u +1F3=%u links=%08X/%08X self=%08X "
+                         "ready[0..3]=%u,%u,%u,%u\n",
+                         runtime->Load32(rdram, ctx, tcb + 0x1ACu), runtime->Load8(rdram, ctx, tcb + 0x1F0u),
+                         runtime->Load8(rdram, ctx, tcb + 0x1F1u), runtime->Load8(rdram, ctx, tcb + 0x1F2u),
+                         runtime->Load8(rdram, ctx, tcb + 0x1F3u), runtime->Load32(rdram, ctx, tcb + 0x1F8u),
+                         runtime->Load32(rdram, ctx, tcb + 0x1FCu), runtime->Load32(rdram, ctx, tcb + 0x200u),
+                         runtime->Load16(rdram, ctx, 0x0048F570u), runtime->Load16(rdram, ctx, 0x0048F572u),
+                         runtime->Load16(rdram, ctx, 0x0048F574u), runtime->Load16(rdram, ctx, 0x0048F576u));
+            // Is 0x4079A0 still reachable from the run queue? Print every known TCB's state and links, so an
+            // orphaned node (some other TCB's next no longer pointing at it) is visible.
+            static const uint32_t kTcbs[6] = {0x00407160u, 0x00407370u, 0x00407580u,
+                                              0x00407790u, 0x004079A0u, 0x00407BB0u};
+            std::fprintf(stderr, "[gchain]");
+            for (uint32_t t = 0u; t < 6u; ++t)
+            {
+                std::fprintf(stderr, " %08X:st%u/p%u/n%08X/pv%08X", kTcbs[t],
+                             runtime->Load8(rdram, ctx, kTcbs[t] + 0x1F0u),
+                             runtime->Load8(rdram, ctx, kTcbs[t] + 0x1F1u),
+                             runtime->Load32(rdram, ctx, kTcbs[t] + 0x1FCu),
+                             runtime->Load32(rdram, ctx, kTcbs[t] + 0x1F8u));
+            }
+            std::fprintf(stderr, "\n");
         }
         if (gYieldTracePrev != nullptr)
         {
@@ -5694,8 +5720,22 @@ namespace
         {
             const uint32_t loader = GPR_U32(ctx, 17);
             const uint32_t mode = runtime->Load32(rdram, ctx, loader + 0x14u);
-            std::fprintf(stderr, "[unitwait] resume #%llu s0=%u loader=0x%08X mode=%u\n",
-                         static_cast<unsigned long long>(sEntries), GPR_U32(ctx, 16), loader, mode);
+            // Which green thread is this, and is it still alive? The run loop deletes a thread whose
+            // +0x1AC is zero, so the TCB fields at the last resume say whether it died or was starved.
+            const uint32_t curTcb = runtime->Load32(rdram, ctx, 0x003DB198u);
+            uint32_t tcbState = 0u, tcbAlive = 0u, tcbPrio = 0u, tcbResume = 0u;
+            if (curTcb >= 0x00407160u && curTcb + 0x210u <= 0x00407E00u)
+            {
+                tcbState = runtime->Load8(rdram, ctx, curTcb + 0x1F0u);
+                tcbPrio = runtime->Load8(rdram, ctx, curTcb + 0x1F1u);
+                tcbAlive = runtime->Load32(rdram, ctx, curTcb + 0x1ACu);
+                tcbResume = runtime->Load32(rdram, ctx, curTcb + 0x1B4u);
+            }
+            std::fprintf(stderr,
+                         "[unitwait] resume #%llu s0=%u loader=0x%08X mode=%u | tcb=0x%08X st=%u prio=%u alive=%u "
+                         "resume=0x%08X\n",
+                         static_cast<unsigned long long>(sEntries), GPR_U32(ctx, 16), loader, mode, curTcb,
+                         tcbState, tcbPrio, tcbAlive, tcbResume);
         }
         if (gUnitWaitPrev != nullptr)
         {
@@ -5818,12 +5858,93 @@ namespace
         {
             const uint32_t loader = GPR_U32(ctx, 17);
             const uint32_t mode = runtime->Load32(rdram, ctx, loader + 0x14u);
-            std::fprintf(stderr, "[unitwait] LOOP-EXIT #%llu s0=%u mode=%u\n",
-                         static_cast<unsigned long long>(sExits), GPR_U32(ctx, 16), mode);
+            const uint32_t st = runtime->Load32(rdram, ctx, loader);
+            std::fprintf(stderr, "[unitwait] TAIL-ENTRY #%llu s0=%u mode=%u obj[0]=0x%08X f20=%.3f\n",
+                         static_cast<unsigned long long>(sExits), GPR_U32(ctx, 16), mode, st,
+                         static_cast<double>(ctx->f[20]));
         }
         if (gUnitExitPrev != nullptr)
         {
             gUnitExitPrev(rdram, ctx, runtime);
+        }
+    }
+
+    // The three calls inside the fade's wait loop (0x20439C..0x2043F8): 0x1520C0 (object getter),
+    // 0x1520F0 (its status byte) and 0x153010 (the timer/flag table). Counting entry vs exit says which one
+    // the thread is stuck in when the resumptions stop at 64.
+    struct TailCallCount
+    {
+        const char *name;
+        PS2Runtime::RecompiledFunction prev;
+        unsigned long long in;
+        unsigned long long out;
+    };
+
+    static TailCallCount gTailGet = {"1520C0", nullptr, 0u, 0u};
+    static TailCallCount gTailStatus = {"1520F0", nullptr, 0u, 0u};
+    static TailCallCount gTailFlag = {"153010", nullptr, 0u, 0u};
+
+    void tailCallProbe(TailCallCount *t, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        ++t->in;
+        if (t->prev != nullptr)
+        {
+            t->prev(rdram, ctx, runtime);
+        }
+        ++t->out;
+        if (sEnv && (t->out <= 24u || (t->out % 32u) == 0u))
+        {
+            std::fprintf(stderr, "[tailcall] %s in=%llu out=%llu ret=0x%08X\n", t->name, t->in, t->out, GPR_U32(ctx, 2));
+        }
+    }
+
+    void tailGetProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        tailCallProbe(&gTailGet, rdram, ctx, runtime);
+    }
+    void tailStatusCallProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        tailCallProbe(&gTailStatus, rdram, ctx, runtime);
+    }
+    void tailFlagProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        tailCallProbe(&gTailFlag, rdram, ctx, runtime);
+    }
+
+    // The mode==1 scene-start tail (0x204438..0x2044A0) and its return. Probes on the call sites name the
+    // step that never comes back: 0x204524 is the status re-check path, 0x2044A0 the function's return.
+    PS2Runtime::RecompiledFunction gTailReturnPrev = nullptr;
+    PS2Runtime::RecompiledFunction gTailStatusPrev = nullptr;
+
+    void tailReturnProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        static uint64_t sN = 0u;
+        ++sN;
+        if (sEnv && sN <= 40u)
+        {
+            std::fprintf(stderr, "[tail] RETURN #%llu ra=0x%08X loader=0x%08X\n",
+                         static_cast<unsigned long long>(sN), GPR_U32(ctx, 31), GPR_U32(ctx, 17));
+        }
+        if (gTailReturnPrev != nullptr)
+        {
+            gTailReturnPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void tailStatusProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        static uint64_t sN = 0u;
+        ++sN;
+        if (sEnv && (sN <= 40u || (sN % 200u) == 0u))
+        {
+            std::fprintf(stderr, "[tail] STATUS-PATH #%llu\n", static_cast<unsigned long long>(sN));
+        }
+        if (gTailStatusPrev != nullptr)
+        {
+            gTailStatusPrev(rdram, ctx, runtime);
         }
     }
 
@@ -5880,6 +6001,34 @@ namespace
         {
             gUnitExitPrev = runtime.lookupFunction(0x00204400u);
             runtime.replaceFunction(0x00204400u, &unitWaitExitProbe);
+        }
+        if (std::getenv("TOL_TRACE_YIELD") != nullptr && runtime.lookupFunction(0x002044A0u) != nullptr)
+        {
+            gTailReturnPrev = runtime.lookupFunction(0x002044A0u);
+            runtime.replaceFunction(0x002044A0u, &tailReturnProbe);
+        }
+        if (std::getenv("TOL_TRACE_YIELD") != nullptr && runtime.lookupFunction(0x00204524u) != nullptr)
+        {
+            gTailStatusPrev = runtime.lookupFunction(0x00204524u);
+            runtime.replaceFunction(0x00204524u, &tailStatusProbe);
+        }
+        if (std::getenv("TOL_TRACE_YIELD") != nullptr)
+        {
+            if (PS2Runtime::RecompiledFunction f = runtime.lookupFunction(0x001520C0u))
+            {
+                gTailGet.prev = f;
+                runtime.replaceFunction(0x001520C0u, &tailGetProbe);
+            }
+            if (PS2Runtime::RecompiledFunction f = runtime.lookupFunction(0x001520F0u))
+            {
+                gTailStatus.prev = f;
+                runtime.replaceFunction(0x001520F0u, &tailStatusCallProbe);
+            }
+            if (PS2Runtime::RecompiledFunction f = runtime.lookupFunction(0x00153010u))
+            {
+                gTailFlag.prev = f;
+                runtime.replaceFunction(0x00153010u, &tailFlagProbe);
+            }
         }
     }
 

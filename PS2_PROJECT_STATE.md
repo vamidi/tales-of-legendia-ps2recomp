@@ -13248,3 +13248,81 @@ so the port is not dead -- the unit-1 tail simply never returns to the loop that
 Next session starts here: `TOL_TRACE_SCENE=1` for 150 s and read the `[scenetest]` scene-start lines,
 then follow the mode==1 tail after `0x204400` (fade-out loop at `0x204340`-`0x204390`, `gFadeCalls` must
 reach 2). The IPU work (200.1) is independent and waits for the movie phase, which is behind this tail.
+
+---
+
+## Session 201 (2026-11-25) - TRACED: the mode-1 tail at 0x204400 is NEVER entered. The fade thread (TCB 0x4079A0) is starved after its 64th yield - still alive, still queued, never dispatched again. The IPU is untouched.
+
+Answers the two questions left at the end of session 200: (a) trace the tail after `0x204400` until the
+second fade, (b) does the opening movie exercise the new IPU.
+
+### 201.1 The fade's wait loop stops being scheduled; it does not time out and does not block
+
+New probes (all `TOL_TRACE_YIELD=1`, installed in `installYieldProbes`):
+
+| probe address | what it says |
+|---|---|
+| `0x2043F0` | `[unitwait] resume` - loop head after each yield, with the current green TCB and its fields |
+| `0x204400` | `[unitwait] TAIL-ENTRY` - the mode==1 tail (scene start) is entered |
+| `0x2044A0` / `0x204524` | `[tail] RETURN` / `[tail] STATUS-PATH` |
+| `0x1520C0`, `0x1520F0`, `0x153010` | `[tailcall] in/out` - the three calls in the loop body |
+
+Measured over 150 s runs (`TOL_VU0_SEED=logs/ref199/vu0mem.bin`, `--gs=sdlgpu`):
+
+```
+resumes at 0x2043F0 : 64   (s0 = 0..63), identical in every run (90 s, 116 s, 146 s, 150 s, 180 s)
+TAIL-ENTRY at 0x204400: 0
+[tail] RETURN        : 0
+[scene] 285E80       : never (the scene start in the tail is never called)
+[fade] #2            : never  (gFadeCalls stays 1)
+[tailcall] 1520C0    : 64 in / 64 out, ret 0x004079A0   (all returned)
+[tailcall] 1520F0    : 64 in / 64 out, ret 0x00000000   (all returned; status byte still 0)
+[tailcall] 153010    : 0 calls (the mode==1 short-circuit skips it)
+```
+
+So the 65th loop iteration's body is never entered: the thread is neither running nor blocked inside a
+callee - it is simply never dispatched again. This **corrects 200.5** ("exits after 64 and stalls in the
+tail"): the tail is never reached at all.
+
+TCB identity and state (`[gtcb]`/`[gchain]` samples at every 200th yield):
+
+```
+TCB 0x4079A0 (prio 4): +1AC toggles 1/0 (alive for the run loop), +1F0=1 (ready), +1F1=4,
+                       +1F2=0, +1F3=1, +1F8(prev)=0x00407580, +1FC(next)=0x00000000
+ready list from head 0x407160: 0x407370 -> 0x407790 -> 0x407580 -> 0x4079A0 -> 0
+```
+
+The node is **not deleted and not orphaned**: it is reachable from the head, state=1 (ready), prio 4, and
+the chain of the other five TCBs is intact. The port is idle while this happens (guest work 0.3 % of
+wall, paceWait 80-91 %), and the other threads (0x407160/0x407370 at prio 0, plus 0x407790/0x407580)
+keep taking turns.
+
+### 201.2 The IPU decoder is not exercised at all
+
+150 s with `TOL_TRACE_IPU=1` and `TOL_TRACE_IPU_DMA=1`:
+
+```
+IPU_CMD writes = 0   IPU_CTRL/BP/TOP writes = 0   IPU register reads = 0
+ipu-dma starts = 0   IPU command log = 0
+only movie-related line: [Deci2Call:kputs] DVCI: "\AFS\MOVIE.AFS" found.   (boot-time AFS index)
+```
+
+So the decoder added in session 200 has not run: the opening movie is behind the unit-1 tail, and the
+tail never runs. Gate B therefore remains *unverified* (not failed - unexercised).
+
+### 201.3 Next step: why does the guest run loop stop selecting 0x4079A0?
+
+The green run loop resumes a thread from a context block at `0x49F590` indexed by `*(0x3EB1A0)` with
+stride `*(0x3EB1B0)` and offset `*(0x3EB1C0)` (see `FUN_0015231C`), and the current thread is named at
+`0x3DB198`. The exact signature observed here - a live, ready, queued TCB that is never dispatched again -
+is what two TCBs sharing one context slot would produce (the second one always resumes the first one's
+`saved $ra` and the first never comes back).
+
+Next measurement (single): at every yield, log `idx=*(0x3EB1A0)`, `stride=*(0x3EB1B0)`,
+`off=*(0x3EB1C0)`, `cur=*(0x3DB198)`, and the resolved context pointer
+`0x49F590 + idx + off`, for 0x4079A0 and for the two prio-0 workers in the same window; a repeated
+context pointer for different TCBs names the collision. Also print `ready[4..7]` (only `ready[0..3]`
+was sampled: it reads `2,0,0,0`), to check the prio-4 ready count against the three queued prio-4 TCBs.
+
+Tooling in this session: the probes above (all inert without `TOL_TRACE_YIELD`), no runtime behaviour
+change.
