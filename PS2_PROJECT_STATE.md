@@ -13348,3 +13348,89 @@ Status of gate B: **implemented, wired, self-tested, not yet fed real video**.
 
 Tooling in this session: the probes above plus `TOL_IPU_SELFTEST` (all inert without their env var), no
 runtime behaviour change.
+---
+
+## Session 202 (2026-11-25) - SCHEDULER DECODED IN GHIDRA + REFERENCE COMPARED: the port's fade wait loop stops after 64 clean iterations (status 0, s0 clean) although the reference runs all 90; the tail therefore never runs and the IPU is never fed. Session 201's "tail never entered" was measured with blind probes and is withdrawn.
+
+### 202.1 The green scheduler, from Ghidra (FUN_00151e90 family)
+
+| address | what it does |
+|---|---|
+| `FUN_00151e90` + `0x151f60..0x151fa8` | dispatcher: walks the ready list (head `gp-0x5C` = `0x3DB194`, links `TCB+0x1FC`); runs a TCB only if `state(+0x1F0)==1 && prio(+0x1F1)==arg`; slot `*(0x48F750 + level*0x1D0)` = running TCB |
+| `0x151f6c..0x151fb0` | first entry uses the `+0x1F3` latch and calls the body at `TCB+0x1B0`; later passes go `save(0x15243c) -> svcA(0x152200) -> svcB(0x15253c)` then `if (TCB+0x1AC == 0) delete` |
+| `FUN_00152200` | `TCB+0x1A8 = its $ra` (dispatcher continuation `0x151F88`), **clears `TCB+0x1AC`**, restores the thread's registers from the TCB, jumps into the thread |
+| `FUN_0015231C` (yield) | saves the registers into the running TCB, sets `TCB+0x1AC = 1`, `TCB+0x1B4 = $ra`, then `jr TCB+0x1A8` |
+| `FUN_001517c0` | `next = TCB ? *(TCB+0x1FC) : head` |
+
+So `+0x1AC` = "yielded and alive", `+0x1B4` = resume pc, `+0x1A8` = continuation, `+0x1F2` = the status byte
+`func_1520F0` returns, `+0x1F3` = started latch. This is a plain coroutine round-robin; nothing in it
+deletes or skips a yielding thread.
+
+### 202.2 Port probes (new this session, all `TOL_TRACE_YIELD`)
+
+| probe | measured |
+|---|---|
+| `[ctxmap]` | one context slot (`0x48F920`) for all switches, holding the runner's TCB; no cross-thread collision (the COLLISION lines are two call sites of the *same* thread) |
+| `[switch] save/svcA/svcB` | every switch prints running TCB, `+0x1A8` (= `0x151F88` for all, as designed), `+0x1B4`, `+0x1AC`; TCB `0x4079A0` is selected **286 times** and is `alive=1` after every yield -> **not deleted, not starved** |
+| `[dispatch]` | dispatcher called at prio 0/1/4/6/7/8/9; at prio 4 the walk `0x407160->0x407370->0x407790->0x407580->0x4079A0->0` reaches the fade TCB while it is `st1 p4` |
+| `[unitwait] resume` | **64** entries at `0x2043F0`, identical in every run; at all 64 the status byte `+0x1F2` is **0**, the mode word (`+0x14`) is exactly **1**, and `$s0` lanes are clean (`0x0000003F`, upper lanes 0) with `sltiu64 = 1` |
+| `[tailcall]` | loop body `0x1520C0` 64 in/64 out, `0x1520F0` 64 in/64 out, `0x153010` 0 calls |
+| `[mode]` | mode word at `0x63D890+0x14`: 0 -> junk -> 0 -> **1**, then constant |
+| `[scene]` (now prints `$ra`) | `232190` only from `ra=0x1ED574`, `2321b0` only from `0x231FDC`; **`285e80` never called** |
+
+So the loop does not exit through any of its three observable exits (status==1, the `0x153010` flag, or
+`s0 >= 90`), yet it stops. The backward edge at `0x2043F8` is emitted as
+
+```c
+if (branch_taken_0x2043f8) { ctx->pc = 0x20439Cu; if (runtime->eeCheckpointDue()) return; goto label_20439c; }
+```
+
+i.e. a preemption there parks the thread at **`0x20439C`** (the `jal func_1520C0`), and the resume never
+happens. `TOL_TRACE_PARK=1` prints **no `[park]`** and no `[badpc]` for that pc (only the pre-existing
+`0x35` badpc), so the park is silent. **That is the leading hypothesis and the next probe**: trace the
+resume of pc = `0x20439C` (checkpoint park -> activation recycle, the session-154 class).
+
+Note `0x20439C` is the *correct* branch target: base is `PC+4 = 0x2043FC`, `0x2043FC - 0x60 = 0x20439C`
+(an earlier reading of mine that suspected the emitter here was wrong).
+
+### 202.3 Reference comparison (new tool: `tools/ref_tail.py`)
+
+PCSX2 is not limited to dispatchable addresses, so it can break on the tail's branch-reached call sites.
+Breakpoints `0x204444` (scene-start arm), `0x204460` (join point used by the other arm), `0x2044A0`
+(return), fresh `-fastboot` boot:
+
+```
+t= 3.97 SCENE-START f20=-8.05e-07 s1=0x0063D890 mode=1 s0=90
+t= 3.98 TEARDOWN    f20=-8.05e-07 mode=1 s0=90
+t= 4.01 RETURN      f20=-8.05e-07 mode=1 s0=90
+t= 8.92 TEARDOWN    f20=-8.05e-07 mode=2 s0=90
+t=13.97 TEARDOWN    f20=-8.05e-07 mode=3 s0=90
+```
+
+Three facts, all measured:
+
+1. the reference's wait loop **always runs the full 90 iterations** (the tail is entered with `s0 = 90`,
+   i.e. via the `sltiu` fall-through, never via the status branch);
+2. at the tail `f20 ~ 0` (the fade has already been faded out by the loop, not 1.0);
+3. the scene-start arm (`0x204444` -> `FUN_00285E80`) runs **only when mode == 1**; modes 2 and 3 join at
+   `0x204460` and skip it.
+
+The port matches (2) and (3) structurally but never gets there: it stalls at iteration 64 with a clean
+state, so the scene start never runs, `FUN_00204240` returns to the app job, no second fade occurs, the
+movie never starts, and the IPU is never fed (0 register accesses, 0 DMA starts, 0 commands - session 201).
+
+### 202.4 Methodological corrections (must be kept)
+
+- **`replaceFunction` hooks only fire on dispatches.** Addresses reached by branch/fall-through inside a
+  row (`0x204400`, `0x2044A0`, `0x151F90`) never dispatch, so hooks there are blind. Session 201's
+  "TAIL-ENTRY = 0 / tail never entered" is therefore **withdrawn**; it measured nothing.
+- **Never hook a continuation** (`0x151F88`, `TCB+0x1A8`): replacing it desynchronises the coroutine
+  round-robin (measured: 566k garbage hits, `resumes=0`, scheduler wedged). Removed.
+- For "did this code run", hook the *callees* (`0x1520C0`, `0x1520F0`, `0x285E80`) or log `$ra` at them.
+
+### 202.5 Next step (single)
+
+Trace the resume of `pc = 0x20439C` after the 64th backward edge: whether the runtime recorded the park,
+which activation/return point it belongs to, and why nothing ever dispatches it again. Everything else in
+the unit-1 chain (dispatcher priority, list order, TCB links, alive flag, mode, status) is measured and
+clean, so this is the one remaining discontinuity between the port and the reference's 90-iteration loop.

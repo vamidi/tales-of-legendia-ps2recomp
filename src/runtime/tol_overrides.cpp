@@ -970,8 +970,8 @@ namespace
         ps2_syscalls::SifCallRpc(rdram, ctx, runtime);
     }
 
-    // The PS2 ABI passes the eighth argument of sceSifCallRpc â€” the SIF RPC end
-    // function â€” in $t3, with the end parameter as the first stack word. This
+    // The PS2 ABI passes the eighth argument of sceSifCallRpc ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the SIF RPC end
+    // function ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â in $t3, with the end parameter as the first stack word. This
     // replacement answers the RPC inline (gameFileRead, loadfile, IxAudio, ...),
     // so the normal libsif reply path never runs and that end function would be
     // dropped. Completion-driven callers depend on it: libcdvd's async read
@@ -1852,7 +1852,7 @@ namespace
     // ---------------------------------------------------------------------------------------------------------
     // CRI I/O LATENCY (TOL_CRI_IO_LATENCY=1) - diagnostic.
     //
-    // FUN_00197940 pumps as `FUN_0019f468(); â€¦ FUN_0019f468(); FUN_001973a8();` and the tick FUN_001973a8 (which
+    // FUN_00197940 pumps as `FUN_0019f468(); ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ FUN_0019f468(); FUN_001973a8();` and the tick FUN_001973a8 (which
     // credits the DVCI handle) therefore samples the ADXF stream AFTER two stream pumps. Our file RPCs complete
     // synchronously, so a read goes 2 (reading) -> 3 (done) -> 2 (next read armed) inside one cycle and the tick
     // almost never observes 3: measured 1 observation in 148k polls, which is why the 430-entry AFS table freezes at
@@ -2221,7 +2221,7 @@ namespace
     // This wrapper reports the REAL status and, while the descriptor is still pending, runs the guest
     // scheduler (FUN_00151FF0) so worker 2 and the transfer handler make progress. Guest code stays in charge;
     // if the scheduler is preempted we keep its resume PC and return without fabricating a status.
-    constexpr uint32_t kStatusThunkPc = 0x001F7310u; // thunk_FUN_001f8480 â€” what FUN_001660A0 calls
+    constexpr uint32_t kStatusThunkPc = 0x001F7310u; // thunk_FUN_001f8480 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â what FUN_001660A0 calls
     constexpr uint32_t kStatusRealPc = 0x001F8480u;  // the status function itself
     constexpr uint32_t kSchedEntryPc = 0x00151FF0u;  // guest scheduler entry
     PS2Runtime::RecompiledFunction gStatusThunkPrev = nullptr;
@@ -3292,9 +3292,9 @@ namespace
     //     FUN_00232190(...); FUN_00285E80(...); FUN_002321B0(x, 1);
     // Everything above it is verified correct (app job one-shot, fade completes, scheduler fair, presenter 1 %), so
     // this is where "nothing is drawn" must be decided: do these run at all, and what do they return?
-    void sceneStartLog(const char *tag, uint32_t n, uint32_t a0, uint32_t a1, uint32_t ret)
+    void sceneStartLog(const char *tag, uint32_t n, uint32_t a0, uint32_t a1, uint32_t ret, uint32_t ra)
     {
-        std::fprintf(stderr, "[scene] %s #%u a0=0x%08X a1=0x%08X ret=0x%08X\n", tag, n, a0, a1, ret);
+        std::fprintf(stderr, "[scene] %s #%u a0=0x%08X a1=0x%08X ret=0x%08X ra=0x%08X\n", tag, n, a0, a1, ret, ra);
     }
 
     // The scene object handed to FUN_00285E80 (0x5AA170) is built by the now-verified scene start. Reading its
@@ -3454,7 +3454,7 @@ namespace
         static uint32_t sCalls = 0u;
         ++sCalls;
         if (sEnv && (sCalls <= 10u || (sCalls % 100u) == 0u))
-            sceneStartLog("232190", sCalls, a0, a1, GPR_U32(ctx, 2));
+            sceneStartLog("232190", sCalls, a0, a1, GPR_U32(ctx, 2), GPR_U32(ctx, 31));
     }
 
     void sceneBProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -3469,7 +3469,7 @@ namespace
         static uint32_t sCalls = 0u;
         ++sCalls;
         if (sEnv && (sCalls <= 10u || (sCalls % 100u) == 0u))
-            sceneStartLog("285e80", sCalls, a0, a1, GPR_U32(ctx, 2));
+            sceneStartLog("285e80", sCalls, a0, a1, GPR_U32(ctx, 2), GPR_U32(ctx, 31));
         // One-shot RAM snapshot at the scene start: the same call happens at the same point in the reference
         // emulator, so the two dumps are directly comparable.
         if (const char *const dumpSpec = std::getenv("TOL_DUMP_RAM_SCENE"))
@@ -3501,7 +3501,7 @@ namespace
         static uint32_t sCalls = 0u;
         ++sCalls;
         if (sEnv && (sCalls <= 10u || (sCalls % 100u) == 0u))
-            sceneStartLog("2321b0", sCalls, a0, a1, GPR_U32(ctx, 2));
+            sceneStartLog("2321b0", sCalls, a0, a1, GPR_U32(ctx, 2), GPR_U32(ctx, 31));
     }
 
     // Timestamps manager teardowns so the create -> clear order for global 0x3DB31C is visible.
@@ -5650,11 +5650,70 @@ namespace
     // call site of every switch. Env: TOL_TRACE_YIELD.
     PS2Runtime::RecompiledFunction gYieldTracePrev = nullptr;
 
+    // Thread -> context-block map. Every yield saves the caller's registers into the block
+    // *(0x48F590 + idx*stride + off) and then jr's to that block's saved +0x1A8, so the (caller $ra, idx,
+    // block) triple identifies "which thread uses which context". Printing only when a triple is NEW, and
+    // flagging when an already-seen $ra resolves to a DIFFERENT block, catches both a collision (two $ras,
+    // one block) and a slot migration (one $ra, two blocks).
+    void ctxMapSample(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        if (!sEnv)
+            return;
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const uint32_t idx = runtime->Load32(rdram, ctx, 0x003DB1A0u);
+        const uint32_t stride = runtime->Load32(rdram, ctx, 0x003DB1B0u);
+        const uint32_t off = runtime->Load32(rdram, ctx, 0x003DB1C0u);
+        const uint32_t cur = runtime->Load32(rdram, ctx, 0x003DB198u);
+        const uint32_t slotAddr = 0x0048F590u + idx * stride + off;
+        uint32_t ptr = 0u;
+        if (slotAddr + 4u < PS2_RAM_SIZE)
+            ptr = runtime->Load32(rdram, ctx, slotAddr);
+        static uint32_t sRa[16] = {}, sIdx[16] = {}, sPtr[16] = {};
+        static int sN = 0;
+        for (int i = 0; i < sN; ++i)
+        {
+            if (sRa[i] == ra)
+            {
+                if (sPtr[i] != ptr || sIdx[i] != idx)
+                {
+                    std::fprintf(stderr,
+                                 "[ctxmap] MOVE  ra=0x%08X idx %u->%u ptr 0x%08X->0x%08X curTcb=0x%08X off=0x%X\n", ra,
+                                 sIdx[i], idx, sPtr[i], ptr, cur, off);
+                    sIdx[i] = idx;
+                    sPtr[i] = ptr;
+                }
+                return;
+            }
+        }
+        if (sN < 16)
+        {
+            sRa[sN] = ra;
+            sIdx[sN] = idx;
+            sPtr[sN] = ptr;
+            ++sN;
+            std::fprintf(stderr, "[ctxmap] NEW   ra=0x%08X idx=%u stride=0x%X off=0x%X slot=0x%08X ptr=0x%08X curTcb=0x%08X\n",
+                         ra, idx, stride, off, slotAddr, ptr, cur);
+            // Two different callers on one block: name it immediately.
+            for (int i = 0; i < sN - 1; ++i)
+            {
+                if (sPtr[i] == ptr && sRa[i] != ra)
+                    std::fprintf(stderr, "[ctxmap] COLLISION ra=0x%08X and ra=0x%08X share block 0x%08X\n", sRa[i], ra,
+                                 ptr);
+            }
+        }
+    }
+
+    void modeChangeSample(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx);
+
     void yieldTraceProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
         static uint64_t sCalls = 0u;
         ++sCalls;
+        // Every switch, not just the sampled ones: the collapse we are chasing happens at a specific yield.
+        ctxMapSample(runtime, rdram, ctx);
+        modeChangeSample(runtime, rdram, ctx);
         if (sEnv && (sCalls <= 60u || (sCalls % 200u) == 0u))
         {
             // Cost of the turn that just ended: wall, emulated EE cycles and guest transfers since the
@@ -5674,8 +5733,12 @@ namespace
                          "[yield] #%llu ra=0x%08X sp=0x%08X wall=%.1fms guestCyc=%.1fms transfers=+%llu\n",
                          static_cast<unsigned long long>(sCalls), GPR_U32(ctx, 31), GPR_U32(ctx, 29), wallMs, cycMs,
                          static_cast<unsigned long long>(transfers - sLastTransfers));
-            // The fade thread's TCB (0x4079A0) and the green ready counts, sampled after its 64th yield:
-            // state 0 / links cleared means the run loop deleted it, a live TCB with no turns means starvation.
+            // The switch target: FUN_0015231C saves the current registers into the context block at
+            // *(0x48F590 + idx*stride + off) (Ghidra: puVar1 = *(u32**)(iVar2 + 0x48f590 + iRam003db1c0),
+            // iVar2 = *(0x3db1a0) * *(0x3db1b0)) and then jr's to that block's +0x1A8. Two threads that
+            // resolve to the same block resume each other's $ra forever, which is exactly the observed
+            // signature (a live, ready thread that is never dispatched again).
+            ctxMapSample(runtime, rdram, ctx);
             const uint32_t tcb = 0x004079A0u;
             std::fprintf(stderr,
                          "[gtcb] 0x4079A0 +1AC=%u +1F0=%u +1F1=%u +1F2=%u +1F3=%u links=%08X/%08X self=%08X "
@@ -5731,11 +5794,17 @@ namespace
                 tcbAlive = runtime->Load32(rdram, ctx, curTcb + 0x1ACu);
                 tcbResume = runtime->Load32(rdram, ctx, curTcb + 0x1B4u);
             }
+            // Full 128-bit $s0: the loop's exit test is `sltiu $v0,$s0,0x5A` on the 64-bit register, so a
+            // stale upper lane would make the compare false at s0 = 64 and leave the loop early.
+            uint32_t lanes[4] = {0u, 0u, 0u, 0u};
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(lanes), ctx->r[16]);
+            const uint64_t s0u64 = (static_cast<uint64_t>(lanes[1]) << 32) | lanes[0];
             std::fprintf(stderr,
-                         "[unitwait] resume #%llu s0=%u loader=0x%08X mode=%u | tcb=0x%08X st=%u prio=%u alive=%u "
-                         "resume=0x%08X\n",
-                         static_cast<unsigned long long>(sEntries), GPR_U32(ctx, 16), loader, mode, curTcb,
-                         tcbState, tcbPrio, tcbAlive, tcbResume);
+                         "[unitwait] resume #%llu s0=%u lanes=%08X,%08X,%08X,%08X sltiu64=%u loader=0x%08X mode=%u "
+                         "status=%u | tcb=0x%08X st=%u prio=%u alive=%u resume=0x%08X\n",
+                         static_cast<unsigned long long>(sEntries), GPR_U32(ctx, 16), lanes[0], lanes[1], lanes[2],
+                         lanes[3], static_cast<unsigned>(s0u64 < 90u), loader, mode,
+                         runtime->Load8(rdram, ctx, 0x00407B92u), curTcb, tcbState, tcbPrio, tcbAlive, tcbResume);
         }
         if (gUnitWaitPrev != nullptr)
         {
@@ -5948,6 +6017,180 @@ namespace
         }
     }
 
+    // The green dispatcher is FUN_00151e90, entered through FUN_00151ff0(priority); it walks the ready list
+    // (head at gp-0x5C, links at TCB+0x1FC) and runs only TCBs whose +0x1F1 equals that priority. Logging
+    // the priority plus the list state per call says whether the level is still serviced when a thread
+    // stops getting turns (starved inside a serviced level) or the level itself is no longer requested.
+    PS2Runtime::RecompiledFunction gGreenDispatchPrev = nullptr;
+
+    void dispatchProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        static uint64_t sCalls = 0u;
+        ++sCalls;
+        const uint32_t prio = GPR_U32(ctx, 4);
+        if (sEnv && (sCalls <= 40u || (sCalls % 200u) == 0u))
+        {
+            std::fprintf(stderr, "[dispatch] #%llu prio=%u head=0x%08X", static_cast<unsigned long long>(sCalls),
+                         prio, runtime->Load32(rdram, ctx, 0x003DB194u));
+            static const uint32_t kTcbs[6] = {0x00407160u, 0x00407370u, 0x00407580u,
+                                              0x00407790u, 0x004079A0u, 0x00407BB0u};
+            for (uint32_t t = 0u; t < 6u; ++t)
+            {
+                std::fprintf(stderr, " | %08X st%u p%u n%08X", kTcbs[t],
+                             runtime->Load8(rdram, ctx, kTcbs[t] + 0x1F0u),
+                             runtime->Load8(rdram, ctx, kTcbs[t] + 0x1F1u),
+                             runtime->Load32(rdram, ctx, kTcbs[t] + 0x1FCu));
+            }
+            // Walk the queue the way FUN_00151e90 does (head, then +0x1FC), to see exactly which TCBs the
+            // dispatcher will visit on this pass.
+            std::fprintf(stderr, " walk=");
+            uint32_t node = runtime->Load32(rdram, ctx, 0x003DB194u);
+            for (int g = 0; g < 10 && node >= 0x00407160u && node + 0x210u <= 0x00407E00u; ++g)
+            {
+                std::fprintf(stderr, "%08X->", node);
+                node = runtime->Load32(rdram, ctx, node + 0x1FCu);
+            }
+            std::fprintf(stderr, "%08X\n", node);
+        }
+        if (gGreenDispatchPrev != nullptr)
+        {
+            gGreenDispatchPrev(rdram, ctx, runtime);
+        }
+    }
+
+    // FUN_00151e90 runs a thread's body only on its first pass (+0x1F3 latch); afterwards it goes through
+    // FUN_0015243c (save), FUN_00152200 and FUN_0015253c (restore/jump). Those three decide which thread
+    // actually executes, so log the TCB the dispatcher stored in the running slot
+    // (0x48F750 + level*0x1D0) plus that TCB's saved resume pc and $ra at each pass.
+    PS2Runtime::RecompiledFunction gSvcAPrev = nullptr;
+    PS2Runtime::RecompiledFunction gSvcBPrev = nullptr;
+    PS2Runtime::RecompiledFunction gSaveCtxPrev = nullptr;
+
+    void switchServiceProbe(const char *tag, PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx,
+                            PS2Runtime::RecompiledFunction prev)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        static uint64_t sCalls[3] = {0u, 0u, 0u};
+        const int which = tag[3] == 'A' ? 0 : tag[3] == 'B' ? 1 : 2;
+        ++sCalls[which];
+        const uint32_t idx = runtime->Load32(rdram, ctx, 0x003DB1A0u);
+        const uint32_t stride = runtime->Load32(rdram, ctx, 0x003DB1B0u);
+        const uint32_t slot = 0x0048F750u + idx * stride;
+        const uint32_t run = (slot + 4u < PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, slot) : 0u;
+        uint32_t resume = 0u, savedRa = 0u, alive = 0u;
+        if (run >= 0x00407160u && run + 0x210u <= 0x00407E00u)
+        {
+            resume = runtime->Load32(rdram, ctx, run + 0x1A8u);
+            savedRa = runtime->Load32(rdram, ctx, run + 0x1B4u);
+            alive = runtime->Load32(rdram, ctx, run + 0x1ACu);
+        }
+        if (sEnv && (sCalls[which] <= 24u || (sCalls[which] % 200u) == 0u))
+        {
+            std::fprintf(stderr, "[switch] %s #%llu idx=%u run=0x%08X resume18=0x%08X ra1B4=0x%08X alive=%u\n", tag,
+                         static_cast<unsigned long long>(sCalls[which]), idx, run, resume, savedRa, alive);
+        }
+        // Two events are decisive and must not be sampled away: this thread being selected at all, and any
+        // thread reaching the post-switch check with its alive word cleared (the dispatcher deletes those).
+        if (sEnv)
+        {
+            static uint64_t sNotable = 0u;
+            const bool isFade = (run == 0x004079A0u);
+            const bool isDead = (alive == 0u && run >= 0x00407160u && run + 0x210u <= 0x00407E00u);
+            if ((isFade || isDead) && sNotable < 300u)
+            {
+                ++sNotable;
+                std::fprintf(stderr, "[switch] %s NOTABLE %s run=0x%08X alive=%u resume=0x%08X saved=0x%08X\n", tag,
+                             isFade ? "fade-selected" : "alive=0", run, alive, resume, savedRa);
+            }
+        }
+        if (prev != nullptr)
+        {
+            prev(rdram, ctx, runtime);
+        }
+    }
+
+    void svcAProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        switchServiceProbe("svcA", runtime, rdram, ctx, gSvcAPrev);
+    }
+    void svcBProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        switchServiceProbe("svcB", runtime, rdram, ctx, gSvcBPrev);
+    }
+    void saveCtxProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        switchServiceProbe("save", runtime, rdram, ctx, gSaveCtxPrev);
+    }
+
+    // The dispatcher's post-switch decision (Ghidra, FUN_00151e90 @0x151f88..0x151fa4):
+    //   jal 0x15253c        ; restore dispatcher context
+    //   lw  v0, 0x1AC(s0)   ; alive?
+    //   bne v0, zero, next  ; alive -> continue the walk
+    //   jal 0x151cf0        ; NOT alive -> DELETE this thread
+    // So entering 0x151F90 with s0 = the TCB and +0x1AC == 0 means the thread is being deleted. Log every
+    // pass with the TCB and the flag; that names the exact thread and moment of a deletion.
+    PS2Runtime::RecompiledFunction gAliveCheckPrev = nullptr;
+
+    void aliveCheckProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        static uint64_t sCalls = 0u;
+        ++sCalls;
+        const uint32_t tcb = GPR_U32(ctx, 16);
+        const uint32_t alive = (tcb + 0x210u <= PS2_RAM_SIZE) ? runtime->Load32(rdram, ctx, tcb + 0x1ACu) : 0xFFFFFFFFu;
+        if (sEnv && (sCalls <= 40u || alive == 0u || (sCalls % 200u) == 0u))
+        {
+            std::fprintf(stderr, "[alive] #%llu tcb=0x%08X alive=%u%s\n", static_cast<unsigned long long>(sCalls), tcb,
+                         alive, alive == 0u ? "  <== DELETE" : "");
+        }
+        if (gAliveCheckPrev != nullptr)
+        {
+            gAliveCheckPrev(rdram, ctx, runtime);
+        }
+    }
+
+    // The unit mode lives at loader+0x14 (0x63D890). The mode==1 tail calls the scene start (FUN_00285E80)
+    // only while it is still 1; the other arm (0x204460) skips straight to teardown and returns. Log every
+    // change so the moment the unit advances (or the app job advances it early) is visible.
+    void modeChangeSample(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        if (!sEnv)
+            return;
+        static uint32_t sMode = 0xFFFFFFFFu;
+        static uint64_t sChanges = 0u;
+        const uint32_t mode = runtime->Load32(rdram, ctx, 0x0063D894u);
+        if (mode != sMode)
+        {
+            sMode = mode;
+            ++sChanges;
+            std::fprintf(stderr, "[mode] -> %u (change #%llu) at ra=0x%08X\n", mode,
+                         static_cast<unsigned long long>(sChanges), GPR_U32(ctx, 31));
+        }
+    }
+
+    // FUN_00164B90 + func_153300 are the mode!=1 teardown arm of the tail; the scene start is FUN_00285E80.
+    // Seeing these fire without 285E80 proves which arm ran.
+    PS2Runtime::RecompiledFunction gTeardownPrev = nullptr;
+
+    void teardownProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        static uint64_t sN = 0u;
+        ++sN;
+        if (sEnv && sN <= 20u)
+        {
+            std::fprintf(stderr, "[tailpath] 0x164B90 (mode!=1 teardown) #%llu a0=0x%08X mode=%u\n",
+                         static_cast<unsigned long long>(sN), GPR_U32(ctx, 4),
+                         runtime->Load32(rdram, ctx, 0x0063D894u));
+        }
+        if (gTeardownPrev != nullptr)
+        {
+            gTeardownPrev(rdram, ctx, runtime);
+        }
+    }
+
     void installYieldProbes(PS2Runtime &runtime)
     {
         // TOL_TRACE_ORDER's orderYieldProbe owns 0x15231C when it is on; do not steal the slot from it.
@@ -6011,6 +6254,36 @@ namespace
         {
             gTailStatusPrev = runtime.lookupFunction(0x00204524u);
             runtime.replaceFunction(0x00204524u, &tailStatusProbe);
+        }
+        if (std::getenv("TOL_TRACE_YIELD") != nullptr)
+        {
+            if (PS2Runtime::RecompiledFunction f = runtime.lookupFunction(0x00151FF0u))
+            {
+                gGreenDispatchPrev = f;
+                runtime.replaceFunction(0x00151FF0u, &dispatchProbe);
+            }
+        }
+        {
+            if (PS2Runtime::RecompiledFunction f = runtime.lookupFunction(0x00164B90u))
+            {
+                gTeardownPrev = f;
+                runtime.replaceFunction(0x00164B90u, &teardownProbe);
+            }
+            if (PS2Runtime::RecompiledFunction f = runtime.lookupFunction(0x0015243Cu))
+            {
+                gSaveCtxPrev = f;
+                runtime.replaceFunction(0x0015243Cu, &saveCtxProbe);
+            }
+            if (PS2Runtime::RecompiledFunction f = runtime.lookupFunction(0x00152200u))
+            {
+                gSvcAPrev = f;
+                runtime.replaceFunction(0x00152200u, &svcAProbe);
+            }
+            if (PS2Runtime::RecompiledFunction f = runtime.lookupFunction(0x0015253Cu))
+            {
+                gSvcBPrev = f;
+                runtime.replaceFunction(0x0015253Cu, &svcBProbe);
+            }
         }
         if (std::getenv("TOL_TRACE_YIELD") != nullptr)
         {
@@ -10402,7 +10675,7 @@ namespace tol
         installChildStepEntryFix(runtime);
         installXferProbes(runtime);
         // installXferStartFix is deliberately NOT called: wrapping 0x00196DB0 perturbs the submit path
-        // (41 submits -> 2) even when the wrapper only observes. See HANDOFF Â§0o.
+        // (41 submits -> 2) even when the wrapper only observes. See HANDOFF Ãƒâ€šÃ‚Â§0o.
         installDrainProbe(runtime);
         installFrameStartFix(runtime);
         installSpinRelease(runtime);
