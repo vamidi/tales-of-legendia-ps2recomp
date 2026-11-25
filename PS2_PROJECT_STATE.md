@@ -13225,3 +13225,26 @@ wrong: the frame body is an early-boot loop that finishes by design.
 Tooling added this session: `tools/ref_unit_wait.py` (PCSX2 side of the unit-1 wait), and the env-gated
 probes `TOL_TRACE_YIELD` (`[yield]`, `[unitwait]`), `TOL_TRACE_GSSTATUS` (`[gsstatus]`, `[gsflush]`,
 `[proctime]`), `TOL_TRACE_IPU_DMA` � all inert unless set.
+
+### 200.5 Where the stall actually is (correction to 200.2)
+
+Ran the wait loop long enough to settle it (`TOL_TRACE_YIELD=1`, `--gs=sdlgpu`, 180 s):
+
+```
+resumes at 0x2043F0: 64 (s0 = 0..63)   exits at 0x204400: 0 logged
+same 64 resumes in a 90 s run and in a 180 s run -> deterministic, not a timeout
+guest time frozen at ~36.4 s; paceWait 80-91 % of wall; guest work 0.3 % of wall
+[fade] #1 (mode 1) enters and exits; [fade] #2 (mode 2) never arrives
+```
+
+So the 90-iteration limit is **not** what ends the loop: `func_1520F0()` returns 1 (the TCB status byte
+`+0x1F2` flips) after 64 iterations and the loop falls through to `0x204400` in both runs. The stall is
+therefore **after the wait, in FUN_00204240's mode==1 tail** (the scene-start sequence that session 158
+measured: `FUN_00285E80(a0=0x5AA170, a1=4, a2=0xE0)`, then the four idle entities, then the next unit),
+not in the loader wait itself and not in the fade. The green scheduler still rotates the other five TCBs
+(`[gthreads]`: worker1 0x1F8168, worker2 0x1F8528, 0x2DF7F4, loader job 0x164FCC, unit loop 0x2047D0),
+so the port is not dead -- the unit-1 tail simply never returns to the loop that would start unit 2.
+
+Next session starts here: `TOL_TRACE_SCENE=1` for 150 s and read the `[scenetest]` scene-start lines,
+then follow the mode==1 tail after `0x204400` (fade-out loop at `0x204340`-`0x204390`, `gFadeCalls` must
+reach 2). The IPU work (200.1) is independent and waits for the movie phase, which is behind this tail.
