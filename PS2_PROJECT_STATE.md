@@ -13507,3 +13507,34 @@ Probe to confirm the fix, in order: `[unitwait] resume` > 90, `[faderesume]` > 0
 for the decoder.
 
 Tooling added: `[faderesume]` probe (0x20439C) in `tol_overrides.cpp`; `tools/ref_tail.py` (session 202).
+### 203.5 RETRACTION (same session, measured): the stop is NOT a runtime checkpoint. New leading hypothesis: the tail is reached but `$s1` is not the loader object, so the mode==1 arm is skipped.
+
+Three A/B runs, each ~240 s, in addition to the baseline:
+
+| run | result |
+|---|---|
+| baseline | `[unitwait]` 64, `[faderesume]` 0, no `[scene] 285e80` |
+| `TOL_NO_CKPT_FADE=1` (new, suppresses `checkpointDue` while `ctx->pc` is in `0x20439C..0x2043F0`) | **still 64**, `[faderesume]` 0 |
+| `TOL_DEFER_CALL_CKPT=1` (defers the call-boundary checkpoint at the `jal 0x15231C` yield) | **still 64**, `[faderesume]` 0 |
+| `TOL_NO_FIBER_PREEMPT=1` (unwinding preemption) | worse: the fade loop never starts (`resume = 0` in 156 s) |
+
+So neither the backward-edge checkpoint, nor the call-boundary checkpoint at the yield, nor the preemption
+mode is what stops the loop. 203.1's "orphaned park" reading stands as a *fact* (`0x20439C` is never
+dispatched) but is not the cause: the park never happens in the first place, or the loop leaves before it.
+
+What is left, and it fits every measurement so far: the loop is left through the **tail**, and the tail
+takes the **mode != 1 arm** (`0x204460`) instead of the scene-start arm (`0x204438..0x20445C`), because the
+comparison uses `$s1` - and `$s1` may not be the loader object `0x63D890` any more at that point. Evidence:
+
+- the tail's first instruction is `lw v1,0x14(s1)` (0x204400) and the arm decision at 0x20442C compares that
+  word with 1; my `[mode]` probe reads the *global* `0x63D894`, which is 1 all along, and PCSX2 shows
+  `s1 = 0x0063D890` with `mode = 1` at the same point (tools/ref_tail.py);
+- the teardown arm's first call (`0x164B90`) **does** run with `mode = 1` printed from the global, i.e. the
+  guest took the arm whose condition is "mode != 1" while the global says 1 - a perfect signature of a
+  wrong `$s1`;
+- `FUN_00204240` then returns, the app-job thread yields from `0x3661DC`, and `gFadeCalls` stays 1.
+
+Next probe (single): hook the teardown callee `0x164B90` **and** the scene-start callee `0x285E80`, and print
+`$s1` (GPR17) plus `*(s1+0x14)` at both; also print `$s1` whenever the fade TCB (`0x4079A0`) is restored by
+`svcA` (`0x152200`). Compare `$s1` with the reference's `0x0063D890`. If `$s1` is wrong, the fix belongs in
+the green context restore (the TCB register save/restore path), not in the scheduler.
