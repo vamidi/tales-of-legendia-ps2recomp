@@ -13434,3 +13434,76 @@ Trace the resume of `pc = 0x20439C` after the 64th backward edge: whether the ru
 which activation/return point it belongs to, and why nothing ever dispatches it again. Everything else in
 the unit-1 chain (dispatcher priority, list order, TCB links, alive flag, mode, status) is measured and
 clean, so this is the one remaining discontinuity between the port and the reference's 90-iteration loop.
+---
+
+## Session 203 (2026-11-25) - WHY THE PARK NEVER RESUMES: a runtime checkpoint inside a green coroutine unwinds the frame the coroutine's own switch depends on. The parked pc 0x20439C is never dispatched (0 hits in 160 s), while the coroutine resumes elsewhere (TCB+0x1B4 = 0x3661DC). Reference has no such preemption at all.
+
+### 203.1 The park point is real and provably never resumed
+
+New probe `[faderesume]` on `0x20439C` (the target of the backward edge at `0x2043F8`, which the emitter
+guards with `if (runtime->eeCheckpointDue()) return;`). Over a 160 s run:
+
+```
+[faderesume] hits = 0        (no dispatch ever enters 0x20439C)
+[unitwait] resume = 64       (unchanged: the loop never gets a 65th iteration)
+```
+
+So a checkpoint at that backward edge parks the guest with `ctx->pc = 0x20439C`, and nothing ever
+dispatches that pc again. The green thread itself keeps running - the same TCB (`0x4079A0`) is selected
+**286 times** with `TCB+0x1B4 = 0x3661DC` (the app-job wait), i.e. **the coroutine's own saved resume
+point is no longer 0x20439C**. The runtime-level park is orphaned.
+
+A/B control: `TOL_NO_FIBER_PREEMPT=1` (the documented opt-out of in-place preemption) is **worse** - in
+156 s the fade loop never starts at all (`[unitwait] resume = 0`), so the in-place path is the working one
+and the defect is narrower than "preemption mode".
+
+Scheduler view at the stall (`TOL_TRACE_RESUME=1`, every 200th turn):
+
+```
+[resume] tid=-1 status=0 inGuestCall=0 dispatched=0 pendingFn=0 pendingCtx=0 activeFiber=0 inv=1
+         pc=0x00000000 / pc=0x00166490 (GS ISR)  gap~0.97 s
+```
+
+The run loop is servicing only the invocation carrier; no guest kernel thread is runnable, and the parked
+`0x20439C` never appears.
+
+### 203.2 Comparison with PCSX2 (the asymmetry that explains it)
+
+The reference has **no checkpoint/preemption concept inside that loop at all**: the guest's own
+`FUN_0015231C` yield is the only switch, and the loop simply runs 90 times (session 202, measured with
+`tools/ref_tail.py`: the tail is entered with `s0 = 90`, `f20 ~ 0`, and the scene-start arm at `0x204444`
+runs for mode 1). So the port's park at `0x20439C` is a **port-only artifact introduced at exactly the pc
+the guest expects to continue from**.
+
+The structural reason: this title runs a **two-level scheduler**. The EE kernel thread executes a *green
+coroutine* scheduler whose switch (`FUN_0015231C`) saves the coroutine's registers into its TCB and `jr`s
+to `TCB+0x1A8`; the coroutine continues later from `TCB+0x1B4`. A runtime-level preemption
+(`eeCheckpointDue() -> return` in generated code) unwinds the C++ activation that this `jr`-based switch
+lives in, so the coroutine's next yield records a *different* `+0x1B4` (here `0x3661DC`), and the
+`0x20439C` park the runtime recorded is never consumed by anybody. That is the same class documented in
+session 154 ("the durable fix belongs in the resume path"), now with a concrete, reproducible instance and
+address.
+
+### 203.3 Consequence for the milestone (unchanged and now fully explained)
+
+Unit 1: the fade-in completes, the wait loop dies at iteration 64 (status byte `+0x1F2` still 0, mode
+still 1, `$s0` clean), the scene start `FUN_00285E80` is never called, `FUN_00204240` returns to the app
+job, **no second fade occurs**, the movie never starts and the IPU is never fed (0 register accesses,
+0 DMA starts, 0 commands).
+
+### 203.4 Next step (single, concrete)
+
+**Defer runtime checkpoints while a green coroutine is on the fiber.** The guest already yields every
+iteration of this loop (`0x15231C`), so a runtime preemption there is not needed for scheduling and only
+creates the orphaned park. Concretely: in `EeScheduler::checkpointDue`, when the running guest thread's
+context pc is inside a green-coroutine body (or, minimally, when the last guest transfer was
+`FUN_0015231C`'s continuation `0x151F88`), return false and let the next `0x15231C` yield do the switch -
+the same trade `TOL_DEFER_CALL_CKPT` makes for call boundaries. Expected result: the loop reaches s0 = 90,
+the tail runs, `FUN_00285E80` is called, and `[fade] #2` appears - which is the first time the IPU would
+be exercised.
+
+Probe to confirm the fix, in order: `[unitwait] resume` > 90, `[faderesume]` > 0 at 0x20439C,
+`[scene] 285e80` >= 1, `[fade] #2` (needs `TOL_TRACE_ORDER`), then `TOL_TRACE_IPU=1` + `TOL_TRACE_IPU_DMA=1`
+for the decoder.
+
+Tooling added: `[faderesume]` probe (0x20439C) in `tol_overrides.cpp`; `tools/ref_tail.py` (session 202).

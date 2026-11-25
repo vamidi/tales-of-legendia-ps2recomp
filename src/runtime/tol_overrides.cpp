@@ -6191,6 +6191,27 @@ namespace
         }
     }
 
+    // The backward edge at 0x2043F8 is emitted as `if (runtime->eeCheckpointDue()) return;`, so a preemption
+    // there parks the guest with pc = 0x20439C (the `jal func_1520C0`). That pc is ONLY ever entered again by
+    // a dispatch, so hooking it tells exactly whether the resume happens (and with which registers).
+    PS2Runtime::RecompiledFunction gFadeResumePrev = nullptr;
+
+    void fadeResumeProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        static uint64_t sN = 0u;
+        ++sN;
+        if (sEnv && (sN <= 12u || (sN % 100u) == 0u))
+        {
+            std::fprintf(stderr, "[faderesume] #%llu ra=0x%08X s0=%u s1=0x%08X sp=0x%08X\n",
+                         static_cast<unsigned long long>(sN), GPR_U32(ctx, 31), GPR_U32(ctx, 16), GPR_U32(ctx, 17),
+                         GPR_U32(ctx, 29));
+        }
+        if (gFadeResumePrev != nullptr)
+        {
+            gFadeResumePrev(rdram, ctx, runtime);
+        }
+    }
     void installYieldProbes(PS2Runtime &runtime)
     {
         // TOL_TRACE_ORDER's orderYieldProbe owns 0x15231C when it is on; do not steal the slot from it.
@@ -6264,6 +6285,11 @@ namespace
             }
         }
         {
+            if (PS2Runtime::RecompiledFunction f = runtime.lookupFunction(0x0020439Cu))
+            {
+                gFadeResumePrev = f;
+                runtime.replaceFunction(0x0020439Cu, &fadeResumeProbe);
+            }
             if (PS2Runtime::RecompiledFunction f = runtime.lookupFunction(0x00164B90u))
             {
                 gTeardownPrev = f;
