@@ -6,20 +6,21 @@
 
 ---
 
-## CURRENT STATUS - updated 2026-11-25 (session 200; READ THIS FIRST, then jump to *Session 200* at the bottom)
+## CURRENT STATUS - updated 2026-11-25 (session 201; READ THIS FIRST, then jump to *Session 201* at the bottom)
 
-> **Session 200 (latest) - the IPU is implemented and wired; the boot stalls in FUN_00204240's mode==1
-> tail, after the fade and after the yield wait.** A real MPEG-2 IPU (adapted from the Grandia port) now
-> lives in the runtime (`include/ps2_ipu.h`, `src/lib/hw/ps2_ipu.{cpp}` + `mpeg_tables.h` + `ipu_common.h`)
-> and `ps2_memory.cpp` forwards `0x10002000..0x10002030`, the `0x10007000` FIFO (32- and 128-bit) and DMA
-> channels 3/4 to it, so the movie/title video has a decoder waiting for it (not yet exercised: the movie is
-> behind the cards). Measured on the card phase: `FUN_00204240` mode 1 runs a bounded 90-iteration yield
-> loop at `0x20439C..0x2043F8`; the port exits it deterministically after **64** iterations (the TCB status
-> byte `+0x1F2` flips), then **stalls in the mode==1 tail** - `[fade] #2` never arrives, guest time freezes
-> at ~36.4 s with 80-91 % paceWait, while the green scheduler still rotates the other five TCBs. Also
-> retracted: `mainIters` freezing at 108 is normal (the `0x152B70` frame body is an early-boot loop that
-> exits at ~5.4 s). Details, probes and next steps: *Session 200* / *200.5*.
-
+> **Session 201 (latest) - the mode-1 tail is NEVER entered: the fade thread is starved after 64 yields.
+> The IPU is therefore unexercised, but it is implemented, wired and self-tested.** Traced with new probes:
+> `[unitwait] resume` at `0x2043F0` fires exactly **64** times in every run (90/116/146/150/180 s) and then
+> stops; `TAIL-ENTRY` at `0x204400` is **0**, `[tail] RETURN` is **0**, `[scene] 285E80` is never called from
+> the tail and `[fade] #2` never arrives. The loop body is innocent (`0x1520C0` 64 in / 64 out, `0x1520F0`
+> 64 in / 64 out, `0x153010` never called). The thread is TCB **0x4079A0** (prio 4): after the 64th yield it
+> is still `state=1` (ready) and still linked (`head 0x407160 -> 0x407370 -> 0x407790 -> 0x407580 ->
+> 0x4079A0 -> 0`), not deleted and not blocked - the guest run loop simply stops dispatching it, so the port
+> idles (guest work 0.3 % of wall, paceWait 80-91 %). IPU: **0** register writes/reads and **0** DMA starts
+> in 150 s (only `DVCI: "\AFS\MOVIE.AFS" found` from the boot AFS index), but `TOL_IPU_SELFTEST=1` proves the
+> decoder answers the guest contract (`cmd=0x00010001 busy=0 bp=1 commands=1`). Next single measurement:
+> whether two TCBs resolve to the same context block (`0x49F590 + *(0x3EB1A0) + *(0x3EB1C0)`). Details:
+> *Session 201*.
 
 > **Session 197 (latest) - the boot sequence is 3 logo CARDS (2D) then an MPEG-2 opening movie + video title.**
 > Reference boot captured frame by frame (`logs/refseq2/montage.png`): NOW LOADING (5-11 s) -> **namco** (13.6 s)
@@ -13326,3 +13327,24 @@ was sampled: it reads `2,0,0,0`), to check the prio-4 ready count against the th
 
 Tooling in this session: the probes above (all inert without `TOL_TRACE_YIELD`), no runtime behaviour
 change.
+
+### 201.4 The decoder itself is verified live (self-test), even though the movie never reaches it
+
+`TOL_IPU_SELFTEST=1` (in `ps2_memory.cpp::initialize`, right after `ipu::init()`) feeds one quadword of
+all-ones into the data FIFO and issues `IPU_CMD = 0x30000000` (VDEC, table 0 = macroblock address
+increment) - the exact command `FUN_00129258` uses. Measured:
+
+```
+[ipuselftest] top_before=0xFFFFFFFF cmd=0x00010001 busy=0x00000000 bp=0x00010001 top_after=0xFFFFFFFF commands=1
+```
+
+which is the hardware contract the guest polls: the command completes (busy bit clear), the decoded MBA
+(1) is returned in `IPU_CMD[15:0]` with the "data valid" flag `0x10000`, the one-bit code consumes exactly
+one bit (`IPU_BP` low = 1), `IPU_TOP` exposes the next 32 input bits, and the command counter advances.
+So the register/FIFO/decode path is functional; what is missing is only *real bitstream traffic* (the
+movie), which the unit-1 tail still blocks.
+
+Status of gate B: **implemented, wired, self-tested, not yet fed real video**.
+
+Tooling in this session: the probes above plus `TOL_IPU_SELFTEST` (all inert without their env var), no
+runtime behaviour change.
