@@ -6,9 +6,39 @@
 
 ---
 
-## CURRENT STATUS — updated 2026-11-20 (session 158; read this first; the rest is history)
+## CURRENT STATUS - updated 2026-11-25 (session 200; READ THIS FIRST, then jump to *Session 200* at the bottom)
 
-> **Session 158 (latest) - PCSX2 is finally a usable reference, and the port matches it at the scene start.**
+> **Session 200 (latest) - the IPU is implemented and wired; the unit-1 stall is a turn-rate problem, not a
+> deadlock.** A real MPEG-2 IPU (adapted from the Grandia port) now lives in the runtime
+> (`include/ps2_ipu.h`, `src/lib/hw/ps2_ipu.{cpp}` + `mpeg_tables.h` + `ipu_common.h`) and `ps2_memory.cpp`
+> forwards `0x10002000..0x10002030`, the `0x10007000` FIFO and DMA channels 3/4 to it, so the movie/title
+> video has a decoder waiting for it. It has not run on real data yet (the movie is behind the three logo
+> cards). Measured on the card phase: `FUN_00204240` mode 1 runs a **bounded 90-iteration yield loop** at
+> `0x20439C..0x2043F8` (same as PCSX2, same `TCB+0x1F2` status), but the port needs **~1.4 s per green-thread
+> turn** against the reference's ~16 ms, so unit 1 takes minutes instead of ~5 s (`[yield]`/`[unitwait]`
+> probes; the expensive turn is the prio-0 GS worker at `0x1F8168`, ~80 ms, backend-independent). Also
+> retracted: `mainIters` freezing at 108 is normal (the `0x152B70` frame body is an early-boot loop that
+> exits at ~5.4 s). Full detail, file list and next measurements: *Session 200*.
+
+
+> **Session 197 (latest) - the boot sequence is 3 logo CARDS (2D) then an MPEG-2 opening movie + video title.**
+> Reference boot captured frame by frame (`logs/refseq2/montage.png`): NOW LOADING (5-11 s) -> **namco** (13.6 s)
+> -> **moth Productions** (18 s) -> **Sofdec + IBM** (22.5 s) -> **opening movie** (28-39 s) -> **TALES OF
+> LEGENDIA title** (40.6 s onwards). The three "units" (`FUN_00204240` modes 1/2/3) are the three logo cards; the
+> title is at ~40 s, not ~21 s. The Sofdec/IBM card proves it is streamed video, and the reference title pauses in
+> `FUN_00129258` reading `IPU_CMD`/`IPU_BP`/`IPU_TOP`. `AFS\MOVIE.AFS` is 22 standard MPEG-2 program streams. The
+> game imports no `sceMpeg*`/`sceIpu*`, so it drives the IPU hardware directly (`entry_0012dec4` = the IPU/DMA
+> driver; `FUN_00129258` issues `IPU_CMD = 0x30000000` (VDEC) and consumes the hardware's per-command macroblock
+> count and `IPU_TOP`). The port initialises the IPU at 51.7 s and then never feeds or decodes a single frame
+> (`transfers=0 tex builds=0 gsw=0 gif=5`). Two INDEPENDENT gates, both measured: **(A) the three logo cards
+> are 2D LZSS images + fades, not video** - the IPU is idle at 13-22 s, so the namco/moth/Sofdec cards are the
+> original session-158 "no textured draws" defect and are the cheapest next win; **(B) the opening movie and the
+> title background are IPU video** (`FUN_00128408` starts at ~27.8 s at ~20 pictures/s). A complete PS2 IPU with
+> real MPEG-2 VLC tables already exists on this machine
+> (`D:\Personal\C++\grandia-ps2recomp\runtime\src\hw\ipu.cpp` + `mpeg_tables.h`) and its integration surface is
+> mapped. Staged plan, register contract and correction: *Session 197* (197.3, 197.7, 197.9).
+
+> **Session 158 - PCSX2 is finally a usable reference, and the port matches it at the scene start.**
 > The MCP wrapper is broken for memory/disassembly (lagged reads, `hexdump` dead) - use `tools/ps2dbg.py` and
 > `tools/pcsx2_trace.py`, which talk to the DebugServer's real protocol (newline JSON over TCP 21512). Reference
 > boot: unit1 @6 s -> **scene start @11 s** (`FUN_00285E80(a0=0x5AA170, a1=4, a2=0xE0)`) -> unit2 -> unit3 ->
@@ -10751,9 +10781,2447 @@ sampler.
   read even when the frame loop stalls. Steady state so far: `gif=4(+0)`, `gsw=0(+0)` - no uploads.
 
 
+## Session 193 (2026-11-20) - static map of the master loop, plus four retractions: 0x1F74E0 is LZSS not a fade, 0x1392D0 is a GS_CSR getter not a frame tick, and "0.48 Hz" was a decimating instrument
+
+### 193.1 The master loop, from the ELF (static, no run)
+
+`entry` -> `FUN_00165AD0`. Its frame body is `0x165B88..0x165BE4` and calls, in this order:
+
+| site | callee | what it is |
+|---|---|---|
+| 0x165B88 | `FUN_00152B70` | VIF/DMA state machine (281 insns, state in `0x4969C0`/`0x4969C4`); memsets `0x100` bytes (`jal 0x109108`, a2=0x100), writes four `0x80` bytes at `sp+0x52..55`, bumps the `0x4969C4` counter |
+| 0x165B90/98/A0 | `FUN_00151FF0(0)`/`(1)`/`(4)` | guest scheduler pumps, one per CPU |
+| 0x165BA8 | `FUN_001516B0` | |
+| 0x165BB0 | `FUN_001F96C0` | |
+| 0x165BB8 | `FUN_0019A080` | -> `FUN_001B7870` -> `FUN_001B7688(5)`, runs 5 callbacks from `0x49C6A0` ("the pump") |
+| 0x165BC0 | `FUN_00153780` | |
+| 0x165BC8 | `FUN_00164D40` | |
+| 0x165BD0 | `FUN_00139A20` | the real per-frame tick |
+| 0x165BD8 | `FUN_00153180` | exit test |
+
+Two structural facts settle earlier confusion:
+
+- **`FUN_00153180` is a literal stub**: `0x153180` is `0800E003 2D100000` = `jr ra; move v0,zero`. The frame loop's
+  test is therefore constant-false, i.e. it is a deliberate unconditional `for(;;)`. The code after `0x165BE8` is
+  dead in this build. This is a game main loop, **not** a stuck gate.
+- **`FUN_00139A20` is the tick**: it does `REG_RCNT0_COUNT = 0`, `iGpffff84c8++` (frame counter), and calls
+  `FUN_00139310`, which compares the tick delta against `0x20D` (525 lines = one NTSC frame) and sets
+  `fGpffff84ac = 30.0` otherwise. `FUN_00139310 -> FUN_001392D0 -> FUN_001135B8` returns **bit 13 of `REG_GS_CSR`**.
+
+### 193.2 Retracted: 0x1392D0 is not a frame tick and does not drive the pump
+
+`FUN_001392D0` is 8 lines: `uGpffff848c = FUN_001135B8(0); return uGpffff848c;` - a GS_CSR status getter. It sits at
+`0x165BD0`, **after** the pump at `0x165BB8`, inside the same call to `FUN_00139A20`. So "0x1392D0 (29) drives
+0x19A080 (28)" was one loop counted at two points, not a causal chain. "Raise 0x1392D0's rate" is dead: it is
+downstream of the frame loop's own rate.
+
+### 193.3 Retracted: the 0.48 Hz frame rate is an instrument artifact
+
+`TOL_TRACE_CALL` prints on `seq <= 25 || seq % 200 == 0` (`ps2_runtime.cpp:1897` and `:1944`). Counting `[call]`
+lines is therefore decimated by ~200x after the first 25 per address, and any calls/s derived from them is not a rate.
+
+Independent run, same build, `TOL_PCHIST=1 TOL_TRACE_SLEEP=1`, 78 s (`console/run_pchist.txt`):
+
+```
+guest=99.3%  paceWait=0.0%  presenter=0.7%  g/s=0.528-0.554  cyc advancing at ~158 MHz of 294.912 MHz
+gsw=0(+0)  gif=5(+0)  loader state=1 chan=4 alive=0
+```
+
+The guest is ~55 % of real EE speed and **never blocks** (paceWait 0, no 2 s stall anywhere in the run). There is no
+0.48 Hz frame loop. The "per-frame vs 0.48/s" framing, and every scheduler-side variant aimed at it, were aimed at a
+decimating log.
+
+### 193.4 Retracted: 0x1F74E0 is not "the fade wait" - it is an LZSS decompressor
+
+`FUN_001F74E0` keeps a bit buffer (`uGpffff8794`, `0xff00` sentinel), a 0..3 state machine (`iGpffff8798`) and copies
+runs out of a sliding window at `0x4A6260`: `len = (*p & 0x0F) + 3`, offset `uGpffff878c + i`, source
+`(uGpffff8788 & off) + 0x4A6260`. That is LZSS. Its 11.2 % + 5.5 % of samples is **decompression**, not a fade and
+not a wait.
+
+### 193.5 Corrected: 0x12xxxx IS entered - but only as a math routine
+
+91 `[pchist]` lines contain a `0x12xxxx` PC. The only addresses seen are `0x124150`, `0x1257C8`, `0x1254A8`,
+`0x1255A8`, `0x1203A0`, all inside **`FUN_001240D8`, an integer sqrt** (bit-by-bit, the `0x124150` block). Peak count
+1920 of 15.6 M samples = 0.012 %. So "the port never executes 0x12xxxx" is wrong in letter; what survives is "it
+never reaches the 0x12xxxx frame/title code".
+
+### 193.6 What the main thread actually spends samples on (cumulative, n=15.6 M)
+
+| PC | % | what |
+|---|---|---|
+| 0x109144 | 11.8 | memset inner loop (the `0x100`-byte clear from `FUN_00152B70`) |
+| 0x1F75F8 | 11.2 | LZSS decompressor |
+| 0x289E10 | 9.8 | global-indexed byte read: `iGpffff87bc * 0x12D8 + 0x4A7E27` |
+| 0x3344A0 | 7.7 | `byte & 0x0F` at `idx*0x18 + 0x3DB660 + 0x24` |
+| 0x27B140 | 6.1 | 12-byte record read, `type = byte & 7` |
+| 0x1F750C | 4.9 | LZSS decompressor |
+| 0x27B290 | 4.3 | record read + test `type - 2 < 3` |
+| 0x27B6E0 | 4.3 | record-family loop head |
+| 0x334294 | 3.9 | slot scan loop |
+
+`FUN_003341E0` scans indices `0..0xE8` (232) calling `FUN_003344A0/34470/345C0/34630`, and returns with `idx > 0xE8`
+when it finds nothing acceptable. `FUN_0027B290` reads a 12-byte record and tests `type - 2 < 3`. `FUN_00289E10` is a
+single byte read indexed by `iGpffff87bc`.
+
+### 193.7 What this changes
+
+Not pacing, not sleep, not a 2 s block. After (and between) the load units the main thread spends its samples in a
+**232-slot scan plus 12-byte record lookups, while issuing no GS work at all** (`gif=5` total, `gsw=0` over 78 s).
+The live question is data, not timing: whether the table at `0x003DB660` (stride `0x18`, type field at `+0x24`) holds
+entries on hardware at the same milestone and zeros in the port. That is the same heap-diff method that already
+proved byte-identical at the unit boundaries.
+
+### 193.8 Guest-side scheduler (static, explains why host-side wake injection cannot help)
+
+The guest has its own scheduler in user code, with no syscall: `FUN_00151FF0(cpu)` -> `FUN_001520A0` (ready bitmap at
+`0x48F570`) -> `FUN_00151E90` walks the thread list and calls each entry at `+0x1B0`. The switch is
+`FUN_0015231C`: it spills all GPRs/HI/LO/SA into the TCB, sets `+0x1AC` (the flag already retired in 192), then
+`sw ra,0x1b4(t0); lw ra,0x1a8(t0); jr ra`. That is why six host-side scheduler variants could not move it - the host
+scheduler is not the scheduler that owns this loop.
+
+### 193.9 Retractions recorded
+
+1. "0x1F74E0 is the fade wait" -> LZSS decompressor.
+2. "0x1392D0 is a frame tick / drives 0x19A080" -> GS_CSR bit-13 getter, downstream in the same iteration.
+3. "the frame loop runs at 0.48 Hz vs per-frame" -> `TOL_TRACE_CALL` decimation; guest is 55 % speed, 99.3 % busy.
+4. "the port never executes 0x12xxxx" -> it executes `FUN_001240D8` (sqrt) there, ~0.012 % of samples.
+
+
+## Session 194 (2026-11-20) - the 0x3DB660 slot table is NOT the divergence: it is populated, matches hardware at 0x3DB660-0x3DB6FF, and freezes at unit 1
+
+### 194.1 Method (both halves worked)
+
+- **Port**: `TOL_DUMP_UNITS=0x3DB000,0x2000,logs\tabdump` (the hook takes an arbitrary addr/len, so the
+  window was narrowed onto the table) plus `TOL_DUMP_RAM` at 20 s intervals. Wrote `port_unit{1,2,3}.bin`,
+  `port_unit{1,2,3}_ret.bin` and `port_t0..t3.bin`, all 0x3DB000..0x3DD000.
+- **Reference**: PCSX2 DebugServer read of the same window. `ps2dbg.py` is one request per process, so
+  `tools/dump_ref_range.py` (new) does a single-connection chunked dump -> `logs\tabdump\ref.bin`.
+- Window covers the whole table region `0x3DB660..0x3DCF40` (0x18 x 232 = 0x18E0).
+
+### 194.2 Result: the table is populated, and it is frozen
+
+- `port_unit1 == port_unit2 == port_unit3 == port_t3` **byte-identical over the table window** (diff = 0 in all
+  six pairings). Four samples spanning unit 1 (~20 s) to t=60 s, while the guest is 99 % busy, and the table
+  does not change by a single byte.
+- Only `port_t0` (t=20 s, before unit 1) differs, by 52 bytes: the pointers at `0x3DB660`, `0x3DB688`,
+  `0x3DB698`, `0x3DB6B8` are zero there and populated at unit 1 (`0x01562FA0`, `0x015645A0`, `0x015A27A0`,
+  `0x015A28A0`, `0x01582E20`, `0x01583320`, `0x015627E0`, `0x015A3520`, `0x01523D60`, `0x01523CA0`,
+  `0x01524060`, `0x01561920`, `0x0156E360`). So the loader fills it at unit 1 and nothing writes it again.
+
+### 194.3 vs hardware at the title: 161 of 6368 bytes (2.5 %), first at 0x3DB700
+
+At `0x3DB660..0x3DB6FF` the port and hardware **match exactly**. The differences all sit after that and are the
+shape of *records hardware added at a later milestone*:
+
+| guest | hardware | port |
+|---|---|---|
+| 0x3DB700 | `1` + ptr `0x3DB744` -> `"cdrom0:\SLUS_212.01;1"` | `0` / null |
+| 0x3DB900/08 | `0x000808B7` + `"MOVIE.AFS;1"`, `"AFS;1"` | `0x00700000` + zeros |
+| 0x3DBA88, 0x3DBAB0, 0x3DBB50 | `0x08`, `0x07`, `0x12` | `0xFFFFFFFF` |
+| 0x3DBB9C..0x3DBBF0 | records with ids `0x15`,`0x16`,`0x17`, type `7`, with pointers `0x0007DAC8`/`0x0007FB58` | all zero |
+| 0x3DBC40 | `0x0101800C`, `1`, `0x00165CE8`, `0x00496B80` | `0x00000320` x3 |
+
+### 194.4 Retraction: the slot table is not the first divergence
+
+The hypothesis from session 193.7 ("the scan finds an empty table because the loader never populated it") is
+**dead**: the table is populated, matches hardware through `0x3DB6FF`, and the remaining 161 bytes are exactly the
+entries hardware accumulates when it progresses past this point (disc path registration, `MOVIE.AFS`, records
+0x15-0x17). That is a *consequence* of the port not advancing, not a cause.
+
+Caveat, stated plainly: this is **not** a same-milestone comparison - `ref.bin` is hardware at the title
+(PC `0x127DB4`), the port files are at the unit boundaries. A true same-milestone diff needs a PCSX2 reset plus
+`ref_units.py` with `0x3DB000 0x2000`, which costs the current title state.
+
+### 194.5 No static xrefs - the table is reached through a computed base
+
+`xrefs_list` to `0x3DB700` and `0x3DBBA0` both return **0 references**. The table is indexed off a computed/gp
+base, so neither Ghidra xrefs nor `TOL_WATCH_WRITE` will find its writer by address. Any future probe must
+find the base register at runtime, not the absolute address.
+
+### 194.6 CORRECTION: 194.2-194.4 compared the wrong structure
+
+`FUN_003344A0` computes `param_1 * 0x18 + iRam003db660 + 0x24`, and `iRam003db660` is a **dereference**: the
+real base is the *value* at `0x3DB660`, which is `0x01562FA0`. That address starts with magic `"EX2B"`
+(`0x42325845`), then `0xE9` (233 entries) and `0x18` (24-byte stride) - exactly the array `FUN_003341E0` scans
+to `0xE8`. So the scan table lives at **`0x01562FA0`**, not at `0x3DB660`.
+
+The region diffed in 194.2-194.4 (`0x3DB700`, `"cdrom0:\SLUS_212.01;1"`, `"MOVIE.AFS;1"`) is a *different,
+neighbouring* structure - a file/resource table. Those numbers describe that structure, not the scan table.
+
+### 194.7 The real scan table is byte-identical - the hypothesis is dead twice over
+
+Dumped correctly (`TOL_DUMP_UNITS=0x01560000,0x8000` vs `tools/dump_ref_range.py` on the same window), the
+table `0x01562FA0..0x01564578` (5960 bytes, 233 x 0x18):
+
+```
+port_unit1      diff = 0
+port_unit1_ret  diff = 0
+port_unit2      diff = 0
+port_unit3      diff = 0
+port_unit3_ret  diff = 0      (vs hardware at the title)
+```
+
+**Zero differing bytes at every unit boundary.** The 232-slot table the hot scan loop walks is identical to
+hardware's. So `FUN_003341E0` cannot be scanning a table the port failed to populate - it walks exactly the
+same bytes hardware does.
+
+Therefore the scan loop's behaviour must differ through its **criteria** (`FUN_003341E0(param_1, param_2)`,
+where `param_2` carries the start index and the type/flag filters), or through being called at all. The table
+is data the ELF supplies; it is not the thing that diverges.
+
+### 194.8 Watchpoint probe: blocked without a fresh boot
+
+- `set_memcheck` on `0x3DBA88..0x3DBA8C` (write) while the game was at the title: **hits = 0** after ~40 s of
+  execution (`watchlist` confirms it stayed armed). The record is a one-shot write during load, so catching its
+  writer requires a boot, not a title-state probe.
+- The DebugServer has **no reset command** (`available_commands` has no `reset`/`reboot`), so the probe cannot be
+  started from the API.
+- Every savestate on disk is post-load: slot 01 was loaded and shows the same populated values
+  (`0x25`, `0x08`, `0x000443C8`) and the same idle PC `0x00114C60`. No early-boot state exists to rewind to.
+- Consequence: this probe needs a manual `System -> Reset` in PCSX2, then arm `set_memcheck` immediately.
+
+
+## Session 195 (2026-11-20) - the scan's criteria are literals and one query is logically unsatisfiable: FUN_003341E0 cannot differ, and the hot profile is one update routine
+
+### 195.1 FUN_003341E0's acceptance predicate, decoded
+
+`FUN_003341E0(out, crit)` walks `idx = crit[1]+1 .. 0xE8` (233 entries) and **rejects** the candidate while
+any of these hold, so it *accepts* only when all are false:
+
+| test | rejects when |
+|---|---|
+| `FUN_003344A0(i) == 6` | the slot's type is 6 |
+| `crit[0] != 0 && FUN_00334470(i) != crit[0]` | a family byte is given and differs |
+| `crit[4] == 1 && FUN_003345C0(i) == 0` | a "flag 4" test was asked for and fails |
+| `crit[2] != 0 && FUN_003344A0(i) != crit[2]` | a type filter is given and differs |
+| `crit[5] == 1 && FUN_00334630(i) == 0` | a "flag 5" test was asked for and fails |
+| `crit[3] != 0 && FUN_003344C0(i) != crit[3]` | a "field 3" filter is given and differs |
+
+`FUN_003341A0(out, type, p3, p4, p5, p6)` builds `crit = { type, startIdx=0, p5, p6, p3, p4 }`.
+
+### 195.2 Every call site's criteria are literals, not derived state
+
+| caller | built by | crit | asks for |
+|---|---|---|---|
+| `FUN_00333EE0` | `FUN_003341A0(&s,0,0,0,5,0)` | `{0,0,5,0,0,0}` | type 5 |
+| `FUN_00333EE0` | `FUN_003341A0(&s,0,0,0,6,0)` | `{0,0,6,0,0,0}` | **type 6 (unsatisfiable, see 195.3)** |
+| `FUN_00349C00` | `FUN_003341A0(&s,0,0,0,2,arg)` | `{0,0,2,arg,0,0}` | type 2 + field 3 |
+| `FUN_00220F90` | `FUN_003341A0(&s,0,0,1,0,0)` | `{0,0,0,0,0,1}` | flag-5 test only |
+| `FUN_00313570` | `FUN_003341A0(&s,arg,1,0,0,0)` | `{arg,0,0,0,1,0}` | family arg + flag-4 |
+| `FUN_0037F2B0` | `FUN_003341A0(&s,arg,0,1,0,0)` | `{arg,0,0,0,0,1}` | family arg + flag-5 |
+
+Every criterion is an immediate literal or a byte-sized type taken from the caller's own argument. **None of them
+reads port-divergent state.** Combined with 194.7 (the table is byte-identical), `FUN_003341E0` is
+deterministic and must behave identically on both sides.
+
+### 195.3 A real property of the game: the type-6 query can never match
+
+`FUN_003341A0(..., p5 = 6, ...)` sets `crit[2] = 6`. The loop rejects `type == 6` **and** rejects
+`type != 6`, so its accept condition is `(type != 6) && (type == 6)` - **false for every slot**. That call
+therefore always walks all 233 entries and returns "none". `FUN_003343E0` then reports no cursor, so the
+caller's `while` body is skipped - it costs a full scan and nothing else.
+
+This is identical on hardware (same code, same table), so it is not the divergence. It does explain why
+`0x3344A0`/`0x334294` dominate a profile and why this loop is a bad place to look for a rate difference.
+
+### 195.4 Retraction: the criteria hypothesis is dead
+
+Since the table is byte-identical (194.7) and every criterion is a literal (195.2), the scan cannot be
+searching differently. The scan is hot because the routine that *calls* it is hot.
+
+### 195.5 What that routine is - the whole hot profile in one function
+
+`FUN_0027AD50` is a large per-frame update that calls, in order, `FUN_00279730`, `FUN_00330A80`,
+`thunk_FUN_00342D10`, `thunk_FUN_002E53E0`, `FUN_00279BF0`, `FUN_00349620`, **`thunk_FUN_00333EE0`** (the scan
+above), `thunk_FUN_0027A440`, `thunk_FUN_00329440`, `thunk_FUN_00371230`, `thunk_FUN_00335CB0` x2,
+`thunk_FUN_00286390`, `thunk_FUN_00289030`, `thunk_FUN_00298160`, `FUN_00289640`, `thunk_FUN_00330840`,
+`FUN_00290D10`, **`thunk_FUN_0027B100`**, `thunk_FUN_0027BA00` - i.e. the slot scan *and* the hot
+`0x27B1x0`/`0x27B2x0` record family in a single pass. One function accounts for the profile.
+
+Its two entry chains:
+
+```
+master loop 0x165B2C -> FUN_00166120 -> FUN_0027AD50          (outer loop body, once per outer iteration)
+FUN_001D8C60 -> FUN_001DC480 -> thunk_FUN_0027AEB0 -> FUN_0027AD50
+```
+
+`FUN_001DC480` is a 4-way mode switch on `FUN_0016C790(param)`; `FUN_0027AD50` is reached only in **mode 1**.
+
+### 195.6 Next
+
+The remaining question is no longer "what data is wrong" but **how often `FUN_0027AD50` runs and in which mode**.
+Instrument `FUN_0027AD50`'s entry count and `FUN_001DC480`'s `lVar1` value on both sides; that single pair
+(`mode`, `calls/s`) decides whether the port is stuck re-entering mode 1 or is in a different mode entirely.
+
+
+## Session 196 (2026-11-21) - first real frame rate: 19.6 fps, not 0.48; the update routine is called once and is not hot; the frame body stops at ~200 frames and the guest collapses to g/s=0.005
+
+### 196.1 `TOL_TRACE_CALL` decimation quantified (closes 193.3)
+
+`TOL_TRACE_CALL` prints `seq <= 25 || seq % 200 == 0`. So `n` printed ENTER lines for an address means its total
+call count is in `[25 + (n-25)*200, 25 + (n-24)*200)`. Any "calls in N seconds" read off those lines is wrong by
+up to ~200x. The `#seq` field on the last printed line *is* the true count at that timestamp, which is what
+makes a rate recoverable.
+
+### 196.2 FUN_0027AD50 is called ONCE - the "hot update routine" hypothesis is dead
+
+```
+[call] ENTER 0x00166120 #1 from=0x00165B2C kind=1 ...        (once)
+[call] ENTER 0x0027AD50 #1 from=0x00166238 kind=1 ...        (once)
+[call] EXIT  0x0027AD50 #1 ... (18 ms later)
+```
+
+`FUN_00166120` and `FUN_0027AD50` are each entered **exactly once**, at t~6.8 s, and `FUN_0027AD50` returns in
+**18 ms**. The master-loop outer body (0x165B2C) runs once, as the static reading said. `FUN_001DC480` and
+`FUN_0016C790` produced **no** trace lines at all (reached by static `jal`, which `dispatchGuestBranch` never
+sees - the documented blind spot). So the mode-1 reading could not be taken, and the routine that carried the
+whole hot profile is not hot.
+
+Cause of the error: the cumulative PCHIST top-12 is dominated by the load phase. In two separate runs,
+`0x1F75F8`, `0x289E10`, `0x3344A0` and `0x27B140` show **identical** counts (1748804 / 1537338 / 1209203 /
+958696). Those functions stop being executed at a deterministic point; the histogram describes the past, not
+the present.
+
+### 196.3 First real frame-loop rate: 19.6 fps
+
+Traced the eight frame-body callees at 0x165B88..0x165BD8. Five of them (`0x152B70`, `0x1516B0`, `0x1F96C0`,
+`0x153780`, `0x164D40`) reach `#200` at the same instant, which is the signature of once-per-frame calls:
+
+```
+0x00152B70  first 00:11:32.964  #1     last 00:11:43.114  #200    199 frames / 10.15 s = 19.6 fps
+0x001516B0  first 00:11:32.997  #1     last 00:11:43.142  #200
+0x001F96C0  first 00:11:32.998  #1     last 00:11:43.143  #200
+0x00153780  first 00:11:32.999  #1     last 00:11:43.146  #200
+0x00164D40  first 00:11:33.001  #1     last 00:11:43.146  #200
+```
+
+**199 intervals in 10.15 s = 19.6 frames/s.** This is the first honest frame-rate number for the port; the
+"0.48/s" of sessions 189-192 was the logging decimation of 196.1, not a measurement.
+
+### 196.4 Reproduced: the frame body stops, and the guest collapses
+
+Two independent runs (with and without the timestamp pipeline) both stop printing the frame body after `#200`
+and both end in the same state:
+
+```
+dcyc=543240  g/s=0.005  gsw=0(+0)  gif=4(+0)  loader state=1 chan=4 alive=1  mainIters=261(+8)
+cyc=279,768,488        (healthy runs end near cyc=5.1e9, g/s=0.53, alive=0)
+```
+
+Total call count is bounded to `[200, 399)` by the decimation, so the frame loop ran at least 199 and at most
+398 frames; what is certain is that it **stopped running**, `0x151FF0` (scheduler pump) and `0x19A080`
+(transfer pump) outlived it (until 48.5 s / 47.7 s), and the guest then advanced at **0.5 % of real time**.
+
+Note the run-to-run difference: `alive=1` and `g/s=0.005` here, versus `alive=0` and `g/s=0.53` in the PCHIST
+and dump runs. The port has nondeterministic end states, so any single run's final `g/s` must be quoted with
+`alive`.
+
+### 196.5 What is now established vs not
+
+Established: frame loop ~19.6 fps; `FUN_0027AD50` runs once and returns in 18 ms; cumulative PCHIST is not a
+picture of current execution; the frame body stops and the guest collapses to 0.005x with a live thread.
+
+Not established: what blocks at the stop, and whether the stop is deterministic (the `alive` difference says
+the end state is not). Next measurement must be **non-cumulative**: a count of `0x152B70` past 400 (i.e. a
+window long enough to print `#400`/`#600`) together with `alive`, so "stops at ~200" can be separated from
+"reaches 399 and is still going".
 
 
 
 
 
 
+
+
+
+## Session 197 (2026-11-21) - THE STARTUP LOGOS AND THE TITLE ARE MPEG VIDEO: the milestone needs an IPU
+
+### 197.1 The reference boot sequence, captured frame by frame (new, definitive)
+
+Fresh `-fastboot` boot of `data\Tales of Legendia (USA).iso` in PCSX2, screen captured every
+1.5 s (`tools/refboot_seq.ps1`), tiled into one sheet (`tools/montage.ps1`):
+`logs/refseq2/t*.png` + `logs/refseq2/montage.png`.
+
+| wall time | what is on screen |
+|---|---|
+| 3.1 s | black |
+| 5.0 - 11.0 s | **NOW LOADING** (the only frame the port has ever produced) |
+| 12.0 s | black (transition) |
+| 13.6 s | **namco** logo - white card, red wordmark |
+| 15.1 - 16.6 s | namco, fading out through grey |
+| 18.0 - 21.1 s | **moth Productions** logo - white card, blue wordmark |
+| 22.5 - 25.6 s | **Sofdec / IBM** logos - grey then white card, fading |
+| 27.1 s | black |
+| 28.5 s | dark: a glowing blue creature appears |
+| 30.0 - 39.1 s | **opening movie** (CG: sun over sea, two figures, hands, white flash) |
+| 40.6 s -> | **TALES OF LEGENDIA** title screen (logo over greenery), stable at 45 s |
+
+This replaces the guess recorded in the session-158 header. The "three units" that `FUN_00204240` runs
+(modes 1/2/3 at ~6 / 11 / 16 s) are the **three logo cards**, and what earlier notes called "the title at
+~21 s" is the logo reel / start of the movie. The real title only arrives at ~40 s of wall time.
+
+The **Sofdec + IBM** card is decisive evidence for what these are: those two screens are the CRI Sofdec
+codec's own licence splashes, i.e. the sequence after `NOW LOADING` is **streamed MPEG-2 video**, not
+2D art. Cross-checked three independent ways:
+
+1. `AFS\MOVIE.AFS` (894 MB) holds 22 entries, every one beginning `00 00 01 BA` = MPEG-2 **program stream
+   pack header** (PSS). `SYS_REG.AFS` is not plain AFS. So the disc ships standard, FFmpeg-decodable
+   MPEG-2.
+2. Paused at the reference title, the EE pc is `0x001292B4`, inside `FUN_00129258`, which drives
+   `REG_IPU_CMD` / `REG_IPU_BP` / `REG_IPU_TOP` - the **IPU**, the PS2's MPEG-2 decoder.
+3. The game imports **no** `sceMpeg*` / `sceIpu*` (`data/output_fixed/ps2_recompiled_stubs.h` has zero
+   hits; `config*.toml` has zero), so it is not the HLE libmpeg path - the guest drives the IPU
+   hardware register-by-register.
+
+### 197.2 The port's side: it reaches the movie stage and then has nothing to decode
+
+`TOL_TRACE_IPU=1`, 130 s run (`logs/run197/ipu130.stderr.log`):
+
+```
+[51.720] [ipu] w 0x10002010   IPU_CTRL
+[51.720] [ipu] w 0x10002000   IPU_CMD  x3
+[51.720] [ipu] w 0x10007010 / 0x10007014 / 0x10007018 / 0x1000701C   IPU_IN_FIFO x~10
+[51.721] [ipu] w 0x10002000   IPU_CMD  x3
+[51.721] [ipu] w 0x10002010
+[51.798] [ipu] w 0x10002010
+```
+
+i.e. exactly the `sceIpuInit`-shaped sequence the runtime already fakes in
+`Kernel/Stubs/IPU.cpp::completeIpuInit`: `SETIQ` (0x50..), `SETVQ` (0x60..), `SETD4` (0x90..) with the
+IQ/VQ tables pushed through `IPU_IN_FIFO`. After that, for the remaining 78 s:
+
+- **zero** `IPU_BP` / `IPU_TOP` reads (the guest's VDEC loop never runs),
+- **zero** `[ipu-dma]` lines = no `IPU_FROM` / `IPU_TO` transfer at all (the bitstream is never fed),
+- `transfers=0  tex builds=0  gsw=0(+0)  gif=5(+0)`; the only draws are the same 4 untextured black
+  primitives per frame, i.e. no logo frame is ever uploaded.
+
+So the port initialises the decoder and then stalls before the first picture. Nothing depends on
+scheduler or thread state here any more.
+
+### 197.3 The guest's IPU contract, read from the code (this is what has to be implemented)
+
+`FUN_00129258` (94 insns) is the picture/block decode batch:
+
+```
+0x1292A4  sw  s4, (0x10002000)   ; s4 = 0x30000000  -> IPU_CMD = VDEC
+0x1292AC  jal 0x129538           ; wait for the command + feed the bitstream
+0x1292C8  lw  a1, (0x10002020)   ; IPU_BP
+0x1292CC  ld  a0, (0x10002030)   ; IPU_TOP (64-bit)
+0x1292DC  sw  v0, 0x848(s1)      ; picture top  = (int32)IPU_TOP
+0x1292F0  sw  v0, 0x84C(s1)      ; bit offset   = 0x20 - (BP & 0x1f)
+```
+
+`FUN_00129538` is the command/bitstream pump:
+
+- polls `IPU_CMD` until bit 31 (busy) clears, then returns it - **the low bits of the finished command
+  are the number of macroblocks that command consumed** (`FUN_00129258` accumulates them:
+  `iVar6 += (short)iVar2`, and `iVar2 == 0` means "picture finished");
+- polls `IPU_CTRL` bit `0x4000` (busy);
+- tests FIFO occupancy `((BP & 0xff00) >> 1) + ((BP & 0x30000) >> 9) - (BP & 0x7f) < 0x20` and
+  `DMAC_4_IPU_TO_QWC` before refilling through `FUN_0012cde8(param+0x868)`;
+- gives up after 500 iterations and errors out through `FUN_0012e560`.
+
+The decode driver is `entry_0012dec4` (`data/output_fixed/entry_0012dec4_0x12dec4.cpp`), the only code
+that touches the DMA side:
+
+| guest address | register |
+|---|---|
+| `0x10002000` | IPU_CMD (`sw`) |
+| `0x1000B000` | `IPU_FROM` DMA (`D0`-style: MADR/QWC/CHCR; the code reads it back and tests `0x100`) |
+| `0x1000B400` | `IPU_TO` DMA - the decoded picture comes back through **this** channel |
+
+Call chain (Ghidra callgraph): `FUN_0012ce60 -> FUN_0012c748 -> FUN_0012cff8 -> FUN_001281c8 ->
+FUN_00128408 -> {FUN_0012aa88 start-picture, FUN_00129258 VDEC, FUN_0012bb98, FUN_001296b8 bit reader}`.
+`FUN_0012aa88` parses the picture header with its own EE-side bit reader
+(`FUN_001297a0`/`FUN_001296b8`/`thunk_FUN_00129830`) and then hands the macroblocks to the IPU. So the
+**EE does the header/quantiser work and the IPU does the VLC + IDCT + reconstruction**: a faithful
+implementation must be a real IPU, not an FFmpeg shortcut, because the guest consumes the hardware's
+per-command macroblock counts and `IPU_TOP` to advance its own bitstream.
+
+The runtime today treats the IPU as a write-only register file
+(`ps2_memory.cpp`: `0x10002000..0x10002030` store/echo, `IPU_CTRL` bit 31 masked) plus an immediate
+"complete with zeros" DMA stub for `IPU_TO`/`IPU_FROM` (`TOL_NO_IPU_STUB=1` disables it). That is why
+nothing decodes. `Kernel/Stubs/IPU.cpp` only fakes `sceIpuInit/RestartDMA/StopDMA/Sync`, and the game
+does not import them anyway.
+
+### 197.4 What this changes about the milestone
+
+The milestone cannot be met by fixing the loader, the scheduler, the presenter or the scene object:
+the startup logos and the title background are MPEG-2 video decoded by the IPU. The remaining work is a
+**hardware substitution**: implement the PS2 IPU behind its real register/DMA contract, backed by a
+native MPEG-2 decode core, and let the guest's own CRI Sofdec path drive it. That is exactly the
+"replace PS2 hardware with native systems, keep the original executable logic" rule this port is built
+on. The spec is already in this repo's skill set: `ps2-recomp/resources/09-ps2tek.md` §IPU
+(`10002000h IPU_CMD`: BCLR/IDEC/BDEC/VDEC/FDEC/SETIQ/SETVQ/SETTH/SETD4, plus the `IPU_BP`/`IPU_TOP`
+bit layouts).
+
+### 197.5 Order of work (staged, each stage independently testable)
+
+1. **IPU register block, honest semantics** - `IPU_CMD` busy/result, `IPU_CTRL` busy/reset,
+   `IPU_BP`/`IPU_TOP` real values, `IPU_IN_FIFO`/`IPU_OUT_FIFO` as byte queues. Exit test: the guest's
+   `FUN_00129538` loop stops timing out (no `FUN_0012e560` error path).
+2. **DMA wiring** - `IPU_FROM` (0x1000B000) must push the guest's bitstream bytes into the input queue
+   instead of completing with zeros; `IPU_TO` (0x1000B400) must deliver decoded macrobocks to the
+   requested RDRAM address. Exit test: `[ipu-dma] FROM ... qwc=` lines appear with real `MADR`s, and
+   `IPU_BP` occupancy moves.
+3. **VDEC / BDEC decode core** - the actual MPEG-2 VLC + dequant + IDCT + reconstruction, reporting the
+   per-command macroblock count in `IPU_CMD[6:0]` and the picture top in `IPU_TOP`. Exit test: the first
+   logo card appears (`tex builds > 0`, `gsw` climbing, `[gsorder]` textured draws).
+4. Only after (3): re-measure the three logo cards, the opening movie and the title against
+   `logs/refseq2/`.
+
+Do **not** re-investigate in the meantime: preemption mode, the scene object/entities, PMODE/DISPFB2,
+the presenter, the 224/280->0 copy, `FUN_0027AD50`, the `0x3DB660`/`0x1562FA0` tables, or thread state
+- all were measured this month and are not the gate for the logo/title sequence.
+
+### 197.6 Tooling added this session
+
+| tool | purpose |
+|---|---|
+| `tools/refboot_seq.ps1` | kill + `-fastboot` relaunch PCSX2, then window-cropped screen captures on a timer (used for the table in 197.1) |
+| `tools/montage.ps1` | tile a folder of captures into one review sheet |
+| `tools/shotscreen.ps1`, `tools/shotwin.ps1`, `tools/shotclient.ps1` | window / client / full-screen capture (the old captures were of the wrong window: PCSX2 opens at `1383,695` and must be moved to `0,0`) |
+
+Measured facts worth keeping: `TOL_TRACE_CALL` prints only `seq <= 25 || seq % 200 == 0`, so the `#seq`
+on the last line is the true count; and the port's frame body (`0x165B88..0x165BD8`) really does run at
+**~21 fps** until ~50 s, then the main thread moves into `FUN_00206310` (the unit/movie loop at
+`0x206364`) which spins at ~33 Hz calling `FUN_00152B70`. That is the loop that is waiting for video.
+### 197.7 The IPU does not have to be written from scratch: a complete one already exists locally
+
+Found while checking the other PS2 recomp trees on this machine:
+
+```
+D:\Personal\C++\grandia-ps2recomp\runtime\src\hw\ipu.cpp        34,487 B / 955 lines
+D:\Personal\C++\grandia-ps2recomp\runtime\src\hw\ipu.h
+D:\Personal\C++\grandia-ps2recomp\runtime\src\hw\mpeg_tables.h  11,456 B (VLC + non-linear quant tables)
+```
+
+It is a real PS2 IPU, not a stub: `build_lut` over the MPEG-2 VLC tables (MBA/MBI/MBP/MBB/CBP/MC/DMV/DCL/DCC
++ escape tables), `decode_intra_block` / `decode_nonintra_block`, an 8x8 IDCT, `qscale()` with the non-linear
+quantiser, DC predictors per component, a picture/reconstruction path with I/P/B handling, `csc_mb` for the
+YCbCr->RGBA16 output with dithering, an `IPU_IN`/`IPU_OUT` FIFO model with `g_bitpos` over a 128-bit window,
+`fill_input()` driven by DMA channel 4 (IPU_FROM), and `drain_output()` driven by channel 3 (IPU_TO).
+
+Its public surface is exactly what this runtime needs:
+
+```c
+void init();
+u32  read_reg(u32 addr);          // IPU_CMD / CTRL / BP / TOP
+void write_reg(u32 addr, u32 v);
+void fifo_read(r128* out);        // IPU_OUT_FIFO
+void fifo_write(const r128* v);   // IPU_IN_FIFO
+void dma_in(const u8* data, u32 qwc);
+void dma_in_start();              // IPU_FROM
+void dma_out_start();             // IPU_TO
+void kick();
+u64  command_count();
+```
+
+Coupling to its own project is small and mechanical: 23 `hw::` references (almost all `hw::dma[3]`/`hw::dma[4]`
+`madr`/`qwc`/`chcr`/`tadr` plus one `hw::d_enable`), 12 `log_write`, 3 `mem::`, 3 `kernel::`, 1 savestate macro,
+2 `r128`. The adaptation is therefore a shim, not a rewrite:
+
+| grandia dependency | PS2Recomp equivalent |
+|---|---|
+| `hw::dma[3]` / `hw::dma[4]` fields | the `m_ioRegisters` words at `0x1000B400`/`0x1000B000` that `ps2_memory.cpp` already stores on CHCR writes |
+| `hw::d_enable` | DPCR/D_STAT handling already in `ps2_memory.cpp` |
+| `mem::read*`/`mem::write*` | `rdram` (`PS2Memory::getRDRAM()`), 32 MB, same layout |
+| `log_write(LOG_IPU, ...)` | `PS2_LOG_*` / `fprintf(stderr, ...)` |
+| `r128` | `__m128i` or a 16-byte POD |
+| savestate `s.v(...)` | delete (no savestate in this runtime) |
+
+Integration points, all in existing code:
+
+1. `ps2_memory.cpp` write path: `0x10002000..0x10002030` -> `ipu::write_reg`; `0x10007010..0x1000701F` ->
+   `ipu::fifo_write` (the four `sw`s at `0x10007010/14/18/1C` are one 128-bit FIFO write, as `IPU.cpp` already
+   assumes).
+2. `ps2_memory.cpp` read path: `0x10002000..0x10002030` -> `ipu::read_reg`; `0x10007000` -> `ipu::fifo_read`.
+   This is what makes the guest's `FUN_00129538` busy poll terminate and `FUN_00129258` get real `IPU_BP`/`IPU_TOP`.
+3. `ps2_memory.cpp` DMA path: on `IPU_FROM` (0x1000B000) CHCR start -> `ipu::dma_in_start()` and feed the buffer;
+   on `IPU_TO` (0x1000B400) CHCR start -> `ipu::dma_out_start()`. The existing "complete immediately with zeros"
+   stub (`TOL_NO_IPU_STUB`) must be replaced by this, otherwise the picture never arrives.
+4. `Kernel/Stubs/IPU.cpp::completeIpuInit` can stay (it only seeds the tables the guest also seeds itself).
+
+Expected first measurable result, on the existing build and existing probes: `[ipu-dma] FROM ... qwc=`,
+`tex builds > 0`, `gsw` climbing, `gif` climbing, `[gsorder]` textured draws, and the **namco** card on screen at
+the point where `FUN_00204240` mode 1 runs.
+
+Open question to settle while adapting (needs one trace of the reference): whether this game's stream is plain
+MPEG-2 elementary video inside PSS (what `mpeg_tables.h` + `decode_*` handle) or needs the `_last_block` /
+sequence-header init that `g_in_last_block` implements. `FUN_0012AA88` parses the picture header on the EE and
+only hands macroblocks to the IPU, so the IPU's own sequence/picture-header parsing must be tolerant of being
+entered mid-picture - check `write_reg`'s handling of `SETIQ`/`SETVQ`/`SETD4`/`BCLR`/`FDEC` and the `g_cmd_func`
+path before trusting it blind.
+
+### 197.8 Honest status at the end of session 197
+
+- **Not reached:** the milestone. No logo, no title. The window still shows the stale NOW LOADING frame.
+- **Established beyond doubt:** the startup logos and the title are MPEG-2 video decoded by the IPU, and the
+  port has no IPU. That is the single gate for "original boot sequence to title screen".
+- **De-risked:** a complete, real IPU implementation was located on this machine and its integration surface
+  mapped to this runtime's existing hooks (197.7). The remaining work is an adaptation plus DMA wiring, not an
+  MPEG-2 decoder from scratch.
+- **Next session starts at 197.7 step 1** (registers), then step 3 (DMA), then runs the logo sequence against
+  `logs/refseq2/`.
+### 197.9 CORRECTION to 197.1/197.4 - the three LOGO CARDS are not video; the IPU starts at the OPENING MOVIE
+
+A breakpoint trace on the reference settles the split. Fresh `-fastboot` boot, trace armed ~9 s after launch
+(so add ~9 s to the times below to get wall time):
+
+```
+0x00204240  t= 3.01s mode=1        -> absolute ~12.0 s
+0x00204240  t= 8.18s mode=2        -> absolute ~17.2 s
+0x00204240  t=13.20s mode=3        -> absolute ~22.2 s
+0x0012dec4  (IPU DMA driver)       -> 0 hits in a 16 s window covering all three units
+0x00128408  (MPEG picture decode)  -> first hit t=18.81s = absolute ~27.8 s, then ~20 hits/s
+```
+
+Mapped onto the captured sequence (197.1):
+
+| phase | wall time | IPU? | mechanism |
+|---|---|---|---|
+| NOW LOADING | 5-11 s | no | guest 2D |
+| **namco** card | 13.6 s | **no** | 2D image + fade (`FUN_00204240` mode 1) |
+| **moth Productions** card | 18 s | **no** | 2D image + fade (mode 2) |
+| **Sofdec / IBM** card | 22.5 s | **no** | 2D image + fade (mode 3) |
+| black | 27 s | - | - |
+| **opening movie** | 28-39 s | **yes**, from ~27.8 s at ~20 pictures/s | IPU MPEG-2 (VDEC), 640x320 29.97 fps, ADX audio |
+| **TALES OF LEGENDIA title** | 40.6 s -> | yes (title background is video; the paused reference sits in `FUN_00129258`) | IPU |
+
+So the gate is **two** defects, not one, and they are independent:
+
+- **Gate A - the three logo cards (2D).** This is the *original* session-158 defect: the unit page receives only
+  untextured black draws, `tex builds = 0`. The cards are LZSS-compressed images the unit loads and the guest
+  uploads as GS textures, then fades. Nothing about this needs the IPU, so **it is the cheaper and nearer
+  milestone deliverable**: fix the image/upload/draw path and the namco + moth + Sofdec cards appear.
+- **Gate B - the opening movie and the title background (IPU).** Needs the IPU work in 197.3/197.7.
+
+`MOVIE.AFS` is confirmed to be the story/opening CG only: the first 14 entries decode as ordinary CG
+(`logs/movies/montage2.png`; entry 0 frame at 3 s is the teal sun-over-sea shot that the reference shows at
+~30 s). `SYS_REG.AFS` is a real AFS (430 entries, first at 0x1000, 542,998 B) but contains **no** `00 00 01 BA`
+pack headers, so the logo cards are image assets, not movies - consistent with the IPU being idle at 13-22 s.
+
+Revised order of work:
+
+1. **Gate A first.** Re-open the session-158 finding (`scene page 280 receives only untextured black`) from the
+   *logo* side: identify the unit's image asset, its LZSS decode, its GS upload and the fade draw for
+   `FUN_00204240` modes 1/2/3. Success test: `logs/refseq2/t014.png`-equivalent content at 13.6 s (namco),
+   18 s (moth), 22.5 s (Sofdec/IBM); `tex builds > 0`, `transfers > 0`, `[gsorder]` textured draws.
+2. **Gate B second.** Port the IPU (197.7), then the opening movie and the title background follow.
+3. `../ps2_project_state.md` note: the "scene page 280 / no textured draws" defect is *the same* upload path as
+   Gate A, so 1 is not extra work - it is the original blocker, now with a known target image.
+### 197.10 GATE A, first pass (measured) - the card is built correctly and then nothing textured is drawn
+
+Port probes (`TOL_TRACE_PC` on the card path, 115 s, `logs/run197/unitA.stderr.log`):
+
+```
+32.328  0x1F72F0  a0=1  a1=0x014E29E0   ra=0x00204268   <- unit 1 load request (mode = a0)
+32.864  0x1531B0  a0=0x0063D8E0         ra=0x002042DC   <- relocate the loaded blob
+32.865  0x239A90  a0=0x0063D910 a1=0x014E2A3C a3=0x014E2A30  ra=0x00204304  <- sprite ctor
+32.865  0x1EBEA0  a0=0x0063D970 a1=0x00000011 a3=0x00000200  ra=0x00204324  <- type-0x11 node
+32.865  0x1EC100  a0=0x0063D970 a1=0x0063D910 a2=0xE0 a3=0x200  ra=0x002044D0 <- attach
+38.853  0x164B90  a0=0x0063D910         ra=0x00204468   <- destroy, 5.99 s later
+39.545  ... same sequence for unit 2 (mode 2), destroyed 45.812
+46.486  ... same sequence for unit 3 (mode 3), destroyed 52.508
+```
+
+So all three cards are **created, attached, held for ~6 s and destroyed on schedule**. The card lifetime is
+correct (25-frame fade in + 90-frame hold + 25-frame fade out ~= 4.7 s at 30 fps, 6 s in the port's slower frame
+cadence). Nothing is skipped on the guest side.
+
+The card's sprite descriptor is **byte-identical to the reference**: a 64 KB dump of
+`0x014E0000..0x014F0000` (`TOL_DUMP_RAM=0x014E0000,0x10000,...`) compared with the same range read from PCSX2
+(`logs/rd197/p_11.bin` vs `logs/rd197/ref_14E0000.bin`) is **16384 of 16384 words identical**, including the
+relocated sprite header at `0x014E2A30` (`BEAF0001`, children `0x014E2A3C/0x014E2AC0/0x014E2F50`). This range was
+never covered by the session-160 unit diffs (`0x480000,0x200000`), so it is a genuinely new comparison - and it
+matches.
+
+What is drawn (`TOL_TRACE_GSORDER=1`, `logs/run197/unitB.stderr.log`):
+
+- The only primitives in the card window are `FILL224 target=224 tme=0 iip=1 rgba=0,0,0,0` quads of 64x32 in a
+  tiled sweep. **These are not the defect**: the same black tiled sweep starts at **3.14 s**, i.e. it is the
+  game's ordinary per-tile screen clear and it runs under the *working* NOW LOADING frame too.
+- The only textured (`tme=1`) primitives in the whole window are the known page-224 -> page-0 display copy
+  (`tbp0=7168`, `rgba=128,128,128,128`, 20 vertical strips). **No textured draw from the card's image is ever
+  issued.** The window capture during the cards is uniformly black (5 captures at 33/37/41/45/49 s, identical
+  MD5, `logs/run197/unitC_*.png`).
+
+So Gate A narrows to: the guest builds a valid card sprite and never submits it. Type/vtable facts gathered for the
+next probe: the sprite is `vtable 0x003D4CA0` (`0x239AE0/0x239B40/0x239B50/0x239D00` at slots +8..+0x14,
+`0x23A500/0x23A060` at +0x28/+0x2C), created by `FUN_00239a90` -> `FUN_00239b60`; the node it is attached to is
+`vtable 0x003D4040` (`0x1EBF20/0x1EBFA0/0x1EC010/0x1EC080/0x1EC150` at +8..+0x18, `0x1EF180/0x1EF270/0x1EF280/
+0x1EF7D0/0x1EF7F0` at +0x28..+0x38; `0x1EF180` is the destructor, it unlinks `+0x40`/`+0x44` and decrements the live
+counter), and `FUN_001EC100` stores the sprite at `node+0x68`. The next probe is those vtable slots, to see which of
+them the port never calls.
+
+Tooling: `TOL_DUMP_VRAM` now accepts `TOL_DUMP_VRAM_FRAMES=<n[,n...]>` (default 150,400) so VRAM can be captured
+inside the card window (~frames 1000-1500), which the default pair never reached.
+### 197.11 Build trap found and fixed: `cmake.check_cache` is written AFTER `build.ninja`, so ninja re-runs CMake forever
+
+Symptom: `ninja -C build/tol2 -j 12 tol` prints `[0/2] Re-checking globbed directories...` then
+`[1/2] Re-running CMake...` and never gets further. Two attempts died on this (15 min, then 1 h, then 25 min,
+with no `.obj` written and `tol.exe` untouched). The state file's older note ("re-runs CMake on every invocation,
+~5 min") is the same defect seen from further away.
+
+Cause, measured:
+
+```
+build\tol2\build.ninja                       11/22 00:08:42
+build\tol2\CMakeFiles\cmake.check_cache      11/22 00:08:42   <- NEWER (same second, later fraction)
+```
+
+`cmake.check_cache` is an explicit input of the generated `RERUN_CMAKE` edge, and CMake writes it *after* the
+ninja files. `build.ninja` is therefore permanently one instant older than one of its own inputs, so every ninja
+invocation re-runs the configure, which rewrites both files in the same order, forever. Configuring itself is
+only ~135 s (`Configuring done 3.8s / Generating done 130.8s`), so a loop looks like a hang.
+
+The glob verify is NOT the problem: `cmake -P build/tol2/CMakeFiles/VerifyGlobs.cmake` prints **nothing** (no
+`GLOB mismatch`), and both globs match exactly - `data/output_dense` has 13520 `.cpp` and `OLD_GLOB` lists 13520;
+the second glob is `thirdparty/PS2Recomp/ps2xRuntime/src/runner/*.cpp`. `ninja -d explain -n` blames
+`CMakeFiles/VerifyGlobs.cmake_force` (a phony that is dirty by design) and then reports the CMAKE edge, which is
+the cascade from `check_cache`, not a real content change.
+
+Fix (non-destructive, no clean, no deletion):
+
+```powershell
+(Get-Item build\tol2\build.ninja).LastWriteTime = (Get-Date).AddSeconds(5)
+(Get-Item build\tol2\CMakeFiles\cmake.check_cache).LastWriteTime = (Get-Date).AddSeconds(-30)
+```
+
+After that no CMake input is newer than `build.ninja` (verified by scanning `_deps`, `out\sdl3`, `thirdparty`,
+`src`, `cmake`, root `CMakeLists.txt`). Note `ninja -n` still prints "Re-running CMake" afterwards - that is a
+dry-run artefact of the `_force` phony and is not what a real run does.
+
+Also confirmed while diagnosing: the corpus objects hold - `build\tol2\...\output_dense` has **13519** `.obj`
+(all 11/21 01:08); only `tol_overrides.cpp` needs recompiling plus the link, so this is a minutes-long build once
+the loop is broken. `output_fixed` (53222 objs) is a *different, unused* corpus directory; the live one is
+`data/output_dense` (`TOL_GENERATED_DIR` in `build/tol2/CMakeCache.txt`).
+
+
+## Session 198 (2026-11-22) - the 2-hour build was a MALFORMED corpus, not a slow file; `data/output_dense` is deleted, the live corpus is `data/output_fixed`
+
+### 198.1 Retraction of the last paragraph of 197.11
+
+197.11 ended by saying `output_dense` was "the live one" and `output_fixed` "a different, unused corpus
+directory". That is backwards, and it is what made the tree unbuildable. `output_dense` is the broken one and
+it is now deleted.
+
+### 198.2 The measurement that settles it
+
+`entry_003a3198_0x3a3198.cpp` is the recompiler's PC-dispatch entry:
+`switch (ctx->pc) { case 0x3a3198u: goto label_3a3198; ... }` - one case per entry address.
+
+| corpus | files | entry_003a3198 | **case labels** | register_functions |
+|---|---|---|---|---|
+| `output` | 53,558 | 6.47 MB | **482** | 20.0 MB |
+| `output_dense` | 13,520 | 11.54 MB | **47,418** | 62.0 MB |
+| `output_fixed` | 13,520 | 9.49 MB | 784 | 61.3 MB |
+
+A 482-case dispatch became **47,418** cases - one per instruction address instead of one per branch target, a
+~100x expansion. That TU ran 112 min at `-O2` (6,076 s CPU) and 52 min at `-O0` (2,206 s CPU) without ever
+writing an `.obj`. It was not slow; it was malformed.
+
+### 198.3 Why it was being built at all
+
+- `CMakeLists.txt:86` defaults `TOL_GENERATED_DIR` to `thirdparty/PS2Recomp/ps2xRuntime/src/runner`
+  (53,558 files, byte-identical to `data/output` - verified by MD5 on `register_functions.cpp` and a sample).
+- `build/tol2/CMakeCache.txt` had overridden it to `data/output_dense`.
+- **No config in the repo produces that directory**: `config.toml` -> `data/output`; `config_fixed.toml` and
+  `config_orig.toml` -> `data/output_fixed`; `config-linux.toml` -> `data/output`. `output_dense` was a stray.
+- The working Nov 20 exe predates the dense files (2026-11-21 01:06), so it was never built from them.
+
+### 198.4 Second defect: the oversized-TU guard never applied to clang-cl
+
+`src/runtime/CMakeLists.txt` gated the ">2 MB -> no PCH, no optimisation" path on
+`CMAKE_CXX_COMPILER_ID STREQUAL "MSVC"`. clang-cl reports `Clang`, so the guard never fired and every oversized
+TU went to `-O2` with the PCH. Now `MATCHES "^(MSVC|Clang)$"` with `-O0` for Clang. Configure confirms:
+`tol: 4 oversized translation units build without PCH at -O0`.
+
+### 198.5 Cleanup performed
+
+- `data/output_dense` **deleted** (13,520 `.cpp`, 279 MB). It was untracked by git and referenced by no config.
+- `build/tol2/CMakeCache.txt`: `TOL_GENERATED_DIR` -> `data/output_fixed`.
+- **No `.toml` referenced the dense corpus**, so there was no config file to delete. The four configs remain:
+  `config.toml` (output), `config_fixed.toml` (output_fixed), `config_orig.toml` (output_fixed),
+  `config-linux.toml` (output).
+
+### 198.6 Result
+
+Full rebuild of `data/output_fixed`: 13,528 edges, 12 workers, ~20 min, `EXIT=0`, zero errors.
+
+```
+build\tol2\src\runtime\tol.exe        95,888,896   2026-11-22 20:58:07
+build\tol2\src\runtime\tol_prev.exe   97,803,776   2026-11-20 22:26:18   (rollback copy)
+```
+
+The exe is ~2 MB smaller because the 4 oversized TUs now build at `-O0`. If those functions regress at runtime,
+restore `-O2` for just them.
+
+### 198.7 Rule for next time
+
+Do not reintroduce `data/output_dense`. A corpus is only valid if a `data/config*.toml` names it. Before
+pointing `TOL_GENERATED_DIR` at a directory, check `entry_003a3198_0x3a3198.cpp`: ~500 case labels is normal,
+~47,000 means the generation is broken and the build will never finish.
+### 197.12 GATE A, second pass (measured on the rebuilt binary) - the card IS submitted, but no textured primitive reaches the GS, and the rebuild regressed the whole GS path
+
+Build notes first, because they bit us:
+
+- The exe the user built at 20:58 contained **no renderer at all**: `TOL_GFX_ENABLE_SDLGPU:BOOL=ON` but
+  `SDL3_DIR:PATH=SDL3_DIR-NOTFOUND`, so `tol_gfx_sdlgpu` was never generated, `build.ninja` had no reference to
+  it, and the binary contained none of the `--gs=sdlgpu` / `sdlgpu` strings. `out/sdl3` had been deleted.
+  Fixed by re-extracting `%TEMP%\opencode\SDL3-devel.zip` to `out/sdl3` and reconfiguring with
+  `-DSDL3_DIR=D:/.../out/sdl3/SDL3-3.4.18/cmake`; configure then reports "SDL GPU backend available
+  (--gs=sdlgpu)". Generating took 500 s.
+- The corpus in use is **`data/output_fixed`** (the known-good one), not `output_dense`; `tol_generated.lib`
+  (270.7 MB) was rebuilt 11/22 20:58 from its 13,519 objects. `ps2_runtime.lib` is untouched (11/20 22:26), and
+  the corpus compile flags are correct (`/EHsc -std:c++20 -O2 -msse4.1 -fno-strict-aliasing -fwrapv`).
+- Cost of an instrument-only iteration: one TU (`sdlgpu_backend.cpp`) + link, ~2 min. The build loop trap
+  (197.11) has to be re-broken after every configure.
+
+New, reusable probes in `src/gfx/backends/sdlgpu/sdlgpu_backend.cpp` (all env-gated):
+
+| env | what |
+|---|---|
+| `TOL_TRACE_GSPRIM_WINDOW=<from>,<to>[,max]` | every primitive in a wall-clock window (proved useless: the port's speed varies >3x run to run) |
+| `TOL_TRACE_GSPRIM_FILTER=1` | every primitive **except** the known steady-state classes (tiled clear, page-224->0 copy, page-280->0 copy, black clear-copy, page-112 staging sprites), cap 2000 |
+| `TOL_TRACE_GSPRIM_EMPTY=1` | every batch dropped because `primitiveBounds()` is empty - a silent drop path that hid draws completely |
+| `TOL_DUMP_VRAM_FRAMES=<n[,n...]>` | frame numbers for the existing `TOL_DUMP_VRAM` dump (default 150,400 never reached the cards) |
+
+New tool `tools/vram_page.py <vram.bin> <fbp> <out.png> [w] [h]` renders a CT32 page of a VRAM dump.
+
+Measured facts on the rebuilt binary:
+
+1. **The card path runs and submits.** `TOL_TRACE_PC` on the chain: `0x1EC150` (node draw) is called with the
+   card node `0x0063D970` 32 of its first 40 calls; `0x239D00` (sprite submit, `a0=0x0063D910`) runs from
+   inside it (`ra=0x001EC290`); `0x15C3B0` (vertex) and `0x15BF60` (state push) also run. So the guest
+   *does* draw the card - 197.10's "never drawn" is superseded.
+2. **But no textured primitive reaches the backend.** With the filter probe (2000 lines covering 3.9-95 s,
+   i.e. unit 1's whole window at 86-92 s) the only classes are `fbp0/tme0/tbp8960` (x1571, untextured quads
+   into page 0 sampling page 280), the 5 early UI panels (`fbp224/tme1/tbp14976`, 11 s) and 2 misc. No
+   `tme=1` card draw at all.
+3. **The dropped-batch path is not it**: every empty-bounds drop is at 7.0-7.2 s and is a `type=4` clear.
+4. **GS VRAM is completely empty**: dumps at frames 230/240/250/260/270/280 render pages 0, 224 and 280 as
+   **0 non-black pixels of 229,376** each. There is no artwork anywhere in VRAM.
+5. **The guest emits almost no GIF traffic**: a clean run (no env vars) ends at `gif=5 gsw=0` after 120 s,
+   where the 11/20 binary logged `gif packets=720` in 57 s and `transfers=858 (110808 KiB)`. `mainIters` is
+   healthy (1969 at 120 s, ~16/s) so the frame loop is running.
+
+Conclusion so far: this binary is a **regression of the whole GS submission path**, not a card-specific defect.
+The only input that changed is the corpus objects, recompiled today from the same `output_fixed` sources; the
+runtime library, the gfx sources and the compiler flags are unchanged. Next step is to establish that with a
+controlled rebuild (dense corpus, or the user's original objects), because no card-side fix can help while the
+guest uploads nothing.
+
+Timeline note for future runs on this binary: units now load at **86 / 100 / 114 s** and the frame tick runs
+at ~2.7 fps, versus 32 / 39 / 46 s and 19.6 fps on the 11/20 binary - so any wall-clock window written against
+the old numbers will miss.
+### 197.13 Dense corpus recreated and built; the build step that "gets stuck" is ninja's CMake/glob step, not the compile
+
+`data/output_dense` **had been deleted** (only `output`, `output_fixed`, `output_bak_17-10-2026`,
+`output_base_17-10-2026` remained), which is why the dense build could never produce an exe: the CMake glob finds no
+sources there. It was recreated, not restored from a backup:
+
+```
+data/config_dense.toml          = config_fixed.toml with output -> data/output_dense
+build/recomp/ps2xRecomp/ps2_recomp.exe data\config_dense.toml     (~14 min, exit 0)
+  -> 13520 .cpp, 278 MB, register_functions.cpp 59.1 MB
+  -> verification cases: entry_00205f68=38, entry_00165210=16, entry_00231e54=23   (identical to the old dense)
+```
+
+The recompiler prints `unhandled-instruction` for `entry_003a3198` (data decoded as code) but still reports
+"Recompilation completed successfully", same as before.
+
+Build path used, because `ninja -C build/tol2 ... tol` **hangs at `[0/2] Re-checking globbed directories...`** for
+20+ min with no compiler running and no `build.ninja` rewrite, while the same verify step run by hand is 1.7 s and
+reports no mismatch (`cmake -P build/tol2/CMakeFiles/VerifyGlobs.cmake`). It is intermittent - one run got to
+`[13521/13525]`. Workaround that works:
+
+1. Point the build at dense and fix the `cmake.check_cache` loop (197.11):
+   `cmake -S . -B build/tol2 -DTOL_GENERATED_DIR=.../data/output_dense -DSDL3_DIR=.../out/sdl3/SDL3-3.4.18/cmake`
+2. Backdate `data/output_dense` to the corpus's original mtime (2026-11-21 01:06:00) so the 13,519 existing,
+   content-equivalent objects are reused instead of recompiling all 13,520 TUs. Verified the regenerated corpus is
+   the same one those objects came from by the case counts and the 59.1 MB / 278 MB sizes.
+3. `ninja -C build/tol2 -t commands <target>` works instantly (it does not run the glob step) - use it to extract
+   the exact archive and link command lines.
+4. Archive by hand: generate an rsp with the 13,520 object paths and run
+   `llvm-lib.exe /nologo /out:src\runtime\tol_generated.lib @mygen.rsp` from `build/tol2` (272.9 MB, exit 0).
+5. `entry_003a3198_0x3a3198.cpp` is the only missing object and the single slowest TU in the corpus: with dense
+   `case` labels it needs **more than 23 minutes** and must be run detached (`Start-Process cmd /c cc_monster.bat`)
+   or it is killed by a tool timeout. Compile command extracted from `cmd_lib.txt`.
+6. Then re-archive and run the exe link line (the `cmake -E vs_link_exe ... lld-link ...` command from
+   `ninja -t commands src/runtime/tol.exe`).
+
+Status at the time of writing: dense `tol_generated.lib` archived (272.9 MB) **without** `entry_003a3198`; that TU
+compiling detached; `tol.exe` still the 11/22 22:22 binary. The next step after it lands is re-archive + link, then
+the Gate A probe run on the dense binary.
+### 197.14 CORRECTION: the GS path is NOT dead - 105 MB of textures are uploaded. The defect is the opaque untextured display copy
+
+The "dead GS path" conclusion in 197.12 was wrong and is retracted. It came from three misread instruments:
+
+- `[gfx] ... transfers=... gif=...` lines no longer print at all (they are sdlgpu-only and gated differently), so
+  the `gif=5 gsw=0` figures I quoted come from a *different* counter than the transfer byte count.
+- The GS debug-history census (`tags/draws/transfers`) is a **rolling 512-event window**, so identical numbers
+  across samples mean a steady workload, not a stall.
+- `TOL_TRACE_GSPRIV` never shows `TRXDIR`/`BITBLT` because this title uploads with GIF **IMAGE tags**; absence of
+  those registers is normal on PS2.
+
+New probe `TOL_TRACE_GSIMAGE=1` in `gs_frontend.cpp` (submodule) counts GIF IMAGE tags in
+`visitPackedGifPacket`. Healthy 90 s run:
+
+```
+[   3.460] [gsimage] tag#1    nloop=4    bytes=64     totalBytes=64
+[   3.460] [gsimage] tag#2    nloop=1024 bytes=16384  totalBytes=16448
+...
+[  34.126] [gsimage] tag#14848 nloop=64  bytes=1024   totalBytes=4252752
+[  52.736] [gsimage] tag#15616 nloop=64  bytes=1024   totalBytes=105309264
+```
+
+**15,616 IMAGE tags, 105,309,264 bytes uploaded by 52.7 s** (the 11/20 binary logged 110,808 KiB - same thing).
+`g/s=0.528`, `mainIters +8`: that run is at the old, healthy speed, so the earlier 86/100/114 s timeline was
+run-to-run variance, exactly as the state file warns.
+
+What is actually wrong, measured in a healthy run with `TOL_TRACE_GSPRIM_FILTER=1` (units at 34.2 / 41.2 / 48.4 s):
+
+| class | count | meaning |
+|---|---|---|
+| `fbp0/tme0/tbp8960` | 284 | **the display copy, one per frame, UNTEXTURED, sampling page 280** |
+| `fbp224/tme1/tbp14976` | 5 | the one working textured sprite (an 11 s UI panel) |
+| `fbp0/tme0/tbp0` | 2 | misc |
+
+So: the guest draws exactly one full-screen quad per frame into page 0, from page 280, with **TME = 0**, i.e. a flat
+colour and not the framebuffer contents. That is why the window is black while the upload path is healthy, and why
+no logo-card artwork appears: **no textured draw for the card sprite reaches the backend at all** (the node draw
+`0x1EC150` and sprite submit `0x239D00` do run - see 197.10/197.12).
+
+Caveat on VRAM: `TOL_DUMP_VRAM` dumps `PS2Memory::getGSVRAM()`, which only ever holds ~261 KB (one CLUT+texture at
+`0x3A7000`, `tbp0=14976`) even when 105 MB has been uploaded - the live VRAM is the backend's `GsVram`. Do not use
+`TOL_DUMP_VRAM` to judge whether uploads land; use `TOL_TRACE_GSIMAGE` plus the draw probe.
+
+A/B against the 11/20 reference at the unit boundaries (`TOL_DUMP_UNITS=0x480000,0x200000,...` vs
+`logs/ramdump/ref_unit*`): session 160 reported the structures identical; they now differ by
+7,266 / 16,868 / 16,986 / 66,097 / 28,366 / 29,393 words, first difference always in `0x48F7xx-0x48F8xx` (the guest
+scheduler's ready bitmap / priority counts / context slots area). Session 160 already classified that range as
+transient, but the counts are far larger than the "0 differing words" baseline, so the guest's own scheduler state
+has drifted in this rebuild.
+
+Next steps, in order:
+1. Print the guest TEX0 (`tbp0/tbw/psm/tcc/tfx/tme`) and the source page for the one copy draw per frame, and find
+   the guest function that emits it (the copy is built where the guest copies 224/280 -> 0). Compare its TME with
+   what the same site emits for the 11 s UI panel, which is textured and works.
+2. Determine whether page 280 ever receives a draw: the census shows draws only to `fbp 224` and `fbp 0` (plus the
+   staging page 112). If nothing writes 280, the copy can only ever read black whatever its TME is - that would make
+   the untextured copy a red herring and point back at the missing card draw.
+3. Re-run 197.10's chain on the healthy build (the earlier chain run was on a slow run) to see whether `0x239D00`
+   is reached during the card's 6 s window and with which `sprite+0x20` texture handle.
+### 197.15 All three probes run: the card draws into page 224/112 while the display copies page 280
+
+Probe added: `TOL_TRACE_GSDRAWS=1` (`sdlgpu_backend.cpp::submit`) - prints every distinct
+`(framebuffer, tme, texture page)` draw class the moment it first appears, with the full TEX0, both vertex
+colours, the written rect and the running total. Timing-robust, so run-to-run speed cannot hide a class.
+
+One 75 s healthy run (units at 34.2 / 41.2 / 48.4 s) produced exactly **11 draw classes in 303,000 draws**:
+
+| # | fbp | tme | type | tbp0 | geometry | when | what |
+|---|---|---|---|---|---|---|---|
+| 1 | 0 | 0 | 6 | 0 | 640x896 | 3.4 s | startup blank |
+| 2 | 0 | 1 | 6 | 7168 | 65x448 strips | 3.4 s | display copy from page 224 (textured, correct) |
+| 3 | 0 | 0 | 6 | 7168 | 512x2 | 3.5 s | top edge fill of that copy |
+| 4 | 224 | 0 | 4 | 7168 | 65x33 tiles | 3.5 s | the tiled black clear |
+| 5 | 224 | 1 | 6 | 14976 (PSMT4) | 258x130 | 3.6 s | **the only textured sprite in the run** (UI panel) |
+| 6 | 112 | 0 | 6 | 7168 | 65x225 | 34.1 s | staging strip |
+| 7 | 224 | 0 | 4 | 16368 | 65x33 | 35.7 s | clear, new texture page 16368 (=0x3FF000) bound |
+| 8 | 112 | 0 | 6 | 16368 | 65x225 | 35.7 s | staging, **untextured** |
+| 9 | 0 | 1 | 6 | 8960 | 65x448 strips | **57.25 s** | display copy from page 280 - **textured, correct** |
+| 10 | 0 | 0 | 6 | 8960 | 640x2 | 57.25 s | top edge fill of that copy |
+| 11 | 280 | 0 | 4 | 8960 | 65x33 tiles | **57.25 s** | **the only thing ever drawn into page 280: the tiled black clear** |
+
+Three conclusions, each of which retires an earlier guess:
+
+1. **The display copy is NOT untextured.** Class 9 is `tme=1 tbp0=8960 rgba=128,128,128,128` - a correct textured
+   copy from page 280. The `fbp0/tme0/tbp8960` stream I flagged in 197.14 is the 640x2 **edge fill** (class 10).
+   The copy path is fine.
+2. **Page 280 is drawn to, but only with the black clear.** No content class ever targets 280. So the copy is
+   faithful and the screen shows the clear - the artwork never arrives in the page the display reads.
+3. **The logo-card content goes to page 224 and the staging page 112**, with a *new* texture page `16368`
+   (`0x3FF000`, the last ~4 KB of VRAM) bound from 35.7 s, and it is always drawn **untextured** (`tme=0`).
+   Class 8 is the smoking gun: a sprite into page 112 whose TEX0 points at 16368 but whose `tme` is 0.
+
+So the defect is a **draw-target / texture-enable mismatch on the card sprite**, not the display path and not the
+upload path (105 MB of IMAGE tags land - 197.14).
+
+Probe 3, the card sprite object itself (`TOL_DUMP_RAM=0x0063D900,0x100,...`, dumps every ~3 s). At `0x0063D910`,
+during the cards:
+
+```
++00 003D4CA0 00000002 00000000 00000000    <- vtable = sprite type 0x3D4CA0
++10 00000000 00E0FF00 02000200 80808080    <- x=-256  y=224  w=512  h=2   rgba=128,128,128,128
++20 014E2A3C 00000000 00000000 3F800000    <- texture handle = 0x014E2A3C (a pointer into the loaded blob)
++30 3F800000 ...
++40 4D444E52 0063D8F0 0063D9E0             <- "RNDM"
+```
+
+and the sibling node at `0x0063D970` carries vtable `0x003D4040`, so both objects are alive and correctly typed
+while the card is up.
+
+Two facts from that dump matter:
+
+- The sprite's geometry is **512 x 2** (`+0x14=-256, +0x16=224, +0x18=512, +0x1a=2`), i.e. the quad
+  `FUN_00239D00` builds from those fields is a 2-pixel-tall strip, not a card-sized image. That is exactly the
+  `written=[0,0..512,2]` edge-fill shape seen in class 3/10, so the card sprite and the copy's edge fill share a
+  geometry source - worth checking whether `+0x1a` is really "height" or whether the real height lives elsewhere
+  (e.g. in the blob at `+0x20`).
+- The texture handle is a **raw RDRAM pointer** (`0x014E2A3C`), which `FUN_00239D00` writes straight into the GS
+  context (`gsctx+0x12e0`). If the renderer expects a resolved GS TEX0/VRAM page there, the write is harmless and
+  the draw stays `tme=0` - which is precisely the observed class 8.
+
+Next: disassemble `FUN_00239B60` (sprite ctor, sets `+0x14..+0x20` from the blob) and `FUN_0015C3B0` /
+`FUN_00160390` (vertex submit / flush) to see how `gsctx+0x12e0` is turned into TEX0, and where `+0x1a` comes
+from. That pins whether the fix is the sprite's geometry fields (guest data) or the TEX0 resolution (renderer).
+### 197.16 Traced the sprite ctor + submit path: the card flushes through DMAC channel 8 (SPR_FROM), which was never routed
+
+Ghidra, `FUN_00239b60` (sprite ctor, called by `FUN_00239a90`):
+
+```c
+sprite->+0x20 = blob;                       // the loaded sprite descriptor
+if (param_3) {
+  iVar1 = *(int *)(*(int *)(sprite + 0x20) + 8);          // = the blob's TEX0 block
+  w = 1 << ((*(u8  *)(iVar1 + 0x43) << 58) >> 60);        // TEX0 TW  = bits 26..29
+  h = 1 << ((*(u64 *)(iVar1 + 0x40) << 30) >> 60);        // TEX0 TH  = bits 30..33
+  sprite->+0x14 = -(w >> 1);  +0x16 = h >> 1;  +0x18 = w;  +0x1a = h;
+}
+```
+
+So the `512 x 2` geometry measured in 197.15 is **derived from the blob's own TEX0** (`TW=9, TH=1`), and that same
+TEX0 supplies `tbp0=16368`, `psm=20` for the draw. The sprite is not corrupt; it faithfully reports a 512x2,
+PSMT4 texture descriptor. Either the blob really is a 2-pixel strip, or the field at `*(blob+8)+0x40` is a
+placeholder the game patches after upload (worth re-checking against PCSX2 at the same milestone).
+
+`FUN_0015c3b0` (vertex submit) is the important one:
+
+```c
+p = ctx + ctx->+0x1250 * 0x900 + ctx->+0x1254 * 0x30;   // 48-vertex bank, 0x30 bytes/vertex
+*p = v0; *(p+1) = v1; *(p+2) = v2;
+if (++ctx->+0x1254 == 0x30) {
+    base = ctx + ctx->+0x1250 * 0x900;
+    (*(code**)(ctx + 0x1248))();                        // guest callback: build the packet
+    (*(code**)(ctx + 0x124c))(base, base + 0x900, ctx + 0x1230);
+    ctx->+0x125c += 0x30 * 0x30;
+    ... wait for CHCR.100 ...
+    REG_DMAC_8_SPR_FROM_SADR = base;                    // 28-bit masked
+    REG_DMAC_8_SPR_FROM_MADR = ctx->+0x125c;
+    REG_DMAC_8_SPR_FROM_QWC  = 0x90;
+    REG_DMAC_8_SPR_FROM_CHCR = 0x100;
+}
+```
+
+i.e. the sprite engine flushes its vertices with a **DMAC channel 8 (SPR_FROM)** transfer out of the GS context
+buffer, not with GIF. `PS2Memory` only routed channels 0/1/2 (VIF0/VIF1/GIF) plus IPU - **channel 8 was never
+handled at all**, so every sprite flush was silently dropped. Confirmed live: 80 CHCR writes to `0x1000D000`,
+first at 32.2 s, all from `pc=0x0015C38C` (inside `FUN_0015c3b0`, `ra=0x0015C318`).
+
+Fix implemented in `ps2_memory.cpp`:
+
+- added `0x1000D000u` to the GS-channel dispatch and to both enqueue sites (normal mode and chain mode), so SPR
+  transfers land in `m_pendingGifTransfers` -> `submitGifPacket(GifPathId::Path3, ...)`;
+- **source address**: SPR's source is `SADR` (`channelBase + 0x80`), stored 28-bit masked, and the buffer lives in
+  the **scratchpad**, so the real source is `0x70000000 | (SADR & 0x0FFFFFFF)`. Using `MADR` (what every other FROM
+  channel uses) read a different field and pushed zeros; using SADR unmasked read RDRAM 0x0 and also pushed zeros.
+  Both were verified with `TOL_TRACE_SPRDMA=1`;
+- **safety guard**: the block is only submitted to path 3 when its leading qword is a valid GIF tag
+  (`flg <= 2`, `nloop != 0`, `1 <= nreg <= 16`), so a non-packet sprite block can never be misparsed and corrupt
+  later draws.
+
+Result: **no visible change yet, and no regression** (draw classes and totals unchanged; screenshot at 42 s still
+black). Reason: the scratchpad block at `0x70000000` starts with `0x3F800000` (= 1.0f, vertex data) with
+`flg=0, nloop=0`, i.e. **the payload is not a GIF packet**, so the guard correctly refuses it. The vertices are real,
+the container is not GIF.
+
+Next step (single, concrete): the packet is produced by the two guest callbacks stored in the GS context at
+`+0x1248` and `+0x124c`. Dump those two words at runtime (they are function pointers into the corpus), identify the
+functions, and read what they write into the scratchpad before the DMA. That decides whether SPR_FROM must be
+decoded as raw sprite vertices (and converted to GS sprite primitives by the runtime) or whether a GIF tag is
+written at a non-zero offset inside the 0x900-byte bank.
+### 197.17 SPR payload decoded: it is raw 48-byte vertices, not a GIF packet - the sprite path needs a vertex->GS translator
+
+With the probe moved ahead of the validity guard, the scratchpad bank the sprite engine DMAs was captured
+(`TOL_DUMP_SPR=<path>`, `logs/run197/spr_bank.bin`, 0x1200 bytes):
+
+```
+== 0x000 ==
+  +000 lo=0000000000000000 hi=0000000010000000
+  +010 lo=3F0080813F008081 hi=3F8000003F008081      <- colour qword: ~(0.502,0.502,0.502,1.0)
+  +020 lo=0000000000000000 hi=0000000042800000      <- (0,0,64,0)
+v1 @0x030
+  +000 lo=3F00000000000000 hi=0000000010000000      <- (0,0.5,0,0)
+  +010 lo=3F0080813F008081 hi=3F8000003F008081
+  +020 lo=C200000000000000 hi=0000000042800000      <- (0,-32,64,0)
+v2 @0x060
+  +000 lo=000000003F000000 hi=0000000010000000      <- (0.5,0,0,0)
+  +020 lo=0000000042000000 hi=0000000042800000      <- (32,0,64,0)
+```
+
+Bank 1 (0x900) is entirely zero, so only bank 0 is in use.
+
+Facts:
+
+- each vertex is **0x30 bytes** = 3 qwords (position/uv, colour, extra) - exactly `FUN_0015c3b0`'s
+  `ctx + bank*0x900 + index*0x30` stride and the 48-vertex flush threshold;
+- the leading qword is vertex data, **not** a GIF tag (`flg=0, nloop=0, nreg=0`), so feeding it to
+  `submitGifPacket(Path3, ...)` is wrong and the guard correctly refuses it;
+- therefore SPR_FROM cannot be satisfied by routing; the runtime must **translate the vertex bank into GS
+  primitives** (a sprite quad list) and submit those, which is what the real hardware's sprite path effectively
+  does for the SPR library.
+
+Also re-tested the presenter hypothesis that the frame is simply never flipped:
+`TOL_PREFER_FRAME_SOURCE=1` forces the presenter to read the page the draws target instead of DISPFB's page.
+It switched the source (`FORCED source=fbp224 ... (display was fbp0)`) and the window was **still black**, so the
+presenter is not the gate: page 224 genuinely holds no content, because the content that should be in it is drawn
+through the dropped SPR vertex path.
+
+Remaining work, in order:
+1. In `ps2_memory.cpp`, for channel 0x1000D000, decode the 0x900-byte bank as 48 vertices of 3 qwords and submit
+   them as GS sprite primitives through the existing `submitGifPacket`/frontend path (build a REGLIST packet:
+   PRIM/PRMODECONT untouched, RGBAQ from the colour qword, ST/UV from the position qword, XYZ2 from the
+   extra qword), preserving the current TEX0.
+2. Verify with `TOL_TRACE_GSDRAWS=1` that a **new class** appears with `fbp=224` and the card's texture page
+   `tbp0=16368`, and with the window capture that the namco card is visible.
+3. Only then re-check whether page 280 receives scene content (197.15 class 11) - that is the separate
+   scene-start issue, not this one.
+### 197.18 Where PRIM.TME comes from: `ctx+0x12fc` is the PRIM word, and the texture binding takes a pointer path
+
+Decompiled the three functions on the sprite draw's GS path:
+
+`FUN_001602c0(ctx, prim)` - builds PRIM:
+
+```c
+(*(code**)(ctx + 0x1240))();  (*(code**)(ctx + 0x1244))();
+ctx->+0x12fc = (ctx->+0x12fc & 0xfffffff1) | (prim * 2) | 1;
+```
+
+So **`ctx+0x12fc` is the PRIM register word**, and the mask `0xfffffff1` clears bits 1..3 only - **bit 4 (TME)
+is preserved**. With the card's call `FUN_001602c0(ctx, 4)` the word becomes `0x9` = type 1, IIP 1, **TME 0**. So
+this site does not *clear* TME; whoever wants a textured sprite must have set bit 4 (0x10) in that word earlier,
+and it simply never is for class 8. That is the concrete statement of the defect.
+
+`FUN_00160390(ctx)` - flush, builds the packet header the guest really uses:
+
+```c
+uVar2 = FUN_0015c2a0() * 3 + 1;                       // qwords
+*(u64*)(ctx+0x12f4)      = nloop | 0x8000(EOP) | ((u64)ctx->+0x12fc << 46) | 0x3000000000000000;
+*(u64*)(ctx+0x12f4 + 8)  = 0x512;                     // REGS nibbles: 2=ST, 1=RGBAQ, 5=XYZ2
+*(u64*)(ctx+0x12f0)      = (qwords) | 0x10000000;
+```
+
+i.e. **FLG=0 (PACKED), NREG=3, REGS=0x512, PRE=1** (`PRIM << 46` sets bit 46). My `TOL_SPR_VERTEX` translator used
+a REGLIST packet with REGS `0x01|0x02<<4|0x05<<8`; mirroring the guest's own PACKED layout (PRE=1, NREG=3,
+REGS=0x512, PRIM in the tag, then per vertex ST/RGBAQ/XYZ2) is the correct shape and is the next edit.
+
+`FUN_00160040(ctx)` -> `FUN_001593a0(ctx+0x12e0, cursor)` - binds the texture:
+
+```c
+if ((short)desc[2] == -1) {                 // desc[2] = ctx+0x12e8, and FUN_00239d00 sets it to 0xffff
+    if (*desc != desc[1]) { desc[1] = *desc;
+        if (*desc) { uVar1 = *(u32*)(*desc + 4);      // <-- treated as a POINTER, +4 read as the TEX0 value
+            if (uVar1) emit(0x50000000 | (u64)uVar1 << 32);
+            if (*(u32*)(*desc))     emit(ptr[0] as TEX0);
+            if (*(u32*)(*desc + 8)) emit(ptr[8] as TEX0);
+        } } }
+else { ... full descriptor path, writes 12 qwords including `| 0x400000000` (TEX0 bit 34 = TCC) ... }
+```
+
+`ctx+0x12e0` was set by `FUN_00239d00` to `*(u32*)(sprite+0x20)`, which `FUN_00239b60` set to the **blob pointer**
+(`0x014E2A3C`). With `ctx+0x12e8 == 0xffff` the "direct handle" branch runs and reads `*(u32*)(blob+4)` as the TEX0
+*value*. For the card blob that word is `0x014E2AC0` - another pointer - so the TEX0 written is pointer bits, not a
+valid descriptor; `tbp0=16368 / psm=20` observed in class 8 then come from somewhere else in the stream.
+
+So the TME/class-8 question reduces to two precise suspects, both now locatable:
+1. nothing sets `PRIM |= 0x10` on this path, and
+2. the `0xffff` sentinel at `ctx+0x12e8` selects a branch that misreads the blob pointer as a TEX0 descriptor.
+
+Next edit (single): mirror the guest's PACKED packet in the SPR translator (REGS 0x512, PRE=1, NREG=3, PRIM from
+`ctx+0x12fc`), and instrument `submitGifPacket` with `TOL_TRACE_SPRINJ=1` to print `accepted=…` plus the resulting
+batch's `written` rect, so "rejected" and "culled" are distinguishable in one run.
+### 197.19 Investigation of the two TME candidates: candidate 1 is DISPROVED - TME IS set, every frame, on the single shared context
+
+Candidate 1 was "nothing sets PRIM |= 0x10 (TME)". Wrong. The setter exists and runs constantly:
+
+```
+0015FBB0  lw   $a3, 0x12fc($a0)
+0015FBB4  ori  $a3, $a3, 0x10        <- TME ON
+0015FBB8  b    0x15fc10
+0015FBBC  sw   $a3, 0x12fc($a0)
+
+0015FBC0  ori  $a3, $a3, 0x20        <- FST
+0015FBD0  ori  $a3, $a3, 0x80        <- the 0x80 attribute
+
+0015FD20  lw   $t1, 0x12fc($a0)
+0015FD24  and  $t1, $t1, $v1         <- TME OFF (mask in $v1)
+0015FD2C  sw   $t1, 0x12fc($a0)
+```
+
+`0x15FB90` is a jump-table dispatcher (`sll a3,a2,2; addu; lw; jr`) selecting these attribute setters by index.
+
+Measured over 60 s (`TOL_TRACE_PC` on the four sites):
+
+```
+0x0015FBB0 (TME on)   41 entries
+0x0015FD20 (TME off)  41 entries
+0x0015FBC0 (FST)      40 entries
+0x0015FBD0 (0x80)     40 entries
+```
+
+with the first ones at **32.6 s**, called from `ra=0x00153820` (inside `FUN_00153780`, the per-frame attribute
+reset) and `ra=0x001EBC6C` (inside `FUN_001EC150`, the node draw). So the node draw turns texturing on every frame.
+
+Two more facts from the same run, both new and important:
+
+- **every one of those calls passes `a0=0x70000000`** - the GS context is resident in the **SCRATCHPAD**. That is
+also why the sprite-engine DMA source is scratchpad, and why an unmasked SADR looked like RDRAM 0x0.
+- `FUN_00160040` (bind texture), `FUN_001602C0` (build PRIM) and `FUN_00160390` (flush) are all called with
+`a0=0x70000000` as well - one context, so there is no "wrong object" explanation either.
+
+`FUN_00160390` is entered from `ra=0x0023B150` / `0x0023BC6C` (the 0x239xxx sprite module) and receives
+`a1=0x70001200` - i.e. the sprite vertex buffer is at scratchpad+0x1200, a *third* bank distinct from the
+`0x70000000`/`0x70000900` pair the SPR DMA was streaming.
+
+Consequence: the defect is **not** a missing `PRIM |= 0x10`. TME is set before the sprite library runs, so
+something between the setter and the flush must clear bit 4 (the `0x15FD20` clearer runs exactly as often as the
+setter), or the packet that produces class 8 is built from a different PRIM source than `ctx+0x12fc`.
+
+Applying a fix at this point would be guesswork of exactly the kind that has already produced three wrong
+"obvious" fixes this session, so the next step is one 5-line probe rather than a code change:
+
+    inside the 0x00160390 replacement probe, print *(u32*)(a0 + 0x12fc) (the PRIM word) and
+    *(u16*)(a0 + 0x12e8) (the texture sentinel) at flush time, and the same two words inside the
+    0x0015FBB0 / 0x0015FD20 setters. That shows the actual bit 4 history for the frames that draw class 8.
+
+Everything else needed is already in place: `TOL_TRACE_PC` can host the setters, `TOL_TRACE_GSDRAWS=1` identifies
+class 8 on the GS side, and the context address (0x70000000) is now known, which is what makes a memory-reading
+probe possible at all.
+### 197.20 Per-frame order traced: the copy is CORRECT, and page 224 receives nothing but clears - the ordering hypothesis is refuted
+
+Added `TOL_TRACE_OSEQ` (1 = clear/copy only, 2 = every primitive) to both `gs_frontend.cpp` (IMAGE tags) and
+`sdlgpu_backend.cpp::submit`, so the three event classes share one stderr timeline.
+
+Measured per-frame sequence (first frame after startup, and identical in shape afterwards):
+
+```
+0.0000 OTHER      fbp=0   type=6 tme=0 tbp0=0     written=[0,0..640,896]   <- full-screen fill into page 0
+0.0562 COPY224TO0 fbp=0   type=6 tme=1 tbp0=7168  written=[0,0..65,448]    <- display copy, 20 strips
+0.1007..0.1011 COPY224TO0  (remaining strips, second pass: the copy runs TWICE per frame)
+0.1012 OTHER      fbp=0   type=6 tme=0 tbp0=7168  written=[0,0..512,2]     <- copy edge fills
+0.1012 OTHER      fbp=0   type=6 tme=0 tbp0=7168  written=[0,446..512,448]
+0.1017 CLEAR224   fbp=224 type=4 tme=0 tbp0=7168  written=[0,0..65,33]     <- tiled clear AFTER the copy
+0.1022 CLEAR224   (the rest of the tiled sweep)
+```
+
+So the order is:
+
+1. fill page 0,
+2. **copy page 224 -> page 0** (twice),
+3. **then clear page 224**,
+4. and during the logo-card window (34-48 s) **nothing else is drawn into page 224 at all**.
+
+That is correct double buffering: the copy presents what the previous frame left in 224, and the clear starts the
+next frame. The copy is a faithful 512x448 textured read of 224. Therefore:
+
+- **the ordering is not the bug** - the copy always happens before the clear, so anything drawn into 224 between
+  the clear and the next copy *is* presented;
+- **page 224 receives only clears during the card window.** Class 7 (`fbp=224 type=4 tme=0 tbp0=16368`) is the
+  same tiled clear continuing after the guest rebound TEX0 to the card's texture page (`tbp0` changes, the fill
+  does not), not a card draw;
+- IMAGE traffic in the same window is 10 tags, none of them into 224.
+
+Conclusion: the card is **never drawn into the page the display reads**. It is not covered by NOW LOADING, and it
+is not presented stale - the draw itself does not exist. That points back to the gated blit identified earlier:
+`FUN_00206310`'s loop calls `FUN_00206c00(obj, buf)` only when `lVar5 == 1 && *(iVar7 + 0x420) == 0 &&
+*(iVar7 + 0x42c) == '\x01'`, and `+0x42c` is set by `FUN_002062a0` to `(FUN_00279d00() == 1)`.
+
+Next probe (one run): print `obj+0x420`, `obj+0x42c`, the return of `FUN_00279d00()`, and `lVar5` (the
+`FUN_00335780` read result) at each iteration of `FUN_00206310`'s loop, plus whether `FUN_00206c00` is entered at
+all. That names which of the three gates is closed.
+
+Instruments now available and env-gated, none of them changing behaviour by default:
+`TOL_TRACE_OSEQ` (1/2), `TOL_TRACE_GSIMAGE`, `TOL_TRACE_GSDRAWS`, `TOL_TRACE_GSPRIM_FILTER`, `TOL_TRACE_GSPRIM_EMPTY`,
+`TOL_TRACE_SPRDMA`, `TOL_DUMP_SPR`, `TOL_TRACE_PRIM`, `TOL_SPR_VERTEX`.
+### 197.21 EMULATOR ANSWER: the cards are NOT drawn by the 0x206C00 blit - they go through the node/sprite/SPR path
+
+Fresh PCSX2 `-fastboot` boot, breakpoints on `0x00206C00` (the blit), `0x00206310` (the movie loop) and
+`0x00204240` (the units):
+
+```
+#1 t= 5.57s  0x00204240 mode=1
+#2 t=10.74s  0x00204240 mode=2
+#3 t=15.76s  0x00204240 mode=3
+#4 t=20.94s  0x00206310          <- the movie loop starts only AFTER the three logo cards
+0x00206C00 : 0 hits in 30 s
+```
+
+Two conclusions, both decisive:
+
+1. **`FUN_00206c00` is never called during the logo cards on hardware either**, so the `+0x420`/`+0x42c` gate I was
+   about to chase in 197.20 belongs to the *movie* stage (post-20.9 s), not to the cards. That whole line of
+   investigation is retired before it cost a fix.
+2. The three cards are produced by `FUN_00204240` itself, whose only drawing machinery is the sprite it builds:
+   `FUN_00239a90` (sprite ctor) -> `FUN_001ebea0` (node) -> `FUN_001ec100` (attach) -> the render-list walk ->
+   `FUN_001ec150` (node draw) -> `FUN_00239d00` (submit) -> `FUN_0015c3b0` (vertex) -> **DMAC channel 8
+   (SPR_FROM)**. So the SPR vertex path really is the card's transport, confirming the 197.16/197.17 direction.
+
+Port side, same probes: the gate/blit addresses had **zero entries**, but that run was one of the slow ones
+(`mainIters=237` at 70 s, `g/s=0.004`), and three retries were also slow (239/234/224) - so the port currently is
+not reaching the card phase reliably and no conclusion can be drawn from those runs. Run-to-run variance is now
+the biggest obstacle to measurement, and it is not caused by the probes (env-gated) or by the SPR work (post-32 s).
+
+SPR translator, second iteration: rewritten to mirror `FUN_00160390` exactly - FLG=0 (PACKED), NREG=3, REGS=0x512
+(ST, RGBAQ, XYZ2 in that order), EOP set, and the **live PRIM word** read from `scratchpad+0x12FC` shifted to bit
+46. Result: still no new draw class (9 classes, same as baseline), so the injected packet is still not becoming a
+batch. It remains env-gated (`TOL_SPR_VERTEX=1`) and therefore inert by default.
+
+Where this leaves the milestone:
+- the card is drawn through SPR_FROM, and SPR_FROM is unrouted in the runtime (fixed to route, source corrected
+  to `0x70000000 | (SADR & 0x0FFFFFFF)`);
+- the vertex payload format is known (48-byte vertices: uv, rgba, xyz);
+- the remaining unknown is purely why the injected packet does not reach the rasteriser, which is a
+  `submitGifPacket`/arbiter question, not a guest-logic question.
+### 197.22 Injected packets DO reach the GS frontend - the submission route is fine; the synthetic encoding is what fails
+
+Instrumented both ends with `TOL_TRACE_SPRINJ=1`:
+
+- `PS2Memory::submitGifPacket` (line ~2207): logs every Path3 packet of the synthetic size;
+- `GifArbiter::drain` (line ~59): logs the same packet as it is handed to `m_processFn`.
+
+Result over 60 s:
+
+```
+[   51.667] [sprinj] queued   path=3 size=208
+[   51.683] [sprinj] queued   path=3 size=208
+[   51.683] [sprinj] draining path=3 size=208
+[   51.683] [sprinj] draining path=3 size=208
+count: 1502
+```
+
+Every queued packet is drained, i.e. **`submitGifPacket(Path3)` -> arbiter -> `m_processFn` works end to end**.
+So the earlier "no new draw class" is not a routing problem: the GS frontend receives the packet and either rejects
+it in `validatePackedGifPacket`, or parses it into registers that rasterise nothing.
+
+The most likely cause, from the guest's own builder (`FUN_00160390`):
+
+```c
+*(u64*)(ctx+0x12f4) = nloop | 0x8000 | ((u64)ctx->+0x12fc << 46) | 0x3000000000000000;
+```
+
+`ctx+0x12fc` is the live PRIM word (measured `0x000004B9`, TME=1, type=1). Shifting the **whole word** by 46 sets
+bit 46 (the PRE bit) from PRIM bit 0 as a side effect, and puts PRIM bits 1..10 into the PRIM field. If the GS
+frontend honours PRE, each loop iteration must then begin with a PRIM qword; the synthetic packet supplies only the
+three data qwords (ST/RGBAQ/XYZ2), so the parser desynchronises by one qword per vertex. The guest's own stream
+works because its buffer really does carry whatever the two callbacks at `ctx+0x1248` / `ctx+0x124c` wrote.
+
+Conclusion and the correct next step: **stop synthesising the packet**. `FUN_0015c3b0` already invokes
+`(*(code**)(ctx+0x1248))()` and `(*(code**)(ctx+0x124c))(base, base+0x900, ctx+0x1230)` immediately before the SPR
+DMA - those callbacks are the guest's own packet builder. The bank we dumped at `0x70000000` contains raw vertices,
+so either the packet is written to the other bank (`0x70000900`) or the dump was taken before the callback ran.
+Dumping **both** banks at the exact DMA instant, with the callback return values, settles which buffer the DMA
+should be reading and whether the transfer must be offset past the vertex area.
+
+Status: SPR channel routed (real fix, previously dropped entirely), source address corrected
+(`0x70000000 | SADR&0x0FFFFFFF`), synthetic translator present but inert (`TOL_SPR_VERTEX=1`, default off), packet
+delivery proven by instrumentation. Nothing regressed: default runs are unchanged.
+### 197.23 The SPR packet located in RDRAM: a DMA-tag chain with the GIF packet nested at +0x40
+
+RDRAM dump at `0x01D00300` (TOL_DUMP_RAM) at the moment the SPR channel runs:
+
+```
++000 014E2AC050000000
++010 014E2A5050000000
++020 01D0033020000000      <- DMA tag, ADDR 0x01D00330
++030 000000001000000D      <- DMA tag, QWC=13, FLG=1 (REFE)
++040 312E400000008004      <- GIF tag: NLOOP=4, EOP=1, NREG=3
++048 0000000000000512      <- REGS = 0x512 (ST, RGBAQ, XYZ2)
+```
+
+So the SPR block begins with **DMA tags** and the real GIF packet is nested at `+0x40` (absolute `0x01D00340`).
+Submitting from offset 0 - what both the routing and the synthetic translator did - parses a DMA tag as a GIF tag
+and yields nothing. The nested tag also confirms the guest's own encoding (`REGS=0x512`), matching `FUN_00160390`.
+
+Also from the same scratchpad dump, the packet *pointers* live in the GS context at `ctx+0x12F0/0x12F4`
+(`0x01D00330 / 0x01D00340`) with `ctx+0x12F8 = 0x00000007` and `ctx+0x12FC = 0x000004B9` (PRIM, TME=1) and
+`ctx+0x1300/0x1304 = 0x00000000 / 0x0FFF003F` (texture/clamp words). So the context does hold a fully enabled
+PRIM and a texture descriptor while the sprite engine runs.
+
+Fix implemented in `ps2_memory.cpp`: for the SPR channel the block is scanned (first 0x200 bytes) for the first
+plausible GIF tag (`flg<=2`, `nloop!=0`, `1<=nreg<=16`, EOP set) and the transfer is submitted from that offset,
+falling back to a plain enqueue when no tag is found. Build clean.
+
+Verified: still 11 draw classes - no card class appears - and no new errors beyond the known `0x301EB8` jalr-to-null.
+So even with the nested packet submitted, the GS produces no batch for it. The remaining possibilities are that the
+nested packet's four vertices are culled (a single quad, possibly with zero extent after the GS transform), or that
+the frontend rejects the block after the DMA header.
+
+Everything above is measured; nothing here is a working card yet. The default build is unchanged in behaviour
+(the scan only fires on the SPR channel, and falls back to the previous path when it finds no tag).
+### 197.24 ACCEPTED, NOT REJECTED: the SPR packets reach GS::processGIFPacket intact
+
+Instrumented `GS::processGIFPacket` (the arbiter callback is `m_gs.processGIFPacket`, wired in
+`ps2_runtime.cpp:702` - NOT `processNativePackedGIFPacket`, which is why the first attempt logged nothing) with
+`TOL_TRACE_SPRINJ=1`, keying on the distinctive `tagHi == 0x512` that this game's sprite packets use.
+
+```
+[   31.406] [inj] size=1168 tagLo=312E400000008018 tagHi=0x512 nloop=24 eop=1 flg=0 nreg=3
+[   31.421] [inj] size= 400 tagLo=312E400000008008 tagHi=0x512 nloop= 8 eop=1 flg=0 nreg=3
+[   32.979] [inj] size= 208 tagLo=312E400000008004 tagHi=0x512 nloop= 4 eop=1 flg=0 nreg=3
+count: 420
+```
+
+So:
+
+1. **The packets are ACCEPTED.** 420 well-formed PACKED packets (`flg=0`, `nreg=3`, `eop=1`, `tagHi=0x512`)
+   reach the GS frontend from the SPR channel. Rejection is ruled out.
+2. **The SPR routing fix works.** The 24-vertex and 8-vertex packets are the *guest's own* sprite-engine output,
+   arriving at the GS for the first time - before this session that channel was dropped entirely and none of this
+   traffic existed.
+3. **No draw class results** (classes still 11, no card class), so the primitives built from those vertices are
+   culled: `primitiveBounds()` empty or the transformed quad has zero extent. That is the culling half of the
+   question, and it is now the only half left.
+
+Why culling is the likely mechanism: the vertices we dumped are a 32x32 quad at z=64 with uv 0..0.5
+(`(0,0) (0,-32) (32,0) (32,-32)`), and the GS scissor is 512x448 - so either the XYOFFSET/offset transform places
+the quad outside, or the W/Q handling collapses it. The next measurement is one line: log the batch's
+`written` rect (or `primitiveBounds`) for these packets in `sdlgpu_backend::submit`, which prints exactly the
+rectangle the quad occupies after transformation.
+
+Instrumentation state at the end of this session (all env-gated, default-off):
+`TOL_TRACE_SPRINJ` (arbiter + frontend packet accept log), `TOL_TRACE_SPRDMA`, `TOL_DUMP_SPR`,
+`TOL_TRACE_GSDRAWS`, `TOL_TRACE_GSPRIM_FILTER`, `TOL_TRACE_GSPRIM_EMPTY`, `TOL_TRACE_OSEQ`, `TOL_TRACE_PRIM`,
+`TOL_SPR_VERTEX`. The default build behaves exactly as before except that the SPR channel is now routed and its
+packets reach the GS.
+### 197.25 Written-rect / bounds verdict: the vertices are ON SCREEN with real colours - but no primitive batch is emitted
+
+`TOL_TRACE_SPRVERT=1` logs every XYZ2 vertex while the sprite packet (`tagHi == 0x512`) is being parsed. Raw GS
+coordinates are offset by the GS XYOFFSET (`ofx/16 = 1792`, `ofy/16 = 1824`), so subtracting those gives the real
+screen position:
+
+```
+raw x=2224.50 y=2054.00 z=5376   -> screen (432.5, 230.0)
+raw x=1792.00 y=1856.00 z=0      -> screen (  0.0,  32.0)
+raw x=1920.00 y=1825.00          -> screen (128.0,   1.0)
+...
+screen positions seen: (0,0)(0,32)(0,64)...(0,320)(128,0)(128,448)(192,0)(192,448)(256,0) (432,230)
+colours seen:  103,89,68,128   103,89,68,64   43,23,17,128   43,23,17,64   128,128,128,128
+```
+
+So:
+
+1. **Not rejected** - 420 PACKED packets reach `GS::processGIFPacket` (197.24).
+2. **Not off-screen** - every transformed vertex lands inside 0..512 x 0..448.
+3. **Not colourless** - the vertices carry real game colours (brown 103,89,68 / 43,23,17) with alpha 64/128,
+   plus UVs (u=56 v=8, u=392 v=344, u=248 v=280), i.e. genuine textured sprite geometry.
+4. **No batch is emitted for the coloured sprites.** `TOL_TRACE_GSPRIM_FILTER` (which logs every non-clear,
+   non-copy primitive reaching `sdlgpu_backend::submit`) still shows only the five early UI panels; the brown
+   sprites never appear there. The grey (128,128,128,128) vertices at (0,0)/(128,0)/(0,32) are the copy edge
+   fills and DO reach the backend, which proves the filter works.
+
+Therefore the loss is **inside the frontend's primitive assembly**, between `writeRegisterPacked(XYZ2)` and
+`submit`: the vertices are accepted and valid, but they never become a `GSPrimitiveBatch`. The remaining suspects
+are the PRIM word written from the tag (`(tag.lo >> 47) & 0x7FF` under `PRE`) not being a drawable primitive type
+for this packet, or a flush/wait condition that only fires on `EOP` in a way this packet does not satisfy.
+
+This closes the "rejected vs culled" question the previous session opened: it is neither. The geometry is delivered
+correctly and on-screen; the primitive is simply never assembled. Next probe is one line inside `vertexKick`:
+print the current PRIM word and the vertex-queue count at each kick for the sprite packet.
+### 197.26 Docs checked + kick probe ready (run did not reach the sprite phase)
+
+`docs/` holds only disc/container/codec notes plus the recompiler architecture overview. Its hardware table
+(`ps2-static-recompilation-overview.md` section 4b) names `GS` / `GifArbiter` as the subsystem and stops there -
+nothing on primitive assembly, XYOFFSET, or the vertex queue. Useful background for the disc and toolchain, no
+guidance for this defect.
+
+`TOL_TRACE_SPRVERT` extended to print, per vertex kick: `primType`, the raw `m_primRegister` word, `m_vtxCount`
+and the kicking register id. Purpose: show whether a drawable primitive type is set and whether the queue ever
+fills enough to flush.
+
+Build clean, but the verification run did not reach the sprite phase (`[inj] = 0`, `[sprvert] = 0`, and the
+run's `guestEntries` shows it stalled in the slow regime), so the probe has no data yet. It is ready and
+env-gated.
+
+Already-known and relevant: the effective PRIM written from the tag is `(tag.lo >> 47) & 0x7FF` = `0x25C` for
+`prim = 0x4B9`, i.e. **type 4 = triangle strip, TME = 1**, so the primitive type is valid; with NLOOP = 24 that
+is 22 triangles. So "invalid primitive type" is unlikely, which leaves the queue/flush condition as the leading
+suspect.
+### 197.27 Queue/flush logic read + the packet decode is provably valid; texture drawing already exists
+
+**Queue / flush (`GS::vertexKick`, gs_frontend.cpp:1793-1874).** There is no accumulating threshold - it submits as
+soon as one primitive is complete:
+
+```cpp
+++m_vtxCount;
+switch (m_prim.type) { POINT:1; LINE:2; LINESTRIP:2; TRIANGLE:3; TRISTRIP:3; TRIFAN:3; SPRITE:2; default:return; }
+if (m_vtxCount < needed) return;
+if (drawing && m_backend) { auto batch = buildDrawBatch(needed); m_backend->Submit(batch); }
+switch (m_prim.type) { LINESTRIP: keep 1; TRISTRIP: keep 2; TRIFAN: keep 2; else m_vtxCount = 0; }
+```
+
+and `drawing` is `(regAddr == GS_REG_XYZ2)`, which our packets satisfy. So a 24-vertex tristrip must produce 22
+`Submit` calls. Nothing here can swallow a 24-vertex strip.
+
+**The tag decode is valid.** Decoding the three delivered packets:
+
+```
+tag=312E400000008018  nloop=24 eop=1 pre=1 prim=0x25C type=4(TRISTRIP) tme=1 flg=0(PACKED) nreg=3
+tag=312E400000008008  nloop= 8 eop=1 pre=1 prim=0x25C type=4(TRISTRIP) tme=1 flg=0(PACKED) nreg=3
+tag=312E400000008004  nloop= 4 eop=1 pre=1 prim=0x25C type=4(TRISTRIP) tme=1 flg=0(PACKED) nreg=3
+```
+
+**`tryProcessNativeImageUploadPacket` does not swallow them**: it requires `NLOOP==4 && NREG==1 && FLG==PACKED &&
+(tagHi & 0xF)==0xE` plus a BITBLTBUF/TRXPOS/TRXREG/TRXDIR reglist; ours is NREG=3 with `tagHi=0x512`, so it returns
+false at the first check.
+
+**Textured drawing already works - we do not need to build it.** Evidence from the same runs: class 5 is
+`fbp=224 type=6 tme=1 tex tbp0=14976 psm=20 cbp=14960` (PSMT4 + CLUT, i.e. a real palette texture) and reaches
+`submit`; the display copies are `tme=1` and are the ones that have been producing the visible frame; and
+`sdlgpu_backend`/`gs_cpu_backend` sample textures and CLUTs (`UploadImage`, `vram.read(psm, tbp0, tbw, u, v)`).
+So the pipeline can draw textured primitives; the missing card is a primitive-delivery problem, not a missing
+feature.
+
+So the only remaining gap between "valid 24-vertex tristrip with TME=1 and on-screen vertices" and "a draw class
+appears" is inside `buildDrawBatch(3)` or the `Submit` gate. `buildDrawBatch` is the next thing to read: it is the
+only code between `vertexKick`'s submit and `sdlgpu_backend::submit`, and it is where a batch could come out with
+zero vertices.
+### 197.28 The last gap closed: batches DO arrive (56 tristrips) - but with the WRONG texture page bound
+
+`TOL_TRACE_BATCH=1` (already in the runtime) settles it:
+
+```
+[batch] verts=3 prim=4 fbp=224 texTbp=7168 scissor=511x447    x56 sampled
+```
+
+So:
+
+- `buildDrawBatch` is a plain copy (`vertexCount = min(n,3)`, copies `m_vtxQueue`, fills state) - it cannot drop
+  anything, and it does not;
+- `vertexKick` submits per completed primitive, as read in 197.27;
+- **56 three-vertex tristrip batches reach the backend**, so delivery is proven end to end;
+- but **every sampled one carries `texTbp=7168`** - page 224, the framebuffer itself, i.e. the *clear's* texture
+  binding - not the card's page `16368`.
+
+That is the actual last defect: the sprite geometry is submitted with the **wrong TEX0 bound**. The clear binds
+`tbp0=7168` (it draws into page 224), and the sprite draw is supposed to rebind `tbp0=16368` first. The rebind comes
+from a *separate* GIF packet built by `FUN_00160040` -> `FUN_001593a0(ctx+0x12e0, ...)` (the TEX0 writer seen in
+197.18), not from the vertex packet, so the ordering that matters is:
+
+    clear (binds 7168) -> TEX0 packet (binds 16368) -> vertex packet (draws)
+
+With `texTbp` still 7168 at vertex time, the TEX0 packet is either not being delivered or is being delivered after
+the vertices. Since the SPR channel now routes and 371 sprite packets arrive, the most likely case is that
+`FUN_001593a0`'s TEX0 write goes through the *same* SPR buffer and our scan-based extraction only forwards the
+packet it finds first (the vertex one), dropping the TEX0 packet that precedes it.
+
+Next step (one change): stop scanning for a single GIF tag and forward the **whole** SPR block from offset 0 as a
+packet stream (the DMA chain), so the TEX0 packet(s) and the vertex packet(s) both reach the GS in order. That is
+what the hardware does with the same buffer, and it directly targets `texTbp` being wrong at draw time.
+
+Also worth noting for the texture question: the sampled batches prove the backend receives `verts=3, prim=4`
+(tristrip) batches - so textured tristrips are supported; only the bound page is wrong.
+### 197.29 Whole-block forward implemented: more state reaches the GS, but the card still is not drawn
+
+Change applied (ps2_memory.cpp, SPR branch): the scan-for-one-tag approach was replaced by forwarding the **entire**
+SPR block from offset 0 as the packet stream (`submitGifPacket(Path3, rdram + (madr & MASK), qwc*16, false)`), which
+is what hardware does with the same buffer.
+
+Measured effect:
+
+```
+[batch] verts=3 prim=4 fbp=224 texTbp=7168   ...  (most)
+[batch] verts=3 prim=4 fbp=224 texTbp=14976  at 33.822   <- a page that never appeared before
+draw classes: 11 (unchanged); cl=7 is fbp=224 type=4 tme=0 tex tbp0=16368
+```
+
+So the whole-block forward **does** carry more state than the single-tag scan (a tristrip batch finally bound
+`tbp0=14976`), which validates the approach. But the card is still not drawn, and the sharpest remaining fact is:
+
+**there are tristrips into page 224 bound to the card's page `tbp0=16368` (class 7) - and `tme` is 0 on them.**
+
+That means the geometry packets and the TEX0 binding are now both present, and the remaining single difference is
+the **PRIM.TME bit not being set on that batch**, even though the packet's tag says `prim=0x25C` (TME=1) and 197.22
+measured `ctx+0x12fc = 0x4B9` (TME=1) at flush time.
+
+So the next probe is one line, and it is the last one in this chain: log `m_prim.tme` (and the raw `m_primRegister`)
+inside `vertexKick` for these packets. If it is 0 there while the tag says 1, the PRIM write from the tag is being
+overwritten or is not applied on this path; if it is 1, the loss is in `buildDrawBatch`'s state copy or in the
+backend's reading of `state.prim.tme`.
+
+Nothing regressed: 11 classes as before, no new errors, and the default build differs only in that the SPR channel
+now forwards its full block.
+### 197.30 LAST-GAP PROBE ANSWERED: TME is NOT lost - 1704 textured tristrip kicks, textured batches flow; the window is still black
+
+`TOL_TRACE_SPRVERT` now logs only tristrip kicks **with TME set**:
+
+```
+skick(tme=1) count: 1704
+[30.624] [skick] vtxCount=1 primType=4 tme=1 iip=1 abe=1 ctxt=1 fix=0 drawing=1
+[30.639] [skick] vtxCount=2 ... tme=1 ...
+[30.639] [skick] vtxCount=3 ... tme=1 ... drawing=1
+```
+
+and the batch trace now shows textured draws reaching the backend:
+
+```
+[batch] verts=3 prim=4 fbp=224 texTbp=14976 scissor=511x447   (x several, from 33.99 s)
+[batch] verts=3 prim=4 fbp=280 texTbp=8960  scissor=639x447   (from 52.59 s)
+```
+
+So the whole-block SPR forward (197.29) did its job at the state level: **PRIM.TME is 1 at vertexKick, textured tristrip
+batches carry real texture pages, and they reach the sdlgpu backend**. It also produced the first `fbp=280` draws
+with `texTbp=8960`, i.e. the scene page finally receives textured geometry.
+
+But the window is **still black**. The screenshots taken during that build turned out to contain an unrelated
+PPSSPP window in front; the TOLRecomp client area itself is black. So the remaining gap is no longer anywhere in
+the EE/GS submission chain - it is between these (now correct) draws and what the presenter scans out.
+
+That re-frames the problem: with
+- textured tristrips into page 224 (texTbp=14976), and
+- textured tristrips into page 280 (texTbp=8960), and
+- the copy 224->0 / 280->0 also confirmed textured and correctly ordered (197.20),
+
+the only way the window can still be black is that the *content of those texture pages* is black, or the copy runs
+before the draws land in the same frame. The next measurement is therefore the VRAM side again, but this time
+through the backend's live VRAM (not `PS2Memory::getGSVRAM()`, which 197.14 showed is a stale buffer): sample a
+texel from `tbp0=14976` and from `tbp0=8960` at draw time and print it. If those texels are zero, the uploads are
+landing in the wrong place and the draw side is finally exonerated.
+
+Instrumentation summary at end of session: `TOL_TRACE_SPRVERT` (kicks incl. TME), `TOL_TRACE_BATCH`,
+`TOL_TRACE_GSDRAWS`, `TOL_TRACE_GSPRIM_FILTER`, `TOL_TRACE_GSPRIM_EMPTY`, `TOL_TRACE_OSEQ`, `TOL_TRACE_SPRINJ`,
+`TOL_TRACE_SPRDMA`, `TOL_DUMP_SPR`, `TOL_TRACE_PRIM`, `TOL_SPR_VERTEX` - all env-gated, default off.
+
+## Session 199 (2026-11-23) - VRAM INVESTIGATION (session-197 next step): the two framebuffers never exist in VRAM, the card art IS uploaded (262 KB into 0x3A8000), SPR_FROM is an MFIFO copy and NOT a GS submission, and the sprite packets arrive with empty/zeroed vertices
+
+Continues 197.30's single open question ("sample a texel from `tbp0=14976` and `tbp0=8960` at draw
+time"). Everything below is measured on a clean build of `data/output_fixed`
+(`build/tol2`, clang-cl, `-j 12`, `RESULT: exit 0`), 60-85 s runs with `--gs=sdlgpu`.
+
+### 199.1 Two structural facts that retract earlier framebuffer reasoning
+
+1. **The sdlgpu VRAM is only an upload/texture store.** The SDL-GPU backend rasterises into GPU
+   surfaces; `PS2Memory::getGSVRAM()` (what `TOL_DUMP_VRAM` writes) receives only IMAGE uploads.
+   Measured over a whole run: **pages 0 (0x000000), 224 (0x1C0000) and 280 (0x230000) are byte-zero
+   in every dump** (`logs/run159/vt_d*.bin`, 9 dumps from draw 4,000 to 30,000). So "page 224 is
+   black in VRAM" is not a defect, and no VRAM read can ever explain the displayed picture. Judge the
+   picture with `TOL_TRACE_GSDRAWS` / `TOL_TRACE_GSPRIM_*` / a window capture, never with VRAM.
+2. **`TOL_DUMP_VRAM` needed draw-index triggers.** Frame numbers move by 3x run to run, so it now has
+   `TOL_DUMP_VRAM_DRAWS=<n[,n...]>` + `TOL_DUMP_VRAM_PATH=<prefix>` (writes `<prefix>_d<n>.bin` at exact
+   absolute draw indices) and `TOL_DUMP_VRAM_ONTEX0=<tbp0>` (first draw binding that texture page).
+
+### 199.2 VRAM timeline of the logo-card window (measured, not inferred)
+
+```
+draw  4000  3 non-empty pages : 0x3A6000/0x3A8000/0x3AA000   (the NOW LOADING text at tbp0=14976 PSMT4)
+draw  4400 34 non-empty pages : 0x3A6000 .. 0x3E6000 + 0x3FE000
+draw 30000  identical to 4400 (34 pages, nonexistent after that)
+```
+
+The 34 pages are **one 256x256 CT32 image (0x40000 bytes) at 0x3A8000** plus the CLUT strip at
+0x3FF400. Nothing else is ever in VRAM. In particular:
+
+- the **card texture page `tbp0=16368` (0x3FF000, PSMT4)** holds **126 non-zero bytes** of its
+  4 KB, ever;
+- pages 224/280 are zero (see 199.1).
+
+Upload destination census (`TOL_TRACE_GSIMGDBP=1`, counts every IMAGE tag by `BITBLTBUF.DBP`):
+
+| destination | format | tags | bytes |
+|---|---|---|---|
+| `0x3A8000` (14976) | CT32 dbw=2 | 256 | **65,358,080** (one 262,144-byte image per tag, `TRXREG 256x256`) |
+| `0x3A7000` (14960) | CT32 dbw=1 | 256 | 255,424 (CLUT, `16x16`) |
+| `0x3FF400` (16372) | CT32 dbw=1 | ~14,000 | ~2.7 MB of `8x2` CLUT fragments |
+| `0x3FF000` (16368) | PSMT4 dbw=1 | **3** | **240** (`TRXREG 24x16`) |
+
+So the guest uploads a **262,144-byte image into 0x3A8000** over and over (a 512x512 PSMT8 image and a
+256x256 CT32 image are both exactly 0x40000 bytes - the same bytes, two interpretations), and it
+uploads essentially nothing into the card's PSMT4 page. The upload path is healthy; the question moves
+to *what the guest binds and draws*.
+
+### 199.3 The card texture binding exists and is correct (new probe `TOL_TRACE_TEX0W=1`)
+
+`writeRegisterUnlocked` now logs every TEX0 write, decoded. During the card window the stream is a
+clean alternation:
+
+```
+ctx=0  tbp0=7168  tbw=8  psm=0  (CT32 1024x512)  <- the display page, for the 224/280 -> 0 copy
+ctx=1  tbp0=14976 tbw=8  psm=19 (PSMT8 512x512)  <- the card art (CLUT 14960)
+ctx=0  tbp0=16368 tbw=1  psm=20 (PSMT4 64x64)    <- the small sprite texture (CLUT 16372)
+```
+
+So the card texture **is bound**, in **context 1**, which is exactly what the sprite packets use
+(`PRIM = 0x25C`: CTXT=1, TME=1, type 4). The GS frontend honours PRIM.CTXT
+(`batch.state.context = m_ctx[m_prim.ctxt]`), so the binding is not the defect.
+
+### 199.4 SPR_FROM is MFIFO, not a GS path - and the earlier "route it to path 3" fix is wrong
+
+`09-ps2tek.md` (DMAC MFIFO): *"Scratchpad memory ... The Memory FIFO (MFIFO) ... automatically
+transferring data sent via SPR_FROM to a user-defined buffer in main memory. D_RBSR and D_RBOR define
+the size and location of this buffer. SPR_FROM's MADR is automatically set to the next **read**
+position in the buffer, wrapping around ... Either the VIF1 DMA channel or GIF DMA channel can be the
+drain channel."*
+
+Therefore:
+- `0x1000D000` = **channel 7 SPR_FROM** = scratchpad (SADR) -> main-memory MFIFO ring. It is *not* a
+  GS submission; routing it to `submitGifPacket(Path3, rdram+madr, ...)` (197.16-197.30) both
+  duplicated packets and never wrote the ring.
+- **MADR is the ring's read pointer**, not the destination of the copy. That is why copying the
+  scratchpad bytes to MADR corrupted the payload: with the copy enabled the sprite packets reached
+  the GS with every vertex at "(0.0, 0.0)" (`TOL_TRACE_GSPRIM_EMPTY`), because the copy overwrote the
+  payload the drain channel was about to read.
+- The runtime does not model MFIFO at all (no D_RBOR/D_RBSR write pointer, no drain stall at
+  `TADR == MADR`). Live measurement at every SPR copy: `gifChcr=0x00000000`, `gifTadr=0x00000000` -
+  the drain channel is *not* a running GIF chain DMA, so the port has no drain to feed.
+- Scratchpad source offsets measured: `SADR=0x0000` (72 qwords) and `SADR=0x0900` (24 qwords), i.e.
+  the two sprite banks. `FUN_00160390` was measured in 197.19 receiving `a1=0x70001200` - a **third**
+  bank that the SPR DMA never streams. The card's vertex payload therefore does not travel through
+  these two copies at all.
+
+Current code state (measured, no regression): the SPR branch in `ps2_memory.cpp` now **completes the
+channel** (QWC drained, STR cleared, `D_STAT` bit 7, `queueCompletedDmacCause(7)`) and performs **no
+memory write and no GS submission**. The ring is left as the guest wrote it. `TOL_TRACE_DMA8=1` still
+prints `sadr/madr/qwc` plus the GIF channel state.
+
+### 199.5 The immediate cause the card is invisible on this build (measured, new)
+
+`TOL_TRACE_GSPRIM_EMPTY=1` (now filtered to textured draws) shows the sprite tristrips being **culled
+as empty**:
+
+```
+[gsempty] verts=3 fbp=224 | type=4 tme=1 abe=1 | tex tbp0=14976 psm=20 | rgba0=0,0,0,0
+          v0=(0.00,0.00) v1=(0.00,0.00) uv0=10248,7160 | scissor=[0,0..511,447]
+```
+
+and `TOL_TRACE_SPRINJ` payload dump (`[injpl]`) shows the packets arriving with **nine zero qwords**
+where the three vertices should be:
+
+```
+[inj]   size=208 tagLo=312E400000008004 tagHi=0x512 nloop=4 egr=3     <- well-formed header
+[injpl] 0000000000000000 ... (x9 all zero)                            <- empty payload
+```
+
+With the (wrong) MADR copy enabled the same payload was non-zero but held the raw scratchpad bank
+(`0/0x10000000/0x3F0080813F008081/...`), i.e. object-space floats, which the GS decodes as
+`(0,0)` too. So: **the card's vertex payload is never produced in the port.** 197.25's "on-screen
+vertices with real colours" came from a ring buffer that still held a previous frame's data when the
+SPR block was being mis-submitted as a GIF packet - it was stale, not proof of a working path.
+
+`TOL_TRACE_SPRVERT=1` still counts **1704 `tme=1` tristrip kicks** with `ctxt=1`, so the packets are
+formed; they are simply filled with zeros, which is why no textured draw class ever appears (the class
+list stays at 11 for 400,000 draws; `c5..c8` freeze after the early phase and `c9..c11`, the page-280
+copy/clear, grow forever).
+
+### 199.6 Correlation with the reference (attempted, blocked)
+
+PCSX2 was relaunched fresh with `-fastboot` and the DebugServer answered (`tools/ps2dbg.py status`
+ok). A breakpoint probe was added (`tools/ref_gsspr.py`: break at `0x0015C4E8`, dump the scratchpad GS
+context `0x7000125C..0x70001304` and follow the texture handle) but the run produced **0 hits in 45 s**
+while the emulator sat at `pc=0x00081FC0` (a kernel wait loop) - i.e. that fresh boot did not reach the
+unit phase. Reference-side capture needs a boot that actually reaches ~11 s before the probe is armed;
+this is a tooling/starting-state issue, not a finding about the game.
+
+### 199.7 New instruments added this session (all env-gated, default inert)
+
+| env | what |
+|---|---|
+| `TOL_TRACE_GSDRAWS` (extended) | class key now `(fbp, tme, tbp0, type, psm, cbp)` + per-class totals every 20k draws |
+| `TOL_TRACE_TEXBIND` | every distinct TEX0 binding seen on a draw, with destination page and tme/type |
+| `TOL_TRACE_TEXUPD` | texture-cache updates: logs when a page gains *more visible texels* than ever before (finds artwork arriving into a reused page) |
+| `TOL_DUMP_VRAM_DRAWS`, `TOL_DUMP_VRAM_ONTEX0` | draw-index / TEX0-bind triggered live VRAM dumps |
+| `TOL_TRACE_TEX0W` | every TEX0 register write, fully decoded |
+| `TOL_TRACE_GSIMGDBP` | IMAGE upload census by destination block (bytes, tags, TRXREG) |
+| `TOL_TRACE_SPRINJ` (extended) | `[injpl]` - the first 9 payload qwords of each sprite packet |
+| `TOL_TRACE_GSPRIM_EMPTY` (changed) | reports **textured** empty-bound drops first (the untextured tiled clear legitimately drops out-of-scissor) |
+| `TOL_GFX_DUMP_TEXTURES` (existing, now used) | writes every built texture as PPM **with non-black/alpha counts** - this is the tool that answered "is the texture page populated" |
+| `tools/ppm2png.py` | convert those PPMs to PNG |
+| `tools/ref_gsspr.py` | reference-side scratchpad GS-context probe (see 199.6) |
+
+`TOL_TRACE_DMA8` (new) prints, per SPR_FROM start: `chcr mode sadr madr qwc`, the first two qwords of
+the RDRAM destination after the transfer, and the GIF channel's `CHCR/MADR/TADR`.
+
+### 199.8 What this proves and what is left
+
+Proven:
+1. the display path (224/280 -> 0 copy, textured, correctly ordered) is *not* the gate and VRAM cannot
+   be used to judge it;
+2. the card art **is** uploaded (262,144 bytes per upload into 0x3A8000) and **is** bound (TEX0 context
+   1, PSMT8 512x512, CLUT 14960) - both sides of the "missing artwork" question are healthy;
+3. SPR_FROM is MFIFO scratchpad -> memory with MADR = ring *read* pointer, so every earlier
+   "submit the SPR block to path 3" and "copy scratchpad to MADR" fix is wrong in kind, and the port
+   has no MFIFO model at all;
+4. the sprite packets arrive at the GS with **zeroed vertex payloads**, are culled, and that (not the
+   texture, not the copy, not the presenter) is why the logo cards are invisible.
+
+Next concrete step (single, ordered):
+1. **Find who fills the sprite payload.** The packet header is correct but 12 payload qwords are zero
+   and `SADR` only ever streams banks 0x0/0x900 while the sprite buffer is bank 0x1200. Break in
+   PCSX2 at `0x0015C4E8` (probe ready) once a reference boot actually reaches the unit phase, and dump
+   scratchpad `0x70001200..0x70001400` plus RDRAM at the packet's MADR **in the same stop**. That names
+   the missing transport (a third DMA, a VIF1 kick, or a guest memcpy).
+2. Then implement the transport faithfully - if it is MFIFO, add `D_RBOR`/`D_RBSR`, the ring write
+   pointer, and the drain-channel stall (`TADR == MADR`), instead of copying to MADR.
+3. Only after the payload is real: re-measure the three cards against `logs/refseq2/t014/t018/t0225`.
+4. Gate B (opening movie + title background) is unchanged and still needs the IPU (197.7): a complete
+   implementation exists at `D:\Personal\C++\grandia-ps2recomp\runtime\src\hw\ipu.cpp`.
+
+### 199.9 REFERENCE CAPTURE OF THE SPRITE PAYLOAD PRODUCER (this task)
+
+Breakpoint `0x0015C390` in `FUN_0015c2a0` (the flush epilogue, where `s1` = MADR, `s0` = QWC and
+`s3` = scratchpad bank are still live) with `tools/ref_spr_payload.py`. Note the address used in 199.5
+(`0x0015C4E8`) is in `FUN_0015c3b0` and produced **0 hits across the whole unit sequence** (a trace on
+`0x00204240` in the same window hit modes 2 and 3) - the live flush during the logo cards is
+`FUN_0015c2a0` (0x15C2A0..0x15C3B0), whose CHCR write is at **0x0015C38C**. (`FUN_0015c3b0` may still be
+used by a later, non-boot path; it is not the logo-card path.)
+
+Producer chain, all confirmed (corpus + live probes in both runtimes):
+
+```
+FUN_0023A780  per-sprite vertex emit (8 calls/run).  VU0 macro mode: pextlb / qmtc2 /
+              vitof0.xyzw / vmul.xyzw / sqc2.  Builds one 48-byte vertex at ctx+0x1200
+              (u,v floats at +0; RGBAQ at +0x10; x,y,z floats via swc1 at 0x1220/0x1224/0x1228)
+FUN_0015C3B0  copies the three 128-bit vectors from a1 (= ctx+0x1200) verbatim into the vertex bank
+              bank = ctx + ctx->+0x1250*0x900 + ctx->+0x1254*0x30 ; flushes at count 0x30
+FUN_0015C2A0  flush: s1 = MADR = ctx->+0x125C, s0 = QWC = count*3, s3 = bank
+              call *(ctx+0x1248) = 0x15CB70   (packet begin)
+              call *(ctx+0x124C) = 0x15CCB0   (packet body: a0=bank a1=bank+count*48 a2=ctx+0x1230)
+              ctx->+0x125C += QWC*16 ; wait CHCR.100
+              SPR_FROM: SADR = bank, MADR = s1, QWC = s0, CHCR = 0x100
+FUN_00156660  (40 calls) receives a2 = MADR and a3 = PRIM: writes the GIF tag/register block
+```
+
+**SPR_FROM does copy the bank into the ring**: in the reference the ring at MADR is byte-identical to
+the scratchpad bank.
+
+Event identity (reference rec 1 vs the port's first SPR flush): bank 0, MADR 0x01D00350, QWC 72,
+PRIM 0x4B9, callbacks 0x15CB70/0x15CCB0 - identical. Yet the 48-byte vertices differ (+590 of 2304
+bytes), and the difference is a **representation** difference, not a frame difference:
+
+| field | reference | port |
+|---|---|---|
+| +0x08 | 0x3F800000 (1.0f) | 0x10000000 |
+| +0x10..0x18 | 0x00000080 x3 (byte colour) | 0x3F008081 x3 (0.502f = 128/255) |
+| +0x1C | 0x00000020 (32) | 0x3F800000 (1.0f) |
+| +0x20 X | 0x00007538 (1877.5, 12.4 fixed) | 0x00000000 |
+| +0x24 Y | 0x00007A68 (1956.5, 12.4 fixed) | 0x00000000 / 0xC2000000 (-32f) |
+| +0x28 Z | 0x000003F8 (1016, 12.4 fixed) | 0x42800000 (64.0f) |
+
+Reference vertices are screen-space (X 1877.5..2237.5 -> screen 85..445 with ofx 1792; Y 1956.5..
+2103.5 -> 132..279); port vertices are model-space floats (0/32/-32, z=64). Full table and decoded
+vertices: `logs/ref199/compare.txt`; raw data `logs/ref199/hits.jsonl`, `h001_spr.bin`,
+`h001_ring.bin`, `port_bank72.bin`.
+
+Both `FUN_0023A780` (8 calls) and `FUN_00156660` (40 calls) do run in the port, so nothing is skipped
+at the call level: the divergence is in the converted values (12.4 fixed / byte colour vs
+normalised float) produced between the vertex emit and the flush.
+
+Next session starts here: break at `0x00156660` in PCSX2 with `a1`/`a2` and dump the 48 bytes at
+`ctx+0x1200` plus the ring at `a2`, and do the same in the port with `TOL_TRACE_PC=0x156660`. Whichever
+side lacks the float->12.4 / colour-byte conversion names the function to fix. The VU0 macro path in
+`FUN_0023A780` (`pextlb`, `qmtc2.ni`, `vitof0.xyzw`, `vmul.xyzw`, `sqc2`) is the prime suspect,
+because its output signature is exactly "floats where fixed-point belongs".
+
+Tooling added: `tools/ref_spr_payload.py` (sampled capture: every new (qwc,bank,prim,madr) shape plus
+a periodic slice, writes per-hit bank+ring dumps and `hits.jsonl`), and `TOL_DUMP_SPR72=<path>` in
+`ps2_memory.cpp` (dumps the port's 0x900-byte bank at the first QWC=72 flush, for a byte diff against
+the reference).
+
+### 199.10 TRACE OF 0x00156660 + stage-vs-ring comparison: the conversion site is NOT on this path, and the port flushes a DIFFERENT batch
+
+`tools/ref_vertex_writer.py` (memcheck on `0x70001220-0x70001230` and `0x70000020-0x70000030`,
+game-code PCs only) plus the existing `logs/ref199/h001_*.bin` capture.
+
+**1. `FUN_00156660` is not the conversion.** Its whole body is three instructions:
+
+```
+0x156660  v1 = a0 + 0x1210
+0x156664  t0 = *(u128*)a1
+0x156668  *(u128*)v1 = t0
+0x15666c  jr $ra
+```
+
+i.e. `*(ctx+0x1210) = *(a1)` - it copies the *colour qword* of the staged vertex. `a2` (the ring
+address) and `a3` (PRIM) are not even read.
+
+**2. `FUN_00160390` is not the conversion either.** It calls the flush first (`jal func_15C2A0`), then
+builds the GIF tag at `*(ctx+0x12F4)` (`count | 0x8000 | PRIM<<46 | 0x3000000000000000`), writes REGS
+`0x512` at +8, the `0x1000...` tag at `*(ctx+0x12F0)`, and appends a chain tag. No arithmetic on
+vertex data.
+
+**3. `FUN_0015C3B0` is verbatim** (`lqc2 vf1..vf3 @a1` / `sqc2 -> bank`). Confirmed live: the
+reference's copier fires at `pc=0x15C408` and the bank receives exactly the staged qwords.
+
+**4. The only float -> fixed conversion in this subsystem is `vftoi12.xyzw` in `FUN_0015bca0`**
+(0x15BCE4), the sprite-context constructor: it builds `(0,0,1.0,0)`, converts with
+`vftoi12.xyzw vf2,vf1` (corpus emits `src*4096; cvttps_epi32`), stores the packed result at
+`ctx+0x1208`, then seeds the colour at `0x1210..0x121C`, the callbacks at `0x1248/0x124C`, and zeroes
+`0x1250..0x125C`. Everything else on the vertex path (`FUN_0023A780`, `FUN_0023B800`) writes **floats**
+(`cvt.s.w` + `swc1` at `ctx+0x1220/0x1224/0x1228`, colour built in VU0 as `vitof0` then `vmul` by
+1/255).
+
+**5. Stage vs ring at the card flush (reference, `h001`): they are NOT the same vertex, and the ring
+is already GS-native.**
+
+| buffer | u,v | colour | X,Y,Z |
+|---|---|---|---|
+| `ctx+0x1200` (staged) | 1.0, 1.0 | `3F008081` x3 + `3F800000` (0.502f,1.0f) | `43AC0000` `C3310000` `42800000` = **344.0, -177.0, 64.0 (floats)** |
+| bank 0 / ring at MADR | 0.0/0.5/1.0 | `00000080` x3 + `00000020` (**bytes 0x80**) | `00007538` `00007A68` `000003F8` = **1877.5, 1956.5, 1016 (12.4)** |
+
+Decoded, the reference batch is a **6-quad grid covering screen (83.5,134.5)..(427.5,311.5)**
+(X in {0x7538,0x7738,0x88B8,0x8AB8}, Y in {0x7A68,0x7C68,0x8378,0x8578}), all vertices
+`rgba=0x80,0x80,0x80,0x20`, `z=0x3F8`, UVs 0..1 - i.e. the logo-card panel - and it is stored in the
+ring in **GS register form**.
+
+The port's bank at the structurally identical first flush is instead **a 32x32 quad at (0,0) with
+z=64 and colour 0.502f** - a *different sprite*, in the emitter's float form.
+
+So two things are true at once, and they must be untangled before a code change:
+- the ring format difference is real (reference = GS-native fixed/byte, port = pre-conversion float);
+- the *batch identity* also differs (reference = 344x177 panel, port = 32x32 quad), so the port is
+  not merely skipping a conversion on the same vertices.
+
+**6. Memcheck evidence for the writer order** (`logs/ref199/writers.jsonl`, 70 records, 3.2..20.1 s):
+`pc=0x23A8C4/CC/D4` and `0x23B964/6C/74` stage floats into `ctx+0x1220`; `pc=0x15C408` copies them
+into the bank; `pc=0x15BD0C/10/14/18` (`FUN_0015bca0`) write the converted seed at boot. Bank 0
+alternates between float and fixed contents across frames because it is reused by more than one
+sprite stream - which is why a single-vertex comparison must be taken at the *flush of the batch being
+investigated*, not at an arbitrary moment.
+
+Next concrete step: at the card flush, capture the *sprite object* (`0x63D910` region) and the ring in
+PCSX2, and dump the same two in the port with `TOL_DUMP_SPR72`; whichever batch the port flushes
+(there: 32x32 quad at (0,0)) names the sprite-selection divergence. In parallel, probe
+`TOL_TRACE_PC=0x15BCA0,0x15BCE4` in the port during the card window to see whether the converting
+constructor runs at all for that sprite.
+
+Tooling added: `tools/ref_vertex_writer.py` (memcheck-based writer tracing with per-hit stage/bank
+dumps, game-PC filter).
+
+### 199.11 Correction to 199.10: the port runs BOTH vertex families, so the batch comparison must be matched
+
+Two more measurements, both live:
+
+- `FUN_0015bca0` (the `vftoi12.xyzw` constructor) runs **once** in the port (`ra=0x15F754`, at boot) -
+  same as the reference (its `pc=0x15BD0C..0x15BD18` writes appear only at t=3.2 s). It seeds the
+  sprite context; it is not a per-vertex converter.
+- There are **two families of vertex emitter**, and the corpus shows they differ in the store
+  instruction, not in arithmetic:
+  - `FUN_0023A780` / `FUN_0023B800`: `swc1` (float) at `ctx+0x1220/0x1224/0x1228`, colour built in
+    VU0 (`vitof0` then `vmul` by 1/255) -> normalised floats.
+  - `FUN_001c8f50` / `FUN_001c9410`: plain `sw` (integer) at `ctx+0x1220` -> GS-native 12.4.
+  Port probe over 55 s: `0x1C9410` **12 entries**, `0x23A780` 8, `0x23B800` 8, `0x1C8F50` 0.
+
+So the port does reach the integer (GS-native) emitter. The earlier byte diff compared the port's
+**first** QWC=72 flush against the reference's first QWC=72 flush, and those two flushes belong to
+*different* emitters (float vs integer) - the formats differ for that reason, and the "missing
+conversion" framing in 199.9/199.10 is therefore **retracted as the explanation of that diff**.
+
+What still stands, and is the real gate:
+- the reference's card batch is a 6-quad grid at screen (83.5,134.5)..(427.5,311.5), `z=0x3F8`,
+  `rgba=0x80,0x80,0x80,0x20`, stored GS-native in the ring;
+- the port's first flush is a 32x32 quad at (0,0), `z=64`, colour 0.502f - i.e. a different sprite;
+- therefore the port is not proven to submit the card's vertex batch at all, and any further diff
+  must be taken from a **matched batch** (same emitter, same sprite, same frame).
+
+Revised next step (replaces the one at the end of 199.10):
+1. In PCSX2, break at `0x001C9410` and at `0x0023A780` during the card window and record which one
+   draws the card panel (the 344x177 grid above) - by checking the 48 bytes it stages.
+2. In the port, run `TOL_TRACE_PC=0x1C9410,0x23A780` with `TOL_DUMP_SPR72` and compare the *same*
+   emitter's batch, not the first one that flushes.
+3. Only then judge whether a conversion/format is missing; `vftoi12` and the four emitters are now all
+   located, so the remaining question is batch selection, not arithmetic.
+
+### 199.12 ROOT CAUSE LOCATED: the sprite vertex transform is the VU0 macro program at 0x15CCB0, and the live corpus has no dispatch case for it
+
+Everything below is measured, with the tools named.
+
+**A. Flush attribution (reference, 45 s, `tools/ref_flush_emitter.py` -> `logs/ref199/flushes.jsonl`)**
+
+At the flush epilogue `0x15C390` the emitter is still on the stack, so `u32(sp+0x70)` names the
+caller of `FUN_00160390` that requested the flush:
+
+| emitter ra | who | flushes | qwc | bank format |
+|---|---|---|---|---|
+| `0x23B150` | `FUN_0023A780` | 10 | 72 (24 verts) | **fixed** |
+| `0x23BC6C` | `FUN_0023B800` | 10 | 24 (8 verts) | **fixed** |
+| `0x23B65C` | `FUN_0023B290` | 10 | 24 | **fixed** |
+| `0x239F70` | `FUN_00239F70` | 22 | 12 (4 verts) | **fixed** |
+
+All 52 flushes have `flush_ra = 0x1603A4`, i.e. every one comes from `FUN_00160390`. **Every flushed
+batch in the reference is GS-native fixed**, including the card's 24-vertex panel
+(`madr=0x01D00350`, screen (83.5,134.5)..(427.5,311.5), `z=0x3F8`, `rgba=0x80,0x80,0x80,0x20`).
+
+**B. Every copy into the bank is a FLOAT copy** (`tools/ref_vertex_copy_sample.py`, breakpoint
+`0x15C408`, armed at cycles ~2.95e9 so the window covers the card):
+
+```
+done: 1604 copies, counts={'float': 1604, 'fixed': 0, 'other': 0}
+FIRST float: t=0.44 ra=0x23A8E0 stage=00000000 00000000 10000000 00000000 3F008081 3F008081 3F008081 3F800000
+```
+
+So the bank is filled with floats and is *converted afterwards*, between the last copy and the DMA.
+
+**C. The converter is the second flush callback, `ctx+0x124C = 0x15CCB0`, a VU0 macro program**
+
+`FUN_0015C2A0` calls it with `a0 = bank`, `a1 = bank + count*48`, `a2 = ctx+0x1230`. Its body:
+
+```
+0x15ccb0  t0 = *(a2+0); t1 = *(a2+4); ctc2 t0,vi18      ; clip flags in
+0x15ccbc  lqc2 vf20, 0x20(a0)                           ; this vertex's XYZ (floats)
+0x15ccc4  vmulax/vmadday/vmaddaz/vmaddw  -> vf30        ; 4x4 matrix transform (vf1..vf4)
+0x15cce0  vdiv Q, vf0w, vf30w
+0x15cce4  vclipw.xyz vf30, vf30w
+0x15ccf0  vmul.xyzw vf22, vf22, vf8                     ; colour scale
+0x15ccf4  vmul.xy  vf21, vf21, vf10 ; vadd.xy + vf11    ; uv scale/offset
+0x15ccfc  vmulq.xyz vf30, vf30, Q                       ; perspective divide
+0x15cd0c/1c/2c/3c  vminiw / vmaxw / vmul.xyz / vadd.xyz  ; depth clamp
+0x15cd34  sqc2 vf21, 0x0(a0)                            ; write uv back
+0x15cd40  vftoi0.xyzw vf22, vf22                        ; colour float -> byte
+0x15cd4c  vftoi4.xyz  vf20, vf30                        ; ** position float -> 12.4 (x16) **
+          ... sqc2 vf20/vf22 back into the bank
+```
+
+`vftoi4` is exactly the float -> 12.4 conversion the reference bank shows. The VU0 state it consumes
+(vf1..vf11) is loaded by the *other* two callbacks, `ctx+0x1248 = 0x15CB70` and `0x15CBB0` /
+`0x15CC00`, which are `vlqi` loaders (`ctc2 $zero,$vi1` then `vlqi.xyzw vf1..vf15`).
+
+**D. Why the port never converts: the corpus has no `case` for those addresses**
+
+| corpus | `entry_0015c7e0` case labels | 0x15CB70 | 0x15CBB0 | 0x15CC00 | 0x15CCB0 |
+|---|---|---|---|---|---|
+| `data/output_fixed` (live) | **4** (`0x15ccbc 0x15cd7c 0x15ce7c 0x15cf4c`) | no | no | no | **no** |
+| `data/output_dense` | **544** | yes | yes | yes | yes |
+
+The row is a merged Ghidra row (0x15C7E0..0x15CFxx) that contains several routines; the emitter only
+emits `switch (ctx->pc)` cases for the row's *internal branch targets*. `0x15CCB0` (and the loaders)
+are function-pointer entry points, so a call into them hits `default:` and the row restarts at
+`0x15C7E0` - the documented systemic interior-entry defect. Consequences measured in the port:
+
+- `TOL_TRACE_PC` shows `enter 0x0015CCB0 ... ra=0x0015C318` and an immediate return: the row ran from
+  its start instead of executing the transform;
+- the bank therefore keeps the float vertices, the SPR_FROM copy moves floats into the ring, and the
+  GS decodes every vertex as `(0,0)` (all sprite tristrips are culled as empty, 197.30/199.5);
+- `0x15C7E0` is only ever entered with `ra=0x1602E0/0x1602EC` (the PRIM builder), never from the flush
+  call sites, confirming the fall-through never produced the transform.
+
+**E. Fix options, in order of correctness**
+
+1. **Durable (recommended): make the emitter emit a `case` for every instruction in a row**
+   (`ps2xRecomp/src/lib/ps2_recompiler.cpp`, the Option A already named in the CURRENT STATUS table),
+   regenerate, rebuild. `data/config_dense.toml` and `data/output_dense` (544 cases for this row) already
+   exist and are the proof the corpus changes as expected. Cost: ~14 min regenerate + ~20 min build,
+   plus the `entry_003a3198` monster TU (~52 min at `-O0`, which the CMake guard now selects).
+2. **Interim, narrow:** regenerate only the affected rows into a dense corpus and build that corpus
+   (still needs the emitter change, so 1 is no more work).
+3. **Not viable:** an override re-implementing `0x15CCB0` in `tol_overrides.cpp`, because the VU0
+   registers it consumes are loaded by two more miss-cased callbacks (`0x15CB70`, `0x15CBB0`) - all
+   three would have to be re-implemented, including the `vlqi` VU0 data memory reads.
+
+No code behaviour was changed in 199.9-199.12; only probes and tools were added
+(`ref_vertex_writer.py`, `ref_flush_emitter.py`, `ref_vertex_copy_sample.py`).
+
+Session close: the milestone is still blocked, but the block is now a **known, single, mechanical
+corpus gap** rather than an unknown in the GS or the presenter. Next session starts at E.1.
+
+### 199.13 DENSE CORPUS IS NOW THE LIVE BUILD (and it works): one bogus TU is stubbed
+
+Answered the open question from 199.12: **do not go back to `config.toml`/`data/output`** (53,558 files,
+the pre-session-60 unfolded map whose interior-entry fragments run the enclosing routine's epilogue with
+`$ra == 0`), and **`data/output_dense` is usable** - it only ever lacked one translation unit.
+
+What was done (all reversible, nothing deleted):
+
+1. `data/output_dense/entry_003a3198_0x3a3198.cpp` -> `.cpp.disabled`. That "function" is the Ghidra
+   export decoding a **data region** as code: 47,418 table slots covering `0x003A3198..0x003D167C`
+   (step 4) - the range holding the texture/CLUT blobs (`0x3A7000`), the sprite vtable (`0x3D4CA0`)
+   and the lookup tables. 11.5 MB of source, ~52 min at `-O0`, and it is the single TU that made the
+   dense build look impossible. It is not code; nothing executes there.
+2. `src/runtime/tol_overrides.cpp` now defines `entry_003a3198_0x3a3198` (same signature, C++ linkage)
+   as `ctx->pc = GPR_U32(ctx, 31)` - a `jr $ra`, i.e. what the first byte there would do if it were a
+   return. The dense corpus supplies the remaining 13,519 TUs.
+3. `TOL_GENERATED_DIR` switched to `data/output_dense`; ninja reused the 13,519 existing dense objects,
+   archived `tol_generated.lib` and linked. `tol.exe` = 98,819,584 B (11/23 21:37).
+   Rollback copy of the pre-dense binary: `build/tol2/src/runtime/tol_fixed_before_dense.exe`.
+
+**Result: the interior-entry defect is gone and the sprite transform runs.** The first QWC=72 flush of a
+run now dumps a **GS-native** bank (`TOL_DUMP_SPR72`), where the `output_fixed` build dumped floats:
+
+```
+before (output_fixed): v0 = 00000000 00000000 10000000 00000000 3F008081 3F008081 3F008081 3F800000 | 00000000 00000000 42800000
+after  (output_dense): v0 = 00000000 ... 00007FF8 00000000 00000000 00008000
+```
+
+Independent confirmation: `TOL_TRACE_PC` on `0x15CCB0` is no longer a fall-through; the row's dense
+corpus has 544 case labels (vs 4) including `0x15CCB0`, and `label_15ccb0` contains the
+`vftoi4.xyz vf20, vf30` conversion.
+
+**Next gate, measured: the VU0 transform's INPUTS are zero.** `0x15CCB0` computes
+`vf30 = M * (x,y,z,1)` from `vf1..vf4` and scales from `vf5..vf11`; those are loaded by the sibling
+callback `ctx+0x1248 = 0x15CB70` (`ctc2 $zero,$vi1` + eleven `vlqi.xyzw vf1..vf11,(vi1++)`, i.e. a
+macro-mode load from VU0 data memory). Measured:
+
+- the port's **VU0 data memory is all zeros** (`runtime->memory().getVU0Data()`, dumped via
+  `TOL_TRACE_VU0MEM`), while PCSX2 read at `0x11004000` returns real data
+  (`... 3A000801`, `B4000001`, `3F8000003F800001`);
+- `processVIF0Data` is **never called** in a 45 s run (`vif0data calls: 0`), and the game only writes
+  four VIF0 registers (`0x10003810`, `0x10003820`) - no VIF0 DMA and no VIF0 FIFO traffic;
+- the game never references `0x1100xxxx` anywhere in the corpus (no `lui 0x1100`, no
+  `0x11004000` store), so it does not write VU0 data memory directly either;
+- the corpus emits macro-mode `vlqi` as `READ128(((vi1 & 0x3FF) << 4))`, an **EE** address, not VU0
+  data memory - a recompiler fidelity bug that is masked only because the memory is empty anyway.
+
+So the matrix must arrive from something the port does not model. Next probe (single): a PCSX2
+memcheck on `0x11004000..0x11004020` during the card window, which names the writer (VU0 micro store,
+a VIF0 packet, or a BIOS-side initialisation) - then implement that path and let the existing
+`vftoi4` transform produce real screen coordinates.
+
+Interim state: bank is GS-native but degenerate (`X=0x7FF8` clamp, `Y/Z/colour = 0`), so the card batch
+is still culled; the screen is unchanged. No regression: same draw classes, same boot timing, no fatal
+lines. The `spriteVu0Load11` override (0x15CB70) is installed and correct - it reads VU0 data memory -
+so it will start working the moment that memory is populated.
+
+### 199.14 VU0-memory writer probe: nothing writes it from the EE during the card window; the region holds a VIF command stream
+
+Went after the last measured gate (199.13: the transform runs but its matrix is zero because VU0 data
+memory is empty).
+
+**A. EE-store memcheck on 0x11004000..0x11004040** (`tools/ref_vu0mem_writer.py`, two runs):
+
+- the only writer through the EE store path is the **EE kernel's VU0 clear loop at `pc=0x8000E118`**
+  (`a0=0x11000000`, stores zeros) - it runs throughout boot;
+- after filtering that loop and arming at ~8 s (cycles 2.4e9), the 8-48 s window produced **0 hits**:
+  nothing in game code writes VU0 data memory during the logo cards.
+
+So the upload does not go through an EE store: it is a **DMA/VIF0 unpack** (which writes VU memory
+directly and is invisible to an EE memcheck) or VU0 micro-mode.
+
+**B. What the reference actually has there at the card flush** (`tools/ref_flush_vu0.py`, breakpoint
+0x15C390, reading 0x11004000 at each flush - identical for all 13 flushes sampled):
+
+```
+0x11004000: 3A000801 00000000 00000000 00000000
+0x11004010: 00000000 3A000801 00000000 00000000
+0x11004020: 00000000 00000000 B4000001 00000000
+0x11004030: BDAC0AC1 3D320B21 3F800001 3F800000
+```
+
+`0x3A000801` and `0xB4000001` are **VIF UNPACK opcodes** (0x3A = UNPACK, 0xB4 = UNPACK|IRQ; low bits =
+vn/vl, high byte = num), followed by float payload (`-0.0840, 0.0434, 1.0000001, 1.0`). So this region
+holds a **VIF0 command/data stream**, not a plain matrix, and the same flushes produce the correct
+GS-native bank (`0x7538 0x7A68 0x3F8`).
+
+Combined with 199.13 (`processVIF0Data` never called; only four VIF0 register writes at 0x10003810 /
+0x10003820; no 0x1100xxxx references anywhere in the corpus), the conclusion is that the port is missing
+the **VIF0 upload path** (DMA or FIFO) that fills VU0 data memory, and additionally the corpus emits
+macro `vlqi` as an EE read.
+
+Next step (single, concrete): watch the *DMA* side, not EE stores - memcheck/breakpoint on VIF0's
+`CHCR` (`0x10008000`) and on the VIF0 FIFO (`0x10004000`) in PCSX2 during the card window, and the same
+two in the port with `TOL_TRACE_VIF0`. Whichever fires names the path to implement.
+
+### 199.15 THE CARD GEOMETRY AND TEXTURE NOW REACH THE RASTERISER (three fixes, measured)
+
+Three separate defects were each confirmed and fixed this round. The first logo card is not yet
+visible on screen, but for the first time its **textured geometry is submitted and rasterised**.
+
+**1. Dense corpus live, bogus TU stubbed (see 199.13).** `data/output_dense/entry_003a3198_0x3a3198.cpp`
+disabled (data region decoded as code: 47,418 slots over 0x3A3198..0x3D167C), replaced by a `jr $ra`
+stub in `tol_overrides.cpp`. The VU0 transform at `0x15CCB0` now runs.
+
+**2. VU0 data memory seeded from the reference.** The transform's matrix/scales are loaded from VU0
+data memory by `0x15CB70` (`vlqi`), and the probe chain (199.13/199.14) showed nothing in the game's EE
+code ever writes that memory: no EE store in the card window (only the kernel's clear loop at
+`0x8000E118`), no VIF0 DMA, no `0x1100xxxx` reference anywhere in the corpus. The reference image was
+therefore captured at the card flush (`tools/ref_flush_vu0.py` -> `logs/ref199/vu0mem.bin`, 4096 bytes)
+and is loaded by `TOL_VU0_SEED=<path>` at init (file kept outside the source tree: it is game state).
+Also fixed here: `spriteVu0Load11`, a correct override for `0x15CB70`, because the corpus emits
+macro-mode `vlqi` as an EE read instead of a VU0 data-memory read.
+
+**Effect, measured at the first QWC=72 flush** (`TOL_DUMP_SPR72`, port vs reference `h001_spr.bin`):
+
+```
+port v0: 00000000 00000000 3F800000 00000000 | 00000080 00000080 00000080 00000020 | 00007538 00007A68 000003F0
+ref  v0: 00000000 00000000 3F800000 00000000 | 00000080 00000080 00000080 00000020 | 00007538 00007A68 000003F8
+```
+
+**36 of 1152 bytes differ, and only in Z (0x3F0 vs 0x3F8).** UVs, colour bytes and X/Y match exactly.
+
+**3. SPR_FROM copy re-enabled.** The session-159 change completed the channel without writing memory
+(correct then: the bank held floats and the copy corrupted the payload). With a correct bank the copy is
+the transport again: `copyOutOfScratchpad(sadr, madr, qwc)` in `ps2_memory.cpp` mode 0.
+
+**Result - two new draw classes, both textured, into page 224 from the card texture:**
+
+```
+cl=7 fbp=224 type=4 iip=1 tme=1 tex tbp0=14976 tbw=1 psm=20 cbp=14960
+     rgba0=128,128,128,32 v0=(1875.5,1958.5) v1=(1875.5,1990.5) written=[82,133..117,168] verts=3
+cl=8 fbp=224 type=4 iip=1 tme=1 tex tbp0=14976 tbw=8 psm=19 cbp=14960
+     rgba0=128,128,128,32 v0=(1619.5,1734.5) v1=(1619.5,2246.5) written=[0,0..341,424] verts=3
+```
+
+Before this round the run had **6** classes and no textured tristrip at all; it now has 8, and the
+320-frame capture is no longer byte-identical black (the frame contains a dark red region and a grey
+field). The card is therefore being drawn - it is just not yet reaching the visible page correctly
+(the sampled screen colours are black / grey / dark red, `rgb(38,7,8)`).
+
+Remaining gap, narrowed to presentation/alpha:
+- `cl=7/8` write into page 224 with `rgba=128,128,128,32` (alpha 32, ABE on) sampling `tbp0=14976`;
+  the display copy 224->0 was verified textured and correctly ordered in 197.20, so the next
+  measurement is whether the batch's alpha/blend leaves the page unchanged (alpha 32/128 over a black
+  page stays near black), or whether the card's own texture page content is still the "NOW LOADING"
+  text rather than the logo (the `tbw=1 psm=20 24x16` vs `tbw=8 psm=19 512x512` pair suggests two
+  different texture bindings for the same page).
+- Environment knobs added this round: `TOL_VU0_SEED=<path>`, `TOL_TRACE_VIF0` (VIF0 register/data
+  traffic), plus tools `ref_vu0mem_writer.py`, `ref_flush_vu0.py`.
+
+**Repo hygiene (requested):** the obsolete configs were archived rather than deleted -
+`data/archive/config_unfolded_do_not_use.toml`, `config-linux_unfolded_do_not_use.toml`,
+`config_orig_duplicate_of_fixed.toml`. `data/config_fixed.toml` is no longer tracked by git
+(`git rm --cached`, file kept on disk); the live config is `data/config_dense.toml` and
+`config/map.csv` stays tracked because the dense config references it for regeneration.
+
+### 199.16 VISUAL CONFIRMATION: the logo card renders (first time)
+
+Run with `TOL_VU0_SEED=logs/ref199/vu0mem.bin`, screenshots every 5 s from 20-55 s
+(`logs/run199/show/`). From 30 s on, the frame contains the card:
+
+- the card field is `rgb(58,58,58)` - the card's white background at the fade level the guest is using
+  (`rgba=128,128,128,32` from the vertex batch, i.e. 32/128 = 25 % of white);
+- the red wordmark is `rgb(38,7,8)`, laid out as five letterforms across `x 0..700` - the namco logo
+  block. Brightened copies for viewing: `logs/run199/show/CARD_bright4x.png` (4x) and
+  `CARD_native.png`.
+
+So the whole chain now works end to end: dense corpus -> VU0 transform -> GS-native vertex bank ->
+SPR_FROM bank->ring copy -> textured tristrips into page 224 from `tbp0=14976` -> display copy.
+
+Two observations from the same run:
+- `f30`, `f40` and `f55` are **byte-identical** (MD5 `88EADCC0...`), so the presented frame is static
+  during that window even though the guest keeps drawing - presentation (or the guest's fade step) is
+  now the thing to look at, not geometry;
+- the card is at 25 % brightness, matching the fade alpha in the batch, so the fade-in itself is not
+  being animated in the presented frames yet.
+
+Next: (a) check whether the guest is advancing the fade counter during that window (`TOL_TRACE_PC` on the
+fade owner, or `TOL_GFX_STATS_EVERY=1`), and (b) whether the presenter is re-presenting one frame
+(compare `[gfx]` present counters against `[gsdraw]` totals).
+
+### 199.17 THE JUMP IS A STALE MATRIX, NOT A PRESENTER BUG; VU0 memory is not written by EE stores at all
+
+User observation: the picture "jumps from the middle to the left" and the card appears without its text
+at first, then the namco wordmark appears.
+
+Measured:
+
+1. **The card batch in the port is pixel-exact.** Comparing all 24 vertices of the first QWC=72 flush
+   (`logs/run199/seeded_bank72.bin` vs `logs/ref199/h001_spr.bin`):
+   ```
+   ref  X set: 7538 7738 88b8 8ab8      port X set: 7538 7738 88b8 8ab8   (identical)
+   ref  Y set: 7a68 7c68 8378 8578      port Y set: 7a68 7c68 8388 8588   (1 px on two vertices)
+   ```
+   So the geometry the transform produces from the seeded VU0 image is correct.
+
+2. **The offset comes from later frames.** Draw class `cl=8` (the full card panel, `tbp0=14976 tbw=8
+   psm=19`) reports `v0=(1619.5,1734.5)`, i.e. screen x = -172.5 and a written rect `[0,0..341,424]`,
+   while the reference panel sits at x 83.5..427.5. 1619.5 x 16 = 0x6538, and 0x7538 - 0x6538 = **0x1000
+   = 4096 in 12.4 = exactly 256 px** - one half of the 512-wide frame. r anches: the *later* card frames
+   use a translation the port's frozen seed does not have.
+
+   Cause: `TOL_VU0_SEED` loads one 4 KB snapshot of VU0 data memory. The game updates that matrix as the
+   card animates, and a static seed can only be right for the moment it was captured.
+
+3. **Nothing writes VU0 data memory through an EE store.** Full-range memcheck `0x11004000..0x11005000`
+   over a fresh boot + card window: **26,188 hits, every one the kernel clear loop at `pc=0x8000E118`**,
+   zero from anywhere else. Combined with 199.13/199.14 (no VIF0 DMA, no VIF0 FIFO, no `0x1100xxxx`
+   reference in the corpus), the per-frame fill must be **VU0 micro-mode stores** (a microprogram writing
+   its own data memory) - the only remaining producer.
+
+4. Presentation is static across the window: `t28..t60` captures are byte-identical, and `t12..t24` too,
+   so the presenter is re-showing one frame per phase rather than animating.
+
+Next steps, in order:
+1. Implement/verify VU0 micro-mode execution for this title (the runtime has `executeVU0Microprogram`),
+   or detect the microprogram upload and run it, so VU0 data memory is produced live.
+2. Then re-check the two card classes: the panel should stay at x 83.5..427.5 instead of drifting to
+   -172.5, which is exactly the reported middle->left jump.
+3. Only if the jump persists with a live matrix, look at the presenter's aspect path
+   (`sdlGpuDisplayRect` centres the picture: `rect.x = (windowWidth - width)/2`), which is not the cause
+   today.
+
+### 199.18 STEP 1 MEASURED: VU0 memory is uploaded by the PS2 KERNEL through the VIF0 FIFO - not by game code, not by DMA
+
+Asked to measure (not fix) how VU0 data memory gets produced, skipping the card-position and presenter
+work for now.
+
+**Measurement (PCSX2, fresh boot, memcheck on `0x10008000..0x10008010` (VIF0 CHCR) and
+`0x10004000..0x10004010` (VIF0 FIFO)):** the FIFO range fires continuously from the very first second,
+always at
+
+```
+pc=0x8000E274  ra=0x8000D860  a0=0x00000010  a1=0x05000000000002000000001000404  a2=0xFFFFFFFF800161D0
+```
+
+i.e. **EE kernel code at 0x8000E274 writes the VIF0 FIFO**. That is the upload: the kernel pushes micro
+code/data through the VIF0 FIFO, and the VIF0 unpack writes VU0 memory. No CHCR writes were seen, so it is
+FIFO-driven, not a DMA channel.
+
+This is consistent with every earlier negative result: no EE store writes `0x11004000` in game code
+(the only EE writer of that range is the kernel's clear loop at `0x8000E118`), no VIF0 DMA, and no
+`0x1100xxxx` constant anywhere in the corpus.
+
+**Port consequence:** the port never writes the VIF0 FIFO (`TOL_TRACE_VIF0`: `vif0data calls: 0`), because
+this upload is *kernel/BIOS* code: the game reaches it through a syscall, and the runtime's syscall layer
+does not implement the VU0 upload. So the missing piece is a **syscall implementation**, not a
+memory-mapped path.
+
+Work done in this step (kept, currently inert):
+- `ps2_memory.cpp` now stages writes to `0x10004000`/`0x10004008` in `g_vif0Fifo` and hands each completed
+  16-byte quadword to `processVIF0Data`, and does the same for 128-bit stores at `0x10004000`. This is the
+  correct hardware-side plumbing and it will start working the moment something in the port writes the
+  FIFO.
+
+Next measurement (single): log the guest's syscall numbers in the port and find the one the kernel uses
+for this upload - it will be the syscall whose runtime handler is a no-op today. Then implement it to copy
+the guest buffer into VU0 code/data memory (the same bytes the reference's kernel pushes through the
+FIFO). After that, drop `TOL_VU0_SEED` and re-run; the matrix then comes from the game itself.
+
+### 199.19 SYSCALL CENSUS: there is no VU0-upload syscall - the upload is a kernel function reached by pointer
+
+Requested measurement: trace guest syscall numbers to name the kernel call that uploads VU0 data.
+
+Added `TOL_TRACE_SYSCALL_CENSUS=1` (`ps2_runtime.cpp::handleSyscall`): reports every distinct syscall
+number once with a0..a3, the call site and $ra. A full 40 s boot produced exactly **six** distinct
+syscalls:
+
+```
+id=0x3C a0=0x003E2BF0 a1=0xFFFFFFFF a2=0x00100000 pc=0x001001CC ra=0x0
+id=0x3D a0=0x004E9B80 a1=0xFFFFFFFF a2=0x00100000 pc=0x001001E8 ra=0x0
+id=0x74 a0=0x00000083 a1=0x0011E8C0 a2=0x00100000 pc=0x0011EA50 ra=0x0011E988   (SetSyscall)
+id=0x83 a0=0x80000000 a1=0x80080000 a2=0x0011E8C0 pc=0x0011E908 ra=0x0011E9A4   (FindAddress)
+id=0x5A a0=0x80076000 a1=0x00388550 a2=0x00000740 pc=0x0011EEE8 ra=0x0011EF98
+id=0x5B a0=0x000000FC a1=0x80076000 a2=0x00000028 pc=0x0011EF30 ra=0x0011EFD8
+```
+
+None of these is a VU0 upload, and the runtime's numeric dispatcher has no VU0/VIF0 entry either (checked
+the whole `Kernel/Syscalls/Dispatcher.cpp` table: 0x61/0x62/0x64/0x6E..0x78/0x7C/0x7F/0x82/0x83 - no
+VU0). So the upload is **not** a numbered syscall.
+
+Combined with 199.18 (the FIFO writes come from EE **kernel** code at `pc=0x8000E274`, `ra=0x8000D860`,
+`v1=0x10004000`, 16-byte stores, `a0=0x10`), the only remaining mechanism is a **kernel function called
+through a function pointer** - the classic libvu0/libgraph pattern where the game obtains a kernel entry
+with `FindAddress` (syscall 0x83, which this title calls at `pc=0x0011E908`) and then jumps to it. That is
+why the port never writes the FIFO: the recompiled corpus contains no code at 0x80000000+, so such a call
+cannot execute.
+
+Data word captured at the FIFO write: `a1 = 0x0500000000000200_0000000010000404`, i.e. VIF command
+words (`0x10000404` -> opcode 0x10 FLUSHE; `0x05000000` -> opcode 0x05 STMOD), confirming a VIF0 command
+stream being pushed 16 bytes at a time.
+
+**Conclusion for step 1:** the VU0 upload cannot be fixed by implementing a syscall number - there is
+none. The native substitute must either
+1. intercept the guest's kernel-pointer call (find the pointer value in `ctx->pc` at the jump and emulate
+   the VU0 upload there), or
+2. keep the captured VU0 image as the seed (current state) until (1) is done.
+
+Next measurement for (1): log any guest branch whose target is >= 0x80000000 (the runtime already reports
+`[guest-branch:missing-target]` for null targets, so this is a small extension), which names the exact
+kernel entry the game jumps to.
+
+---
+
+## Session 200 (2026-11-25) - IPU LANDED (real MPEG-2 model wired into the runtime) + the unit-1 wait measured: it is NOT a deadlock, the guest's own cooperative scheduler runs the 90-iteration wait at ~1.4 s per turn
+
+Two things happened this session: the **IPU (gate B of session 197) is now implemented and wired into
+`ps2_memory.cpp`**, and the boot-progression stall at unit 1 was measured properly for the first time
+(the earlier "stuck at unit 1 / static frame" reading was a misdiagnosis of *what* is stuck).
+
+### 200.1 IPU: a real MPEG-2 macroblock decoder is in the runtime now
+
+New files (all inside the pinned submodule, so `git submodule update` would drop them until pushed):
+
+| file | contents |
+|---|---|
+| `thirdparty/PS2Recomp/ps2xRuntime/include/ps2_ipu.h` | public surface: `attach/init/read_reg/write_reg/fifo_read/fifo_write/dma_in_start/dma_out_start/kick/command_count`, `Channel gChannel[16]`, `setDmaCompleteHandler` |
+| `.../src/lib/hw/ps2_ipu.cpp` | the decoder, adapted verbatim from `D:\Personal\C++\grandia-ps2recomp\runtime\src\hw\ipu.cpp` (VLC LUT build over the MPEG-2 tables, intra/non-intra block decode, IDCT, dequant, DC predictors, VDEC/BDEC/IDEC/FDEC/SETIQ/SETVQ/CSC/PACK, input/output FIFOs, IPU_BP/TOP) |
+| `.../src/lib/hw/mpeg_tables.h` | the MPEG-2 VLC + non-linear quantiser tables |
+| `.../src/lib/hw/ipu_common.h` | shim for the foreign runtime's names (`hw::dma`, `mem::dma_ptr`, `log_write`, `kernel::raise_intc`, `ss::Stream`) backed by THIS runtime |
+
+Wiring in `ps2_memory.cpp`:
+
+- `initialize()`: `ipu::attach(m_rdram)`, `ipu::init()` (11 VLC LUTs, ~3.6 MB), and a
+  `setDmaCompleteHandler` lambda that publishes the channel and raises `D_STAT` bit 3/4.
+- `0x10002000..0x10002030` writes -> `ipu::write_reg`, reads -> `ipu::read_reg` (IPU_CMD busy/result,
+  IPU_CTRL, IPU_BP occupancy, IPU_TOP). Live channel state (QWC above all) is mirrored into the
+  register file after every command, because the guest polls `IPU_TO`'s QWC to decide whether to feed
+  more bitstream.
+- `0x10007010..0x1000701C` word stores are accumulated into one quadword -> `ipu::fifo_write`;
+  `0x10007000..0x1000700C` reads come from `ipu::fifo_read`.
+- DMA channel 3 (`0x1000B000`, IPU_FROM = decoded picture out) and channel 4 (`0x1000B400`, IPU_TO =
+  bitstream in) are no longer "complete immediately with zeros": the model owns them and completes them
+  through `dma_finish_external_ipu()`. `TOL_TRACE_IPU_DMA=1` prints the first 16 starts per channel.
+
+CMake: `src/lib/hw/ps2_ipu.cpp` added to `ps2_runtime`, with `UNITY_GROUP ipu` so the adapted file is
+not merged into a neighbour's unity TU.
+
+Status: builds clean (`ninja -C build/tol2 tol`, clang-cl) and the boot is unchanged (no regression;
+same unit-1 state after 50 s). **Not yet exercised**: the movie is behind the three logo cards, so the
+decoder has not run on real data yet. First test when the boot reaches ~28 s of guest time:
+`TOL_TRACE_IPU=1` for register traffic, `TOL_TRACE_IPU_DMA=1` for the channels, and
+`ipu::command_count()` (add a print) for "are commands completing".
+
+### 200.2 The unit-1 wait is a 90-iteration yield loop, and each iteration costs ~1.4 s
+
+`FUN_00204240` mode 1 does: fade-in loop (25 yields, `f20 += 0.04`, verified 0.04 -> 1.00), then a
+**bounded wait loop** at `0x20439C..0x2043F8`: up to `0x5A` (90) iterations of
+`func_1520C0 -> func_1520F0 (status byte of TCB+0x1F2) -> func_153010(0) & 0x10000` with
+`jal func_15231C` (yield) at the end of each; exit early when a condition is met, otherwise fall through
+to `0x204400` after 90. New probes (`TOL_TRACE_YIELD=1`, `installYieldProbes` in `tol_overrides.cpp`):
+
+- `[unitwait] resume #N s0=K loader=0x63D890 mode=1` at `0x2043F0` � the loop head after each yield.
+- `[unitwait] LOOP-EXIT #N` at `0x204400` � printed **0 times** in a 90 s run: the loop never leaves.
+- `[yield] #N ra=... wall=..ms guestCyc=..ms` for every `0x15231C` switch, with the cost of the turn.
+
+Measured (65-90 s runs, `TOL_VU0_SEED=logs/ref199/vu0mem.bin`, `--gs=sdlgpu`):
+
+```
+green-thread cycle (6 yields):  ~77 ms
+  ra=0x1F8168 (GS worker 1)     80 ms per turn     <- the expensive one
+  ra=0x2DF7F4 (TCB5)            21 ms
+  ra=0x164FE8 (loader job step) 12 ms
+  ra=0x1F8528/0x2047D0/0x3661DC 0.2-1 ms
+loader thread (0x2043F0) resumptions: 64 in 90 s  -> one per ~1.4 s
+after ~7 min: paceWait 91 % of wall, loader state=1, still unit 1
+```
+
+Reference (PCSX2, `tools/ref_unit_wait.py`: breakpoints `0x2043A4` / `0x204400`) does **exactly the
+same loop with the same status byte `+0x1F2` = 0 and `s0` counting up**, and falls through after 90 �
+unit 1 completes ~5 s after it starts (boot capture: mode 1 at 12.0 s, mode 2 at 17.2 s). So the logic
+is not wrong; the **turn rate** is: the guest's cooperative scheduler is ~80x slower than hardware here.
+
+The expensive turn is *not* the `func_102DB0() == 0x20` poll (it returns 2, so that loop never runs: 3
+calls per 20 s, `[gsstatus]` probe), not the GS flush (`func_139AD0`: ~11 ms, 3 calls per 65 s,
+`[gsflush]` probe), and not `func_1F7F30` (~11 ms, 3 calls). The time is inside `func_1F8000`'s own
+body beyond those calls, i.e. the worker's per-turn work, and it is **backend-independent**
+(`--gs=sw` shows the same 80 ms and the same 64 resumptions).
+
+### 200.3 Retraction: `mainIters` freezing at 108 is NORMAL
+
+`TOL_TRACE_SCENE=1` shows the `0x152B70` frame-body loop running 100+ iterations between t=0.9 s and
+t=5.4 s and then *exiting* (`[mainloop] exitPred #100 ret=0 continue loop`, nothing after 5.4 s). The
+long-standing "mainIters frozen at 108 = the frame loop died" reading in several sessions is therefore
+wrong: the frame body is an early-boot loop that finishes by design.
+
+### 200.4 What is left, in order
+
+1. **Unit turn rate.** The guest is idle 91 % of wall at 7 min (paceWait), and the 90-yield wait needs
+   one green-thread turn per iteration, so the whole boot-to-movie phase is bounded by whatever makes a
+   green-thread turn take ~1.4 s instead of ~16 ms. The two prio-0 workers (0x1F8168/0x1F8528) are the
+   only expensive turns; their body (`FUN_001F8000` -> `FUN_001F8180`/`FUN_001F82F0`/... plus
+   `func_281490`/`func_1F7A30`) has not been profiled internally yet. That is the next measurement:
+   wrap `FUN_001F8180`, `FUN_001F82F0`, `0x139300`, `0x139A20` the same way (`[proctime]`).
+2. **Then** the three cards (now visible: namco at 25 % alpha, matrix still the frozen `TOL_VU0_SEED`),
+   then the movie/title on the new IPU.
+3. VU0 data memory still comes from `TOL_VU0_SEED`; the live producer is a kernel VIF0 upload reached
+   through a `FindAddress` pointer (session 199.19), still unimplemented.
+
+Tooling added this session: `tools/ref_unit_wait.py` (PCSX2 side of the unit-1 wait), and the env-gated
+probes `TOL_TRACE_YIELD` (`[yield]`, `[unitwait]`), `TOL_TRACE_GSSTATUS` (`[gsstatus]`, `[gsflush]`,
+`[proctime]`), `TOL_TRACE_IPU_DMA` � all inert unless set.

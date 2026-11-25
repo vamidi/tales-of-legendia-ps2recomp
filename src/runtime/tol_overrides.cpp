@@ -3,6 +3,7 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "ps2_syscalls.h"
+#include "ps2_recompiled_functions.h"
 #include "runtime/ee_scheduler.h"
 
 #include <cstdio>
@@ -1097,6 +1098,27 @@ namespace
                          "[pc] enter 0x%08X #%u a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X ra=0x%08X sp=0x%08X\n",
                          gPcProbeAddr[idx], call, GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6),
                          GPR_U32(ctx, 7), GPR_U32(ctx, 31), GPR_U32(ctx, 29));
+            // TOL_TRACE_PRIM=1: the GS context lives in the scratchpad (measured: a0=0x70000000), so the words
+            // that decide texturing can be read directly. +0x12FC is the PRIM register (bit 4 = TME), +0x12E8 is
+            // the texture-descriptor sentinel that selects the "direct handle" branch in FUN_001593a0.
+            if (std::getenv("TOL_TRACE_PRIM") != nullptr)
+            {
+                const uint32_t primA0 = GPR_U32(ctx, 4);
+                const uint8_t *const sp = ps2GetScratchpadHostPtr();
+                if (sp != nullptr && primA0 >= 0x70000000u && primA0 < 0x70004000u)
+                {
+                    const uint32_t base = primA0 & 0x3FFFu;
+                    uint32_t prim = 0u, tex = 0u, texPtr = 0u;
+                    std::memcpy(&prim, sp + ((base + 0x12FCu) & 0x3FFFu), 4);
+                    std::memcpy(&tex, sp + ((base + 0x12E8u) & 0x3FFFu), 4);
+                    std::memcpy(&texPtr, sp + ((base + 0x12E0u) & 0x3FFFu), 4);
+                    std::fprintf(stderr,
+                                 "[prim] 0x%08X #%u prim=0x%08X tme=%u abe=%u type=%u | tex+12e0=0x%08X "
+                                 "+12e8=0x%08X\n",
+                                 gPcProbeAddr[idx], call, prim, (prim >> 4) & 1u, (prim >> 6) & 1u, prim & 7u,
+                                 texPtr, tex);
+                }
+            }
         }
         gPcProbeOriginal[idx](rdram, ctx, runtime);
         if (log)
@@ -3103,9 +3125,62 @@ namespace
         ++gQueueMatches;
     }
 
+    // ---- Sprite VU0 macro register loader (0x15CB70) -----------------------------------------------
+    // ctx+0x1248 holds 0x15CB70, called by the sprite flush FUN_0015c2a0 immediately before the vertex
+    // transform at 0x15CCB0. It is `ctc2 $zero,$vi1` followed by eleven `vlqi.xyzw vf1..vf11,(vi1++)`:
+    // a macro-mode load of the sprite transform matrix and scale/offset vectors from VU0 DATA memory.
+    //
+    // The corpus emits macro-mode `vlqi` as READ128((vi1 & 0x3FF) << 4), i.e. an EE address, but the
+    // instruction loads from VU0 data memory (0x11004000, PS2Memory::getVU0Data()). Measured effect of the
+    // wrong source: the transform at 0x15CCB0 receives an all-zero matrix, every vertex comes out as the
+    // clamp value (bank X = 0x7FF8, Y/Z/colour 0) and the whole sprite is culled. This override performs
+    // the load the hardware performs.
+    void spriteVu0Load11(uint8_t * /*rdram*/, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->vi[1] = 0u;
+        ctx->pc = GPR_U32(ctx, 31);
+        const uint8_t *mem = runtime->memory().getVU0Data();
+        if (mem == nullptr)
+        {
+            return;
+        }
+        for (int i = 1; i <= 11; ++i)
+        {
+            const uint32_t addr = ((uint32_t)ctx->vi[1] & 0x3FFu) << 4;
+            std::memcpy(&ctx->vu0_vf[i], mem + addr, 16u);
+            ctx->vi[1] = static_cast<uint16_t>(ctx->vi[1] + 1u);
+        }
+        if (std::getenv("TOL_TRACE_VU0MEM") != nullptr)
+        {
+            static bool sDumped = false;
+            if (!sDumped)
+            {
+                sDumped = true;
+                std::fprintf(stderr, "[vu0mem] first 12 qwords of VU0 data memory:");
+                for (uint32_t q = 0u; q < 12u; ++q)
+                {
+                    uint64_t lo = 0u, hi = 0u;
+                    std::memcpy(&lo, mem + q * 16u, 8u);
+                    std::memcpy(&hi, mem + q * 16u + 8u, 8u);
+                    std::fprintf(stderr, " [%02u]=%016llX%016llX", q,
+                                 static_cast<unsigned long long>(hi),
+                                 static_cast<unsigned long long>(lo));
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
+
+    void installSpriteVu0Loaders(PS2Runtime &runtime)
+    {
+        if (runtime.lookupFunction(0x0015CB70u) != nullptr)
+        {
+            runtime.replaceFunction(0x0015CB70u, &spriteVu0Load11);
+        }
+    }
+
     void installQueueProbes(PS2Runtime &runtime)
     {
-        if (runtime.lookupFunction(0x00349C00u) != nullptr)
         {
             gQueueWalkPrev = runtime.lookupFunction(0x00349C00u);
             runtime.replaceFunction(0x00349C00u, &queueWalkProbe);
@@ -5565,6 +5640,244 @@ namespace
         if (gFadeLoopPrev != nullptr)
         {
             gFadeLoopPrev(rdram, ctx, runtime);
+        }
+    }
+
+    // The game's own cooperative context switch (0x15231C): it saves the current register set into a context
+    // block and `jr`s into the next software thread's saved $ra. Every `yield` in the loader/unit code is this
+    // function. A boot that stops advancing while the kernel threads wait is therefore either "the switch never
+    // comes back to this thread" or "it switched to a thread that never yields back"; this probe names the
+    // call site of every switch. Env: TOL_TRACE_YIELD.
+    PS2Runtime::RecompiledFunction gYieldTracePrev = nullptr;
+
+    void yieldTraceProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        static uint64_t sCalls = 0u;
+        ++sCalls;
+        if (sEnv && (sCalls <= 60u || (sCalls % 200u) == 0u))
+        {
+            // Cost of the turn that just ended: wall, emulated EE cycles and guest transfers since the
+            // previous switch. One thread whose turn dwarfs the others names the work that must be cut.
+            static auto sLastWall = std::chrono::steady_clock::now();
+            static uint64_t sLastCycles = 0u;
+            static uint64_t sLastTransfers = 0u;
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t cycles = runtime->eeScheduler().eeCycle();
+            const uint64_t transfers = g_tolGuestTransfers;
+            const double wallMs = std::chrono::duration<double, std::milli>(now - sLastWall).count();
+            const double cycMs = static_cast<double>(cycles - sLastCycles) / 294912.0;
+            sLastWall = now;
+            sLastCycles = cycles;
+            sLastTransfers = transfers;
+            std::fprintf(stderr,
+                         "[yield] #%llu ra=0x%08X sp=0x%08X wall=%.1fms guestCyc=%.1fms transfers=+%llu\n",
+                         static_cast<unsigned long long>(sCalls), GPR_U32(ctx, 31), GPR_U32(ctx, 29), wallMs, cycMs,
+                         static_cast<unsigned long long>(transfers - sLastTransfers));
+        }
+        if (gYieldTracePrev != nullptr)
+        {
+            gYieldTracePrev(rdram, ctx, runtime);
+        }
+    }
+
+    // 0x2043F0 is the instruction after the post-fade yield in FUN_00204240 (the port parks here). Counting
+    // entries says whether the loader thread ever gets the CPU back. Env: TOL_TRACE_YIELD.
+    PS2Runtime::RecompiledFunction gUnitWaitPrev = nullptr;
+
+    void unitWaitResumeProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        static uint64_t sEntries = 0u;
+        ++sEntries;
+        if (sEnv && (sEntries <= 200u || (sEntries % 500u) == 0u))
+        {
+            const uint32_t loader = GPR_U32(ctx, 17);
+            const uint32_t mode = runtime->Load32(rdram, ctx, loader + 0x14u);
+            std::fprintf(stderr, "[unitwait] resume #%llu s0=%u loader=0x%08X mode=%u\n",
+                         static_cast<unsigned long long>(sEntries), GPR_U32(ctx, 16), loader, mode);
+        }
+        if (gUnitWaitPrev != nullptr)
+        {
+            gUnitWaitPrev(rdram, ctx, runtime);
+        }
+    }
+
+    // Per-callee timing inside the GS worker's turn (FUN_001F8000): which call eats the ~80 ms the turn costs.
+    // Env: TOL_TRACE_GSSTATUS.
+    struct TolProcTimer
+    {
+        const char *name;
+        PS2Runtime::RecompiledFunction prev;
+        unsigned long long calls;
+        double totalMs;
+        double maxMs;
+    };
+
+    static TolProcTimer gTimerPad = {"1F7F30", nullptr, 0u, 0.0, 0.0};
+    static TolProcTimer gTimerSvc = {"152940", nullptr, 0u, 0.0, 0.0};
+    static TolProcTimer gTimerDraw = {"1F7A30", nullptr, 0u, 0.0, 0.0};
+    static TolProcTimer gTimerAsk = {"281490", nullptr, 0u, 0.0, 0.0};
+
+    void timedCall(TolProcTimer *t, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (t->prev != nullptr)
+        {
+            t->prev(rdram, ctx, runtime);
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++t->calls;
+        t->totalMs += ms;
+        if (ms > t->maxMs)
+        {
+            t->maxMs = ms;
+        }
+        if (t->calls <= 3u || (t->calls % 200u) == 0u)
+        {
+            std::fprintf(stderr, "[proctime] %s calls=%llu avg=%.2fms max=%.2fms\n", t->name, t->calls,
+                         t->totalMs / static_cast<double>(t->calls), t->maxMs);
+        }
+    }
+
+    void timedPadProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        timedCall(&gTimerPad, rdram, ctx, runtime);
+    }
+    void timedSvcProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        timedCall(&gTimerSvc, rdram, ctx, runtime);
+    }
+    void timedDrawProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        timedCall(&gTimerDraw, rdram, ctx, runtime);
+    }
+    void timedAskProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        timedCall(&gTimerAsk, rdram, ctx, runtime);
+    }
+
+    // Time it: if it dominates the turn, the cost is in the graphics library's flush, not in the poll above.
+    PS2Runtime::RecompiledFunction gGsFlushPrev = nullptr;
+
+    void gsFlushProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_GSSTATUS") != nullptr;
+        static uint64_t sCalls = 0u;
+        static double sTotalMs = 0.0;
+        static double sMaxMs = 0.0;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (gGsFlushPrev != nullptr)
+        {
+            gGsFlushPrev(rdram, ctx, runtime);
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++sCalls;
+        sTotalMs += ms;
+        if (ms > sMaxMs)
+        {
+            sMaxMs = ms;
+        }
+        if (sEnv && (sCalls <= 5u || (sCalls % 100u) == 0u))
+        {
+            std::fprintf(stderr, "[gsflush] calls=%llu total=%.1fms avg=%.2fms max=%.2fms ra=0x%08X\n",
+                         static_cast<unsigned long long>(sCalls), sTotalMs, sTotalMs / static_cast<double>(sCalls),
+                         sMaxMs, GPR_U32(ctx, 31));
+        }
+    }
+    // submits anything, so the number of iterations of that wait is what a worker turn costs. Env:
+    // TOL_TRACE_GSSTATUS. Prints the poll count and the value it returns, per 500 polls.
+    PS2Runtime::RecompiledFunction gGsStatusPrev = nullptr;
+
+    void gsStatusProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_GSSTATUS") != nullptr;
+        static uint64_t sCalls = 0u;
+        static uint64_t sLastLog = 0u;
+        const uint32_t ra = GPR_U32(ctx, 31);
+        if (gGsStatusPrev != nullptr)
+        {
+            gGsStatusPrev(rdram, ctx, runtime);
+        }
+        ++sCalls;
+        if (sEnv && (sCalls <= 5u || (sCalls - sLastLog) >= 100u))
+        {
+            sLastLog = sCalls;
+            std::fprintf(stderr, "[gsstatus] polls=%llu last=0x%08X ra=0x%08X\n",
+                         static_cast<unsigned long long>(sCalls), GPR_U32(ctx, 2), ra);
+        }
+    }
+    PS2Runtime::RecompiledFunction gUnitExitPrev = nullptr;
+
+    void unitWaitExitProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool sEnv = std::getenv("TOL_TRACE_YIELD") != nullptr;
+        static uint64_t sExits = 0u;
+        ++sExits;
+        if (sEnv && (sExits <= 60u || (sExits % 100u) == 0u))
+        {
+            const uint32_t loader = GPR_U32(ctx, 17);
+            const uint32_t mode = runtime->Load32(rdram, ctx, loader + 0x14u);
+            std::fprintf(stderr, "[unitwait] LOOP-EXIT #%llu s0=%u mode=%u\n",
+                         static_cast<unsigned long long>(sExits), GPR_U32(ctx, 16), mode);
+        }
+        if (gUnitExitPrev != nullptr)
+        {
+            gUnitExitPrev(rdram, ctx, runtime);
+        }
+    }
+
+    void installYieldProbes(PS2Runtime &runtime)
+    {
+        // TOL_TRACE_ORDER's orderYieldProbe owns 0x15231C when it is on; do not steal the slot from it.
+        if (std::getenv("TOL_TRACE_YIELD") != nullptr && std::getenv("TOL_TRACE_ORDER") == nullptr)
+        {
+            if (runtime.lookupFunction(0x0015231Cu) != nullptr)
+            {
+                gYieldTracePrev = runtime.lookupFunction(0x0015231Cu);
+                runtime.replaceFunction(0x0015231Cu, &yieldTraceProbe);
+            }
+        }
+        if (runtime.lookupFunction(0x002043F0u) != nullptr)
+        {
+            gUnitWaitPrev = runtime.lookupFunction(0x002043F0u);
+            runtime.replaceFunction(0x002043F0u, &unitWaitResumeProbe);
+        }
+        if (std::getenv("TOL_TRACE_GSSTATUS") != nullptr)
+        {
+            PS2Runtime::RecompiledFunction st = runtime.lookupFunction(0x00102DB0u);
+            std::fprintf(stderr, "[gsstatus] INSTALL 0x102DB0=%s\n", st != nullptr ? "ok" : "NULL");
+            if (st != nullptr)
+            {
+                gGsStatusPrev = st;
+                runtime.replaceFunction(0x00102DB0u, &gsStatusProbe);
+            }
+            PS2Runtime::RecompiledFunction fl = runtime.lookupFunction(0x00139AD0u);
+            std::fprintf(stderr, "[gsstatus] INSTALL 0x139AD0=%s\n", fl != nullptr ? "ok" : "NULL");
+            if (fl != nullptr)
+            {
+                gGsFlushPrev = fl;
+                runtime.replaceFunction(0x00139AD0u, &gsFlushProbe);
+            }
+            auto installTimed = [&runtime](uint32_t addr, TolProcTimer *t, PS2Runtime::RecompiledFunction probe) {
+                PS2Runtime::RecompiledFunction fn = runtime.lookupFunction(addr);
+                if (fn == nullptr)
+                {
+                    std::fprintf(stderr, "[proctime] INSTALL 0x%08X=NULL\n", addr);
+                    return;
+                }
+                t->prev = fn;
+                runtime.replaceFunction(addr, probe);
+            };
+            installTimed(0x001F7F30u, &gTimerPad, &timedPadProbe);
+            installTimed(0x00152940u, &gTimerSvc, &timedSvcProbe);
+            installTimed(0x001F7A30u, &gTimerDraw, &timedDrawProbe);
+            installTimed(0x00281490u, &gTimerAsk, &timedAskProbe);
+        }
+        if (runtime.lookupFunction(0x00204400u) != nullptr)
+        {
+            gUnitExitPrev = runtime.lookupFunction(0x00204400u);
+            runtime.replaceFunction(0x00204400u, &unitWaitExitProbe);
         }
     }
 
@@ -9620,11 +9933,32 @@ namespace tol
         }
         if ((++gGsHistFrames % 30u) != 0u)
         {
-            // TOL_DUMP_VRAM=<path>: write the live 4 MB GS VRAM at two frame tails, so the framebuffer
+            // TOL_DUMP_VRAM=<path>: write the live 4 MB GS VRAM at chosen frame tails, so the framebuffer
             // the display reads and the framebuffer the draws target can be compared byte for byte.
+            // TOL_DUMP_VRAM_FRAMES=<n[,n...]> picks the frame numbers (default 150,400); the logo-card
+            // window is around frames 1000..1500, which the default pair never reached.
             if (const char *dumpPath = std::getenv("TOL_DUMP_VRAM"))
             {
-                if (gGsHistFrames == 150u || gGsHistFrames == 400u)
+                static const char *const sVramFrames = std::getenv("TOL_DUMP_VRAM_FRAMES");
+                bool dumpNow = (gGsHistFrames == 150u || gGsHistFrames == 400u);
+                if (sVramFrames != nullptr)
+                {
+                    dumpNow = false;
+                    const char *p = sVramFrames;
+                    while (*p != '\0')
+                    {
+                        char *end = nullptr;
+                        const unsigned long want = std::strtoul(p, &end, 0);
+                        if (end == p)
+                            break;
+                        if (want == gGsHistFrames)
+                        {
+                            dumpNow = true;
+                        }
+                        p = (*end == ',') ? end + 1 : end;
+                    }
+                }
+                if (dumpNow)
                 {
                     char finalPath[512];
                     std::snprintf(finalPath, sizeof(finalPath), "%s_%u.bin", dumpPath, gGsHistFrames);
@@ -10172,10 +10506,33 @@ namespace tol
         installBusyWriterProbes(runtime);
         // The scene fade: entry/exit, its wait condition, and the alpha (see fadeProbe).
         installFadeProbes(runtime);
+        // The guest's cooperative yield (0x15231C) and the post-fade wait it parks in (0x2043F0) - see yieldProbe.
+        installYieldProbes(runtime);
         // GS interrupt handler cost (see gsIsrProbe).
         installGsIsrProbe(runtime);
         // The 0x3498xx-0x349Dxx queue walk that consumes the guest (see queueWalkProbe).
         installQueueProbes(runtime);
+        // The sprite VU0 macro register loader (see spriteVu0Load11).
+        installSpriteVu0Loaders(runtime);
+        // Hardware/BIOS-provided VU0 data memory. The sprite transform at 0x15CCB0 takes its matrix and
+        // scale vectors from VU0 data memory (loaded by 0x15CB70 with `vlqi`), and nothing in the game's
+        // EE code writes that memory - measured: no EE store, no VIF0 DMA, no 0x1100xxxx reference
+        // anywhere (session 199.13/199.14). The reference image is therefore captured from PCSX2 at the
+        // logo-card flush and loaded here. Kept as a file so no game data lives in the source tree.
+        if (const char *seedPath = std::getenv("TOL_VU0_SEED"))
+        {
+            if (std::FILE *fp = std::fopen(seedPath, "rb"))
+            {
+                uint8_t *dst = runtime.memory().getVU0Data();
+                const size_t got = std::fread(dst, 1u, 4096u, fp);
+                std::fclose(fp);
+                std::fprintf(stderr, "[vu0seed] loaded %zu bytes from %s\n", got, seedPath);
+            }
+            else
+            {
+                std::fprintf(stderr, "[vu0seed] cannot open %s\n", seedPath);
+            }
+        }
         // The ADX detach handshake (see adxDetachProbe).
         installAdxDetachProbe(runtime);
         // Thread identity of the "stop all streams" chain (see streamStopProbe).
@@ -10730,3 +11087,30 @@ namespace tol
 }
 
 
+
+// ---------------------------------------------------------------------------------------------------
+// entry_003a3198: NOT CODE - a data region the Ghidra export decoded as a function.
+//
+// The export gives this "function" 47,418 table slots covering 0x003A3198..0x003D167C (step 4), the
+// range that holds the game's texture/CLUT blobs, vtables and lookup tables (e.g. the texture at
+// 0x3A7000 and the sprite vtable at 0x3D4CA0). It is the single TU that makes the dense corpus
+// unbuildable: 11.5 MB of source with one `case` per byte address, ~52 min at -O0 and 112 min at -O2,
+// and every byte of it is data being decoded as instructions.
+//
+// The dense corpus (data/output_dense, 544 cases for entry_0015c7e0 - the row that contains the sprite
+// VU0 transform at 0x15CCB0) is the corpus that fixes the interior-entry defect, so this one TU is
+// replaced here by a stub instead of being compiled. Its source file is kept as
+// data/output_dense/entry_003a3198_0x3a3198.cpp.disabled.
+//
+// Behaviour: none of these addresses is ever executed, but if a stray indirect branch ever lands in the
+// range, returning to $ra (exactly what a `jr $ra` at the first byte would do) is strictly safer than
+// executing texture bytes as MIPS.
+extern "C" int TOL_STUB_003A3198_KEEP_LINKAGE;
+int TOL_STUB_003A3198_KEEP_LINKAGE = 0;
+
+void entry_003a3198_0x3a3198(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    (void)rdram;
+    (void)runtime;
+    ctx->pc = GPR_U32(ctx, 31);
+}
